@@ -1,0 +1,89 @@
+/*
+ * Depth splat (pass 1 of the compute warp).
+ *
+ * One thread per target-sized grid pixel: taps the layer depth image
+ * through the eye's sub-image rect, unprojects with the render
+ * (source) inverses and reprojects to the target pose, then records
+ * the winning depth at the target pixel with an atomic min. Depth is
+ * uint-encoded so min-wins selects the foreground surface with no
+ * blending and no tuning knobs. Target-view depth is encoded because
+ * atomicMin orders contributors; the pull side unprojects through the
+ * target inverses.
+ *
+ * Integer encoding exists because compute image atomics are
+ * integer-only. 24 bits preserve D24 input precision near-exactly;
+ * 0xffffffff stays reserved as the "no splat here" sentinel.
+ *
+ * Warp math follows the OpenWarp family (https://github.com/Zee2/openwarp,
+ * NCSA-licensed); the splat/pull structure is original.
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D src_depth;
+
+layout(set = 0, binding = 1) uniform SplatUBO
+{
+	mat4 render_inv_vp; // source clip -> world (inverse view * inverse projection, folded on CPU)
+	mat4 warp_vp; // target projection * target view
+	vec4 depth_rect; // normalized depth sub-image: x, y, w, h
+	float depth_flip; // 1 = mirror rows (Vulkan-ordered source)
+	float src_reverse_z; // 1 = reverse-Z source (convert 1-z)
+	vec2 _pad;
+} ubo;
+
+layout(set = 0, binding = 2, r32ui) uniform coherent uimage2D dst_splat;
+
+#define DEPTH_SCALE 16777215.0
+
+void main()
+{
+	ivec2 src_xy = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(dst_splat);
+	if (src_xy.x >= size.x || src_xy.y >= size.y)
+		return;
+
+	vec2 guv = (vec2(src_xy) + vec2(0.5)) / vec2(size);
+	vec2 dguv = vec2(guv.x, guv.y + ubo.depth_flip * (1.0 - 2.0 * guv.y));
+	vec2 duv = ubo.depth_rect.xy + dguv * ubo.depth_rect.zw;
+
+	// Source depth is standard 0..1 nonlinear (reverse-Z sources are
+	// converted below, once, instead of in a separate resolve pass).
+	float z = texture(src_depth, duv).x;
+	z = mix(z, 1.0 - z, ubo.src_reverse_z);
+
+	// Far-plane clamp (mesh parity): sky/clear pixels sit at exactly
+	// 1.0, and without this any backward motion pushes their reprojected
+	// target.z past 1.0 so the frustum reject below drops the whole
+	// background. 0.995 keeps them on the far plane instead.
+	z = min(z, 0.995);
+
+	vec4 clip_pos = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
+	vec4 frag_worldspace = ubo.render_inv_vp * clip_pos;
+	vec4 result = ubo.warp_vp * frag_worldspace;
+
+	// Behind the target camera: nothing to splat (sign must be tested
+	// before the perspective divide destroys it).
+	if (result.w <= 0.0)
+		return;
+	result /= result.w;
+	// Outside the target frustum in depth: the mesh rasterizer clips
+	// these; without the reject they splat clamped garbage.
+	if (result.z < -1.0 || result.z > 1.0)
+		return;
+
+	vec2 tuv = result.xy * 0.5 + 0.5;
+	if (tuv.x < 0.0 || tuv.x > 1.0 || tuv.y < 0.0 || tuv.y > 1.0)
+		return;
+
+	ivec2 dst_xy = ivec2(tuv * vec2(size));
+	dst_xy = clamp(dst_xy, ivec2(0), size - ivec2(1));
+	// Encode TARGET-view depth: the pull side unprojects through the
+	// target inverses, and atomicMin must order contributors by target
+	// depth or occlusion resolves wrong under motion.
+	float zt = result.z * 0.5 + 0.5;
+	uint enc = uint(clamp(zt, 0.0, 1.0) * DEPTH_SCALE);
+	imageAtomicMin(dst_splat, dst_xy, enc);
+}

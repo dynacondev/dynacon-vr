@@ -340,6 +340,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	std::array<xrt_pose, 2> src_pose{};
 	bool has_depth_src = false;
 
+	// Latest predicted warp target, filled by the entry point below and
+	// consumed by the foveation reroute when a warp recorded.
+	std::array<xrt_pose, 2> dst_pose{};
+	std::array<xrt_fov, 2> dst_fov{};
+
 	beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
 
 	// Check if we can pass a layer directly to foveation
@@ -419,11 +424,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	// Depth reprojection entry point (v3): a single depth layer warps
 	// from its own generation pose/images to the latest predicted pose,
-	// at most once per commit. Until the warp slices land reproject() is
-	// a stub returning false, so every commit flows into the straight
-	// foveation path below unchanged. The warp-true reroute (view_info
-	// takes the dst poses, foveation reads the warp output) lands with
-	// the warp slices.
+	// at most once per commit. On a recorded warp the foveation call
+	// below reads the warp output with the dst poses; otherwise the
+	// frame flows straight unchanged.
 	bool warped = false;
 	if (has_depth_src and depth_reprojection_enabled)
 	{
@@ -436,8 +439,6 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// tick's display time. get_view_poses returns head-relative eye
 		// offsets plus the head-in-world relation (Monado device
 		// contract): compose world-space targets here.
-		std::array<xrt_pose, 2> dst_pose{};
-		std::array<xrt_fov, 2> dst_fov{};
 		xrt_space_relation head{};
 		bool dst_ok = session.get_hmd().get_view_poses(
 		        nullptr,
@@ -462,6 +463,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			for (int view = 0; view < 2 && warped; ++view)
 			{
 				warped = reprojector.reproject(
+				        vk.device,
 				        cmd,
 				        view,
 				        src[view],
@@ -507,16 +509,51 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		auto now = os_monotonic_get_ns();
 		session.add_tracking_request(device_id::EYE_GAZE, frame.rendering.desired_present_time_ns, now, now);
 	}
-	view_info.foveation = foveation.foveate(
-	        vk.device,
-	        cmd,
-	        images[i].view_y,
-	        images[i].view_cbcr,
-	        flip_y,
-	        src,
-	        src_rect,
-	        src_fov,
-	        view_info.alpha);
+	if (warped)
+	{
+		// The warp output carries this tick's predicted pose: publish
+		// it and foveate from the warp targets (full-eye, GL-ordered
+		// by construction) instead of the layer images.
+		for (int view = 0; view < 2; ++view)
+		{
+			view_info.pose[view] = xrt_cast(dst_pose[view]);
+			view_info.fov[view] = xrt_cast(dst_fov[view]);
+		}
+		const auto warp_extent = images[0].image.info().extent;
+		const std::array<xrt_rect, 2> warp_rect{
+		        xrt_rect{
+		                .offset = {.w = 0, .h = 0},
+		                .extent = {.w = int(warp_extent.width), .h = int(warp_extent.height)},
+		        },
+		        xrt_rect{
+		                .offset = {.w = 0, .h = 0},
+		                .extent = {.w = int(warp_extent.width), .h = int(warp_extent.height)},
+		        },
+		};
+		view_info.foveation = foveation.foveate(
+		        vk.device,
+		        cmd,
+		        images[i].view_y,
+		        images[i].view_cbcr,
+		        true,
+		        reprojector.get_views(),
+		        warp_rect,
+		        dst_fov,
+		        view_info.alpha);
+	}
+	else
+	{
+		view_info.foveation = foveation.foveate(
+		        vk.device,
+		        cmd,
+		        images[i].view_y,
+		        images[i].view_cbcr,
+		        flip_y,
+		        src,
+		        src_rect,
+		        src_fov,
+		        view_info.alpha);
+	}
 
 	for (auto & encoder: encoders)
 	{
@@ -793,7 +830,10 @@ compositor::compositor(wivrn_session & session) :
         pacer(U_TIME_1S_IN_NS / frame_rate),
         squasher(vk, render_extent(session.get_info())),
         foveation(vk, images[0].image.info().extent),
-        reprojector(),
+        reprojector(
+                vk,
+                vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
+                configuration().reprojection.source_reverse_z),
         depth_reprojection_enabled(configuration().reprojection.enabled),
         depth_source_reverse_z(configuration().reprojection.source_reverse_z)
 {
