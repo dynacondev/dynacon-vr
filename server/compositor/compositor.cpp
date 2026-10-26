@@ -602,6 +602,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 		}
 	}
+	// Remember for the encoder size triage (present path below).
+	images[i].warped_frame = warped;
 	if (triage_time_warp)
 	{
 		uint64_t triage_warp_ns = uint64_t(os_monotonic_get_ns()) - triage_warp_start_ns;
@@ -902,7 +904,10 @@ void compositor::encoder_work(std::stop_token tok)
 			for (auto & encoder: encoders)
 			{
 				if (encoder->stream_idx < 2 or image.view_info.alpha)
+				{
+					encoder->note_frame_kind(image.frame_index, image.warped_frame);
 					encoder->encode(session, image.view_info, image.frame_index);
+				}
 			}
 		}
 		catch (std::exception & e)

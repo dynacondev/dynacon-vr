@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -102,6 +103,20 @@ private:
 	// shard to send
 	to_headset::video_stream_data_shard shard;
 
+	// Encoded-size triage (logging only): frame_idx -> warped flag for
+	// in-flight frames, plus per-window byte/frame totals split by
+	// kind. Fed by note_frame_kind on the worker thread, consumed in
+	// SendData (any thread); all under mutex.
+	std::map<uint64_t, bool> size_kind_by_frame;
+	uint64_t size_win_start_ns = 0;
+	uint64_t size_w_frames = 0;
+	uint64_t size_w_bytes = 0;
+	uint64_t size_s_frames = 0;
+	uint64_t size_s_bytes = 0;
+
+	void accumulate_size_locked(uint64_t frame_index, size_t bytes, bool end_of_frame);
+	void maybe_report_size_locked();
+
 	to_headset::video_stream_data_shard::timing_info_t timing_info;
 	clock_offset clock;
 
@@ -139,6 +154,10 @@ public:
 	void encode(wivrn_session & cnx,
 	            const to_headset::video_stream_data_shard::view_info_t & view_info,
 	            uint64_t frame_index);
+
+	// Tags a frame for the encoded-size triage below. Called on the
+	// worker thread before encode() for the same frame.
+	void note_frame_kind(uint64_t frame_index, bool warped);
 
 protected:
 	// called on present to submit command buffers for the image.

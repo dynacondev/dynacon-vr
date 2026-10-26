@@ -55,6 +55,9 @@ public:
 		vk::raii::ImageView view_cbcr;
 		to_headset::video_stream_data_shard::view_info_t view_info{};
 		uint64_t frame_index;
+		// Set at commit for the encoder size triage (warped content
+		// defeats inter-frame prediction differently than repeats).
+		bool warped_frame = false;
 	};
 
 private:

@@ -24,6 +24,7 @@
 
 #include "encoder_settings.h"
 #include "os/os_time.h"
+#include "util/u_logging.h"
 #include "utils/wivrn_trace.h"
 #include "wivrn_config.h"
 
@@ -295,9 +296,67 @@ void video_encoder::encode(wivrn_session & cnx,
 	}
 }
 
+void video_encoder::note_frame_kind(uint64_t frame_index, bool warped)
+{
+	std::lock_guard lock(mutex);
+	size_kind_by_frame[frame_index] = warped;
+	// In-flight frames are bounded by the compositor image pool; drop
+	// anything ancient so a lost frame can't grow the map.
+	while (not size_kind_by_frame.empty() and size_kind_by_frame.begin()->first + 16 < frame_index)
+		size_kind_by_frame.erase(size_kind_by_frame.begin());
+	maybe_report_size_locked();
+}
+
+void video_encoder::accumulate_size_locked(uint64_t frame_index, size_t bytes, bool end_of_frame)
+{
+	bool warped = false;
+	if (auto it = size_kind_by_frame.find(frame_index); it != size_kind_by_frame.end())
+		warped = it->second;
+	if (warped)
+		size_w_bytes += bytes;
+	else
+		size_s_bytes += bytes;
+	if (end_of_frame)
+	{
+		if (warped)
+			size_w_frames += 1;
+		else
+			size_s_frames += 1;
+		size_kind_by_frame.erase(frame_index);
+	}
+	maybe_report_size_locked();
+}
+
+void video_encoder::maybe_report_size_locked()
+{
+	uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+	if (size_win_start_ns == 0)
+	{
+		size_win_start_ns = now_ns;
+		return;
+	}
+	if (now_ns - size_win_start_ns < 5'000'000'000ull)
+		return;
+	U_LOG_I("encode size triage (5 s): stream %u warped %llu frames %llu bytes (avg %llu) straight %llu frames %llu bytes (avg %llu)",
+	        stream_idx,
+	        (unsigned long long)size_w_frames,
+	        (unsigned long long)size_w_bytes,
+	        (unsigned long long)(size_w_frames ? size_w_bytes / size_w_frames : 0),
+	        (unsigned long long)size_s_frames,
+	        (unsigned long long)size_s_bytes,
+	        (unsigned long long)(size_s_frames ? size_s_bytes / size_s_frames : 0));
+	size_win_start_ns = now_ns;
+	size_w_frames = 0;
+	size_w_bytes = 0;
+	size_s_frames = 0;
+	size_s_bytes = 0;
+}
+
 void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool control)
 {
 	std::lock_guard lock(mutex);
+	if (not control)
+		accumulate_size_locked(shard.frame_idx, data.size(), end_of_frame);
 	if (shard.shard_idx == 0)
 	{
 		// One SendData call per NAL; span the whole frame, not each call.
