@@ -101,7 +101,6 @@ private:
 
 	// Cached at construction: server config is startup-read.
 	const bool depth_reprojection_enabled;
-	const bool depth_source_reverse_z;
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 

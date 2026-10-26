@@ -39,6 +39,8 @@
 #include "utils/method.h"
 #include "utils/wivrn_trace.h"
 
+#include <atomic>
+
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 #ifdef XRT_FEATURE_RENDERDOC
 #include "renderdoc_app.h"
@@ -92,6 +94,26 @@ const comp_swapchain_image & get_layer_image(const comp_layer & layer, uint32_t 
 const comp_swapchain_image & get_layer_depth_image(const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index)
 {
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_depth_swapchain(&layer, swapchain_index))->images[image_index];
+}
+
+// Server config is startup-read: parsed once here, cached in the
+// compositor members at construction.
+struct reprojection_switches
+{
+	bool enabled;
+	bool source_reverse_z;
+};
+
+const reprojection_switches & cached_reprojection_switches()
+{
+	static const reprojection_switches switches = [] {
+		const auto config = configuration();
+		return reprojection_switches{
+		        config.reprojection.enabled,
+		        config.reprojection.source_reverse_z,
+		};
+	}();
+	return switches;
 }
 
 std::array<vk::Format, 3> image_formats(int bit_depth)
@@ -332,7 +354,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// by the single-layer fast path below. Depth always travels paired
 	// with its color (or the layer is plain PROJECTION): no freshness
 	// tracking, no retained store.
-	std::array<vk::ImageView, 2> src_depth;
+	std::array<vk::ImageView, 2> src_depth{};
 	std::array<std::array<float, 4>, 2> src_color_nrect{};
 	std::array<std::array<float, 4>, 2> src_depth_nrect{};
 	std::array<float, 2> src_near_z{1, 1};
@@ -385,7 +407,22 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	}
 	else
 	{
-		// no fast-path, squash layers
+		// no fast-path, squash layers. A depth layer here means the
+		// warp stands down for this commit (throttled note).
+		bool squash_has_depth = false;
+		for (uint32_t li = 0; li < layer_accum.layer_count; ++li)
+			squash_has_depth = squash_has_depth or layer_accum.layers[li].data.type == XRT_LAYER_PROJECTION_DEPTH;
+		if (squash_has_depth)
+		{
+			static std::atomic<uint64_t> last_stand_down_ns{0};
+			uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+			if (now_ns - last_stand_down_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+			{
+				last_stand_down_ns.store(now_ns, std::memory_order_relaxed);
+				U_LOG_W("depth reprojection standing down: %u layers (need exactly 1), serving straight",
+				        layer_accum.layer_count);
+			}
+		}
 		std::array<xrt_pose, 2> poses;
 		const auto extent = images[0].image.info().extent;
 		std::tie(poses, src_fov, src_rect) = squasher.do_layers(
@@ -431,7 +468,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	if (has_depth_src and depth_reprojection_enabled)
 	{
 		// Both planes travel the same import chain, so they share one
-		// row-order decision.
+		// row-order decision. Live evidence (v2): a hardcoded depth
+		// flip here rendered warped frames vertically mirrored, so
+		// this follows the color plane — do not "fix" per-plane.
 		const bool flip_color = !flip_y;
 		const bool flip_depth = !flip_y;
 
@@ -459,6 +498,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				m_relation_chain_resolve(&xrc, &rel);
 				dst_pose[view] = rel.pose;
 			}
+			// Preset true: the per-eye loop below ANDs each result
+			// in, so any single degenerate view serves the whole
+			// frame straight (earlier views' scratch writes are
+			// harmless — scratch only).
 			warped = true;
 			for (int view = 0; view < 2 && warped; ++view)
 			{
@@ -833,9 +876,8 @@ compositor::compositor(wivrn_session & session) :
         reprojector(
                 vk,
                 vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
-                configuration().reprojection.source_reverse_z),
-        depth_reprojection_enabled(configuration().reprojection.enabled),
-        depth_source_reverse_z(configuration().reprojection.source_reverse_z)
+                cached_reprojection_switches().source_reverse_z),
+        depth_reprojection_enabled(cached_reprojection_switches().enabled),
 {
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers
@@ -898,7 +940,7 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
 	U_LOG_I("depth reprojection %s (source-reverse-z %s)",
 	        depth_reprojection_enabled ? "enabled" : "disabled",
-	        depth_source_reverse_z ? "true" : "false");
+	        cached_reprojection_switches().source_reverse_z ? "true" : "false");
 
 	// Start the thread after everything is initialized
 	encoder_thread = std::jthread{[&](std::stop_token t) { encoder_work(t); }};

@@ -73,7 +73,8 @@ struct vk_bundle;
 // size): not a pool, no acquire/release. Per-warp descriptor rewrites
 // and UBO uploads mirror foveation exactly — including its safety
 // story (the commit tail waits on the submitted work, serializing
-// commits against the GPU).
+// commits against the GPU) and its one shared hole (a >1 s GPU stall
+// skips that wait on the timeout path).
 class depth_reprojector
 {
 public:
