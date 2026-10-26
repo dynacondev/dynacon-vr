@@ -306,13 +306,88 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 {
 	u_graphics_sync_unref(&sync_handle);
 
+	// Reprojection triage (logging only, no behavior change): 5 s
+	// window counting commits, warped vs straight frames, silent
+	// commit-path drops, inter-commit gaps over ~1.5x the display
+	// period, and CPU wall time of the warp block below.
+	static std::atomic<uint64_t> triage_win_start_ns{0};
+	static std::atomic<uint64_t> triage_commits{0};
+	static std::atomic<uint64_t> triage_warped{0};
+	static std::atomic<uint64_t> triage_straight{0};
+	static std::atomic<uint64_t> triage_drop_busy{0};
+	static std::atomic<uint64_t> triage_drop_acquire{0};
+	static std::atomic<uint64_t> triage_gap_over{0};
+	static std::atomic<uint64_t> triage_gap_worst_ns{0};
+	static std::atomic<uint64_t> triage_warp_ns_sum{0};
+	static std::atomic<uint64_t> triage_warp_ns_max{0};
+	static std::atomic<uint64_t> triage_warp_samples{0};
+	static std::atomic<uint64_t> triage_last_commit_ns{0};
+
+	uint64_t triage_now_ns = uint64_t(os_monotonic_get_ns());
+	uint64_t triage_last_ns = triage_last_commit_ns.exchange(triage_now_ns, std::memory_order_relaxed);
+	triage_commits.fetch_add(1, std::memory_order_relaxed);
+	uint64_t triage_start_ns = triage_win_start_ns.load(std::memory_order_relaxed);
+	if (triage_start_ns == 0)
+	{
+		triage_win_start_ns.store(triage_now_ns, std::memory_order_relaxed);
+		triage_start_ns = triage_now_ns;
+	}
+	if (triage_last_ns != 0)
+	{
+		uint64_t triage_gap_ns = triage_now_ns - triage_last_ns;
+		uint64_t triage_limit_ns = pacer.get_frame_duration() + pacer.get_frame_duration() / 2;
+		if (triage_gap_ns > triage_limit_ns)
+		{
+			triage_gap_over.fetch_add(1, std::memory_order_relaxed);
+			if (triage_gap_ns > triage_gap_worst_ns.load(std::memory_order_relaxed))
+				triage_gap_worst_ns.store(triage_gap_ns, std::memory_order_relaxed);
+		}
+	}
+	if (triage_now_ns - triage_start_ns > 5'000'000'000ull and
+	    triage_win_start_ns.compare_exchange_strong(triage_start_ns, triage_now_ns, std::memory_order_relaxed))
+	{
+		uint64_t triage_n_commits = triage_commits.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_warped = triage_warped.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight = triage_straight.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_drop_busy = triage_drop_busy.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_drop_acquire = triage_drop_acquire.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_gap_over = triage_gap_over.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_gap_worst_ns = triage_gap_worst_ns.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_warp_ns_sum = triage_warp_ns_sum.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_warp_ns_max = triage_warp_ns_max.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_warp_samples = triage_warp_samples.exchange(0, std::memory_order_relaxed);
+		double triage_warp_avg_us = triage_n_warp_samples ? double(triage_n_warp_ns_sum) / double(triage_n_warp_samples) / 1000.0 : 0.0;
+		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu",
+		        (unsigned long long)triage_n_commits,
+		        (unsigned long long)triage_n_warped,
+		        (unsigned long long)triage_n_straight,
+		        (unsigned long long)triage_n_drop_busy,
+		        (unsigned long long)triage_n_drop_acquire,
+		        (unsigned long long)triage_n_gap_over,
+		        double(triage_n_gap_worst_ns) / 1000000.0,
+		        triage_warp_avg_us,
+		        double(triage_n_warp_ns_max) / 1000.0,
+		        (unsigned long long)triage_n_warp_samples);
+		if (triage_n_gap_over)
+		{
+			U_LOG_W("reprojection triage: %llu commit gaps over 1.5x period in 5 s window, worst %.2f ms",
+			        (unsigned long long)triage_n_gap_over,
+			        double(triage_n_gap_worst_ns) / 1000000.0);
+		}
+	}
+
 	// Move waited frame to rendering frame, clear waited.
 	comp_frame_move_and_clear_locked(&frame.rendering, &frame.waited);
 
 	U_LOG_IFL_D(log_level, "frame %ld commit %d layers", frame.rendering.id, layer_accum.layer_count);
 
-	if (encode_request >= 0 // encoders have not picked up the previous frame
-	    or not session.connected() or not session.get_offset())
+	if (encode_request >= 0) // encoders have not picked up the previous frame
+	{
+		triage_drop_busy.fetch_add(1, std::memory_order_relaxed);
+		comp_frame_clear_locked(&frame.rendering);
+		return XRT_SUCCESS;
+	}
+	if (not session.connected() or not session.get_offset())
 	{
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
@@ -321,6 +396,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	int i = acquire_image();
 	if (i < 0)
 	{
+		triage_drop_acquire.fetch_add(1, std::memory_order_relaxed);
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
 	}
@@ -465,6 +541,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// below reads the warp output with the dst poses; otherwise the
 	// frame flows straight unchanged.
 	bool warped = false;
+	bool triage_time_warp = has_depth_src and depth_reprojection_enabled;
+	uint64_t triage_warp_start_ns = triage_time_warp ? uint64_t(os_monotonic_get_ns()) : 0;
 	if (has_depth_src and depth_reprojection_enabled)
 	{
 		// Both planes travel the same import chain, so they share one
@@ -524,6 +602,18 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			}
 		}
 	}
+	if (triage_time_warp)
+	{
+		uint64_t triage_warp_ns = uint64_t(os_monotonic_get_ns()) - triage_warp_start_ns;
+		triage_warp_ns_sum.fetch_add(triage_warp_ns, std::memory_order_relaxed);
+		triage_warp_samples.fetch_add(1, std::memory_order_relaxed);
+		if (triage_warp_ns > triage_warp_ns_max.load(std::memory_order_relaxed))
+			triage_warp_ns_max.store(triage_warp_ns, std::memory_order_relaxed);
+	}
+	if (warped)
+		triage_warped.fetch_add(1, std::memory_order_relaxed);
+	else
+		triage_straight.fetch_add(1, std::memory_order_relaxed);
 
 	image_barriers.push_back(
 	        vk::ImageMemoryBarrier2{
