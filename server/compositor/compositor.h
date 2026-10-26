@@ -25,6 +25,7 @@
 #include "util/u_logging.h"
 
 #include "encoder/encoder_settings.h"
+#include "depth_reprojector.h"
 #include "foveation.h"
 #include "layer_squasher.h"
 #include "pacer.h"
@@ -96,6 +97,11 @@ private:
 
 	layer_squasher squasher;
 	wivrn::foveation foveation;
+	depth_reprojector reprojector;
+
+	// Cached at construction: server config is startup-read.
+	const bool depth_reprojection_enabled;
+	const bool depth_source_reverse_z;
 
 	std::array<std::unique_ptr<video_encoder>, 3> encoders;
 

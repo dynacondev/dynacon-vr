@@ -31,9 +31,11 @@
 #include "util/u_time.h"
 #include "vk/vk_helpers.h"
 
+#include "driver/configuration.h"
 #include "driver/wivrn_session.h"
 #include "encoder/video_encoder.h"
 #include "inplace_vector.hpp"
+#include "math/m_space.h"
 #include "utils/method.h"
 #include "utils/wivrn_trace.h"
 
@@ -85,6 +87,11 @@ namespace
 const comp_swapchain_image & get_layer_image(const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index)
 {
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_swapchain(&layer, swapchain_index))->images[image_index];
+}
+
+const comp_swapchain_image & get_layer_depth_image(const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index)
+{
+	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_depth_swapchain(&layer, swapchain_index))->images[image_index];
 }
 
 std::array<vk::Format, 3> image_formats(int bit_depth)
@@ -321,6 +328,18 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	std::array<xrt_rect, 2> src_rect;
 	std::array<xrt_fov, 2> src_fov;
 
+	// Depth reprojection inputs, valid only when has_depth_src is set
+	// by the single-layer fast path below. Depth always travels paired
+	// with its color (or the layer is plain PROJECTION): no freshness
+	// tracking, no retained store.
+	std::array<vk::ImageView, 2> src_depth;
+	std::array<std::array<float, 4>, 2> src_color_nrect{};
+	std::array<std::array<float, 4>, 2> src_depth_nrect{};
+	std::array<float, 2> src_near_z{1, 1};
+	std::array<float, 2> src_far_z{1000, 1000};
+	std::array<xrt_pose, 2> src_pose{};
+	bool has_depth_src = false;
+
 	beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
 
 	// Check if we can pass a layer directly to foveation
@@ -329,6 +348,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	     layer_accum.layers[0].data.type == XRT_LAYER_PROJECTION_DEPTH))
 	{
 		const auto & layer = layer_accum.layers[0];
+		has_depth_src = layer.data.type == XRT_LAYER_PROJECTION_DEPTH;
 		for (int view = 0; view < 2; ++view)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
@@ -341,6 +361,21 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			flip_y = layer.data.flip_y;
 			view_info.pose[view] = xrt_cast(data.pose);
 			view_info.fov[view] = xrt_cast(data.fov);
+			src_pose[view] = data.pose;
+			const auto & cnr = data.sub.norm_rect;
+			src_color_nrect[view] = {cnr.x, cnr.y, cnr.w, cnr.h};
+			if (has_depth_src)
+			{
+				const auto & dvd = layer.data.depth.d[view];
+				src_depth[view] = get_image_view(
+				        &get_layer_depth_image(layer, view, dvd.sub.image_index),
+				        layer.data.flags,
+				        dvd.sub.array_index);
+				const auto & dnr = dvd.sub.norm_rect;
+				src_depth_nrect[view] = {dnr.x, dnr.y, dnr.w, dnr.h};
+				src_near_z[view] = dvd.near_z;
+				src_far_z[view] = dvd.far_z;
+			}
 		}
 	}
 	else
@@ -380,6 +415,69 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		                        .layerCount = 2,
 		                },
 		        });
+	}
+
+	// Depth reprojection entry point (v3): a single depth layer warps
+	// from its own generation pose/images to the latest predicted pose,
+	// at most once per commit. Until the warp slices land reproject() is
+	// a stub returning false, so every commit flows into the straight
+	// foveation path below unchanged. The warp-true reroute (view_info
+	// takes the dst poses, foveation reads the warp output) lands with
+	// the warp slices.
+	bool warped = false;
+	if (has_depth_src and depth_reprojection_enabled)
+	{
+		// Both planes travel the same import chain, so they share one
+		// row-order decision.
+		const bool flip_color = !flip_y;
+		const bool flip_depth = !flip_y;
+
+		// Latest predicted target: fresh tracker poses/FOV at this
+		// tick's display time. get_view_poses returns head-relative eye
+		// offsets plus the head-in-world relation (Monado device
+		// contract): compose world-space targets here.
+		std::array<xrt_pose, 2> dst_pose{};
+		std::array<xrt_fov, 2> dst_fov{};
+		xrt_space_relation head{};
+		bool dst_ok = session.get_hmd().get_view_poses(
+		        nullptr,
+		        frame.rendering.predicted_display_time_ns,
+		        XRT_VIEW_TYPE_STEREO,
+		        2,
+		        &head,
+		        dst_fov.data(),
+		        dst_pose.data()) == XRT_SUCCESS;
+		if (dst_ok)
+		{
+			for (int view = 0; view < 2; ++view)
+			{
+				xrt_relation_chain xrc{};
+				xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+				m_relation_chain_push_pose_if_not_identity(&xrc, &dst_pose[view]);
+				m_relation_chain_push_relation(&xrc, &head);
+				m_relation_chain_resolve(&xrc, &rel);
+				dst_pose[view] = rel.pose;
+			}
+			warped = true;
+			for (int view = 0; view < 2 && warped; ++view)
+			{
+				warped = reprojector.reproject(
+				        cmd,
+				        view,
+				        src[view],
+				        src_depth[view],
+				        src_color_nrect[view],
+				        src_depth_nrect[view],
+				        flip_color,
+				        flip_depth,
+				        src_pose[view],
+				        src_fov[view],
+				        src_near_z[view],
+				        src_far_z[view],
+				        dst_pose[view],
+				        dst_fov[view]);
+			}
+		}
 	}
 
 	image_barriers.push_back(
@@ -694,7 +792,10 @@ compositor::compositor(wivrn_session & session) :
         frame_rate(settings[0].fps),
         pacer(U_TIME_1S_IN_NS / frame_rate),
         squasher(vk, render_extent(session.get_info())),
-        foveation(vk, images[0].image.info().extent)
+        foveation(vk, images[0].image.info().extent),
+        reprojector(),
+        depth_reprojection_enabled(configuration().reprojection.enabled),
+        depth_source_reverse_z(configuration().reprojection.source_reverse_z)
 {
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers
@@ -755,6 +856,9 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_root(this, "Compositor", false);
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
+	U_LOG_I("depth reprojection %s (source-reverse-z %s)",
+	        depth_reprojection_enabled ? "enabled" : "disabled",
+	        depth_source_reverse_z ? "true" : "false");
 
 	// Start the thread after everything is initialized
 	encoder_thread = std::jthread{[&](std::stop_token t) { encoder_work(t); }};
