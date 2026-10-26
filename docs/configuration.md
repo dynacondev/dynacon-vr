@@ -115,6 +115,33 @@ If `false` or unset, WiVRn will use both TCP and UDP.
 }
 ```
 
+## `reprojection`
+Server-side depth reprojection: every frame carrying depth is
+reprojected from its known generation pose to the latest predicted
+pose before encode.
+
+### `enabled`
+Default value: `true`
+
+Master switch for the warp. `false` serves frames straight (no
+reprojection).
+
+### `source-reverse-z`
+Default value: `true`
+
+Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
+Vulkan). Normal-Z apps set `false` explicitly.
+
+### Example
+```json
+{
+	"reprojection": {
+		"enabled": true,
+		"source-reverse-z": true
+	}
+}
+```
+
 ## `publish-service`
 Default value: `avahi`
 
