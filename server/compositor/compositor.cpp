@@ -107,7 +107,7 @@ struct reprojection_switches
 const reprojection_switches & cached_reprojection_switches()
 {
 	static const reprojection_switches switches = [] {
-		const auto config = configuration();
+		const auto config = wivrn::configuration();
 		return reprojection_switches{
 		        config.reprojection.enabled,
 		        config.reprojection.source_reverse_z,
@@ -877,7 +877,7 @@ compositor::compositor(wivrn_session & session) :
                 vk,
                 vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
                 cached_reprojection_switches().source_reverse_z),
-        depth_reprojection_enabled(cached_reprojection_switches().enabled),
+        depth_reprojection_enabled(cached_reprojection_switches().enabled)
 {
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers
