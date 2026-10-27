@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <format>
 #include <span>
 
 namespace
@@ -217,56 +218,32 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
         reverse_z(reverse_z),
         extent(target_size),
         color_sampler(make_sampler(vk, vk::Filter::eLinear, "reproject color sampler")),
-        depth_sampler(make_sampler(vk, vk::Filter::eNearest, "reproject depth sampler")),
-        target{
-                make_target(
-                        vk, target_size, vk::Format::eR8G8B8A8Unorm,
-                        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-                        "reproject target 0"),
-                make_target(
-                        vk, target_size, vk::Format::eR8G8B8A8Unorm,
-                        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-                        "reproject target 1"),
-        },
-        target_view{
-                make_view(
-                        vk, target[0], vk::Format::eR8G8B8A8Unorm,
-                        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-                        "reproject target view 0"),
-                make_view(
-                        vk, target[1], vk::Format::eR8G8B8A8Unorm,
-                        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-                        "reproject target view 1"),
-        },
-        splat_depth{
-                make_target(
-                        vk, target_size, vk::Format::eR32Uint,
-                        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
-                        "reproject splat 0"),
-                make_target(
-                        vk, target_size, vk::Format::eR32Uint,
-                        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
-                        "reproject splat 1"),
-        },
-        splat_view{
-                make_view(
-                        vk, splat_depth[0], vk::Format::eR32Uint,
-                        vk::ImageUsageFlagBits::eStorage,
-                        "reproject splat view 0"),
-                make_view(
-                        vk, splat_depth[1], vk::Format::eR32Uint,
-                        vk::ImageUsageFlagBits::eStorage,
-                        "reproject splat view 1"),
-        },
-        splat_ubo{
-                make_warp_ubo(vk.device, sizeof(reproject_splat_ubo), "reproject splat UBO 0"),
-                make_warp_ubo(vk.device, sizeof(reproject_splat_ubo), "reproject splat UBO 1"),
-        },
-        pull_ubo{
-                make_warp_ubo(vk.device, sizeof(reproject_pull_ubo), "reproject pull UBO 0"),
-                make_warp_ubo(vk.device, sizeof(reproject_pull_ubo), "reproject pull UBO 1"),
-        }
+        depth_sampler(make_sampler(vk, vk::Filter::eNearest, "reproject depth sampler"))
 {
+	for (size_t s = 0; s < num_slots; ++s)
+	{
+		for (int v = 0; v < 2; ++v)
+		{
+			target[s][v] = make_target(
+			        vk, target_size, vk::Format::eR8G8B8A8Unorm,
+			        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+			        std::format("reproject target {}:{}", s, v).c_str());
+			target_view[s][v] = make_view(
+			        vk, target[s][v], vk::Format::eR8G8B8A8Unorm,
+			        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
+			        std::format("reproject target view {}:{}", s, v).c_str());
+			splat_depth[s][v] = make_target(
+			        vk, target_size, vk::Format::eR32Uint,
+			        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
+			        std::format("reproject splat {}:{}", s, v).c_str());
+			splat_view[s][v] = make_view(
+			        vk, splat_depth[s][v], vk::Format::eR32Uint,
+			        vk::ImageUsageFlagBits::eStorage,
+			        std::format("reproject splat view {}:{}", s, v).c_str());
+			splat_ubo[s][v] = make_warp_ubo(vk.device, sizeof(reproject_splat_ubo), std::format("reproject splat UBO {}:{}", s, v).c_str());
+			pull_ubo[s][v] = make_warp_ubo(vk.device, sizeof(reproject_pull_ubo), std::format("reproject pull UBO {}:{}", s, v).c_str());
+		}
+	}
 	std::array splat_bindings{
 	        vk::DescriptorSetLayoutBinding{
 	                .binding = 0,
@@ -338,51 +315,55 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = 4,
+	                .descriptorCount = 8,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eUniformBuffer,
-	                .descriptorCount = 4,
+	                .descriptorCount = 8,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageImage,
-	                .descriptorCount = 6,
+	                .descriptorCount = 12,
 	        },
 	};
 	pool = vk::raii::DescriptorPool{
 	        vk.device,
 	        vk::DescriptorPoolCreateInfo{
-	                .maxSets = 4,
+	                .maxSets = 8,
 	                .poolSizeCount = pool_sizes.size(),
 	                .pPoolSizes = pool_sizes.data(),
 	        },
 	};
 	vk.name(*pool, "reproject descriptor pool");
 
-	std::array<vk::DescriptorSetLayout, 2> splat_layouts{*splat_ds_layout, *splat_ds_layout};
+	std::array<vk::DescriptorSetLayout, 4> splat_layouts{*splat_ds_layout, *splat_ds_layout, *splat_ds_layout, *splat_ds_layout};
 	auto splat_alloc = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
 	        .descriptorPool = *pool,
 	        .descriptorSetCount = splat_layouts.size(),
 	        .pSetLayouts = splat_layouts.data(),
 	});
-	splat_sets = {splat_alloc[0].release(), splat_alloc[1].release()};
-	vk.name(splat_sets[0], "reproject splat set 0");
-	vk.name(splat_sets[1], "reproject splat set 1");
-
-	std::array<vk::DescriptorSetLayout, 2> pull_layouts{*pull_ds_layout, *pull_ds_layout};
+	std::array<vk::DescriptorSetLayout, 4> pull_layouts{*pull_ds_layout, *pull_ds_layout, *pull_ds_layout, *pull_ds_layout};
 	auto pull_alloc = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
 	        .descriptorPool = *pool,
 	        .descriptorSetCount = pull_layouts.size(),
 	        .pSetLayouts = pull_layouts.data(),
 	});
-	pull_sets = {pull_alloc[0].release(), pull_alloc[1].release()};
-	vk.name(pull_sets[0], "reproject pull set 0");
-	vk.name(pull_sets[1], "reproject pull set 1");
+	for (size_t s = 0; s < num_slots; ++s)
+	{
+		for (int v = 0; v < 2; ++v)
+		{
+			splat_sets[s][v] = splat_alloc[s * 2 + v].release();
+			pull_sets[s][v] = pull_alloc[s * 2 + v].release();
+			vk.name(splat_sets[s][v], std::format("reproject splat set {}:{}", s, v));
+			vk.name(pull_sets[s][v], std::format("reproject pull set {}:{}", s, v));
+		}
+	}
 }
 
 bool depth_reprojector::reproject(
         vk::raii::Device & device,
         vk::raii::CommandBuffer & cmd,
+        int slot,
         int view,
         vk::ImageView src_color,
         vk::ImageView src_depth,
@@ -418,29 +399,29 @@ bool depth_reprojector::reproject(
 	std::memcpy(splat_data.depth_rect, depth_rect.data(), sizeof(splat_data.depth_rect));
 	splat_data.depth_flip = flip_depth ? 1.f : 0.f;
 	splat_data.src_reverse_z = reverse_z ? 1.f : 0.f;
-	upload_ubo(splat_ubo[view], splat_data);
+	upload_ubo(splat_ubo[slot][view], splat_data);
 
 	reproject_pull_ubo pull_data{};
 	math_matrix_4x4_multiply(&dst_inv_v, &dst_inv_p, &pull_data.dst_inv);
 	math_matrix_4x4_multiply(&src_proj, &src_view, &pull_data.src_vp);
 	std::memcpy(pull_data.color_rect, color_rect.data(), sizeof(pull_data.color_rect));
 	pull_data.color_flip = flip_color ? 1.f : 0.f;
-	upload_ubo(pull_ubo[view], pull_data);
+	upload_ubo(pull_ubo[slot][view], pull_data);
 
 	// The layer views change per app frame, so the sets are rewritten
-	// per warp (foveation precedent: rewritten per foveate, same
-	// safety story via the commit tail's submit wait).
+	// per warp. Slot-owned: CPU rewrites are unordered by GPU barriers,
+	// and slot i is only touched while image i is held.
 	vk::DescriptorImageInfo splat_depth_info{
 	        .sampler = *depth_sampler,
 	        .imageView = src_depth,
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	vk::DescriptorBufferInfo splat_ubo_info{
-	        .buffer = splat_ubo[view],
+	        .buffer = splat_ubo[slot][view],
 	        .range = vk::WholeSize,
 	};
 	vk::DescriptorImageInfo splat_target_info{
-	        .imageView = *splat_view[view],
+	        .imageView = *splat_view[slot][view],
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	vk::DescriptorImageInfo pull_color_info{
@@ -449,58 +430,58 @@ bool depth_reprojector::reproject(
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	vk::DescriptorBufferInfo pull_ubo_info{
-	        .buffer = pull_ubo[view],
+	        .buffer = pull_ubo[slot][view],
 	        .range = vk::WholeSize,
 	};
 	vk::DescriptorImageInfo pull_target_info{
-	        .imageView = *target_view[view],
+	        .imageView = *target_view[slot][view],
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	std::array writes{
 	        vk::WriteDescriptorSet{
-	                .dstSet = splat_sets[view],
+	                .dstSet = splat_sets[slot][view],
 	                .dstBinding = 0,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 	                .pImageInfo = &splat_depth_info,
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = splat_sets[view],
+	                .dstSet = splat_sets[slot][view],
 	                .dstBinding = 1,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eUniformBuffer,
 	                .pBufferInfo = &splat_ubo_info,
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = splat_sets[view],
+	                .dstSet = splat_sets[slot][view],
 	                .dstBinding = 2,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eStorageImage,
 	                .pImageInfo = &splat_target_info,
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = pull_sets[view],
+	                .dstSet = pull_sets[slot][view],
 	                .dstBinding = 0,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 	                .pImageInfo = &pull_color_info,
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = pull_sets[view],
+	                .dstSet = pull_sets[slot][view],
 	                .dstBinding = 1,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eUniformBuffer,
 	                .pBufferInfo = &pull_ubo_info,
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = pull_sets[view],
+	                .dstSet = pull_sets[slot][view],
 	                .dstBinding = 2,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eStorageImage,
 	                .pImageInfo = &splat_target_info,
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = pull_sets[view],
+	                .dstSet = pull_sets[slot][view],
 	                .dstBinding = 3,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eStorageImage,
@@ -511,8 +492,8 @@ bool depth_reprojector::reproject(
 
 	// First warp transitions from Undefined; later warps from the
 	// steady state (splat GENERAL, target SHADER_READ_ONLY).
-	const bool ready = warp_ready[view];
-	warp_ready[view] = true;
+	const bool ready = warp_ready[slot][view];
+	warp_ready[slot][view] = true;
 	const auto reuse_stage = ready ? vk::PipelineStageFlagBits2::eComputeShader
 	                               : vk::PipelineStageFlagBits2::eTopOfPipe;
 	vk::AccessFlags2 splat_access = ready ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
@@ -529,7 +510,7 @@ bool depth_reprojector::reproject(
 	                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
 	                .oldLayout = splat_start,
 	                .newLayout = vk::ImageLayout::eTransferDstOptimal,
-	                .image = splat_depth[view],
+	                .image = splat_depth[slot][view],
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
@@ -543,7 +524,7 @@ bool depth_reprojector::reproject(
 	                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
 	                .oldLayout = target_start,
 	                .newLayout = vk::ImageLayout::eGeneral,
-	                .image = target[view],
+	                .image = target[slot][view],
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
@@ -563,7 +544,7 @@ bool depth_reprojector::reproject(
 	const uint32_t empty_bits[4] = {0xffffffffu, 0, 0, 0};
 	std::memcpy(splat_empty.uint32, empty_bits, sizeof(empty_bits));
 	cmd.clearColorImage(
-	        splat_depth[view], vk::ImageLayout::eTransferDstOptimal, splat_empty,
+	        splat_depth[slot][view], vk::ImageLayout::eTransferDstOptimal, splat_empty,
 	        vk::ImageSubresourceRange{
 	                .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                .levelCount = 1,
@@ -578,7 +559,7 @@ bool depth_reprojector::reproject(
 	                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
 	                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
 	                .newLayout = vk::ImageLayout::eGeneral,
-	                .image = splat_depth[view],
+	                .image = splat_depth[slot][view],
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
@@ -595,7 +576,7 @@ bool depth_reprojector::reproject(
 	const uint32_t groups_y = (extent.height + 7) / 8;
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *splat_pipeline);
-	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *splat_layout, 0, splat_sets[view], {});
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *splat_layout, 0, splat_sets[slot][view], {});
 	cmd.dispatch(groups_x, groups_y, 1);
 
 	// Splat atomics must complete before the pull reads.
@@ -607,7 +588,7 @@ bool depth_reprojector::reproject(
 	                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
 	                .oldLayout = vk::ImageLayout::eGeneral,
 	                .newLayout = vk::ImageLayout::eGeneral,
-	                .image = splat_depth[view],
+	                .image = splat_depth[slot][view],
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
@@ -621,7 +602,7 @@ bool depth_reprojector::reproject(
 	});
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pull_pipeline);
-	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pull_layout, 0, pull_sets[view], {});
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pull_layout, 0, pull_sets[slot][view], {});
 	cmd.dispatch(groups_x, groups_y, 1);
 
 	// Warp output ends SHADER_READ_ONLY, ready to feed foveation.
@@ -633,7 +614,7 @@ bool depth_reprojector::reproject(
 	                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
 	                .oldLayout = vk::ImageLayout::eGeneral,
 	                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	                .image = target[view],
+	                .image = target[slot][view],
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
@@ -649,9 +630,9 @@ bool depth_reprojector::reproject(
 	return true;
 }
 
-std::array<vk::ImageView, 2> depth_reprojector::get_views()
+std::array<vk::ImageView, 2> depth_reprojector::get_views(int slot)
 {
-	return {*target_view[0], *target_view[1]};
+	return {*target_view[slot][0], *target_view[slot][1]};
 }
 
 } // namespace wivrn

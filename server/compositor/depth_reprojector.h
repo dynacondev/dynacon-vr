@@ -69,26 +69,28 @@ struct vk_bundle;
 // (premultiplied: valid (rgb, 1), holes black). No hole fill: holes
 // stay black by design.
 //
-// Fixed owned scratch (per-eye warped color + splat depth, full render
-// size): not a pool, no acquire/release. Per-warp descriptor rewrites
-// and UBO uploads mirror foveation exactly — including its safety
-// story (the commit tail waits on the submitted work, serializing
-// commits against the GPU) and its one shared hole (a >1 s GPU stall
-// skips that wait on the timeout path).
+// Fixed owned scratch per (slot, eye): warped color + splat depth at
+// full render size — not a pool, no acquire/release. Per-warp
+// descriptor rewrites and UBO uploads land in the commit's slot, so
+// overlapping submits never share CPU-written state (the safety story
+// is slot ownership via image-busy lifetime, not the commit tail).
 class depth_reprojector
 {
 public:
 	depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, bool reverse_z);
 
 	// Warps one eye's layer images (generation pose/params) to
-	// dst_pose/dst_fov, recording into cmd. Norm-rects map each eye's
-	// sub-image; the flip flags select the per-plane row order (true =
-	// caller rows are Vulkan-ordered, top row first). Output ends in
+	// dst_pose/dst_fov, recording into cmd. Slot selects the commit's
+	// per-slot scratch/UBO/sets (== compositor image index); view
+	// selects the eye. Norm-rects map each eye's sub-image; the flip
+	// flags select the per-plane row order (true = caller rows are
+	// Vulkan-ordered, top row first). Output ends in
 	// SHADER_READ_ONLY_OPTIMAL, ready to feed foveation (see
 	// get_views). Returns false on degenerate input (caller falls
-	// back: no warp recorded).
+	// back: no warp recorded, slot's ready flag untouched).
 	bool reproject(vk::raii::Device & device,
 	               vk::raii::CommandBuffer & cmd,
+	               int slot,
 	               int view,
 	               vk::ImageView src_color,
 	               vk::ImageView src_depth,
@@ -103,7 +105,7 @@ public:
 	               const xrt_pose & dst_pose,
 	               const xrt_fov & dst_fov);
 
-	std::array<vk::ImageView, 2> get_views();
+	std::array<vk::ImageView, 2> get_views(int slot);
 
 private:
 	// Depth encoding at construction (config source-reverse-z):
@@ -115,22 +117,26 @@ private:
 	vk::raii::Sampler color_sampler = nullptr;
 	vk::raii::Sampler depth_sampler = nullptr;
 
-	// Per-eye warped color targets (plain UNORM, sampled raw by
-	// foveation) plus per-eye splatted foreground-depth scratch
+	// Per-(slot, eye) warped color targets (plain UNORM, sampled raw by
+	// foveation) plus per-(slot, eye) splatted foreground-depth scratch
 	// (R32_UINT, cleared each warp). Targets end SHADER_READ_ONLY,
-	// scratch ends GENERAL, between warps. Per-eye images: the two
-	// eyes warp independently.
-	std::array<bool, 2> warp_ready = {false, false};
-	std::array<image_allocation, 2> target;
-	std::array<vk::raii::ImageView, 2> target_view = {nullptr, nullptr};
-	std::array<image_allocation, 2> splat_depth;
-	std::array<vk::raii::ImageView, 2> splat_view = {nullptr, nullptr};
+	// scratch ends GENERAL, between warps. Slot == compositor image
+	// index: the commit for images[i] only touches slot i, so a warp
+	// recording into slot i can never race a still-executing submit that
+	// used slot 1-i.
+	static constexpr size_t num_slots = 2;
+	std::array<std::array<bool, 2>, num_slots> warp_ready = {};
+	std::array<std::array<image_allocation, 2>, num_slots> target;
+	std::array<std::array<vk::raii::ImageView, 2>, num_slots> target_view;
+	std::array<std::array<image_allocation, 2>, num_slots> splat_depth;
+	std::array<std::array<vk::raii::ImageView, 2>, num_slots> splat_view;
 
 	// Splat: depth sampler + splat UBO + splat storage image.
 	// Pull: color sampler + pull UBO + splat storage image (read) +
 	// color storage target (write). Sets are rewritten per warp (src
 	// views change per app frame); only the UBO contents change
-	// otherwise.
+	// otherwise. Per-(slot, eye): CPU rewrites are unordered by GPU
+	// barriers, so sharing one set across overlapping submits would race.
 	vk::raii::DescriptorSetLayout splat_ds_layout = nullptr;
 	vk::raii::PipelineLayout splat_layout = nullptr;
 	vk::raii::Pipeline splat_pipeline = nullptr;
@@ -138,10 +144,10 @@ private:
 	vk::raii::PipelineLayout pull_layout = nullptr;
 	vk::raii::Pipeline pull_pipeline = nullptr;
 	vk::raii::DescriptorPool pool = nullptr;
-	std::array<vk::DescriptorSet, 2> splat_sets;
-	std::array<vk::DescriptorSet, 2> pull_sets;
+	std::array<std::array<vk::DescriptorSet, 2>, num_slots> splat_sets;
+	std::array<std::array<vk::DescriptorSet, 2>, num_slots> pull_sets;
 
-	std::array<buffer_allocation, 2> splat_ubo;
-	std::array<buffer_allocation, 2> pull_ubo;
+	std::array<std::array<buffer_allocation, 2>, num_slots> splat_ubo;
+	std::array<std::array<buffer_allocation, 2>, num_slots> pull_ubo;
 };
 } // namespace wivrn

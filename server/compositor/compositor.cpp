@@ -620,6 +620,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				warped = reprojector.reproject(
 				        vk.device,
 				        cmd,
+				        i,
 				        view,
 				        src[view],
 				        src_depth[view],
@@ -685,7 +686,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        images[i].view_y,
 		        images[i].view_cbcr,
 		        true,
-		        reprojector.get_views(),
+		        reprojector.get_views(i),
 		        warp_rect,
 		        dst_fov,
 		        view_info.alpha);
