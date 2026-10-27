@@ -326,6 +326,7 @@ wivrn::vk_bundle::vk_bundle() :
 		// it behaves as before. Sits outside the backend ifdefs so
 		// every encoder backend gets it.
 		std::vector<vk::DeviceQueueGlobalPriorityCreateInfoKHR> queue_priorities;
+		queue_priorities.reserve(queues_info.size());
 		const bool want_high_priority = configuration().reprojection.gpu_priority ==
 		        configuration::reprojection::gpu_priority::high;
 		if (want_high_priority and has_device_ext(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
