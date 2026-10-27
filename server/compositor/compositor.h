@@ -87,8 +87,8 @@ private:
 	wivrn_session & session;
 	vk_bundle vk;
 	static constexpr size_t num_frame_slots = 2;
-	std::array<vk::raii::CommandPool, num_frame_slots> cmd_pools;
-	std::array<vk::raii::QueryPool, num_frame_slots> query_pools;
+	std::array<vk::raii::CommandPool, num_frame_slots> cmd_pools{nullptr, nullptr};
+	std::array<vk::raii::QueryPool, num_frame_slots> query_pools{nullptr, nullptr};
 	// Set once the slot's first submit has recorded timestamps: avoids
 	// counting a poll-miss on a pool that was never written.
 	std::array<bool, num_frame_slots> query_armed = {false, false};
@@ -96,7 +96,7 @@ private:
 	std::array<encoder_settings, 3> settings;
 
 	std::array<image, num_frame_slots> images;
-	std::array<vk::raii::CommandBuffer, num_frame_slots> cmds;
+	std::array<vk::raii::CommandBuffer, num_frame_slots> cmds{nullptr, nullptr};
 	vk::raii::Semaphore sem;
 	uint64_t sem_value = 0;
 

@@ -77,7 +77,7 @@ class foveation
 	std::array<P, num_slots> last;
 
 	// must hold lock on mutex to call it
-	void compute_params();
+	void compute_params(int slot);
 
 	void update_ubo(
 	        vk::raii::CommandBuffer & cmd,

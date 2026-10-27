@@ -356,8 +356,9 @@ static void fill_param_2d(
 namespace wivrn
 {
 
-void foveation::compute_params()
+void foveation::compute_params(int slot)
 {
+	P & last = this->last[slot];
 	auto e = yaw_pitch(gaze);
 
 	if (manual_foveation.enabled)
@@ -544,7 +545,7 @@ void foveation::update_ubo(
 	        .manual_foveation = manual_foveation,
 	};
 
-	compute_params();
+	compute_params(slot);
 
 	ubo_data ubo;
 	for (size_t view = 0; view < 2; ++view)

@@ -127,9 +127,9 @@ private:
 	static constexpr size_t num_slots = 2;
 	std::array<std::array<bool, 2>, num_slots> warp_ready = {};
 	std::array<std::array<image_allocation, 2>, num_slots> target;
-	std::array<std::array<vk::raii::ImageView, 2>, num_slots> target_view;
+	std::array<std::array<vk::raii::ImageView, 2>, num_slots> target_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
 	std::array<std::array<image_allocation, 2>, num_slots> splat_depth;
-	std::array<std::array<vk::raii::ImageView, 2>, num_slots> splat_view;
+	std::array<std::array<vk::raii::ImageView, 2>, num_slots> splat_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
 
 	// Splat: depth sampler + splat UBO + splat storage image.
 	// Pull: color sampler + pull UBO + splat storage image (read) +
