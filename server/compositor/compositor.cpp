@@ -831,19 +831,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	comp_frame_clear_locked(&frame.rendering);
 
-	// Commit/GPU decoupling is not yet in effect: the tail wait below
-	// stays as the safety net until every shared upload state is slotted
-	// (flag-day slice removes it). Timestamp reads already went lazy
-	// (see the acquire-time poll above), so telemetry never parks.
-	if (vk.device.waitSemaphores(vk::SemaphoreWaitInfo{
-	                                     .semaphoreCount = 1,
-	                                     .pSemaphores = &*sem,
-	                                     .pValues = &sem_info.value,
-	                             },
-	                             U_TIME_1S_IN_NS) == vk::Result::eTimeout)
-	{
-		U_LOG_IFL_W(log_level, "compositor timeout");
-	}
+	// Decoupled: no GPU-progress waits on the commit thread. Slot i is
+	// owned until image i recycles (which strictly postdates this
+	// submit's completion via the encoder semaphore/fifo chain), queries
+	// read lazily at the next acquire, and overload sheds via
+	// drop_busy/drop_acquire/present_skip — so nothing here needs
+	// completion. A slow GPU delays this frame's encode, never the next
+	// tick. (Garbage collection below needs no completion either: it
+	// only pops the app-governed destroy stack.)
 
 	// Now is a good point to garbage collect.
 	comp_swapchain_shared_garbage_collect(&cscs);
