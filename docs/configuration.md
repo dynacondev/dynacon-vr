@@ -132,12 +132,22 @@ Default value: `true`
 Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
 Vulkan). Normal-Z apps set `false` explicitly.
 
+### `gpu-priority`
+Default value: `high`
+
+Device-global queue priority for the compositor, transfer and encode
+queues: `high` prefers our submits when the app saturates the GPU (the
+only lever that arbitrates across our Vulkan device and the app's).
+`medium` requests nothing (driver default). Silently default when the
+driver lacks support.
+
 ### Example
 ```json
 {
 	"reprojection": {
 		"enabled": true,
-		"source-reverse-z": true
+		"source-reverse-z": true,
+		"gpu-priority": "high"
 	}
 }
 ```

@@ -18,6 +18,7 @@
  */
 #include "wivrn_vk_bundle.h"
 
+#include "driver/configuration.h"
 #include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "wivrn-server_shaders.h"
@@ -238,6 +239,9 @@ wivrn::vk_bundle::vk_bundle() :
 		        // For Monado
 		        VK_KHR_EXTERNAL_FENCE_FD_EXTENSION_NAME,
 		        VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
+		        // Queue priority under GPU contention (compositor +
+		        // encode queues prefer our submits over the app's)
+		        VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME,
 		        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
 		        VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
 		        VK_KHR_MAINTENANCE_1_EXTENSION_NAME,
@@ -312,6 +316,34 @@ wivrn::vk_bundle::vk_bundle() :
 			        std::get<vk::PhysicalDeviceVideoMaintenance1FeaturesKHR>(physical_device.getFeatures2<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceVideoMaintenance1FeaturesKHR>()).videoMaintenance1;
 #endif
 #endif
+
+		// Prefer our queues when the app saturates the GPU: global
+		// priority is the only lever that arbitrates across our
+		// VkDevice and the app's device, so it covers the compositor
+		// (warp), transfer and encode queues alike. Requested only
+		// when the driver advertises the extension, and only when the
+		// config asks above default (medium); a driver that ignores
+		// it behaves as before. Sits outside the backend ifdefs so
+		// every encoder backend gets it.
+		std::vector<vk::DeviceQueueGlobalPriorityCreateInfoKHR> queue_priorities;
+		const bool want_high_priority = configuration().reprojection.gpu_priority ==
+		        configuration::reprojection::gpu_priority::high;
+		if (want_high_priority and has_device_ext(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
+		{
+			for (auto & queue_info : queues_info)
+			{
+				queue_priorities.push_back(vk::DeviceQueueGlobalPriorityCreateInfoKHR{
+				        .globalPriority = vk::QueueGlobalPriorityKHR::eHigh,
+				});
+				queue_info.pNext = &queue_priorities.back();
+			}
+			U_LOG_I("Vulkan global queue priority: HIGH (compositor, transfer and encode queues)");
+		}
+		else if (want_high_priority)
+		{
+			U_LOG_W("Vulkan global queue priority unavailable on this driver, running at default priority");
+		}
+
 #ifdef VK_KHR_maintenance9
 		if (has_device_ext(VK_KHR_MAINTENANCE_9_EXTENSION_NAME))
 		{

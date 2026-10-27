@@ -166,6 +166,17 @@ struct configuration
 		// this, so the default encodes the pipeline assumption;
 		// normal-Z apps set it false explicitly.
 		bool source_reverse_z = true;
+		// Device-global queue priority for our compositor, transfer
+		// and encode queues: high prefers our submits when the app
+		// saturates the GPU. This is the only lever that arbitrates
+		// across our VkDevice and the app's device; medium requests
+		// nothing (driver default).
+		enum class gpu_priority
+		{
+			medium,
+			high,
+		};
+		gpu_priority gpu_priority = gpu_priority::high;
 	};
 	reprojection reprojection;
 

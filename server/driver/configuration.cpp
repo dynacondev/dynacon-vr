@@ -663,6 +663,23 @@ configuration::configuration()
 					else
 						U_LOG_W("reprojection.source-reverse-z must be a boolean, ignoring");
 				}
+				if (auto jt = it->find("gpu-priority"); jt != it->end())
+				{
+					if (not jt->is_string())
+						U_LOG_W("reprojection.gpu-priority must be a string, ignoring");
+					else
+					{
+						const auto value = jt->get<std::string>();
+						if (value == "medium")
+							reprojection.gpu_priority = configuration::reprojection::gpu_priority::medium;
+						else if (value == "high")
+							reprojection.gpu_priority = configuration::reprojection::gpu_priority::high;
+						else if (value == "realtime")
+							U_LOG_W("reprojection.gpu-priority realtime is not implemented yet, using high");
+						else
+							U_LOG_W("reprojection.gpu-priority must be \"medium\" or \"high\", ignoring");
+					}
+				}
 			}
 		}
 
