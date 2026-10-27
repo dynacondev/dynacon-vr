@@ -320,30 +320,36 @@ wivrn::vk_bundle::vk_bundle() :
 		// Prefer our queues when the app saturates the GPU: global
 		// priority is the only lever that arbitrates across our
 		// VkDevice and the app's device, so it covers the compositor
-		// (warp), transfer and encode queues alike. Requested only
-		// when the driver advertises the extension, and only when the
-		// config asks above default (medium); a driver that ignores
-		// it behaves as before. Sits outside the backend ifdefs so
-		// every encoder backend gets it.
-		std::vector<vk::DeviceQueueGlobalPriorityCreateInfoKHR> queue_priorities;
-		queue_priorities.reserve(queues_info.size());
-		const bool want_high_priority = configuration().reprojection.gpu_priority ==
-		        configuration::reprojection::gpu_priority::high;
-		if (want_high_priority and has_device_ext(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
+		// (warp), transfer and encode queues alike. Tiers are
+		// attempted highest-first at device creation below:
+		// privilege-gated drivers reject realtime/high with
+		// ErrorNotPermitted, which falls back to the next tier
+		// (medium = driver default, no struct). Sits outside the
+		// backend ifdefs so every encoder backend gets it.
+		std::vector<vk::QueueGlobalPriorityKHR> priority_tiers;
+		if (has_device_ext(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
 		{
-			for (auto & queue_info : queues_info)
+			switch (configuration().reprojection.gpu_priority)
 			{
-				queue_priorities.push_back(vk::DeviceQueueGlobalPriorityCreateInfoKHR{
-				        .globalPriority = vk::QueueGlobalPriorityKHR::eHigh,
-				});
-				queue_info.pNext = &queue_priorities.back();
+				case configuration::reprojection::gpu_priority::realtime:
+					priority_tiers = {vk::QueueGlobalPriorityKHR::eRealtime, vk::QueueGlobalPriorityKHR::eHigh};
+					break;
+				case configuration::reprojection::gpu_priority::high:
+					priority_tiers = {vk::QueueGlobalPriorityKHR::eHigh};
+					break;
+				default:
+					break;
 			}
-			U_LOG_I("Vulkan global queue priority: HIGH (compositor, transfer and encode queues)");
 		}
-		else if (want_high_priority)
+		else if (configuration().reprojection.gpu_priority != configuration::reprojection::gpu_priority::medium)
 		{
 			U_LOG_W("Vulkan global queue priority unavailable on this driver, running at default priority");
 		}
+		std::vector<vk::DeviceQueueGlobalPriorityCreateInfoKHR> queue_priorities;
+		queue_priorities.reserve(queues_info.size());
+		auto priority_name = [](vk::QueueGlobalPriorityKHR tier) {
+			return tier == vk::QueueGlobalPriorityKHR::eRealtime ? "REALTIME" : "HIGH";
+		};
 
 #ifdef VK_KHR_maintenance9
 		if (has_device_ext(VK_KHR_MAINTENANCE_9_EXTENSION_NAME))
@@ -380,16 +386,53 @@ wivrn::vk_bundle::vk_bundle() :
 		}
 #endif
 
-		device = vk::raii::Device(
-		        physical_device,
-		        vk::DeviceCreateInfo{
-		                .pNext = &feat.get(),
-		                .queueCreateInfoCount = uint32_t(queues_info.size()),
-		                .pQueueCreateInfos = queues_info.data(),
-		                .enabledExtensionCount = uint32_t(device_extensions.size()),
-		                .ppEnabledExtensionNames = device_extensions.data(),
-		        });
-
+		vk::DeviceCreateInfo device_info{
+		        .pNext = &feat.get(),
+		        .queueCreateInfoCount = uint32_t(queues_info.size()),
+		        .pQueueCreateInfos = queues_info.data(),
+		        .enabledExtensionCount = uint32_t(device_extensions.size()),
+		        .ppEnabledExtensionNames = device_extensions.data(),
+		};
+		// Attempt tiers highest-first, ending at default (medium, no
+		// struct). A denied tier fails vkCreateDevice and falls back
+		// to the next; a failed default rethrows unchanged.
+		for (size_t attempt = 0;; ++attempt)
+		{
+			const bool use_priority = attempt < priority_tiers.size();
+			if (use_priority)
+			{
+				// Rebuilt per attempt (values differ); reserve()d once
+				// above so chained addresses stay stable, and cleared
+				// when stepping down so no stale pNext survives.
+				queue_priorities.clear();
+				for (auto & queue_info : queues_info)
+				{
+					queue_priorities.push_back(vk::DeviceQueueGlobalPriorityCreateInfoKHR{
+					        .globalPriority = priority_tiers[attempt],
+					});
+					queue_info.pNext = &queue_priorities.back();
+				}
+			}
+			try
+			{
+				device = vk::raii::Device(physical_device, device_info);
+				if (use_priority)
+				{
+					U_LOG_I("Vulkan global queue priority: %s (compositor, transfer and encode queues)",
+					        priority_name(priority_tiers[attempt]));
+				}
+				break;
+			}
+			catch (const vk::SystemError & e)
+			{
+				for (auto & queue_info : queues_info)
+					queue_info.pNext = nullptr;
+				if (not use_priority)
+					throw;
+				U_LOG_W("Vulkan global queue priority %s rejected (%s), falling back",
+				        priority_name(priority_tiers[attempt]), e.what());
+			}
+		}
 		queue.queue = device.getQueue(queue.family_index, queue_index);
 		name(queue.queue, "compute queue");
 		if (transfer_queue_index >= 0)

@@ -175,6 +175,9 @@ struct configuration
 		{
 			medium,
 			high,
+			// Privilege-gated (CAP_SYS_NICE): falls back to high,
+			// then default, when denied.
+			realtime,
 		};
 		gpu_priority gpu_priority = gpu_priority::high;
 	};

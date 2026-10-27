@@ -675,9 +675,9 @@ configuration::configuration()
 						else if (value == "high")
 							reprojection.gpu_priority = configuration::reprojection::gpu_priority::high;
 						else if (value == "realtime")
-							U_LOG_W("reprojection.gpu-priority realtime is not implemented yet, using high");
+							reprojection.gpu_priority = configuration::reprojection::gpu_priority::realtime;
 						else
-							U_LOG_W("reprojection.gpu-priority must be \"medium\" or \"high\", ignoring");
+							U_LOG_W("reprojection.gpu-priority must be \"medium\", \"high\" or \"realtime\", ignoring");
 					}
 				}
 			}

@@ -138,8 +138,10 @@ Default value: `high`
 Device-global queue priority for the compositor, transfer and encode
 queues: `high` prefers our submits when the app saturates the GPU (the
 only lever that arbitrates across our Vulkan device and the app's).
-`medium` requests nothing (driver default). Silently default when the
-driver lacks support.
+`medium` requests nothing (driver default). `realtime` additionally
+needs OS privilege (CAP_SYS_NICE) and falls back to high, then
+default, when denied — the won tier is logged at startup. Silently
+default when the driver lacks support.
 
 ### Example
 ```json
