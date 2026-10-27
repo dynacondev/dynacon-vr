@@ -313,15 +313,15 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	pull_pipeline = make_pipeline(vk, *pull_layout, "reproject_pull", "reproject pull pipeline");
 
 	// Per (slot, eye): splat takes 1 combined + 1 uniform + 1 storage,
-	// pull takes 1 combined + 1 uniform + 2 storage.
+	// pull takes 1 combined + 1 uniform + 2 storage; 4 pairs total.
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = num_slots * 2,
+	                .descriptorCount = num_slots * 4,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eUniformBuffer,
-	                .descriptorCount = num_slots * 2,
+	                .descriptorCount = num_slots * 4,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageImage,
