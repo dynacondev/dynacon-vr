@@ -538,11 +538,37 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        });
 	}
 
+	// NOTE: the warp block lives below (after q1) so the timestamp
+	// queries bracket squash / warp / foveation in GPU order.
+
+	image_barriers.push_back(
+	        vk::ImageMemoryBarrier2{
+	                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+	                .oldLayout = vk::ImageLayout::eUndefined,
+	                .newLayout = vk::ImageLayout::eGeneral,
+	                .image = images[i].image,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = images[i].image.info().arrayLayers,
+	                },
+	        });
+
+	cmd.pipelineBarrier2({
+	        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
+	        .pImageMemoryBarriers = image_barriers.data(),
+	});
+	image_barriers.clear();
+
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
+
 	// Depth reprojection entry point (v3): a single depth layer warps
 	// from its own generation pose/images to the latest predicted pose,
-	// at most once per commit. On a recorded warp the foveation call
-	// below reads the warp output with the dst poses; otherwise the
-	// frame flows straight unchanged.
+	// at most once per commit. Position matters: this records after q1
+	// so the queries bracket squash / warp / foveation in GPU order.
+	// On a recorded warp the foveation call below reads the warp output
+	// with the dst poses; otherwise the frame flows straight unchanged.
 	bool warped = false;
 	bool triage_time_warp = has_depth_src and depth_reprojection_enabled;
 	uint64_t triage_warp_start_ns = triage_time_warp ? uint64_t(os_monotonic_get_ns()) : 0;
@@ -619,28 +645,6 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		triage_warped.fetch_add(1, std::memory_order_relaxed);
 	else
 		triage_straight.fetch_add(1, std::memory_order_relaxed);
-
-	image_barriers.push_back(
-	        vk::ImageMemoryBarrier2{
-	                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-	                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-	                .oldLayout = vk::ImageLayout::eUndefined,
-	                .newLayout = vk::ImageLayout::eGeneral,
-	                .image = images[i].image,
-	                .subresourceRange = {
-	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
-	                        .levelCount = 1,
-	                        .layerCount = images[i].image.info().arrayLayers,
-	                },
-	        });
-
-	cmd.pipelineBarrier2({
-	        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
-	        .pImageMemoryBarriers = image_barriers.data(),
-	});
-	image_barriers.clear();
-
-	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
 	if (session.get_info().eye_gaze)
 	{
