@@ -36,13 +36,17 @@ class video_encoder_raw : public video_encoder
 		vk::raii::Fence fence = nullptr;
 		vk::raii::CommandBuffer cmd = nullptr;
 		buffer_allocation buffer;
+		// True while the sender thread may still transmit this slot's
+		// buffer (see encode()): present polls it so the commit thread
+		// never overwrites a buffer still being sent.
+		std::atomic<bool> sender_busy = false;
 	};
 	std::array<in_t, num_slots> in;
 
 public:
 	video_encoder_raw(wivrn::vk_bundle & vk, const encoder_settings & settings, uint8_t stream_idx);
 
-	void present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
+	bool present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
 
 	std::optional<data> encode(uint8_t slot, uint64_t frame_id) override;
 };

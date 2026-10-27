@@ -208,13 +208,11 @@ video_encoder_x264::video_encoder_x264(
 	}
 }
 
-void video_encoder_x264::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
+bool video_encoder_x264::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
-	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
-	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
-		return;
-	}
+	// Poll, never park (see nvenc present for the ordering rationale).
+	if (vk.device.waitForFences(*in[slot].fence, true, 0) != vk::Result::eSuccess)
+		return false;
 
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
@@ -288,6 +286,7 @@ void video_encoder_x264::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo
 	                                                                         .pCommandBufferInfos = &cmd_info,
 	                                                                 },
 	                                                                 *in[slot].fence);
+	return true;
 }
 
 std::optional<video_encoder::data> video_encoder_x264::encode(uint8_t slot, uint64_t frame_index)
@@ -333,6 +332,7 @@ std::optional<video_encoder::data> video_encoder_x264::encode(uint8_t slot, uint
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
 		U_LOG_E("Timeout on stream %d", stream_idx);
+		wedge_timeouts.fetch_add(1, std::memory_order_relaxed);
 		return {};
 	}
 	int size = x264_encoder_encode(enc, &nal, &num_nal, &pic, &pic_out);

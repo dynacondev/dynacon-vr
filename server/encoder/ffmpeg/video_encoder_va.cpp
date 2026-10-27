@@ -436,13 +436,11 @@ video_encoder_va::video_encoder_va(wivrn::vk_bundle & vk,
 	ts_pool = gpu_timestamp_pool(vk, vk.queue.family_index, num_slots, std::format("va encoder {} pixel copy", stream_idx));
 }
 
-void video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
+bool video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
 {
-	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
-	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
-		return;
-	}
+	// Poll, never park (see nvenc present for the ordering rationale).
+	if (vk.device.waitForFences(*in[slot].fence, true, 0) != vk::Result::eSuccess)
+		return false;
 
 	std::array im_barriers = {
 	        vk::ImageMemoryBarrier{
@@ -555,12 +553,16 @@ void video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, 
 	                               .pCommandBufferInfos = &cmd_info,
 	                       },
 	                       *in[slot].fence);
+	return true;
 }
 
 void video_encoder_va::push_frame(bool idr, uint8_t slot)
 {
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
+	{
+		wedge_timeouts.fetch_add(1, std::memory_order_relaxed);
 		throw std::runtime_error("timeout");
+	}
 
 	if (auto s = ts_pool.collect(slot))
 	{

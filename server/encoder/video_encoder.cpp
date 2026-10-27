@@ -234,19 +234,31 @@ void video_encoder::set_framerate(float framerate)
 	pending_framerate = framerate;
 }
 
-void video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index)
+video_encoder::present_outcome video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index)
 {
 	wivrn::trace::scope trace_present(wivrn::trace::cpu_track::encoder, stream_idx, frame_index, "present_image");
-	// Wait for encoder to be done
 	present_slot = (present_slot + 1) % num_slots;
-	state[present_slot].wait(busy);
+	// Non-blocking: if the worker hasn't consumed this slot, skip the
+	// frame (routine backpressure under load, never a park). The poll
+	// precedes should_skip: that call mutates IDR state, and a skip
+	// decided after it would poison the state machine.
+	if (state[present_slot].load(std::memory_order_acquire) != idle)
+	{
+		state[present_slot].store(skip, std::memory_order_release);
+		return present_outcome::skipped_busy;
+	}
 	if (idr->should_skip(frame_index, stream_idx))
 	{
 		state[present_slot] = skip;
-		return;
+		return present_outcome::skipped_idr;
 	}
 	state[present_slot] = busy;
-	return present_image(y_cbcr, info, present_slot, frame_index);
+	if (not present_image(y_cbcr, info, present_slot, frame_index))
+	{
+		state[present_slot] = skip;
+		return present_outcome::skipped_busy;
+	}
+	return present_outcome::presented;
 }
 
 void video_encoder::encode(wivrn_session & cnx,

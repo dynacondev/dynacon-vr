@@ -641,16 +641,18 @@ std::vector<uint8_t> wivrn::video_encoder_vulkan::get_encoded_parameters(void * 
 	return encoded;
 }
 
-void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t encode_slot, uint64_t frame_index)
+bool wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t encode_slot, uint64_t frame_index)
 {
 	auto & slot_item = slot_data[encode_slot];
 
-	if (vk.device.waitForFences(*slot_item.fence, true, 1'000'000'000) == vk::Result::eTimeout)
-	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
-		return;
-	}
-	slot_item.busy.wait(true);
+	// Polls, never park (see nvenc present for the ordering rationale).
+	// The fence guards the GPU encode; busy guards the async sender
+	// thread, which has no fence. Both precede cmd recording, DPB
+	// mutation (get_ref below) and rate-control exchanges.
+	if (vk.device.waitForFences(*slot_item.fence, true, 0) != vk::Result::eSuccess)
+		return false;
+	if (slot_item.busy.load(std::memory_order_acquire))
+		return false;
 
 	auto & video_cmd_buf = slot_item.video_cmd_buf;
 	video_cmd_buf.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
@@ -1045,6 +1047,7 @@ void wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreS
 		                                },
 		                                *slot_item.fence);
 	}
+	return true;
 }
 
 std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(uint8_t encode_slot, uint64_t frame_index)
@@ -1056,6 +1059,7 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 	if (vk.device.waitForFences(*slot_item.fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
 		U_LOG_E("Timeout on stream %d", stream_idx);
+		wedge_timeouts.fetch_add(1, std::memory_order_relaxed);
 		return {};
 	}
 
@@ -1136,6 +1140,7 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_vulkan::encode(ui
 		if (vk.device.waitForFences(*slot_item.fence, true, 1'000'000'000) == vk::Result::eTimeout)
 		{
 			U_LOG_E("Timeout on stream %d", stream_idx);
+			wedge_timeouts.fetch_add(1, std::memory_order_relaxed);
 			return {};
 		}
 

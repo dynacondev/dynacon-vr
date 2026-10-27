@@ -422,13 +422,13 @@ video_encoder_nvenc::~video_encoder_nvenc()
 		shared_state->fn.nvEncDestroyEncoder(session_handle);
 }
 
-void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
+bool video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
 {
-	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
-	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
-		return;
-	}
+	// Poll, never park: a busy slot means the worker is behind, so the
+	// frame skips (the base layer records the skip). Must precede cmd
+	// recording — nothing below may run on a slot still in flight.
+	if (vk.device.waitForFences(*in[slot].fence, true, 0) != vk::Result::eSuccess)
+		return false;
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
@@ -479,6 +479,7 @@ void video_encoder_nvenc::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInf
 	                               .pCommandBufferInfos = &cmd_info,
 	                       },
 	                       *in[slot].fence);
+	return true;
 }
 
 std::optional<video_encoder::data> video_encoder_nvenc::encode(uint8_t slot, uint64_t frame_index)
@@ -486,6 +487,7 @@ std::optional<video_encoder::data> video_encoder_nvenc::encode(uint8_t slot, uin
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
 		U_LOG_E("Timeout on stream %d", stream_idx);
+		wedge_timeouts.fetch_add(1, std::memory_order_relaxed);
 		return {};
 	}
 

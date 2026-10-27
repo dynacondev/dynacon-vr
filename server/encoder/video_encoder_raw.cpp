@@ -89,13 +89,15 @@ wivrn::video_encoder_raw::video_encoder_raw(
 	}
 }
 
-void wivrn::video_encoder_raw::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
+bool wivrn::video_encoder_raw::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
-	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
-	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
-		return;
-	}
+	// Polls, never park: fence guards the GPU copy, sender_busy guards
+	// the async sender thread (which has no fence). Both precede any
+	// recording into this slot.
+	if (vk.device.waitForFences(*in[slot].fence, true, 0) != vk::Result::eSuccess)
+		return false;
+	if (in[slot].sender_busy.load(std::memory_order_acquire))
+		return false;
 
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
@@ -171,6 +173,7 @@ void wivrn::video_encoder_raw::present_image(vk::Image y_cbcr, vk::SemaphoreSubm
 	                               .pCommandBufferInfos = &cmd_info,
 	                       },
 	                       *in[slot].fence);
+	return true;
 }
 
 std::optional<wivrn::video_encoder::data> wivrn::video_encoder_raw::encode(uint8_t slot, uint64_t frame_id)
@@ -178,11 +181,21 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_raw::encode(uint8
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
 		U_LOG_W("Timeout on stream %d", stream_idx);
+		wedge_timeouts.fetch_add(1, std::memory_order_relaxed);
 		return {};
 	}
 
+	// The sender thread transmits this span asynchronously: hold the
+	// slot until it is done, exactly like the vulkan busy flag.
+	in[slot].sender_busy.store(true, std::memory_order_release);
 	return wivrn::video_encoder::data{
 	        .encoder = this,
 	        .span = std::span<uint8_t>((uint8_t *)in[slot].buffer.map(), in[slot].buffer.info().size),
+	        .mem = std::shared_ptr<void>(
+	                &in[slot].sender_busy,
+	                [](auto * b) {
+				b->store(false, std::memory_order_release);
+				b->notify_all();
+			}),
 	};
 }
