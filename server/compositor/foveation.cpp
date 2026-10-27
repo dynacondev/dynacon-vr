@@ -29,6 +29,7 @@
 
 #include <array>
 #include <cmath>
+#include <format>
 #include <ranges>
 #include <vulkan/vulkan_raii.hpp>
 #include <vulkan/vulkan_structs.hpp>
@@ -152,26 +153,26 @@ vk::raii::DescriptorPool make_ds_pool(wivrn::vk_bundle & vk)
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = 2,
+	                .descriptorCount = 4,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageImage,
-	                .descriptorCount = 2,
+	                .descriptorCount = 4,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageBuffer,
-	                .descriptorCount = 1,
+	                .descriptorCount = 2,
 	        },
 	};
 	vk::raii::DescriptorPool res{
 	        vk.device,
 	        vk::DescriptorPoolCreateInfo{
-	                .maxSets = 5,
+	                .maxSets = 2,
 	                .poolSizeCount = pool_sizes.size(),
 	                .pPoolSizes = pool_sizes.data(),
 	        },
 	};
-	vk.name(*res, "foveation descriptor pool");
+	vk.name(res, "foveation descriptor pool");
 	return res;
 }
 uint32_t divide_and_round_up(uint32_t a, uint32_t b)
@@ -401,30 +402,36 @@ foveation::foveation(wivrn::vk_bundle & bundle, vk::Extent3D foveated_size) :
         // testing shows 10° looks better
         angle_offset(10 * M_PI / 180),
         convergence_distance(1 /* meter*/),
-        gpu_buffer(
-                bundle.device,
-                {
-                        .size = sizeof(ubo_data),
-                        .usage = vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer,
-                },
-                VmaAllocationCreateInfo{
-                        .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-                        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-                },
-                "foveation storage buffer"),
         sampler(make_sampler(bundle)),
         ds_layout(make_ds_layout(bundle)),
         layout(make_layout(bundle, ds_layout)),
         pipeline(make_pipelines(bundle, layout, foveated_size.width / 2)),
-        descriptor_pool(make_ds_pool(bundle)),
-        descriptor_set(bundle.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
-                .descriptorPool = descriptor_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &*ds_layout,
-        })[0]
-                               .release())
+        descriptor_pool(make_ds_pool(bundle))
 {
-	bundle.name(descriptor_set, "foveation descriptor set");
+	for (size_t s = 0; s < num_slots; ++s)
+	{
+		gpu_buffers[s] = buffer_allocation(
+		        bundle.device,
+		        {
+		                .size = sizeof(ubo_data),
+		                .usage = vk::BufferUsageFlagBits::eTransferDst | vk::BufferUsageFlagBits::eStorageBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+		        },
+		        std::format("foveation storage buffer {}", s));
+	}
+	auto sets = bundle.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+	        .descriptorPool = descriptor_pool,
+	        .descriptorSetCount = num_slots,
+	        .pSetLayouts = std::array{*ds_layout, *ds_layout}.data(),
+	});
+	for (size_t s = 0; s < num_slots; ++s)
+	{
+		descriptor_sets[s] = sets[s].release();
+		bundle.name(descriptor_sets[s], std::format("foveation descriptor set {}", s));
+	}
 }
 
 void foveation::update_tracking(const from_headset::tracking & tracking)
@@ -505,11 +512,15 @@ static bool operator==(const xrt_fov & a, const xrt_fov & b)
 }
 void foveation::update_ubo(
         vk::raii::CommandBuffer & cmd,
+        int slot,
         bool flip_y,
         std::array<xrt_rect, 2> src_rect,
         std::array<xrt_fov, 2> src_fov)
 {
-	// Check if the last value is still valid
+	// Check if the last value is still valid. The cache is per slot:
+	// each slot owns its buffer, so a hit here always describes this
+	// slot's buffer contents.
+	P & last = this->last[slot];
 	std::lock_guard lock(mutex);
 	if (last.flip_y == flip_y and
 	    last.src[0] == src_rect[0] and
@@ -578,13 +589,14 @@ void foveation::update_ubo(
 		         extent,
 		         foveated_size.height);
 	}
-	vmaCopyMemoryToAllocation(vk_allocator::instance(), &ubo, gpu_buffer, 0, sizeof(ubo));
-	std::memcpy(gpu_buffer.data<ubo_data>(), &ubo, sizeof(ubo));
+	vmaCopyMemoryToAllocation(vk_allocator::instance(), &ubo, gpu_buffers[slot], 0, sizeof(ubo));
+	std::memcpy(gpu_buffers[slot].data<ubo_data>(), &ubo, sizeof(ubo));
 }
 
 std::array<to_headset::foveation_parameter, 2> foveation::foveate(
         vk::raii::Device & device,
         vk::raii::CommandBuffer & cmd,
+        int slot,
         vk::ImageView y,
         vk::ImageView cbcr,
         bool flip_y,
@@ -593,8 +605,8 @@ std::array<to_headset::foveation_parameter, 2> foveation::foveate(
         std::array<xrt_fov, 2> src_fov,
         bool alpha)
 {
-	update_ubo(cmd, flip_y, src_rect, src_fov);
-	auto ubo = gpu_buffer.data<ubo_data>();
+	update_ubo(cmd, slot, flip_y, src_rect, src_fov);
+	auto ubo = gpu_buffers[slot].data<ubo_data>();
 
 	std::array src_image_info{
 	        vk::DescriptorImageInfo{
@@ -610,7 +622,7 @@ std::array<to_headset::foveation_parameter, 2> foveation::foveate(
 	};
 
 	vk::DescriptorBufferInfo ubo_info{
-	        .buffer = gpu_buffer,
+	        .buffer = gpu_buffers[slot],
 	        .range = vk::WholeSize,
 	};
 
@@ -625,28 +637,28 @@ std::array<to_headset::foveation_parameter, 2> foveation::foveate(
 
 	std::array writes = {
 	        vk::WriteDescriptorSet{
-	                .dstSet = descriptor_set,
+	                .dstSet = descriptor_sets[slot],
 	                .dstBinding = 0,
 	                .descriptorCount = src_image_info.size(),
 	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 	                .pImageInfo = src_image_info.data(),
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = descriptor_set,
+	                .dstSet = descriptor_sets[slot],
 	                .dstBinding = 1,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eStorageBuffer,
 	                .pBufferInfo = &ubo_info,
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = descriptor_set,
+	                .dstSet = descriptor_sets[slot],
 	                .dstBinding = 2,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eStorageImage,
 	                .pImageInfo = &y_info,
 	        },
 	        vk::WriteDescriptorSet{
-	                .dstSet = descriptor_set,
+	                .dstSet = descriptor_sets[slot],
 	                .dstBinding = 3,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eStorageImage,
@@ -657,7 +669,7 @@ std::array<to_headset::foveation_parameter, 2> foveation::foveate(
 	device.updateDescriptorSets(writes, {});
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline[alpha]);
-	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0, descriptor_set, {});
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0, descriptor_sets[slot], {});
 	cmd.dispatch(divide_and_round_up(foveated_size.width, 8),
 	             divide_and_round_up(foveated_size.height, 8),
 	             2);

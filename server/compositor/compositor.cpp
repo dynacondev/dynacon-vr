@@ -683,6 +683,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		view_info.foveation = foveation.foveate(
 		        vk.device,
 		        cmd,
+		        i,
 		        images[i].view_y,
 		        images[i].view_cbcr,
 		        true,
@@ -696,6 +697,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		view_info.foveation = foveation.foveate(
 		        vk.device,
 		        cmd,
+		        i,
 		        images[i].view_y,
 		        images[i].view_cbcr,
 		        flip_y,
