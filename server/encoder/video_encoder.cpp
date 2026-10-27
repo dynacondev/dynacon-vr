@@ -78,7 +78,14 @@ video_encoder::sender::sender() :
 void video_encoder::sender::push(data && d)
 {
 	std::unique_lock lock(mutex);
+	if (d.span.empty())
+		sender_empty_spans.fetch_add(1, std::memory_order_relaxed);
 	pending.push_back(std::move(d));
+	uint64_t depth = pending.size();
+	uint64_t prev = sender_max_depth.load(std::memory_order_relaxed);
+	while (depth > prev and not sender_max_depth.compare_exchange_weak(prev, depth, std::memory_order_relaxed))
+	{
+	}
 	cv.notify_all();
 }
 
@@ -279,7 +286,12 @@ void video_encoder::encode(wivrn_session & cnx,
 	idle_setter i{state[encode_slot]};
 
 	if (state[encode_slot] == skip)
+	{
+		// Commit-time skip consumed (IDR or backpressure — already
+		// counted at present). Counted here as empty: no bytes follow.
+		encode_empty_frames.fetch_add(1, std::memory_order_relaxed);
 		return;
+	}
 
 	if (shared_sender)
 		shared_sender->wait_idle(this);
@@ -302,10 +314,13 @@ void video_encoder::encode(wivrn_session & cnx,
 	auto data = encode(encode_slot, frame_index);
 	if (data)
 	{
+		encode_data_frames.fetch_add(1, std::memory_order_relaxed);
 		timing_info.encode_end = clock.to_headset(os_monotonic_get_ns());
 		assert(shared_sender);
 		shared_sender->push(std::move(*data));
 	}
+	else
+		encode_empty_frames.fetch_add(1, std::memory_order_relaxed);
 }
 
 void video_encoder::note_frame_kind(uint64_t frame_index, bool warped)

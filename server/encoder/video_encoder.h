@@ -90,6 +90,14 @@ public:
 	// timeout in the worker path (commit-thread present polls don't count
 	// — those are routine backpressure). Read by the compositor triage.
 	static inline std::atomic<uint64_t> wedge_timeouts{0};
+	// Throughput-drain counters (logging only, read by the compositor
+	// triage): worker encode() outcomes, sender queue pressure, and
+	// empty-span pushes (an empty span makes the sender thread spin on
+	// the queue head without popping — this counter proves it absent).
+	static inline std::atomic<uint64_t> encode_data_frames{0};
+	static inline std::atomic<uint64_t> encode_empty_frames{0};
+	static inline std::atomic<uint64_t> sender_max_depth{0};
+	static inline std::atomic<uint64_t> sender_empty_spans{0};
 
 private:
 	using state_t = std::atomic_unsigned_lock_free::value_type;

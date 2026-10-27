@@ -321,6 +321,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	static std::atomic<uint64_t> triage_gap_worst_ns{0};
 	static std::atomic<uint64_t> triage_drop_present{0};
 	static std::atomic<uint64_t> triage_query_miss{0};
+	static std::atomic<uint64_t> triage_presented{0};
+	static std::atomic<uint64_t> triage_skipped_idr{0};
+	static std::atomic<uint64_t> triage_last_frame_id{0};
+	static std::atomic<uint64_t> triage_fid_stall{0};
 	static std::atomic<uint64_t> triage_warp_ns_sum{0};
 	static std::atomic<uint64_t> triage_warp_ns_max{0};
 	static std::atomic<uint64_t> triage_warp_samples{0};
@@ -358,6 +362,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		uint64_t triage_n_gap_worst_ns = triage_gap_worst_ns.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_drop_present = triage_drop_present.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_query_miss = triage_query_miss.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_presented = triage_presented.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_skipped_idr = triage_skipped_idr.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_fid_stall = triage_fid_stall.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_enc_data = video_encoder::encode_data_frames.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_enc_empty = video_encoder::encode_empty_frames.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_sender_max = video_encoder::sender_max_depth.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_sender_empty = video_encoder::sender_empty_spans.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_wedge = video_encoder::wedge_timeouts.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_warp_ns_sum = triage_warp_ns_sum.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_warp_ns_max = triage_warp_ns_max.exchange(0, std::memory_order_relaxed);
@@ -365,7 +376,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		double triage_warp_avg_us = triage_n_warp_samples ? double(triage_n_warp_ns_sum) / double(triage_n_warp_samples) / 1000.0 : 0.0;
 		float triage_warp_gpu_max_us = warp_gpu_window_max_us;
 		warp_gpu_window_max_us = 0;
-		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu",
+		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu presented %llu skipped_idr %llu enc_data %llu enc_empty %llu sender_max %llu sender_empty %llu fid_stall %llu",
 		        (unsigned long long)triage_n_commits,
 		        (unsigned long long)triage_n_warped,
 		        (unsigned long long)triage_n_straight,
@@ -379,7 +390,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        double(triage_warp_gpu_max_us),
 		        (unsigned long long)triage_n_drop_present,
 		        (unsigned long long)triage_n_query_miss,
-		        (unsigned long long)triage_n_wedge);
+		        (unsigned long long)triage_n_wedge,
+		        (unsigned long long)triage_n_presented,
+		        (unsigned long long)triage_n_skipped_idr,
+		        (unsigned long long)triage_n_enc_data,
+		        (unsigned long long)triage_n_enc_empty,
+		        (unsigned long long)triage_n_sender_max,
+		        (unsigned long long)triage_n_sender_empty,
+		        (unsigned long long)triage_n_fid_stall);
 		if (triage_n_gap_over)
 		{
 			U_LOG_W("reprojection triage: %llu commit gaps over 1.5x period in 5 s window, worst %.2f ms",
@@ -810,19 +828,37 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
 	auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
 
+	// Frame-ID sanity: the IDR wait-timeout (100 frames) can only fire
+	// while this advances. A stall here would make IDR suppression
+	// infinite-silent — count it so that theory stays falsifiable.
+	{
+		uint64_t prev_fid = triage_last_frame_id.exchange(info.frame_id, std::memory_order_relaxed);
+		if (prev_fid != 0 and info.frame_id <= prev_fid)
+			triage_fid_stall.fetch_add(1, std::memory_order_relaxed);
+	}
+
 	for (auto & encoder: encoders)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
-		// Non-blocking handoff: a skipped_busy encoder is behind, so
-		// its frame drops (lockstep preserved — the worker consumes
-		// the skip). Per-stream: the other encoders still proceed. A
-		// throw here must not strand image slot either: count the drop
-		// and continue, the worker still recycles the image.
+		// Non-blocking handoff, fully partitioned per stream: presented
+		// vs IDR-wait vs backpressure. A throw must not strand image
+		// slot either: count the drop and continue, the worker still
+		// recycles the image.
 		try
 		{
-			if (encoder->present_image(images[slot].image, sem_info, info.frame_id) == video_encoder::present_outcome::skipped_busy)
-				triage_drop_present.fetch_add(1, std::memory_order_relaxed);
+			switch (encoder->present_image(images[slot].image, sem_info, info.frame_id))
+			{
+				case video_encoder::present_outcome::presented:
+					triage_presented.fetch_add(1, std::memory_order_relaxed);
+					break;
+				case video_encoder::present_outcome::skipped_idr:
+					triage_skipped_idr.fetch_add(1, std::memory_order_relaxed);
+					break;
+				case video_encoder::present_outcome::skipped_busy:
+					triage_drop_present.fetch_add(1, std::memory_order_relaxed);
+					break;
+			}
 		}
 		catch (std::exception & e)
 		{
