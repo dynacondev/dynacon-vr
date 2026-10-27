@@ -136,7 +136,7 @@ std::array<vk::Format, 3> image_formats(int bit_depth)
 	throw std::runtime_error(std::format("Unsupported bit depth {}", bit_depth));
 }
 
-std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::CommandPool command_pool, std::span<wivrn::encoder_settings> encoders)
+std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, std::span<wivrn::encoder_settings> encoders)
 {
 	auto formats = image_formats(encoders[0].bit_depth);
 
@@ -418,7 +418,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
-	cmd_pool.reset();
+	// Per-slot frame context: everything this commit records or uploads
+	// lives in slot i, owned until image i recycles (see TODO.md). Only
+	// this slot's pool is reset; the other slot may still execute.
+	auto & cmd = cmds[i];
+	auto & query_pool = query_pools[i];
+	cmd_pools[i].reset();
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
 	cmd.resetQueryPool(*query_pool, 0, 4);
@@ -965,17 +970,8 @@ compositor::compositor(wivrn_session & session) :
         },
         log_level(debug_get_log_option_log()),
         session(session),
-        cmd_pool(vk.device, vk::CommandPoolCreateInfo{
-                                    .flags = vk::CommandPoolCreateFlagBits::eTransient,
-                                    .queueFamilyIndex = vk.queue.family_index,
-                            }),
-        query_pool(vk.device, vk::QueryPoolCreateInfo{
-                                      .queryType = vk::QueryType::eTimestamp,
-                                      .queryCount = 4,
-                              }),
         settings(get_encoder_settings(vk, session)),
-        images{make_images(vk, cmd_pool, settings)},
-        cmd{std::move(vk.device.allocateCommandBuffers({.commandPool = *cmd_pool, .commandBufferCount = 1})[0])},
+        images{make_images(vk, settings)},
         sem{make_semaphore(vk)},
         frame_rate(settings[0].fps),
         pacer(U_TIME_1S_IN_NS / frame_rate),
@@ -987,6 +983,28 @@ compositor::compositor(wivrn_session & session) :
                 cached_reprojection_switches().source_reverse_z),
         depth_reprojection_enabled(cached_reprojection_switches().enabled)
 {
+	// Per-slot frame context (see TODO.md): one pool+buffer+query pool
+	// per compositor image, so the commit for images[i] only ever resets
+	// and records slot i while the other slot may still execute.
+	for (size_t s = 0; s < num_frame_slots; ++s)
+	{
+		cmd_pools[s] = vk::raii::CommandPool(
+		        vk.device,
+		        vk::CommandPoolCreateInfo{
+		                .flags = vk::CommandPoolCreateFlagBits::eTransient,
+		                .queueFamilyIndex = vk.queue.family_index,
+		        });
+		vk.name(cmd_pools[s], std::format("compositor command pool {}", s));
+		cmds[s] = std::move(vk.device.allocateCommandBuffers(
+		        {.commandPool = *cmd_pools[s], .commandBufferCount = 1})[0]);
+		query_pools[s] = vk::raii::QueryPool(
+		        vk.device,
+		        vk::QueryPoolCreateInfo{
+		                .queryType = vk::QueryType::eTimestamp,
+		                .queryCount = 4,
+		        });
+		vk.name(query_pools[s], std::format("compositor query pool {}", s));
+	}
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers
 	assert(intptr_t(&base) == intptr_t(this));

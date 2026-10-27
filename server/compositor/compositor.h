@@ -86,13 +86,17 @@ private:
 	float warp_gpu_window_max_us = 0;
 	wivrn_session & session;
 	vk_bundle vk;
-	vk::raii::CommandPool cmd_pool;
-	vk::raii::QueryPool query_pool;
+	static constexpr size_t num_frame_slots = 2;
+	std::array<vk::raii::CommandPool, num_frame_slots> cmd_pools;
+	std::array<vk::raii::QueryPool, num_frame_slots> query_pools;
+	// Set once the slot's first submit has recorded timestamps: avoids
+	// counting a poll-miss on a pool that was never written.
+	std::array<bool, num_frame_slots> query_armed = {false, false};
 
 	std::array<encoder_settings, 3> settings;
 
-	std::array<image, 2> images;
-	vk::raii::CommandBuffer cmd;
+	std::array<image, num_frame_slots> images;
+	std::array<vk::raii::CommandBuffer, num_frame_slots> cmds;
 	vk::raii::Semaphore sem;
 	uint64_t sem_value = 0;
 
