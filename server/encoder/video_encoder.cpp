@@ -253,7 +253,7 @@ video_encoder::present_outcome video_encoder::present_image(vk::Image y_cbcr, vk
 		return present_outcome::skipped_idr;
 	}
 	state[present_slot] = busy;
-	if (not present_image(y_cbcr, info, present_slot, frame_index))
+	if (not try_present_image(y_cbcr, info, present_slot, frame_index))
 	{
 		state[present_slot] = skip;
 		return present_outcome::skipped_busy;

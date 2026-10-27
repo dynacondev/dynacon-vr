@@ -340,7 +340,7 @@ layer_squasher::layer_squasher(vk_bundle & vk, vk::Extent3D target_size) :
                               .addressModeW = vk::SamplerAddressMode::eClampToEdge,
                               .borderColor = vk::BorderColor::eFloatOpaqueBlack,
                       }},
-        ubo{make_ubo(vk.device, 0), make_ubo(vk.device, 1), make_ubo(vk.device, 2), make_ubo(vk.device, 3)},
+        ubo{{{make_ubo(vk.device, 0), make_ubo(vk.device, 1)}, {make_ubo(vk.device, 2), make_ubo(vk.device, 3)}}},
         render_target{vk.device,
                       vk::StructureChain{
                               vk::ImageCreateInfo{
@@ -371,14 +371,16 @@ layer_squasher::layer_squasher(vk_bundle & vk, vk::Extent3D target_size) :
         descriptor_pool{make_ds_pool(vk, image_array_size)}
 {
 	{
-		std::array layouts = {*ds_layout, *ds_layout, *ds_layout, *ds_layout};
+		std::array<vk::DescriptorSetLayout, num_slots * 2> layouts;
+		layouts.fill(*ds_layout);
 		auto sets = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
 		        .descriptorPool = descriptor_pool,
-		        .descriptorSetCount = uint32_t(descriptor_sets.size()),
+		        .descriptorSetCount = uint32_t(layouts.size()),
 		        .pSetLayouts = layouts.data(),
 		});
-		for (size_t k = 0; k < descriptor_sets.size(); ++k)
-			descriptor_sets[k] = sets[k].release();
+		for (size_t slot = 0; slot < num_slots; ++slot)
+			for (int view = 0; view < 2; ++view)
+				descriptor_sets[slot][view] = sets[slot * 2 + view].release();
 	}
 }
 
@@ -436,7 +438,7 @@ layer_squasher::do_layers(
 		// TODO: staging buffer?
 		// Per-slot UBO: the mapped CPU write is unordered by GPU
 		// barriers, so each commit writes its own slot.
-		auto & ubo = *(render_compute_layer_ubo_data *)this->ubo[slot * 2 + view].map();
+		auto & ubo = *(render_compute_layer_ubo_data *)this->ubo[slot][view].map();
 
 		// Not the transform of the views, but the inverse: actual view matrices.
 		xrt_matrix_4x4 world_view_mat, eye_view_mat;
@@ -592,27 +594,27 @@ layer_squasher::do_layers(
 		};
 
 		vk::DescriptorBufferInfo ubo_info{
-		        .buffer = this->ubo[slot * 2 + view],
+		        .buffer = this->ubo[slot][view],
 		        .range = vk::WholeSize,
 		};
 
 		std::array writes = {
 		        vk::WriteDescriptorSet{
-		                .dstSet = descriptor_sets[slot * 2 + view],
+		                .dstSet = descriptor_sets[slot][view],
 		                .dstBinding = 0,
 		                .descriptorCount = uint32_t(cur_image),
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 		                .pImageInfo = src_image_info.data(),
 		        },
 		        vk::WriteDescriptorSet{
-		                .dstSet = descriptor_sets[slot * 2 + view],
+		                .dstSet = descriptor_sets[slot][view],
 		                .dstBinding = 2,
 		                .descriptorCount = 1,
 		                .descriptorType = vk::DescriptorType::eStorageImage,
 		                .pImageInfo = &target_image_info,
 		        },
 		        vk::WriteDescriptorSet{
-		                .dstSet = descriptor_sets[slot * 2 + view],
+		                .dstSet = descriptor_sets[slot][view],
 		                .dstBinding = 3,
 		                .descriptorCount = 1,
 		                .descriptorType = vk::DescriptorType::eUniformBuffer,
@@ -632,7 +634,7 @@ layer_squasher::do_layers(
 		else
 			device.updateDescriptorSets(writes, {});
 
-		cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0, descriptor_sets[slot * 2 + view], {});
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0, descriptor_sets[slot][view], {});
 		auto [w, h] = calc_dispatch_dims_1_view(viewports[view]);
 		cmd.dispatch(w, h, 1);
 	}

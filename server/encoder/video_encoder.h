@@ -86,20 +86,10 @@ public:
 	static const uint8_t num_slots = 2;
 	const double bitrate_multiplier;
 
-	// Bonded GPU-stall detector: every backend increments this on a fence
+	// Shared wedge counter: every backend increments this on a fence
 	// timeout in the worker path (commit-thread present polls don't count
 	// — those are routine backpressure). Read by the compositor triage.
 	static inline std::atomic<uint64_t> wedge_timeouts{0};
-
-	// Outcome of the commit-thread handoff. Both skip variants advance
-	// present_slot/encode_slot in lockstep (the worker consumes skips);
-	// only skipped_busy counts as backpressure in triage.
-	enum class present_outcome
-	{
-		presented,
-		skipped_idr,
-		skipped_busy,
-	};
 
 private:
 	using state_t = std::atomic_unsigned_lock_free::value_type;
@@ -154,6 +144,16 @@ public:
 	video_encoder(vk_bundle &, uint8_t stream_idx, uint32_t target_queue, const encoder_settings & settings, std::unique_ptr<idr_handler>, bool async_send);
 	virtual ~video_encoder();
 
+	// Outcome of the commit-thread handoff. Both skip variants advance
+	// present_slot/encode_slot in lockstep (the worker consumes skips).
+	// skip (encoder state) == drop (triage): the frame is shed, nothing
+	// is lost. Only skipped_busy counts as backpressure in triage.
+	enum class present_outcome
+	{
+		presented,
+		skipped_idr,
+		skipped_busy,
+	};
 	present_outcome present_image(vk::Image y_cbcr,
 	                            vk::SemaphoreSubmitInfo sem_info,
 	                            uint64_t frame_index);
@@ -179,7 +179,7 @@ protected:
 	// Returns false when the slot's previous work hasn't completed (fence
 	// or sender-busy poll miss): the caller marks the frame skipped
 	// without recording or mutating any backend state. Must not block.
-	virtual bool present_image(vk::Image y_cbcr,
+	virtual bool try_present_image(vk::Image y_cbcr,
 	                           vk::SemaphoreSubmitInfo sem_info,
 	                           uint8_t slot,
 	                           uint64_t frame_index) = 0;

@@ -436,9 +436,9 @@ video_encoder_va::video_encoder_va(wivrn::vk_bundle & vk,
 	ts_pool = gpu_timestamp_pool(vk, vk.queue.family_index, num_slots, std::format("va encoder {} pixel copy", stream_idx));
 }
 
-bool video_encoder_va::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
+bool video_encoder_va::try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
 {
-	// Poll, never park (see nvenc present for the ordering rationale).
+	// Poll, never park (see video_encoder::present_image for the ordering rationale).
 	if (vk.device.waitForFences(*in[slot].fence, true, 0) != vk::Result::eSuccess)
 		return false;
 

@@ -89,7 +89,7 @@ wivrn::video_encoder_raw::video_encoder_raw(
 	}
 }
 
-bool wivrn::video_encoder_raw::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
+bool wivrn::video_encoder_raw::try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
 	// Polls, never park: fence guards the GPU copy, sender_busy guards
 	// the async sender thread (which has no fence). Both precede any
@@ -191,6 +191,8 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_raw::encode(uint8
 	return wivrn::video_encoder::data{
 	        .encoder = this,
 	        .span = std::span<uint8_t>((uint8_t *)in[slot].buffer.map(), in[slot].buffer.info().size),
+	        // No waiter today (present polls via load); the notify is
+	        // kept for symmetry with the vulkan busy flag.
 	        .mem = std::shared_ptr<void>(
 	                &in[slot].sender_busy,
 	                [](auto * b) {

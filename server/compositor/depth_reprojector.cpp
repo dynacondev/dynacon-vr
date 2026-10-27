@@ -220,28 +220,28 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
         color_sampler(make_sampler(vk, vk::Filter::eLinear, "reproject color sampler")),
         depth_sampler(make_sampler(vk, vk::Filter::eNearest, "reproject depth sampler"))
 {
-	for (size_t s = 0; s < num_slots; ++s)
+	for (size_t slot = 0; slot < num_slots; ++slot)
 	{
-		for (int v = 0; v < 2; ++v)
+		for (int view = 0; view < 2; ++view)
 		{
-			target[s][v] = make_target(
+			target[slot][view] = make_target(
 			        vk, target_size, vk::Format::eR8G8B8A8Unorm,
 			        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-			        std::format("reproject target {}:{}", s, v).c_str());
-			target_view[s][v] = make_view(
-			        vk, target[s][v], vk::Format::eR8G8B8A8Unorm,
+			        std::format("reproject target {}:{}", slot, view).c_str());
+			target_view[slot][view] = make_view(
+			        vk, target[slot][view], vk::Format::eR8G8B8A8Unorm,
 			        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eSampled,
-			        std::format("reproject target view {}:{}", s, v).c_str());
-			splat_depth[s][v] = make_target(
+			        std::format("reproject target view {}:{}", slot, view).c_str());
+			splat_depth[slot][view] = make_target(
 			        vk, target_size, vk::Format::eR32Uint,
 			        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
-			        std::format("reproject splat {}:{}", s, v).c_str());
-			splat_view[s][v] = make_view(
-			        vk, splat_depth[s][v], vk::Format::eR32Uint,
+			        std::format("reproject splat {}:{}", slot, view).c_str());
+			splat_view[slot][view] = make_view(
+			        vk, splat_depth[slot][view], vk::Format::eR32Uint,
 			        vk::ImageUsageFlagBits::eStorage,
-			        std::format("reproject splat view {}:{}", s, v).c_str());
-			splat_ubo[s][v] = make_warp_ubo(vk.device, sizeof(reproject_splat_ubo), std::format("reproject splat UBO {}:{}", s, v).c_str());
-			pull_ubo[s][v] = make_warp_ubo(vk.device, sizeof(reproject_pull_ubo), std::format("reproject pull UBO {}:{}", s, v).c_str());
+			        std::format("reproject splat view {}:{}", slot, view).c_str());
+			splat_ubo[slot][view] = make_warp_ubo(vk.device, sizeof(reproject_splat_ubo), std::format("reproject splat UBO {}:{}", slot, view).c_str());
+			pull_ubo[slot][view] = make_warp_ubo(vk.device, sizeof(reproject_pull_ubo), std::format("reproject pull UBO {}:{}", slot, view).c_str());
 		}
 	}
 	std::array splat_bindings{
@@ -312,50 +312,54 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	vk.name(*pull_layout, "reproject pull pipeline layout");
 	pull_pipeline = make_pipeline(vk, *pull_layout, "reproject_pull", "reproject pull pipeline");
 
+	// Per (slot, eye): splat takes 1 combined + 1 uniform + 1 storage,
+	// pull takes 1 combined + 1 uniform + 2 storage.
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = 8,
+	                .descriptorCount = num_slots * 2,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eUniformBuffer,
-	                .descriptorCount = 8,
+	                .descriptorCount = num_slots * 2,
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageImage,
-	                .descriptorCount = 12,
+	                .descriptorCount = num_slots * 6,
 	        },
 	};
 	pool = vk::raii::DescriptorPool{
 	        vk.device,
 	        vk::DescriptorPoolCreateInfo{
-	                .maxSets = 8,
+	                .maxSets = num_slots * 4,
 	                .poolSizeCount = pool_sizes.size(),
 	                .pPoolSizes = pool_sizes.data(),
 	        },
 	};
 	vk.name(*pool, "reproject descriptor pool");
 
-	std::array<vk::DescriptorSetLayout, 4> splat_layouts{*splat_ds_layout, *splat_ds_layout, *splat_ds_layout, *splat_ds_layout};
+	std::array<vk::DescriptorSetLayout, num_slots * 2> splat_layouts;
+	splat_layouts.fill(*splat_ds_layout);
 	auto splat_alloc = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
 	        .descriptorPool = *pool,
 	        .descriptorSetCount = splat_layouts.size(),
 	        .pSetLayouts = splat_layouts.data(),
 	});
-	std::array<vk::DescriptorSetLayout, 4> pull_layouts{*pull_ds_layout, *pull_ds_layout, *pull_ds_layout, *pull_ds_layout};
+	std::array<vk::DescriptorSetLayout, num_slots * 2> pull_layouts;
+	pull_layouts.fill(*pull_ds_layout);
 	auto pull_alloc = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
 	        .descriptorPool = *pool,
 	        .descriptorSetCount = pull_layouts.size(),
 	        .pSetLayouts = pull_layouts.data(),
 	});
-	for (size_t s = 0; s < num_slots; ++s)
+	for (size_t slot = 0; slot < num_slots; ++slot)
 	{
-		for (int v = 0; v < 2; ++v)
+		for (int view = 0; view < 2; ++view)
 		{
-			splat_sets[s][v] = splat_alloc[s * 2 + v].release();
-			pull_sets[s][v] = pull_alloc[s * 2 + v].release();
-			vk.name(splat_sets[s][v], std::format("reproject splat set {}:{}", s, v));
-			vk.name(pull_sets[s][v], std::format("reproject pull set {}:{}", s, v));
+			splat_sets[slot][view] = splat_alloc[slot * 2 + view].release();
+			pull_sets[slot][view] = pull_alloc[slot * 2 + view].release();
+			vk.name(splat_sets[slot][view], std::format("reproject splat set {}:{}", slot, view));
+			vk.name(pull_sets[slot][view], std::format("reproject pull set {}:{}", slot, view));
 		}
 	}
 }

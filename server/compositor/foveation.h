@@ -48,7 +48,11 @@ class foveation
 	float eye_x[2] = {}; // eye x position
 	xrt_quat gaze = {};
 	from_headset::override_foveation_center manual_foveation = {};
-	std::array<to_headset::foveation_parameter, 2> params;
+	// Per-slot solved parameters (slot == compositor image index): the
+	// cache-hit path returns these without recomputing, so sharing one
+	// copy would hand slot A's metadata to slot B's frame.
+	static constexpr size_t num_slots = 2;
+	std::array<std::array<to_headset::foveation_parameter, 2>, num_slots> params;
 
 	vk::raii::Sampler sampler;
 
@@ -57,8 +61,6 @@ class foveation
 	std::array<vk::raii::Pipeline, 2> pipeline;
 	vk::raii::DescriptorPool descriptor_pool;
 	// Per-slot upload/read state (slot == compositor image index).
-	// Member params stays shared: rewritten-before-use per call.
-	static constexpr size_t num_slots = 2;
 	std::array<buffer_allocation, num_slots> gpu_buffers;
 	std::array<vk::DescriptorSet, num_slots> descriptor_sets;
 
@@ -80,7 +82,6 @@ class foveation
 	void compute_params(int slot);
 
 	void update_ubo(
-	        vk::raii::CommandBuffer & cmd,
 	        int slot,
 	        bool flip_y,
 	        std::array<xrt_rect, 2> src_rect,

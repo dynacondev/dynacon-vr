@@ -82,8 +82,13 @@ bool default_idr_handler::should_skip(uint64_t frame_id, uint8_t stream_idx)
 		                              }
 		                              return true;
 	                              },
-	                              [this, frame_id](need_idr) {
-		                              state = wait_idr_feedback{frame_id};
+	                              [](need_idr) {
+		                              // Deliberately no arming: the worker arms via
+			                              // get_type() only for frames actually encoded.
+			                              // Arming here would poison the next ~100 frames
+			                              // if this frame then skips on a backend poll
+			                              // miss (backpressure), waiting on feedback for
+			                              // an IDR that was never sent.
 		                              return false;
 	                              },
 	                              [](auto) {

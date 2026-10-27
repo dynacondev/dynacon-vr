@@ -53,7 +53,7 @@ class video_encoder_va : public video_encoder_ffmpeg
 public:
 	video_encoder_va(wivrn::vk_bundle &, const wivrn::encoder_settings & settings, uint8_t stream_index);
 
-	bool present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
+	bool try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint8_t slot, uint64_t frame_index) override;
 
 protected:
 	void push_frame(bool idr, uint8_t slot) override;

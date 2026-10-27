@@ -106,7 +106,7 @@ tick train.
    GPU-progress waits (remaining parks are CPU/driver-lock bounded —
    see run criteria). A slow GPU delays individual frame *completion*,
    never the next tick. Drop counting (`drop_busy`/`drop_acquire` +
-   new present-skip counter) stays as the backpressure valve.
+   new `drop_present` counter) stays as the backpressure valve.
 
 Deliberately *not* merged: warp+encode stay on separate queues/engines
 (SMs vs NVENC) chained by semaphore/fifo, not one submission.
@@ -144,9 +144,11 @@ absorption as staleness, worse than drops for VR.
 4. Squasher per-slot UBOs/sets (+target decision recorded); slot param
    through `do_layers()` and accessors.
 5. Non-blocking queries + availability-miss counter; non-blocking
-   `present_image` (base + all backends, incl. `slot_item.busy` poll,
-   DPB/IDR poll-ordering, per-encoder try/catch, raw lifetime guard)
-   with present-skip counter. Still with the tail wait (proves the new
+   `try_present_image` (base + all backends, incl. `slot_item.busy`
+   poll, DPB/IDR poll-ordering, per-encoder try/catch, raw lifetime
+   guard) with `drop_present` counter, plus a per-encoder try/catch
+   around the commit-thread present loop so a throw can't strand an
+   image. Still with the tail wait (proves the new
    paths under the old safety net). Flag day is gated on all of the
    above, not just the tail wait.
 6. Remove tail wait + `eWait`. Nothing outstanding (items closed
@@ -155,7 +157,7 @@ absorption as staleness, worse than drops for VR.
    `warp_gpu` distribution unchanged; no validation errors (including
    maintenance9-non-optimal multi-family QFOT reuse, which is
    spec-suspect but almost certainly never hit — verify, don't
-   redesign); drops (busy/acquire/present-skip) only under true
+   redesign); drops (busy/acquire/present) only under true
    overload; steady-state motion-to-photon latency unchanged
    (transient +≤1 frame under spikes by design). Residual `gap_over`
    suspects if non-zero: queue-mutex contention (`vk.queue.mutex`

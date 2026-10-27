@@ -91,7 +91,7 @@ private:
 	std::array<vk::raii::QueryPool, num_frame_slots> query_pools{nullptr, nullptr};
 	// Set once the slot's first submit has recorded timestamps: avoids
 	// counting a poll-miss on a pool that was never written.
-	std::array<bool, num_frame_slots> query_armed = {false, false};
+	std::array<bool, num_frame_slots> query_armed = {};
 
 	std::array<encoder_settings, 3> settings;
 

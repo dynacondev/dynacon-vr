@@ -208,9 +208,9 @@ video_encoder_x264::video_encoder_x264(
 	}
 }
 
-bool video_encoder_x264::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
+bool video_encoder_x264::try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
-	// Poll, never park (see nvenc present for the ordering rationale).
+	// Poll, never park (see video_encoder::present_image for the ordering rationale).
 	if (vk.device.waitForFences(*in[slot].fence, true, 0) != vk::Result::eSuccess)
 		return false;
 

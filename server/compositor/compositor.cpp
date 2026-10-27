@@ -40,6 +40,7 @@
 #include "utils/wivrn_trace.h"
 
 #include <atomic>
+#include <format>
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 #ifdef XRT_FEATURE_RENDERDOC
@@ -318,7 +319,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	static std::atomic<uint64_t> triage_drop_acquire{0};
 	static std::atomic<uint64_t> triage_gap_over{0};
 	static std::atomic<uint64_t> triage_gap_worst_ns{0};
-	static std::atomic<uint64_t> triage_present_skip{0};
+	static std::atomic<uint64_t> triage_drop_present{0};
 	static std::atomic<uint64_t> triage_query_miss{0};
 	static std::atomic<uint64_t> triage_warp_ns_sum{0};
 	static std::atomic<uint64_t> triage_warp_ns_max{0};
@@ -355,7 +356,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		uint64_t triage_n_drop_acquire = triage_drop_acquire.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_gap_over = triage_gap_over.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_gap_worst_ns = triage_gap_worst_ns.exchange(0, std::memory_order_relaxed);
-		uint64_t triage_n_present_skip = triage_present_skip.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_drop_present = triage_drop_present.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_query_miss = triage_query_miss.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_wedge = video_encoder::wedge_timeouts.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_warp_ns_sum = triage_warp_ns_sum.exchange(0, std::memory_order_relaxed);
@@ -364,7 +365,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		double triage_warp_avg_us = triage_n_warp_samples ? double(triage_n_warp_ns_sum) / double(triage_n_warp_samples) / 1000.0 : 0.0;
 		float triage_warp_gpu_max_us = warp_gpu_window_max_us;
 		warp_gpu_window_max_us = 0;
-		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f present_skip %llu query_miss %llu wedge %llu",
+		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu",
 		        (unsigned long long)triage_n_commits,
 		        (unsigned long long)triage_n_warped,
 		        (unsigned long long)triage_n_straight,
@@ -376,7 +377,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        double(triage_n_warp_ns_max) / 1000.0,
 		        (unsigned long long)triage_n_warp_samples,
 		        double(triage_warp_gpu_max_us),
-		        (unsigned long long)triage_n_present_skip,
+		        (unsigned long long)triage_n_drop_present,
 		        (unsigned long long)triage_n_query_miss,
 		        (unsigned long long)triage_n_wedge);
 		if (triage_n_gap_over)
@@ -404,23 +405,23 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		return XRT_SUCCESS;
 	}
 
-	int i = acquire_image();
-	if (i < 0)
+	int slot = acquire_image();
+	if (slot < 0)
 	{
 		triage_drop_acquire.fetch_add(1, std::memory_order_relaxed);
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
 	}
 
-	// Lazy timestamp read for slot i: these queries describe the last
-	// submit that used slot i, whose completion is implied by image i
+	// Lazy timestamp read for this slot: these queries describe the last
+	// submit that used it, whose completion is implied by image slot
 	// having recycled — so the poll almost always hits and never parks.
 	// A miss means the GPU is more than a frame behind: count it (it
 	// doubles as the wedge detector), never wait for it. Polls before
 	// the resetQueryPool below, which would discard the results.
-	if (query_armed[i])
+	if (query_armed[slot])
 	{
-		auto [qres, ts] = query_pools[i].getResults<uint64_t>(
+		auto [qres, ts] = query_pools[slot].getResults<uint64_t>(
 		        0,
 		        4,
 		        4 * sizeof(uint64_t),
@@ -445,8 +446,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		r->StartFrameCapture(NULL, NULL);
 #endif
 
-	auto & view_info = images[i].view_info;
-	images[i].frame_index = frame.rendering.id;
+	auto & view_info = images[slot].view_info;
+	images[slot].frame_index = frame.rendering.id;
 	view_info = {
 	        .display_time = session.get_offset().to_headset(frame.rendering.predicted_display_time_ns),
 	        .alpha = layer_accum.data.env_blend_mode == XRT_BLEND_MODE_ALPHA_BLEND,
@@ -455,11 +456,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
 	// Per-slot frame context: everything this commit records or uploads
-	// lives in slot i, owned until image i recycles (see TODO.md). Only
+	// lives in this slot, owned until image slot recycles (see TODO.md). Only
 	// this slot's pool is reset; the other slot may still execute.
-	auto & cmd = cmds[i];
-	auto & query_pool = query_pools[i];
-	cmd_pools[i].reset();
+	auto & cmd = cmds[slot];
+	auto & query_pool = query_pools[slot];
+	cmd_pools[slot].reset();
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
 	cmd.resetQueryPool(*query_pool, 0, 4);
@@ -548,7 +549,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		std::tie(poses, src_fov, src_rect) = squasher.do_layers(
 		        vk.device,
 		        cmd,
-		        i,
+		        slot,
 		        session.get_hmd(),
 		        pacer.get_frame_duration(),
 		        frame.rendering,
@@ -589,11 +590,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
 	                .oldLayout = vk::ImageLayout::eUndefined,
 	                .newLayout = vk::ImageLayout::eGeneral,
-	                .image = images[i].image,
+	                .image = images[slot].image,
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
-	                        .layerCount = images[i].image.info().arrayLayers,
+	                        .layerCount = images[slot].image.info().arrayLayers,
 	                },
 	        });
 
@@ -657,7 +658,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				warped = reprojector.reproject(
 				        vk.device,
 				        cmd,
-				        i,
+				        slot,
 				        view,
 				        src[view],
 				        src_depth[view],
@@ -675,7 +676,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		}
 	}
 	// Remember for the encoder size triage (present path below).
-	images[i].warped_frame = warped;
+	images[slot].warped_frame = warped;
 	if (triage_time_warp)
 	{
 		uint64_t triage_warp_ns = uint64_t(os_monotonic_get_ns()) - triage_warp_start_ns;
@@ -720,11 +721,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		view_info.foveation = foveation.foveate(
 		        vk.device,
 		        cmd,
-		        i,
-		        images[i].view_y,
-		        images[i].view_cbcr,
+		        slot,
+		        images[slot].view_y,
+		        images[slot].view_cbcr,
 		        true,
-		        reprojector.get_views(i),
+		        reprojector.get_views(slot),
 		        warp_rect,
 		        dst_fov,
 		        view_info.alpha);
@@ -734,9 +735,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		view_info.foveation = foveation.foveate(
 		        vk.device,
 		        cmd,
-		        i,
-		        images[i].view_y,
-		        images[i].view_cbcr,
+		        slot,
+		        images[slot].view_y,
+		        images[slot].view_cbcr,
 		        flip_y,
 		        src,
 		        src_rect,
@@ -768,7 +769,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			                .newLayout = encoder->target_layout,
 			                .srcQueueFamilyIndex = vk.queue.family_index,
 			                .dstQueueFamilyIndex = encoder->target_queue,
-			                .image = images[i].image,
+			                .image = images[slot].image,
 			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
 			                                     .baseMipLevel = 0,
 			                                     .levelCount = 1,
@@ -804,7 +805,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        .pSignalSemaphoreInfos = &sem_info,
 		});
 	}
-	query_armed[i] = true;
+	query_armed[slot] = true;
 
 	pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
 	auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
@@ -814,13 +815,23 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
 		// Non-blocking handoff: a skipped_busy encoder is behind, so
-		// its frame skips (lockstep preserved — the worker consumes
-		// the skip). Per-stream: the other encoders still proceed.
-		if (encoder->present_image(images[i].image, sem_info, info.frame_id) == video_encoder::present_outcome::skipped_busy)
-			triage_present_skip.fetch_add(1, std::memory_order_relaxed);
+		// its frame drops (lockstep preserved — the worker consumes
+		// the skip). Per-stream: the other encoders still proceed. A
+		// throw here must not strand image slot either: count the drop
+		// and continue, the worker still recycles the image.
+		try
+		{
+			if (encoder->present_image(images[slot].image, sem_info, info.frame_id) == video_encoder::present_outcome::skipped_busy)
+				triage_drop_present.fetch_add(1, std::memory_order_relaxed);
+		}
+		catch (std::exception & e)
+		{
+			U_LOG_W("present error: %s", e.what());
+			triage_drop_present.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 
-	auto j = encode_request.exchange(i);
+	auto j = encode_request.exchange(slot);
 	encode_request.notify_all();
 	assert(j == -1);
 
@@ -831,11 +842,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	comp_frame_clear_locked(&frame.rendering);
 
-	// Decoupled: no GPU-progress waits on the commit thread. Slot i is
-	// owned until image i recycles (which strictly postdates this
+	// Decoupled: no GPU-progress waits on the commit thread. This slot is
+	// owned until image slot recycles (which strictly postdates this
 	// submit's completion via the encoder semaphore/fifo chain), queries
 	// read lazily at the next acquire, and overload sheds via
-	// drop_busy/drop_acquire/present_skip — so nothing here needs
+	// drop_busy/drop_acquire/drop_present — so nothing here needs
 	// completion. A slow GPU delays this frame's encode, never the next
 	// tick. (Garbage collection below needs no completion either: it
 	// only pops the app-governed destroy stack.)
@@ -1009,26 +1020,26 @@ compositor::compositor(wivrn_session & session) :
         depth_reprojection_enabled(cached_reprojection_switches().enabled)
 {
 	// Per-slot frame context (see TODO.md): one pool+buffer+query pool
-	// per compositor image, so the commit for images[i] only ever resets
-	// and records slot i while the other slot may still execute.
-	for (size_t s = 0; s < num_frame_slots; ++s)
+	// per compositor image, so the commit for images[slot] only ever resets
+	// and records its own slot while the other slot may still execute.
+	for (size_t slot = 0; slot < num_frame_slots; ++slot)
 	{
-		cmd_pools[s] = vk::raii::CommandPool(
+		cmd_pools[slot] = vk::raii::CommandPool(
 		        vk.device,
 		        vk::CommandPoolCreateInfo{
 		                .flags = vk::CommandPoolCreateFlagBits::eTransient,
 		                .queueFamilyIndex = vk.queue.family_index,
 		        });
-		vk.name(cmd_pools[s], std::format("compositor command pool {}", s));
-		cmds[s] = std::move(vk.device.allocateCommandBuffers(
-		        {.commandPool = *cmd_pools[s], .commandBufferCount = 1})[0]);
-		query_pools[s] = vk::raii::QueryPool(
+		vk.name(cmd_pools[slot], std::format("compositor command pool {}", slot));
+		cmds[slot] = std::move(vk.device.allocateCommandBuffers(
+		        {.commandPool = *cmd_pools[slot], .commandBufferCount = 1})[0]);
+		query_pools[slot] = vk::raii::QueryPool(
 		        vk.device,
 		        vk::QueryPoolCreateInfo{
 		                .queryType = vk::QueryType::eTimestamp,
 		                .queryCount = 4,
 		        });
-		vk.name(query_pools[s], std::format("compositor query pool {}", s));
+		vk.name(query_pools[slot], std::format("compositor query pool {}", slot));
 	}
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers

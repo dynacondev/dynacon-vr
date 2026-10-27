@@ -641,11 +641,11 @@ std::vector<uint8_t> wivrn::video_encoder_vulkan::get_encoded_parameters(void * 
 	return encoded;
 }
 
-bool wivrn::video_encoder_vulkan::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t encode_slot, uint64_t frame_index)
+bool wivrn::video_encoder_vulkan::try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t encode_slot, uint64_t frame_index)
 {
 	auto & slot_item = slot_data[encode_slot];
 
-	// Polls, never park (see nvenc present for the ordering rationale).
+	// Polls, never park (see video_encoder::present_image for the ordering rationale).
 	// The fence guards the GPU encode; busy guards the async sender
 	// thread, which has no fence. Both precede cmd recording, DPB
 	// mutation (get_ref below) and rate-control exchanges.
