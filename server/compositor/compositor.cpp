@@ -357,7 +357,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		uint64_t triage_n_warp_ns_max = triage_warp_ns_max.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_warp_samples = triage_warp_samples.exchange(0, std::memory_order_relaxed);
 		double triage_warp_avg_us = triage_n_warp_samples ? double(triage_n_warp_ns_sum) / double(triage_n_warp_samples) / 1000.0 : 0.0;
-		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu",
+		float triage_warp_gpu_max_us = warp_gpu_window_max_us;
+		warp_gpu_window_max_us = 0;
+		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f",
 		        (unsigned long long)triage_n_commits,
 		        (unsigned long long)triage_n_warped,
 		        (unsigned long long)triage_n_straight,
@@ -367,7 +369,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        double(triage_n_gap_worst_ns) / 1000000.0,
 		        triage_warp_avg_us,
 		        double(triage_n_warp_ns_max) / 1000.0,
-		        (unsigned long long)triage_n_warp_samples);
+		        (unsigned long long)triage_n_warp_samples,
+		        double(triage_warp_gpu_max_us));
 		if (triage_n_gap_over)
 		{
 			U_LOG_W("reprojection triage: %llu commit gaps over 1.5x period in 5 s window, worst %.2f ms",
@@ -418,7 +421,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	cmd_pool.reset();
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-	cmd.resetQueryPool(*query_pool, 0, 3);
+	cmd.resetQueryPool(*query_pool, 0, 4);
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 0);
 
 	bool flip_y = false;
@@ -644,6 +647,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		auto now = os_monotonic_get_ns();
 		session.add_tracking_request(device_id::EYE_GAZE, frame.rendering.desired_present_time_ns, now, now);
 	}
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
+
 	if (warped)
 	{
 		// The warp output carries this tick's predicted pose: publish
@@ -728,7 +733,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
 	        .pImageMemoryBarriers = image_barriers.data(),
 	});
-	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 3);
 
 	cmd.end();
 
@@ -788,8 +793,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		auto [res, ts] = query_pool.getResults<uint64_t>(
 		        0,
-		        3,
-		        3 * sizeof(uint64_t),
+		        4,
+		        4 * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
 
@@ -797,7 +802,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
 			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
-			foveation_times.add((ts[2] - ts[1]) * period / 1e3);
+			float warp_gpu_us = (ts[2] - ts[1]) * period / 1e3;
+			warp_times.add(warp_gpu_us);
+			if (warp_gpu_us > warp_gpu_window_max_us)
+				warp_gpu_window_max_us = warp_gpu_us;
+			foveation_times.add((ts[3] - ts[2]) * period / 1e3);
 		}
 	}
 
@@ -958,7 +967,7 @@ compositor::compositor(wivrn_session & session) :
                             }),
         query_pool(vk.device, vk::QueryPoolCreateInfo{
                                       .queryType = vk::QueryType::eTimestamp,
-                                      .queryCount = 3,
+                                      .queryCount = 4,
                               }),
         settings(get_encoder_settings(vk, session)),
         images{make_images(vk, cmd_pool, settings)},
@@ -1033,6 +1042,7 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_root(this, "Compositor", false);
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
+	u_var_add_f32_timing(this, &warp_times.var, "warp");
 	U_LOG_I("depth reprojection %s (source-reverse-z %s)",
 	        depth_reprojection_enabled ? "enabled" : "disabled",
 	        cached_reprojection_switches().source_reverse_z ? "true" : "false");

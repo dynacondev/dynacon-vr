@@ -82,6 +82,8 @@ private:
 	const u_logging_level log_level;
 	timings squasher_times;
 	timings foveation_times;
+	timings warp_times;
+	float warp_gpu_window_max_us = 0;
 	wivrn_session & session;
 	vk_bundle vk;
 	vk::raii::CommandPool cmd_pool;
