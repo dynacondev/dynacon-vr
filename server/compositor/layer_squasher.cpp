@@ -285,7 +285,7 @@ vk::raii::Pipeline make_pipeline(wivrn::vk_bundle & vk, uint32_t image_array_siz
 
 vk::raii::DescriptorPool make_ds_pool(wivrn::vk_bundle & vk, uint32_t image_array_size)
 {
-	const uint32_t view_size = 2;
+	const uint32_t view_size = 4;
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
@@ -340,7 +340,7 @@ layer_squasher::layer_squasher(vk_bundle & vk, vk::Extent3D target_size) :
                               .addressModeW = vk::SamplerAddressMode::eClampToEdge,
                               .borderColor = vk::BorderColor::eFloatOpaqueBlack,
                       }},
-        ubo{make_ubo(vk.device, 0), make_ubo(vk.device, 1)},
+        ubo{make_ubo(vk.device, 0), make_ubo(vk.device, 1), make_ubo(vk.device, 2), make_ubo(vk.device, 3)},
         render_target{vk.device,
                       vk::StructureChain{
                               vk::ImageCreateInfo{
@@ -371,14 +371,14 @@ layer_squasher::layer_squasher(vk_bundle & vk, vk::Extent3D target_size) :
         descriptor_pool{make_ds_pool(vk, image_array_size)}
 {
 	{
-		std::array layouts = {*ds_layout, *ds_layout};
+		std::array layouts = {*ds_layout, *ds_layout, *ds_layout, *ds_layout};
 		auto sets = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
 		        .descriptorPool = descriptor_pool,
 		        .descriptorSetCount = uint32_t(descriptor_sets.size()),
 		        .pSetLayouts = layouts.data(),
 		});
-		for (int i = 0; i < view_count; ++i)
-			descriptor_sets[i] = sets[i].release();
+		for (size_t k = 0; k < descriptor_sets.size(); ++k)
+			descriptor_sets[k] = sets[k].release();
 	}
 }
 
@@ -388,6 +388,7 @@ std::tuple<std::array<xrt_pose, 2>,
 layer_squasher::do_layers(
         vk::raii::Device & device,
         vk::raii::CommandBuffer & cmd,
+        int slot,
         wivrn_hmd & hmd,
         uint64_t frame_interval_ns,
         const comp_frame & frame,
@@ -433,7 +434,9 @@ layer_squasher::do_layers(
 	for (int view = 0; view < view_count; ++view)
 	{
 		// TODO: staging buffer?
-		auto & ubo = *(render_compute_layer_ubo_data *)this->ubo[view].map();
+		// Per-slot UBO: the mapped CPU write is unordered by GPU
+		// barriers, so each commit writes its own slot.
+		auto & ubo = *(render_compute_layer_ubo_data *)this->ubo[slot * 2 + view].map();
 
 		// Not the transform of the views, but the inverse: actual view matrices.
 		xrt_matrix_4x4 world_view_mat, eye_view_mat;
@@ -589,27 +592,27 @@ layer_squasher::do_layers(
 		};
 
 		vk::DescriptorBufferInfo ubo_info{
-		        .buffer = this->ubo[view],
+		        .buffer = this->ubo[slot * 2 + view],
 		        .range = vk::WholeSize,
 		};
 
 		std::array writes = {
 		        vk::WriteDescriptorSet{
-		                .dstSet = descriptor_sets[view],
+		                .dstSet = descriptor_sets[slot * 2 + view],
 		                .dstBinding = 0,
 		                .descriptorCount = uint32_t(cur_image),
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 		                .pImageInfo = src_image_info.data(),
 		        },
 		        vk::WriteDescriptorSet{
-		                .dstSet = descriptor_sets[view],
+		                .dstSet = descriptor_sets[slot * 2 + view],
 		                .dstBinding = 2,
 		                .descriptorCount = 1,
 		                .descriptorType = vk::DescriptorType::eStorageImage,
 		                .pImageInfo = &target_image_info,
 		        },
 		        vk::WriteDescriptorSet{
-		                .dstSet = descriptor_sets[view],
+		                .dstSet = descriptor_sets[slot * 2 + view],
 		                .dstBinding = 3,
 		                .descriptorCount = 1,
 		                .descriptorType = vk::DescriptorType::eUniformBuffer,
@@ -629,7 +632,7 @@ layer_squasher::do_layers(
 		else
 			device.updateDescriptorSets(writes, {});
 
-		cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0, descriptor_sets[view], {});
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *layout, 0, descriptor_sets[slot * 2 + view], {});
 		auto [w, h] = calc_dispatch_dims_1_view(viewports[view]);
 		cmd.dispatch(w, h, 1);
 	}

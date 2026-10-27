@@ -42,7 +42,13 @@ class layer_squasher
 	const uint32_t image_array_size;
 	vk::raii::Sampler clamp_to_border_black;
 	vk::raii::Sampler clamp_to_edge;
-	std::array<buffer_allocation, 2> ubo;
+	// Per-(slot, eye) UBOs and sets (slot == compositor image index).
+	// The render target stays single: squash output is fully rewritten
+	// (Undefined-discard barrier) and consumed within one submit, and
+	// same-queue FIFO keeps overlapping submits ordered — unlike the
+	// CPU-rewritten UBOs/sets, which genuinely race.
+	static constexpr size_t num_slots = 2;
+	std::array<buffer_allocation, num_slots * 2> ubo;
 	image_allocation render_target;
 	std::array<vk::raii::ImageView, 2> render_view_srgb;
 	std::array<vk::raii::ImageView, 2> render_view_unorm;
@@ -50,7 +56,7 @@ class layer_squasher
 	vk::raii::PipelineLayout layout;
 	vk::raii::Pipeline pipeline;
 	vk::raii::DescriptorPool descriptor_pool;
-	std::array<vk::DescriptorSet, 2> descriptor_sets;
+	std::array<vk::DescriptorSet, num_slots * 2> descriptor_sets;
 
 public:
 	layer_squasher(vk_bundle &, vk::Extent3D target_size);
@@ -61,6 +67,7 @@ public:
 	do_layers(
 	        vk::raii::Device &,
 	        vk::raii::CommandBuffer &,
+	        int slot,
 	        wivrn_hmd &,
 	        uint64_t frame_interval_ns,
 	        const comp_frame &,

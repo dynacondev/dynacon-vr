@@ -512,6 +512,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		std::tie(poses, src_fov, src_rect) = squasher.do_layers(
 		        vk.device,
 		        cmd,
+		        i,
 		        session.get_hmd(),
 		        pacer.get_frame_duration(),
 		        frame.rendering,
