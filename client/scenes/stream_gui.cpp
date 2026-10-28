@@ -104,7 +104,7 @@ ImPlotPoint getter(int index, void * data_)
 }
 } // namespace
 
-void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<shard_accumulator::blit_handle>, view_count + 1> & blit_handles, const gpu_timestamps & timestamps)
+void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std::array<std::shared_ptr<shard_accumulator::blit_handle>, decoder_count> & blit_handles, const gpu_timestamps & timestamps)
 {
 	uint64_t rx = network_session->bytes_received();
 	uint64_t tx = network_session->bytes_sent();
@@ -118,6 +118,16 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 
 	bandwidth_rx = 0.8 * bandwidth_rx + 0.2 * float(rx - bytes_received) / dt;
 	bandwidth_tx = 0.8 * bandwidth_tx + 0.2 * float(tx - bytes_sent) / dt;
+
+	// Per video stream (left, right, alpha, depth): same EWMA over the
+	// payload-byte deltas counted on the network thread.
+	static std::array<uint64_t, decoder_count> last_stream_rx{};
+	for (size_t i = 0; i < decoder_count; ++i)
+	{
+		uint64_t cur = stream_rx_bytes[i].load(std::memory_order_relaxed);
+		stream_bandwidth_rx[i] = 0.8f * stream_bandwidth_rx[i] + 0.2f * float(cur - last_stream_rx[i]) / dt * 8.f;
+		last_stream_rx[i] = cur;
+	}
 
 	// Filter more aggressively for the compact view
 	compact_bandwidth_rx = 0.99 * compact_bandwidth_rx + 0.01 * float(rx - bytes_received) / dt;
@@ -137,6 +147,13 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.cpu_time = application::get_cpu_time().count() * 1e-9f;
 	gm.bandwidth_rx = bandwidth_rx * 8;
 	gm.bandwidth_tx = bandwidth_tx * 8;
+	gm.stream_rx_l = stream_bandwidth_rx[0];
+	gm.stream_rx_r = stream_bandwidth_rx[1];
+	gm.stream_rx_a = stream_bandwidth_rx[2];
+	gm.stream_rx_d = stream_bandwidth_rx[3];
+	gm.volume_virt_ms = (float)(volume_virt_ms * 1e-3);
+	gm.volume_virt_gpu_ms = last_volume_gpu.virt;
+	gm.virt_paired = volume_win_frames ? (float)volume_win_virt_paired / (float)std::max<uint64_t>(volume_win_frames, 1) : 0;
 	gm.track_ms = (float)(fid_detect_ms * 1e-3);
 	gm.solve_ms = (float)(fid_solve_ms * 1e-3);
 	gm.place_ms = (float)(fid_place_ms * 1e-3);
@@ -170,7 +187,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		if (predicted_display_time - last_stats_log > 5'000'000'000LL)
 		{
 			last_stats_log = predicted_display_time;
-			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms vol={:.2f}ms volg={:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
+			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s (l/r/a/d {:.1f}/{:.1f}/{:.1f}/{:.1f}) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms vol={:.2f}ms volg={:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
 			             gm.cpu_time * 1e3f,
 			             gm.gpu_time * 1e3f,
 			             gm.defoveate_gpu_ms * 1e3f,
@@ -179,6 +196,10 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             gm.mask_rest_gpu_ms * 1e3f,
 			             gm.bandwidth_rx * 1e-6f,
 			             gm.bandwidth_tx * 1e-6f,
+			             gm.stream_rx_l * 1e-6f,
+			             gm.stream_rx_r * 1e-6f,
+			             gm.stream_rx_a * 1e-6f,
+			             gm.stream_rx_d * 1e-6f,
 			             gm.track_ms * 1e3f,
 			             gm.solve_ms * 1e3f,
 			             gm.place_ms * 1e3f,
@@ -241,9 +262,11 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			++volume_win_sensor;
 		volume_win_acquire_ms += volume_acquire_ms;
 		volume_win_raster_ms += volume_raster_ms;
+		volume_win_virt_ms += volume_virt_ms;
 		volume_win_compare_ms += volume_compare_ms;
 		volume_win_merge_ms += volume_merge_ms;
 		volume_win_raster_gpu += (double)last_volume_gpu.raster * 1e3;
+		volume_win_virt_gpu += (double)last_volume_gpu.virt * 1e3;
 		volume_win_compare_gpu += (double)last_volume_gpu.compare * 1e3;
 		volume_win_merge_gpu += (double)last_volume_gpu.merge * 1e3;
 	}
@@ -254,7 +277,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		double va = (double)std::max<uint64_t>(volume_win_acquired, 1);
 		double win_s = volume_win_t0 != 0 ? (double)(predicted_display_time - volume_win_t0) * 1e-9 : 5.0;
 		double win_hz = win_s > 0 ? (double)volume_win_new_content / win_s : 0;
-		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m box {:.0f}%% age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/r/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/c/m {:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{}",
+		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m box {:.0f}%% age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/r/v/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/v/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{} virt {}/{}",
 		             (double)volume_last_feather, volume_last_tier, volume_last_draws,
 		             volume_last_seed_w, volume_last_seed_h, volume_sensor_w, volume_sensor_h,
 		             (double)volume_sensor_near, (double)volume_sensor_far,
@@ -262,12 +285,15 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		             volume_win_age_sum / va, volume_win_age_max,
 		             volume_win_dpos_sum / va, volume_win_dang_sum / va,
 		             volume_last_index, win_hz,
-		             volume_win_acquire_ms / vf, volume_win_raster_ms / vf, volume_win_compare_ms / vf, volume_win_merge_ms / vf,
-		             volume_win_raster_gpu / vf, volume_win_compare_gpu / vf, volume_win_merge_gpu / vf,
-		             volume_win_sensor, volume_win_acquired, volume_win_frames);
+		             volume_win_acquire_ms / vf, volume_win_raster_ms / vf, volume_win_virt_ms / vf, volume_win_compare_ms / vf, volume_win_merge_ms / vf,
+		             volume_win_raster_gpu / vf, volume_win_virt_gpu / vf, volume_win_compare_gpu / vf, volume_win_merge_gpu / vf,
+		             volume_win_sensor, volume_win_acquired, volume_win_frames,
+		             volume_win_virt_paired, volume_win_frames);
 		volume_win_frames = volume_win_sensor = volume_win_acquired = 0;
 		volume_win_new_content = 0;
 		volume_win_acquire_ms = volume_win_raster_ms = 0;
+		volume_win_virt_ms = volume_win_virt_gpu = 0;
+		volume_win_virt_paired = 0;
 		volume_win_compare_ms = volume_win_merge_ms = 0;
 		volume_win_raster_gpu = volume_win_compare_gpu = volume_win_merge_gpu = 0;
 		volume_win_age_sum = volume_win_age_max = 0;
@@ -338,11 +364,17 @@ void scenes::stream::gui_performance_metrics()
 	                             {_("Mask 1st"),  &global_metric::mask_first_gpu_ms},
 	                             {_("Mask rest"), &global_metric::mask_rest_gpu_ms},
 	                             {_("Vol R"),     &global_metric::volume_raster_gpu_ms},
+	                             {_("Vol V"),     &global_metric::volume_virt_gpu_ms},
 	                             {_("Vol C"),     &global_metric::volume_compare_gpu_ms},
 	                             {_("Vol M"),     &global_metric::volume_merge_gpu_ms}}, "s"),
 
 	        plot(_("Network"), {{_("Download"),  &global_metric::bandwidth_rx},
 	                            {_("Upload"),    &global_metric::bandwidth_tx}}, "bit/s"),
+
+	        plot(_("Streams"), {{_("Left"),   &global_metric::stream_rx_l},
+	                            {_("Right"),  &global_metric::stream_rx_r},
+	                            {_("Alpha"),  &global_metric::stream_rx_a},
+	                            {_("Depth"),  &global_metric::stream_rx_d}}, "bit/s"),
 
 	        plot(_("Passthrough"), {{_("Detect"),      &global_metric::track_ms},
 	                                {_("Solve"),       &global_metric::solve_ms},
@@ -352,8 +384,10 @@ void scenes::stream::gui_performance_metrics()
 	                                {_("Mask blur"),    &global_metric::mask_blur_ms},
 	                                {_("Vol acq"),     &global_metric::volume_acquire_ms},
 	                                {_("Vol raster"),  &global_metric::volume_raster_ms},
+	                                {_("Vol virt"),    &global_metric::volume_virt_ms},
 	                                {_("Vol compare"), &global_metric::volume_compare_ms},
 	                                {_("Vol merge"),   &global_metric::volume_merge_ms},
+	                                {_("Vol paired"),  &global_metric::virt_paired},
 	                                {_("Gizmos"),       &global_metric::gizmo_ms}}, "s"),
 
 	        plot(_("Features"), {{_("Votes"), &global_metric::feat_votes},

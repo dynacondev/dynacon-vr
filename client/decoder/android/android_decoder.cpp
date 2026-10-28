@@ -113,8 +113,9 @@ decoder::decoder(
 {
 	spdlog::info("hbm_mutex.native_handle() = {}", (void *)hbm_mutex.native_handle());
 
-	auto width = description.width;
-	auto height = description.height / (stream_index == 2 ? 2 : 1);
+	auto width = stream_index == 3 ? description.depth_width : description.width;
+	auto height = stream_index == 3 ? description.depth_height
+	                                : description.height / (stream_index == 2 ? 2 : 1);
 
 	AImageReader * ir;
 	check(AImageReader_newWithUsage(

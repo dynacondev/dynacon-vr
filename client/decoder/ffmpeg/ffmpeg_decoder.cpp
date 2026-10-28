@@ -112,8 +112,9 @@ decoder::decoder(
         weak_scene(scene),
         accumulator(accumulator),
         extent{
-                .width = description.width,
-                .height = description.height / (stream_index == 2 ? 2u : 1u),
+                .width = stream_index == 3 ? description.depth_width : description.width,
+                .height = stream_index == 3 ? description.depth_height
+                                            : description.height / (stream_index == 2 ? 2u : 1u),
         }
 {
 	free_images.resize(image_count);

@@ -76,7 +76,10 @@ public:
 
 private:
 	static const size_t view_count = 2;
-	static const size_t decoder_count = view_count + 1;
+	// left, right, alpha, virtual depth SBS (stream 3, strict frame_idx
+	// pairing with color, null when the color frame had no depth warp)
+	static const size_t decoder_count = view_count + 2;
+	static const uint8_t depth_stream_index = 3;
 
 	struct accumulator_images
 	{
@@ -464,6 +467,10 @@ private:
 	uint64_t bytes_sent = 0;
 	float bandwidth_rx = 0;
 	float bandwidth_tx = 0;
+	// Per-stream payload bytes (network thread, indexed by
+	// stream_item_idx): smoothed into per-stream bitrates below.
+	std::array<std::atomic<uint64_t>, decoder_count> stream_rx_bytes{};
+	std::array<float, decoder_count> stream_bandwidth_rx{};
 
 	// Per-frame passthrough accumulators (milliseconds / counts), filled
 	// by update_fiducial_passthrough and the mask record loop below, then
@@ -472,7 +479,7 @@ private:
 	int fid_votes = 0, fid_tags = 0;
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
 	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
-	double volume_raster_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
+	double volume_raster_ms = 0, volume_virt_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
 	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
 	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
 	// never read unwritten queries). volume_ts_async selects the fence
@@ -482,7 +489,7 @@ private:
 	bool volume_ts_async = false;
 	struct volume_gpu_spans
 	{
-		float raster = 0, compare = 0, merge = 0;
+		float raster = 0, virt = 0, compare = 0, merge = 0;
 	};
 	volume_gpu_spans last_volume_gpu;
 	// Volume heartbeat snapshot (last volume group) + 5s window sums for
@@ -496,6 +503,8 @@ private:
 	float volume_sensor_near = 0, volume_sensor_far = 0;
 	uint64_t volume_win_frames = 0, volume_win_sensor = 0;
 	double volume_win_acquire_ms = 0, volume_win_raster_ms = 0;
+	double volume_win_virt_ms = 0, volume_win_virt_gpu = 0;
+	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
 	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
@@ -577,6 +586,8 @@ private:
 		float cpu_time = 0;
 		float bandwidth_rx = 0;
 		float bandwidth_tx = 0;
+		// Per video stream, bits/s smoothed (left, right, alpha, depth).
+		float stream_rx_l = 0, stream_rx_r = 0, stream_rx_a = 0, stream_rx_d = 0;
 		// Passthrough timings (seconds, sampled per frame): fiducial
 		// detection/tracking, board solve + smoothing, placement +
 		// instance updates, then mask raster/erode/blur, gizmos and the
@@ -589,11 +600,14 @@ private:
 		float mask_blur_ms = 0;
 		float volume_acquire_ms = 0;
 		float volume_raster_ms = 0;
+		float volume_virt_ms = 0;
 		float volume_compare_ms = 0;
 		float volume_merge_ms = 0;
 		float volume_raster_gpu_ms = 0;
+		float volume_virt_gpu_ms = 0;
 		float volume_compare_gpu_ms = 0;
 		float volume_merge_gpu_ms = 0;
+		float virt_paired = 0; // depth frames paired / volume frames (windowed below)
 		float gizmo_ms = 0;
 		float mask_gpu_ms = 0;
 		float defoveate_gpu_ms = 0;

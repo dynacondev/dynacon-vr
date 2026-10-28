@@ -1029,7 +1029,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .pName = "main",
 		        },
 		};
-		vk::DescriptorSetLayoutBinding compare_bindings[2] = {
+		vk::DescriptorSetLayoutBinding compare_bindings[3] = {
 		        {
 		                .binding = 0,
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -1042,9 +1042,17 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .descriptorCount = 1,
 		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
 		        },
+		        {
+		                // Virtual-depth D canvas (same shape as binding 1).
+		                // Unpaired frames rebind the volume canvas here.
+		                .binding = 2,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        },
 		};
 		vk::DescriptorSetLayoutCreateInfo compare_set_info{
-		        .bindingCount = 2,
+		        .bindingCount = 3,
 		        .pBindings = compare_bindings,
 		};
 		compare_set_layout = vk::raii::DescriptorSetLayout(device, compare_set_info);
@@ -1062,7 +1070,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		compare_pipe_layout = vk::raii::PipelineLayout(device, compare_pipe_layout_info);
 		vk::DescriptorPoolSize compare_pool_size{
 		        .type = vk::DescriptorType::eCombinedImageSampler,
-		        .descriptorCount = 3,
+		        .descriptorCount = 4,
 		};
 		vk::DescriptorPoolCreateInfo compare_pool_info{
 		        .maxSets = 1,
@@ -1124,7 +1132,144 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .renderPass = *compare_renderpass_mv,
 		};
 			compare_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
-			}
+	}
+	// Virtual depth SBS -> sensor-D canvas: fullscreen _mv conversion
+	// (meters->D with the volume near/far), so the compare stays in D
+	// space with untouched push constants. Renders into
+	// volume_virt.blur_fb_mv... under its own CLEAR R16 MV pass (the
+	// compare pass is R8: format-incompatible). One draw per volume
+	// group, only when paired.
+	{
+		auto virt_frag = load_shader(device, "volume_virt_mv.frag");
+		vk::PipelineShaderStageCreateInfo virt_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **blur_vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **virt_frag,
+		                .pName = "main",
+		        },
+		};
+		vk::DescriptorSetLayoutBinding virt_binding{
+		        .binding = 0,
+		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 1,
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		};
+		vk::DescriptorSetLayoutCreateInfo virt_set_info{
+		        .bindingCount = 1,
+		        .pBindings = &virt_binding,
+		};
+		volume_virt_set_layout = vk::raii::DescriptorSetLayout(device, virt_set_info);
+		vk::PushConstantRange virt_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        .offset = 0,
+		        .size = sizeof(volume_virt_push),
+		};
+		vk::PipelineLayoutCreateInfo virt_pipe_layout_info{
+		        .setLayoutCount = 1,
+		        .pSetLayouts = &*volume_virt_set_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &virt_push_range,
+		};
+		volume_virt_layout = vk::raii::PipelineLayout(device, virt_pipe_layout_info);
+		vk::DescriptorPoolSize virt_pool_size{
+		        .type = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 1,
+		};
+		vk::DescriptorPoolCreateInfo virt_pool_info{
+		        .maxSets = 1,
+		        .poolSizeCount = 1,
+		        .pPoolSizes = &virt_pool_size,
+		};
+		volume_virt_pool = vk::raii::DescriptorPool(device, virt_pool_info);
+		vk::DescriptorSetAllocateInfo virt_alloc_info{
+		        .descriptorPool = *volume_virt_pool,
+		        .descriptorSetCount = 1,
+		        .pSetLayouts = &*volume_virt_set_layout,
+		};
+		volume_virt_set = *device.allocateDescriptorSets(virt_alloc_info)[0];
+		uint32_t mv_view_mask = 0b11, mv_corr_mask = 0b11;
+		vk::RenderPassMultiviewCreateInfo virt_mv_rp_info{
+		        .subpassCount = 1,
+		        .pViewMasks = &mv_view_mask,
+		        .correlationMaskCount = 1,
+		        .pCorrelationMasks = &mv_corr_mask,
+		};
+		vk::AttachmentDescription virt_attachment{
+		        .format = volume_depth_format,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eClear,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentReference virt_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::SubpassDescription virt_subpass{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .colorAttachmentCount = 1,
+		        .pColorAttachments = &virt_ref,
+		};
+		vk::RenderPassCreateInfo virt_rp_info{
+		        .pNext = &virt_mv_rp_info,
+		        .attachmentCount = 1,
+		        .pAttachments = &virt_attachment,
+		        .subpassCount = 1,
+		        .pSubpasses = &virt_subpass,
+		};
+		volume_virt_renderpass = vk::raii::RenderPass(device, virt_rp_info);
+		vk::PipelineVertexInputStateCreateInfo virt_vertex_input{};
+		vk::PipelineInputAssemblyStateCreateInfo virt_input_assembly{
+		        .topology = vk::PrimitiveTopology::eTriangleList,
+		};
+		vk::PipelineViewportStateCreateInfo virt_viewport_state{
+		        .viewportCount = 1,
+		        .scissorCount = 1,
+		};
+		vk::PipelineRasterizationStateCreateInfo virt_rasterization{
+		        .polygonMode = vk::PolygonMode::eFill,
+		        .cullMode = vk::CullModeFlagBits::eNone,
+		        .frontFace = vk::FrontFace::eCounterClockwise,
+		        .lineWidth = 1,
+		};
+		vk::PipelineMultisampleStateCreateInfo virt_multisample{
+		        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+		};
+		vk::PipelineColorBlendAttachmentState virt_blend_attachment{
+		        .blendEnable = VK_FALSE,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		};
+		vk::PipelineColorBlendStateCreateInfo virt_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &virt_blend_attachment,
+		};
+		vk::DynamicState virt_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+		vk::PipelineDynamicStateCreateInfo virt_dynamic{
+		        .dynamicStateCount = 2,
+		        .pDynamicStates = virt_dynamics,
+		};
+		vk::GraphicsPipelineCreateInfo virt_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = virt_stages,
+		        .pVertexInputState = &virt_vertex_input,
+		        .pInputAssemblyState = &virt_input_assembly,
+		        .pViewportState = &virt_viewport_state,
+		        .pRasterizationState = &virt_rasterization,
+		        .pMultisampleState = &virt_multisample,
+		        .pColorBlendState = &virt_blend,
+		        .pDynamicState = &virt_dynamic,
+		        .layout = *volume_virt_layout,
+		        .renderPass = *volume_virt_renderpass,
+		};
+		volume_virt_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), virt_pipeline_info);
+	}
 	// Homography rides push constants (named vec4 members, see header);
 	// no buffers, views, copies or barriers per frame.
 	// Linear sampler for the compare taps (sensor + volume depth),
@@ -1731,6 +1876,34 @@ void feather_mask_renderer::ensure_volume_targets()
 	                },
 	        });
 
+	// Virtual-depth D canvas (R16, same 320px 2-layer shape): SBS
+	// meters->D conversion output, cleared to far. Own MV framebuffer
+	// under volume_virt_renderpass (CLEAR R16 MV).
+	std::tie(volume_virt.image, volume_virt.memory) = make_target_image(volume_depth_format);
+	volume_virt.view_array = vk::raii::ImageView(device,
+	        vk::ImageViewCreateInfo{
+	                .image = *volume_virt.image,
+	                .viewType = vk::ImageViewType::e2DArray,
+	                .format = volume_depth_format,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .baseMipLevel = 0,
+	                        .levelCount = 1,
+	                        .baseArrayLayer = 0,
+	                        .layerCount = 2,
+	                },
+	        });
+	vk::ImageView raw_virt_array = *volume_virt.view_array;
+	volume_virt_fb_mv = vk::raii::Framebuffer(device,
+	        vk::FramebufferCreateInfo{
+	                .renderPass = *volume_virt_renderpass,
+	                .attachmentCount = 1,
+	                .pAttachments = &raw_virt_array,
+	                .width = ve.width,
+	                .height = ve.height,
+	                .layers = 2,
+	        });
+
 	// Binary canvas (R8): compare renders MV into blur_fb_mv under the
 	// shared R8 pass; merge samples the array view with LINEAR.
 	std::tie(volume_bin.image, volume_bin.memory) = make_target_image(blur_format);
@@ -1873,7 +2046,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 {
 	auto t_total0 = std::chrono::steady_clock::now();
 	double ms_raster = 0, ms_erode = 0, ms_blur = 0, ms_punch = 0;
-	double ms_volume_raster = 0, ms_volume_compare = 0, ms_volume_merge = 0;
+	double ms_volume_raster = 0, ms_volume_virt = 0, ms_volume_compare = 0, ms_volume_merge = 0;
 	// Depth volume engages exactly when the group carries depth draws
 	// with a valid sensor view. The raster is a plain MAX accumulation
 	// (no MIN cuts: the merge below MAXes over the reversed result).
@@ -1895,6 +2068,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cpu_stats->blur_ms = ms_blur;
 			cpu_stats->punch_ms = ms_punch;
 			cpu_stats->volume_raster_ms = ms_volume_raster;
+			cpu_stats->volume_virt_ms = ms_volume_virt;
 			cpu_stats->volume_compare_ms = ms_volume_compare;
 			cpu_stats->volume_merge_ms = ms_volume_merge;
 			cpu_stats->total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_total0).count();
@@ -2374,7 +2548,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, volume->timestamp_pool, q);
 				};
 			if (volume_ts)
-				cmd.resetQueryPool(volume->timestamp_pool, 0, 4);
+				cmd.resetQueryPool(volume->timestamp_pool, 0, 5);
 			volume_stamp(0);
 			{
 				section_clock raster_clk(&ms_volume_raster);
@@ -2417,6 +2591,52 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 			volume_stamp(1);
 			make_readable(*volume_depth.image);
+			// Virtual depth SBS -> D canvas (only when paired): meters->D
+			// fullscreen _mv at 320px with the volume near/far. Unpaired
+			// frames skip the pass (stale canvas ignored: compare rebinds
+			// the volume canvas, so the legacy test is bit-identical).
+			if (volume->virt_valid)
+			{
+				section_clock virt_clk(&ms_volume_virt);
+				vk::DescriptorImageInfo virt_info{
+				        .sampler = volume->virt_sampler,
+				        .imageView = volume->virt_view,
+				        // Decoded depth arrives GENERAL (same barrier
+				        // discipline as color in the stream scene).
+				        .imageLayout = vk::ImageLayout::eGeneral,
+				};
+				std::array<vk::CopyDescriptorSet, 0> no_virt_copies{};
+				std::array<vk::WriteDescriptorSet, 1> virt_writes = {{
+				        {
+				                .dstSet = volume_virt_set,
+				                .dstBinding = 0,
+				                .descriptorCount = 1,
+				                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+				                .pImageInfo = &virt_info,
+				        },
+				}};
+				device.updateDescriptorSets(virt_writes, no_virt_copies);
+				vk::ClearValue vfar{};
+				vfar.color.float32 = {{1.0f, 1.0f, 1.0f, 1.0f}};
+				vk::RenderPassBeginInfo begin_virt{
+				        .renderPass = *volume_virt_renderpass,
+				        .framebuffer = *volume_virt_fb_mv,
+				        .renderArea = {.offset = {0, 0}, .extent = ve},
+				        .clearValueCount = 1,
+				        .pClearValues = &vfar,
+				};
+				cmd.beginRenderPass(begin_virt, vk::SubpassContents::eInline);
+				set_full_viewport(ve);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *volume_virt_pipeline);
+				std::array<vk::DescriptorSet, 1> virt_sets{volume_virt_set};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *volume_virt_layout, 0, virt_sets, no_offsets);
+				cmd.pushConstants<volume_virt_push>(*volume_virt_layout, vk::ShaderStageFlagBits::eFragment, 0,
+				                                    volume_virt_push{.near_z = volume->near_z, .far_z = volume->far_z});
+				cmd.draw(3, 1, 0, 0);
+				cmd.endRenderPass();
+				make_readable(*volume_virt.image);
+			}
+			volume_stamp(2);
 			{
 				section_clock compare_clk(&ms_volume_compare);
 				// Homography + B2 corr push fill (128B named vec4s). Pushed just
@@ -2438,8 +2658,15 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					        .imageView = *volume_depth.view_array,
 					        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 					};
+				// Virtual D canvas (already readable when paired; the
+				// binding below rebinds volume_info when unpaired).
+				vk::DescriptorImageInfo virt_d_info{
+					        .sampler = *volume_sampler_linear,
+					        .imageView = *volume_virt.view_array,
+					        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+					};
 				std::array<vk::CopyDescriptorSet, 0> no_compare_copies{};
-				std::array<vk::WriteDescriptorSet, 2> compare_writes = {{
+				std::array<vk::WriteDescriptorSet, 3> compare_writes = {{
 					{
 					        .dstSet = *compare_set,
 					        .dstBinding = 0,
@@ -2453,6 +2680,15 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					        .descriptorCount = 1,
 					        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 					        .pImageInfo = &volume_info,
+					},
+					{
+					        // Paired: virtual D canvas. Unpaired: the
+					        // volume canvas again (min(v,v) = legacy).
+					        .dstSet = *compare_set,
+					        .dstBinding = 2,
+					        .descriptorCount = 1,
+					        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+					        .pImageInfo = volume->virt_valid ? &virt_d_info : &volume_info,
 					},
 				}};
 				device.updateDescriptorSets(compare_writes, no_compare_copies);
@@ -2477,7 +2713,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 			}
-			volume_stamp(2);
+			volume_stamp(3);
 			make_readable(*volume_bin.image);
 			{
 				section_clock merge_clk(&ms_volume_merge);
@@ -2563,7 +2799,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, max_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
-				volume_stamp(3);
+				volume_stamp(4);
 			}
 		};
 

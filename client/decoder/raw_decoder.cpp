@@ -99,8 +99,9 @@ raw_decoder::raw_decoder(
         fence(device, vk::FenceCreateInfo{.flags = vk::FenceCreateFlagBits::eSignaled}),
         stream_index(stream_index),
         extent{
-                .width = description.width,
-                .height = description.height / (stream_index == 2 ? 2u : 1u),
+                .width = stream_index == 3 ? description.depth_width : description.width,
+                .height = stream_index == 3 ? description.depth_height
+                                            : description.height / (stream_index == 2 ? 2u : 1u),
         },
         weak_scene(scene),
         accumulator(accumulator)
@@ -111,6 +112,7 @@ raw_decoder::raw_decoder(
 	{
 		case 0: // colour left
 		case 1: // colour right
+		case 3: // virtual depth SBS (luma + neutral chroma, like colour)
 			buffer_size += buffer_size / 2;
 			format = vk::Format::eG8B8R82Plane420Unorm;
 			break;

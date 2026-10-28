@@ -210,6 +210,8 @@ scenes::stream::stream(std::string server_name, scene & parent_scene) :
 	height = views[0].recommendedImageRectHeight;
 
 	request_spatial_permissions();
+	for (auto & c: stream_rx_bytes)
+		c.store(0, std::memory_order_relaxed);
 }
 
 static from_headset::visibility_mask_changed::masks get_visibility_mask(xr::instance & inst, xr::session & session, int view)
@@ -480,14 +482,14 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	                .queryCount = 3,
 	        });
 
-	// Volume GPU brackets (raster/compare/merge boundaries, 4 queries).
+	// Volume GPU brackets (raster/virt/compare/merge boundaries, 5 queries).
 	// Dedicated pool so the main/mask read discipline (never wait on an
 	// unwritten query) is untouched; volume_ts_valid gates the poll.
 	self->volume_query_pool = vk::raii::QueryPool(
 	        self->device,
 	        vk::QueryPoolCreateInfo{
 	                .queryType = vk::QueryType::eTimestamp,
-	                .queryCount = 4,
+	                .queryCount = 5,
 	        });
 
 	self->wifi = application::get_wifi_lock().get_wifi_lock();
@@ -694,7 +696,7 @@ bool scenes::stream::accumulator_images::empty() const
 	return true;
 }
 
-std::array<std::shared_ptr<shard_accumulator::blit_handle>, 3> scenes::stream::common_frame(XrTime display_time)
+std::array<std::shared_ptr<shard_accumulator::blit_handle>, scenes::stream::decoder_count> scenes::stream::common_frame(XrTime display_time)
 {
 	if (decoders.empty())
 		return {};
@@ -738,9 +740,10 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, 3> scenes::stream::c
 
 		assert(*min);
 		auto frame_index = (*min)->feedback.frame_index;
+		const size_t color_count = view_count + (alpha ? 1 : 0);
 		for (auto [i, decoder]: utils::enumerate(decoders))
 		{
-			if (alpha or i < view_count)
+			if (i < color_count)
 				result[i] = decoder.frame(frame_index);
 		}
 	}
@@ -760,9 +763,10 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, 3> scenes::stream::c
 			spdlog::warn(frames);
 		}
 
+		const size_t color_count = view_count + (alpha ? 1 : 0);
 		for (auto [i, decoder]: utils::enumerate(decoders))
 		{
-			if (alpha or i < view_count)
+			if (i < color_count)
 			{
 				auto min = std::ranges::min_element(decoder.latest_frames,
 				                                    std::ranges::less{},
@@ -775,6 +779,12 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, 3> scenes::stream::c
 			}
 		}
 	}
+	// Virtual depth (stream 3) never joins the common-frame intersection:
+	// strict frame_idx pairing with the selected color frame, else null
+	// (the volume compare skips the virtual term for that frame). No
+	// hold-last: stale virtual depth occludes wrong pixels.
+	if (result[0])
+		result[depth_stream_index] = decoders[depth_stream_index].frame(result[0]->feedback.frame_index);
 	return result;
 }
 
@@ -1082,7 +1092,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Mask-pool results (async path): q0 start, q1 after first group,
 	// q2 end. Read only when the last mask submission went async (else
 	// the pool holds older data); not-ready carries like the main pool.
-	// Volume-pool results: raster/compare/merge boundaries from the
+	// Volume-pool results: raster/virt/compare/merge boundaries from the
 	// last volume group. Same poll discipline (no eWait, carry over),
 	// plus the retiring fence for the recording path: mask fence on
 	// async frames, main fence (waited above) on inline frames.
@@ -1094,8 +1104,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			auto [vres, vtimestamps] = volume_query_pool.getResults<uint64_t>(
 			        0,
-			        4,
-			        4 * sizeof(uint64_t),
+			        5,
+			        5 * sizeof(uint64_t),
 			        sizeof(uint64_t),
 			        vk::QueryResultFlagBits::e64);
 
@@ -1103,8 +1113,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				float period = application::get_physical_device_properties().limits.timestampPeriod / 1e9f;
 				last_volume_gpu.raster = (vtimestamps[1] - vtimestamps[0]) * period;
-				last_volume_gpu.compare = (vtimestamps[2] - vtimestamps[1]) * period;
-				last_volume_gpu.merge = (vtimestamps[3] - vtimestamps[2]) * period;
+				last_volume_gpu.virt = (vtimestamps[2] - vtimestamps[1]) * period;
+				last_volume_gpu.compare = (vtimestamps[3] - vtimestamps[2]) * period;
+				last_volume_gpu.merge = (vtimestamps[4] - vtimestamps[3]) * period;
 			}
 		}
 	}
@@ -1267,6 +1278,64 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				};
 				images[j].layout_a = blit_handle->current_layout;
 			}
+		}
+	}
+
+	// Virtual depth (stream 3): never defoveated; same ownership/layout
+	// barrier discipline as color so the volume compare samples defined
+	// data. Bookkeeping mirrors color (blitted/displayed feed the
+	// feedback loop below, which is what drives depth IDR + bitrate).
+	if (auto & depth_handle = current_blit_handles[depth_stream_index])
+	{
+		depth_handle->feedback.blitted = instance.now();
+		++depth_handle->feedback.times_displayed;
+		depth_handle->feedback.displayed = frame_state.predictedDisplayTime;
+
+#if WIVRN_USE_V4L2
+		if (depth_handle->foreign_queue_family != vk::QueueFamilyIgnored)
+		{
+			vk::ImageMemoryBarrier barrier{
+			        .srcAccessMask = vk::AccessFlagBits::eNone,
+			        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+			        .oldLayout = depth_handle->current_layout,
+			        .newLayout = vk::ImageLayout::eGeneral,
+			        .srcQueueFamilyIndex = depth_handle->foreign_queue_family,
+			        .dstQueueFamilyIndex = queue_family_index,
+			        .image = depth_handle->image,
+			        .subresourceRange = {
+			                .aspectMask = vk::ImageAspectFlagBits::eColor,
+			                .levelCount = 1,
+			                .layerCount = 1,
+			        },
+			};
+
+			command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eTopOfPipe,
+			                               vk::PipelineStageFlagBits::eFragmentShader,
+			                               {},
+			                               {},
+			                               {},
+			                               barrier);
+			depth_handle->current_layout = vk::ImageLayout::eGeneral;
+		}
+		else
+#endif
+		        if (depth_handle->current_layout == vk::ImageLayout::eUndefined)
+		{
+			vk::ImageMemoryBarrier barrier{
+			        .srcAccessMask = vk::AccessFlagBits::eNone,
+			        .dstAccessMask = vk::AccessFlagBits::eMemoryRead,
+			        .oldLayout = vk::ImageLayout::eUndefined,
+			        .newLayout = vk::ImageLayout::eGeneral,
+			        .image = depth_handle->image,
+			        .subresourceRange = {
+			                .aspectMask = vk::ImageAspectFlagBits::eColor,
+			                .levelCount = 1,
+			                .layerCount = 1,
+			        },
+			};
+
+			command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, barrier);
+			depth_handle->current_layout = vk::ImageLayout::eGeneral;
 		}
 	}
 
@@ -2048,6 +2117,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					g.active = true;
 					g.extent = {(int32_t)gw, (int32_t)gh};
 					feather_mask_renderer::mask_stage_cpu mstats{};
+					bool vol_virt_paired = false;
 					try
 					{
 						feather_mask_renderer::volume_input vol_in;
@@ -2059,6 +2129,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							vol_in.sensor_view = volume_sensor;
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
+							// Virtual depth: strict pairing already resolved
+							// in current_blit_handles[3] (null when the
+							// color frame had no depth warp).
+							if (auto & dh = current_blit_handles[depth_stream_index])
+							{
+								vol_in.virt_view = dh->image_view;
+								vol_in.virt_sampler = decoders[depth_stream_index].decoder->sampler();
+								vol_in.virt_valid = true;
+								vol_virt_paired = true;
+							}
 							if (*volume_query_pool)
 								vol_in.timestamp_pool = *volume_query_pool;
 						}
@@ -2079,8 +2159,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_erode_ms += mstats.erode_ms;
 					mask_blur_ms += mstats.blur_ms;
 					volume_raster_ms += mstats.volume_raster_ms;
+					volume_virt_ms += mstats.volume_virt_ms;
 					volume_compare_ms += mstats.volume_compare_ms;
 					volume_merge_ms += mstats.volume_merge_ms;
+					if (any_volume and vol_virt_paired)
+						++volume_win_virt_paired;
 					mask_draws += (int)mstats.draws;
 					if (any_volume)
 					{
