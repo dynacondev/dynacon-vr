@@ -51,7 +51,7 @@ struct configuration
 		std::optional<std::string> device;
 	};
 
-	std::array<encoder, 3> encoders; // left, right, alpha
+	std::array<encoder, 4> encoders; // left, right, alpha, depth
 	std::optional<uint8_t> bit_depth;
 	std::optional<std::array<float, 3>> grip_surface;
 	std::vector<std::string> application;

@@ -841,9 +841,16 @@ struct video_stream_description
 {
 	// dimensions of the video stream per eye
 	// alpha is half resolution
+	// depth is a 640x320 side-by-side (left|right) 8-bit virtual-depth
+	// channel, 1cm/LSB, 255 = >=2.55m / unknown
 	uint16_t width;
 	uint16_t height;
-	std::array<video_codec, 3> codec; // left, right, alpha
+	std::array<video_codec, 4> codec; // left, right, alpha, depth
+	// Depth SBS dimensions (left|right halves); color width/height above
+	// are per-eye. Fixed 640x320 today, carried explicitly so the client
+	// never hardcodes it.
+	uint16_t depth_width = 640;
+	uint16_t depth_height = 320;
 	float frame_rate;
 	float refresh_rate;
 
@@ -858,6 +865,8 @@ public:
 	// 0 left
 	// 1 right
 	// 2 alpha
+	// 3 virtual depth SBS (640x320 left|right, strict frame_idx pairing
+	//   with color; absent when the color frame had no depth warp)
 	uint8_t stream_item_idx;
 	// Counter increased for each frame
 	uint64_t frame_idx;

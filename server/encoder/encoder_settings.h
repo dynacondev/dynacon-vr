@@ -34,7 +34,7 @@ struct encoder_settings
 {
 	uint16_t width;
 	uint16_t height;
-	video_codec codec; // left, right, alpha
+	video_codec codec; // left, right, alpha, depth (index-matched)
 	float fps;
 	// encoder identifier, such as nvenc, vaapi or x264
 	std::string encoder_name;
@@ -45,8 +45,8 @@ struct encoder_settings
 	std::optional<std::string> device;
 };
 
-std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle &, wivrn_session &);
+std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle &, wivrn_session &);
 
-void print_encoders(const std::array<wivrn::encoder_settings, 3> & encoders);
+void print_encoders(const std::array<wivrn::encoder_settings, 4> & encoders);
 
 } // namespace wivrn

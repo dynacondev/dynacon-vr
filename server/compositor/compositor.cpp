@@ -767,6 +767,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
+		if (encoder->stream_idx == 3)
+			continue; // virtual depth: separate image, wired in depth commit
 		else if (encoder->need_transfer or encoder->target_queue == vk.queue.family_index)
 		{
 			image_barriers.push_back(
@@ -845,6 +847,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// vs IDR-wait vs backpressure. A throw must not strand image
 		// slot either: count the drop and continue, the worker still
 		// recycles the image.
+		// Depth (stream 3) has its own image + present path (depth commit).
+		if (encoder->stream_idx == 3)
+			continue;
 		try
 		{
 			switch (encoder->present_image(images[slot].image, sem_info, info.frame_id))
@@ -991,6 +996,10 @@ void compositor::encoder_work(std::stop_token tok)
 		// still clears below in all cases.
 		for (auto & encoder: encoders)
 		{
+			// Depth (stream 3) encodes from its own image + frame pairing
+			// in the depth commit, never from the color image here.
+			if (encoder->stream_idx == 3)
+				continue;
 			if (encoder->stream_idx < 2 or image.view_info.alpha)
 			{
 				try
@@ -1015,6 +1024,8 @@ void compositor::send_video_stream_description()
 	        .width = uint16_t(images[0].image.info().extent.width),
 	        .height = uint16_t(images[0].image.info().extent.height),
 	        .frame_rate = settings[0].fps,
+	        .depth_width = settings[3].width,
+	        .depth_height = settings[3].height,
 	};
 	get_display_refresh_rate(&desc.refresh_rate);
 	static_assert(std::tuple_size_v<decltype(settings)> == std::tuple_size_v<decltype(desc.codec)>);

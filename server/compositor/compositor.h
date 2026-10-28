@@ -93,7 +93,7 @@ private:
 	// counting a poll-miss on a pool that was never written.
 	std::array<bool, num_frame_slots> query_armed = {};
 
-	std::array<encoder_settings, 3> settings;
+	std::array<encoder_settings, 4> settings;
 
 	std::array<image, num_frame_slots> images;
 	std::array<vk::raii::CommandBuffer, num_frame_slots> cmds{nullptr, nullptr};
@@ -111,7 +111,7 @@ private:
 	// Cached at construction: server config is startup-read.
 	const bool depth_reprojection_enabled;
 
-	std::array<std::unique_ptr<video_encoder>, 3> encoders;
+	std::array<std::unique_ptr<video_encoder>, 4> encoders;
 
 #ifdef __cpp_lib_atomic_lock_free_type_aliases
 	using status_type = std::atomic_signed_lock_free;
