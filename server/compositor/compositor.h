@@ -25,6 +25,7 @@
 #include "util/u_logging.h"
 
 #include "encoder/encoder_settings.h"
+#include "depth_packer.h"
 #include "depth_reprojector.h"
 #include "foveation.h"
 #include "layer_squasher.h"
@@ -58,6 +59,23 @@ public:
 		// Set at commit for the encoder size triage (warped content
 		// defeats inter-frame prediction differently than repeats).
 		bool warped_frame = false;
+		// Set when the depth pack + present was attempted for this frame
+		// (warped with valid near/far): the worker must call the depth
+		// encoder even on present skips (skip bookkeeping is per-encoder).
+		bool has_depth = false;
+	};
+
+	// Virtual-depth staging for stream 3: 640x320 SBS YCbCr, depth in
+	// layer 3 (so encoder backends keep indexing baseArrayLayer 3).
+	// Paired 1:1 with the color slots above (shared busy lifetime).
+	struct depth_image
+	{
+		image_allocation image;
+		// 2D views on layer 3: pack target (Y) + neutral-chroma clear (CbCr).
+		vk::raii::ImageView out_y = nullptr;
+		vk::raii::ImageView out_cbcr = nullptr;
+		// First submit transitions from Undefined; later from steady state.
+		bool ready = false;
 	};
 
 private:
@@ -107,9 +125,13 @@ private:
 	layer_squasher squasher;
 	wivrn::foveation foveation;
 	depth_reprojector reprojector;
+	depth_packer packer;
 
 	// Cached at construction: server config is startup-read.
 	const bool depth_reprojection_enabled;
+
+	// Depth staging images (stream 3), one per color slot.
+	std::array<depth_image, num_frame_slots> depth_images;
 
 	std::array<std::unique_ptr<video_encoder>, 4> encoders;
 

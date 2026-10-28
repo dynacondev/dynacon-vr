@@ -1,0 +1,117 @@
+/*
+ * WiVRn VR streaming
+ * Copyright (C) 2026  Patrick Nicolas <patricknicolas@laposte.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/>.
+ */
+
+/*
+ * Virtual-depth pack (depth video stream, one dispatch per warped frame).
+ *
+ * Reads the warp's target-view splat depth (R32Uint, DEPTH_SCALE-encoded
+ * NDC, 0xffffffff sentinel = no splat) for both eyes at full render size
+ * and packs a 640x320 side-by-side 8-bit image: left eye in x[0..320),
+ * right eye in x[320..640).
+ *
+ * Resample happens FIRST in the encoded NDC/uint domain with MIN pooling
+ * (foreground wins, order-independent): bilinear filtering of nonlinear
+ * NDC would blend foreground/background into false mid-depths and halo
+ * every silhouette. The sentinel is the max uint, so a plain min ignores
+ * holes automatically; all-sentinel windows stay sentinel.
+ *
+ * Linearisation runs only at 320x320 (~102k px/eye, not ~4M): zt back to
+ * eye meters via the dst frustum near/far (same math as depth_viz's
+ * linearize_depth, mirrored here), then 1cm/LSB quantize. 255 is the
+ * single far value: >=2.55m, sky (pinned 1.0 in splat), holes, sentinel.
+ *
+ * The client compares in meters: showReal = sensorM < min(volFarM, virtM).
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r32ui) readonly uniform uimage2D splat_l;
+layout(set = 0, binding = 1, r32ui) readonly uniform uimage2D splat_r;
+// Y plane of the depth staging image, 2D view on layer 3 (SBS canvas).
+layout(set = 0, binding = 2, r8) writeonly uniform image2D dst_y;
+
+layout(push_constant) uniform Push
+{
+	vec2 src_size; // full-res splat extent (both eyes share it)
+	float near_l;
+	float far_l;
+	float near_r;
+	float far_r;
+}
+pc;
+
+#define DEPTH_SCALE 16777215.0
+#define DEPTH_SENTINEL 0xffffffffu
+#define CM_PER_UNIT 100.0
+
+float linearize(float d, float n, float f)
+{
+	if (!(f > n) || f > 1e9)
+	{
+		// Infinite far plane: D=0 -> near, D=1 -> far.
+		return n / max(1.0 - d, 1e-6);
+	}
+	return (n * f) / max(f - d * (f - n), 1e-6);
+}
+
+void main()
+{
+	ivec2 out_xy = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 out_size = imageSize(dst_y);
+	if (out_xy.x >= out_size.x || out_xy.y >= out_size.y)
+		return;
+
+	bool right = out_xy.x >= 320;
+	ivec2 eye_xy = ivec2(right ? out_xy.x - 320 : out_xy.x, out_xy.y);
+
+	vec2 scale = pc.src_size / vec2(320.0, 320.0);
+	vec2 f0 = vec2(eye_xy) * scale;
+	vec2 f1 = (vec2(eye_xy) + vec2(1.0)) * scale;
+	ivec2 i0 = ivec2(floor(f0));
+	ivec2 i1 = ivec2(min(ceil(f1), pc.src_size));
+
+	uint best = DEPTH_SENTINEL;
+	for (int y = i0.y; y < i1.y; ++y)
+	{
+		for (int x = i0.x; x < i1.x; ++x)
+		{
+			uint v = right ? imageLoad(splat_r, ivec2(x, y)).x
+			               : imageLoad(splat_l, ivec2(x, y)).x;
+			best = min(best, v);
+		}
+	}
+
+	float virt_m;
+	if (best == DEPTH_SENTINEL)
+	{
+		virt_m = 1e9; // hole: clamps to 255 below
+	}
+	else
+	{
+		float zt = float(best) / DEPTH_SCALE;
+		if (zt >= 1.0)
+			virt_m = 1e9; // sky pinned at far
+		else
+			virt_m = linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l);
+	}
+
+	uint u8 = uint(clamp(virt_m * CM_PER_UNIT, 0.0, 255.0));
+	imageStore(dst_y, out_xy, vec4(float(u8) / 255.0));
+}

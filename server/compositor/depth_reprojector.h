@@ -109,6 +109,12 @@ public:
 
 	std::array<vk::ImageView, 2> get_views(int slot);
 
+	// Warp scratch: per-eye target-view splat depth (R32Uint,
+	// DEPTH_SCALE-encoded NDC, 0xffffffff sentinel), GENERAL layout.
+	// Valid only after a recorded warp in this slot; consumed read-only
+	// by the depth packer. Slot-owned like everything above.
+	std::array<vk::ImageView, 2> get_splat_views(int slot);
+
 private:
 	// Depth encoding at construction (config source-reverse-z):
 	// reverse-Z sources are converted in the splat pass. Read once

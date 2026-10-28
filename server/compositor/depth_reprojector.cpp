@@ -832,4 +832,9 @@ std::array<vk::ImageView, 2> depth_reprojector::get_views(int slot)
 	return {*target_view[slot][0], *target_view[slot][1]};
 }
 
+std::array<vk::ImageView, 2> depth_reprojector::get_splat_views(int slot)
+{
+	return {*splat_view[slot][0], *splat_view[slot][1]};
+}
+
 } // namespace wivrn

@@ -220,6 +220,96 @@ std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, std::
 	return {make_image(0), make_image(1)};
 }
 
+// Virtual-depth staging (stream 3): 640x320 SBS YCbCr, depth packed into
+// layer 3 so encoder backends keep indexing baseArrayLayer == stream_idx.
+// Always 8-bit (1cm/LSB luma + neutral chroma), independent of the color
+// bit depth. Own image (not a 4th layer of the color image): different
+// extent and formats.
+std::array<wivrn::compositor::depth_image, 2> make_depth_images(wivrn::vk_bundle & vk, const wivrn::encoder_settings & depth_settings)
+{
+	auto formats = image_formats(8);
+
+	vk::StructureChain image_info{
+	        vk::ImageCreateInfo{
+	                .flags = vk::ImageCreateFlagBits::eExtendedUsage | vk::ImageCreateFlagBits::eMutableFormat,
+	                .imageType = vk::ImageType::e2D,
+	                .format = formats.back(),
+	                .extent = {
+	                        .width = depth_settings.width,
+	                        .height = depth_settings.height,
+	                        .depth = 1,
+	                },
+	                .mipLevels = 1,
+	                .arrayLayers = 4, // depth lives in layer 3
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
+	        },
+	        vk::ImageFormatListCreateInfo{
+	                .viewFormatCount = formats.size(),
+	                .pViewFormats = formats.data(),
+	        },
+	};
+#if WIVRN_USE_VULKAN_ENCODE
+	if (
+	        std::get<vk::PhysicalDeviceVideoMaintenance1FeaturesKHR>(vk.feat).videoMaintenance1 and
+	        depth_settings.encoder_name == wivrn::encoder_vulkan)
+	{
+		image_info.get().flags |= vk::ImageCreateFlagBits::eVideoProfileIndependentKHR;
+		image_info.get().usage |= vk::ImageUsageFlagBits::eVideoEncodeSrcKHR;
+	}
+#endif
+
+	auto make_image = [&](int i) {
+		image_allocation image{
+		        vk.device,
+		        image_info.get(),
+		        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
+		        std::format("depth SBS image {}", i),
+		};
+		vk::Image raw{image};
+		vk::ImageViewUsageCreateInfo usage{
+		        .usage = vk::ImageUsageFlagBits::eStorage,
+		};
+		vk::raii::ImageView view_y{
+		        vk.device,
+		        {
+		                .pNext = &usage,
+		                .image = raw,
+		                .viewType = vk::ImageViewType::e2D,
+		                .format = formats[0],
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 3,
+		                        .layerCount = 1,
+		                },
+		        },
+		};
+		vk::raii::ImageView view_cbcr{
+		        vk.device,
+		        {
+		                .pNext = &usage,
+		                .image = raw,
+		                .viewType = vk::ImageViewType::e2D,
+		                .format = formats[1],
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 3,
+		                        .layerCount = 1,
+		                },
+		        },
+		};
+		return wivrn::compositor::depth_image{
+		        .image = std::move(image),
+		        .out_y = std::move(view_y),
+		        .out_cbcr = std::move(view_cbcr),
+		};
+	};
+
+	return {make_image(0), make_image(1)};
+}
+
 vk::raii::Semaphore make_semaphore(wivrn::vk_bundle & vk)
 {
 	vk::raii::Semaphore res{
@@ -763,6 +853,131 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        view_info.alpha);
 	}
 
+	// Virtual-depth pack (stream 3): MIN-pool the warp's target-view splat
+	// to 320x320 per eye, linearise, quantize 1cm/LSB into the 640x320 SBS
+	// staging image (layer 3). Runs only on warped frames with valid
+	// near/far; otherwise images[slot].has_depth stays false and the
+	// worker never touches the depth encoder (strict pairing: no stale
+	// virtual depth on the client).
+	images[slot].has_depth = false;
+	if (warped)
+	{
+		auto & depth = depth_images[slot];
+		const auto ready = depth.ready;
+		depth.ready = true;
+		const auto depth_start = ready ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
+
+		std::array depth_pre{
+		        vk::ImageMemoryBarrier2{
+		                .srcStageMask = ready ? vk::PipelineStageFlagBits2::eComputeShader : vk::PipelineStageFlagBits2::eTopOfPipe,
+		                .srcAccessMask = ready ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2{},
+		                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+		                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+		                .oldLayout = depth_start,
+		                .newLayout = vk::ImageLayout::eGeneral,
+		                .image = depth.image,
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 3,
+		                        .layerCount = 1,
+		                },
+		        },
+		        vk::ImageMemoryBarrier2{
+		                .srcStageMask = ready ? vk::PipelineStageFlagBits2::eComputeShader : vk::PipelineStageFlagBits2::eTopOfPipe,
+		                .srcAccessMask = ready ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2{},
+		                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+		                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+		                .oldLayout = depth_start,
+		                .newLayout = vk::ImageLayout::eGeneral,
+		                .image = depth.image,
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 3,
+		                        .layerCount = 1,
+		                },
+		        },
+		};
+		cmd.pipelineBarrier2({
+		        .imageMemoryBarrierCount = depth_pre.size(),
+		        .pImageMemoryBarriers = depth_pre.data(),
+		});
+
+		// Neutral chroma for the luma-only depth payload (GENERAL is a
+		// legal layout for vkCmdClearColorImage; no ping-pong needed).
+		vk::ClearColorValue neutral{};
+		const float chroma = 128.0f / 255.0f;
+		neutral.float32 = {{chroma, chroma, 0.0f, 1.0f}};
+		cmd.clearColorImage(
+		        depth.image,
+		        vk::ImageLayout::eGeneral,
+		        neutral,
+		        vk::ImageSubresourceRange{
+		                .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+		                .levelCount = 1,
+		                .baseArrayLayer = 3,
+		                .layerCount = 1,
+		        });
+
+		const auto splat_views = reprojector.get_splat_views(slot);
+		const auto warp_extent = images[0].image.info().extent;
+		if (packer.pack(
+		            vk.device,
+		            cmd,
+		            slot,
+		            splat_views[0],
+		            splat_views[1],
+		            vk::Extent2D{warp_extent.width, warp_extent.height},
+		            src_near_z[0],
+		            src_far_z[0],
+		            src_near_z[1],
+		            src_far_z[1],
+		            *depth.out_y))
+		{
+			auto & depth_enc = encoders[3];
+			std::array depth_post{
+			        vk::ImageMemoryBarrier2{
+			                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+			                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+			                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+			                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+			                .oldLayout = vk::ImageLayout::eGeneral,
+			                .newLayout = depth_enc->target_layout,
+			                .srcQueueFamilyIndex = vk.queue.family_index,
+			                .dstQueueFamilyIndex = depth_enc->target_queue,
+			                .image = depth.image,
+			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::ePlane0,
+			                                     .baseMipLevel = 0,
+			                                     .levelCount = 1,
+			                                     .baseArrayLayer = 3,
+			                                     .layerCount = 1},
+			        },
+			        vk::ImageMemoryBarrier2{
+			                .srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
+			                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+			                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+			                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+			                .oldLayout = vk::ImageLayout::eGeneral,
+			                .newLayout = depth_enc->target_layout,
+			                .srcQueueFamilyIndex = vk.queue.family_index,
+			                .dstQueueFamilyIndex = depth_enc->target_queue,
+			                .image = depth.image,
+			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::ePlane1,
+			                                     .baseMipLevel = 0,
+			                                     .levelCount = 1,
+			                                     .baseArrayLayer = 3,
+			                                     .layerCount = 1},
+			        },
+			};
+			cmd.pipelineBarrier2({
+			        .imageMemoryBarrierCount = depth_post.size(),
+			        .pImageMemoryBarriers = depth_post.data(),
+			});
+			images[slot].has_depth = true;
+		}
+	}
+
 	for (auto & encoder: encoders)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
@@ -847,9 +1062,34 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// vs IDR-wait vs backpressure. A throw must not strand image
 		// slot either: count the drop and continue, the worker still
 		// recycles the image.
-		// Depth (stream 3) has its own image + present path (depth commit).
+		// Depth (stream 3) presents from its own staging image, only when
+		// this frame was packed (strict pairing: no depth, no present).
 		if (encoder->stream_idx == 3)
+		{
+			if (not images[slot].has_depth)
+				continue;
+			try
+			{
+				switch (encoder->present_image(depth_images[slot].image, sem_info, info.frame_id))
+				{
+					case video_encoder::present_outcome::presented:
+						triage_presented.fetch_add(1, std::memory_order_relaxed);
+						break;
+					case video_encoder::present_outcome::skipped_idr:
+						triage_skipped_idr.fetch_add(1, std::memory_order_relaxed);
+						break;
+					case video_encoder::present_outcome::skipped_busy:
+						triage_drop_present.fetch_add(1, std::memory_order_relaxed);
+						break;
+				}
+			}
+			catch (std::exception & e)
+			{
+				U_LOG_W("present error: %s", e.what());
+				triage_drop_present.fetch_add(1, std::memory_order_relaxed);
+			}
 			continue;
+		}
 		try
 		{
 			switch (encoder->present_image(images[slot].image, sem_info, info.frame_id))
@@ -996,10 +1236,25 @@ void compositor::encoder_work(std::stop_token tok)
 		// still clears below in all cases.
 		for (auto & encoder: encoders)
 		{
-			// Depth (stream 3) encodes from its own image + frame pairing
-			// in the depth commit, never from the color image here.
+			// Depth (stream 3) encodes from its own staging image, only
+			// when this frame was packed (has_depth doubles as
+			// "present was attempted": the encode consumes the
+			// presented/skipped slot in lockstep, like color).
 			if (encoder->stream_idx == 3)
+			{
+				if (not image.has_depth)
+					continue;
+				try
+				{
+					encoder->note_frame_kind(image.frame_index, image.warped_frame);
+					encoder->encode(session, image.view_info, image.frame_index);
+				}
+				catch (std::exception & e)
+				{
+					U_LOG_W("encode error: %s", e.what());
+				}
 				continue;
+			}
 			if (encoder->stream_idx < 2 or image.view_info.alpha)
 			{
 				try
@@ -1064,7 +1319,9 @@ compositor::compositor(wivrn_session & session) :
                 vk,
                 vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
                 cached_reprojection_switches().source_reverse_z),
-        depth_reprojection_enabled(cached_reprojection_switches().enabled)
+        packer(vk),
+        depth_reprojection_enabled(cached_reprojection_switches().enabled),
+        depth_images{make_depth_images(vk, settings[3])}
 {
 	// Per-slot frame context (see TODO.md): one pool+buffer+query pool
 	// per compositor image, so the commit for images[slot] only ever resets

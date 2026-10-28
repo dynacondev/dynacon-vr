@@ -63,7 +63,9 @@ wivrn::video_encoder_raw::video_encoder_raw(
 		throw std::runtime_error("Raw encoding is only supported for 8 bit");
 
 	vk::DeviceSize buffer_size = extent.width * extent.height;
-	if (stream_idx < 2)
+	// Alpha (stream 2) is luma-only; depth (stream 3) packs luma + neutral
+	// chroma like color.
+	if (stream_idx != 2)
 		buffer_size += buffer_size / 2;
 
 	auto command_buffers = vk.device.allocateCommandBuffers(
@@ -154,7 +156,7 @@ bool wivrn::video_encoder_raw::try_present_image(vk::Image y_cbcr, vk::Semaphore
 	        vk::ImageLayout::eGeneral,
 	        in[slot].buffer,
 	        std::span(regions.data(),
-	                  stream_idx < 2 ? 2 : 1));
+	                  stream_idx != 2 ? 2 : 1));
 
 	cmd.end();
 

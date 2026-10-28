@@ -107,6 +107,7 @@ if (WIVRN_BUILD_SERVER)
 			audio/audio_setup.cpp
 
 			compositor/compositor.cpp
+			compositor/depth_packer.cpp
 			compositor/depth_reprojector.cpp
 			compositor/layer_squasher.cpp
 			compositor/foveation.cpp
@@ -277,6 +278,7 @@ if (WIVRN_BUILD_SERVER)
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_pull.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_bgmax.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_fill.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/depth_pack.comp"
 		)
 
 	target_compile_definitions(wivrn-server PRIVATE JSON_DIAGNOSTICS=1)
