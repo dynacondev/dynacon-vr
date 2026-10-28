@@ -449,7 +449,7 @@ private:
 	vk::raii::Pipeline volume_virt_pipeline{nullptr};
 	vk::raii::DescriptorSetLayout volume_virt_set_layout{nullptr};
 	vk::raii::DescriptorPool volume_virt_pool{nullptr};
-	vk::DescriptorSet volume_virt_set = nullptr;
+	vk::raii::DescriptorSet volume_virt_set{nullptr};
 	// Upscale+MAX merge into the tier seed (LOAD, preserves the
 	// silhouette + reversed-cut result, sets 1 where the sensor is
 	// inside). Reuses the blur shaders with spread 0 (the linear

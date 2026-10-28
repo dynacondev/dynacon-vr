@@ -23,6 +23,9 @@
 // Virtual-depth SBS (640x320, one decoded stream-3 frame) to
 // sensor-compatible D (R16, 320px, per-eye layers). Fullscreen _mv:
 // one draw broadcasts to both layers, gl_ViewIndex selects the SBS half.
+// Note: decoder samplers are linear, so taps at the SBS seam (u ~= 0.5)
+// blend L/R eyes over ~1 texel — subsumed by the downstream feather,
+// no inset applied.
 //
 // keeps the hot compare pass in D space (sensor < min(volume, virtual))
 // and the compare push constants untouched (already at the 128B minimum
@@ -53,9 +56,14 @@ void main()
 	float vd = texture(virt_tex, vuv).g;
 
 	float D;
-	if (vd >= 254.5 / 255.0)
+	// 253.5/255 threshold, not 254.5: the forced 709-full-range Y'CbCr
+	// conversion reads neutral chroma ~0.65 LSB low through green, and
+	// lossy ringing near silhouettes costs a few more LSBs. Sacrificing
+	// the top 1.5cm of range (2.535m vs 2.55m) buys real margin against
+	// phantom-near speckles that would wrongly kill far passthrough.
+	if (vd >= 253.5 / 255.0)
 	{
-		// 255 = far/unknown/sky/hole: no virtual occluder (min no-op).
+		// far/unknown/sky/hole: no virtual occluder (min no-op).
 		D = 1.0;
 	}
 	else

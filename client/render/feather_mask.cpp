@@ -1191,7 +1191,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .descriptorSetCount = 1,
 		        .pSetLayouts = &*volume_virt_set_layout,
 		};
-		volume_virt_set = *device.allocateDescriptorSets(virt_alloc_info)[0];
+		volume_virt_set = std::move(device.allocateDescriptorSets(virt_alloc_info)[0]);
 		uint32_t mv_view_mask = 0b11, mv_corr_mask = 0b11;
 		vk::RenderPassMultiviewCreateInfo virt_mv_rp_info{
 		        .subpassCount = 1,
@@ -2608,7 +2608,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				std::array<vk::CopyDescriptorSet, 0> no_virt_copies{};
 				std::array<vk::WriteDescriptorSet, 1> virt_writes = {{
 				        {
-				                .dstSet = volume_virt_set,
+				                .dstSet = *volume_virt_set,
 				                .dstBinding = 0,
 				                .descriptorCount = 1,
 				                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -2617,7 +2617,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				}};
 				device.updateDescriptorSets(virt_writes, no_virt_copies);
 				vk::ClearValue vfar{};
-				vfar.color.float32 = {{1.0f, 1.0f, 1.0f, 1.0f}};
+				// memcpy: ClearColorValue union members are C arrays here,
+				// not assignable.
+				const float far1[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+				std::memcpy(vfar.color.float32, far1, sizeof(far1));
 				vk::RenderPassBeginInfo begin_virt{
 				        .renderPass = *volume_virt_renderpass,
 				        .framebuffer = *volume_virt_fb_mv,
@@ -2628,7 +2631,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.beginRenderPass(begin_virt, vk::SubpassContents::eInline);
 				set_full_viewport(ve);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *volume_virt_pipeline);
-				std::array<vk::DescriptorSet, 1> virt_sets{volume_virt_set};
+				std::array<vk::DescriptorSet, 1> virt_sets{*volume_virt_set};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *volume_virt_layout, 0, virt_sets, no_offsets);
 				cmd.pushConstants<volume_virt_push>(*volume_virt_layout, vk::ShaderStageFlagBits::eFragment, 0,
 				                                    volume_virt_push{.near_z = volume->near_z, .far_z = volume->far_z});

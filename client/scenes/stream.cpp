@@ -782,7 +782,9 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, scenes::stream::deco
 	// Virtual depth (stream 3) never joins the common-frame intersection:
 	// strict frame_idx pairing with the selected color frame, else null
 	// (the volume compare skips the virtual term for that frame). No
-	// hold-last: stale virtual depth occludes wrong pixels.
+	// hold-last: stale virtual depth occludes wrong pixels. Note the
+	// fallback path above pairs per-decoder nearest, so depth follows
+	// the left eye there (warn path only, same strict rule otherwise).
 	if (result[0])
 		result[depth_stream_index] = decoders[depth_stream_index].frame(result[0]->feedback.frame_index);
 	return result;
@@ -1285,12 +1287,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// barrier discipline as color so the volume compare samples defined
 	// data. Bookkeeping mirrors color (blitted/displayed feed the
 	// feedback loop below, which is what drives depth IDR + bitrate).
+	// Layout is normalized to GENERAL: most backends hand over Undefined
+	// (like color), but raw leaves ShaderReadOnlyOptimal.
 	if (auto & depth_handle = current_blit_handles[depth_stream_index])
 	{
 		depth_handle->feedback.blitted = instance.now();
 		++depth_handle->feedback.times_displayed;
 		depth_handle->feedback.displayed = frame_state.predictedDisplayTime;
 
+		bool depth_undefined = depth_handle->current_layout == vk::ImageLayout::eUndefined;
 #if WIVRN_USE_V4L2
 		if (depth_handle->foreign_queue_family != vk::QueueFamilyIgnored)
 		{
@@ -1319,12 +1324,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		else
 #endif
-		        if (depth_handle->current_layout == vk::ImageLayout::eUndefined)
+		        if (depth_handle->current_layout != vk::ImageLayout::eGeneral)
 		{
 			vk::ImageMemoryBarrier barrier{
-			        .srcAccessMask = vk::AccessFlagBits::eNone,
+			        .srcAccessMask = depth_undefined ? vk::AccessFlagBits::eNone : vk::AccessFlagBits::eShaderRead,
 			        .dstAccessMask = vk::AccessFlagBits::eMemoryRead,
-			        .oldLayout = vk::ImageLayout::eUndefined,
+			        .oldLayout = depth_handle->current_layout,
 			        .newLayout = vk::ImageLayout::eGeneral,
 			        .image = depth_handle->image,
 			        .subresourceRange = {
@@ -1334,7 +1339,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			        },
 			};
 
-			command_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands, {}, {}, {}, barrier);
+			command_buffer.pipelineBarrier(depth_undefined ? vk::PipelineStageFlagBits::eAllCommands : vk::PipelineStageFlagBits::eFragmentShader,
+			                               vk::PipelineStageFlagBits::eAllCommands,
+			                               {},
+			                               {},
+			                               {},
+			                               barrier);
 			depth_handle->current_layout = vk::ImageLayout::eGeneral;
 		}
 	}
@@ -1523,7 +1533,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// above, so it is not reset here; gui_ms/submit_ms are
 		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
-		volume_acquire_ms = volume_raster_ms = volume_compare_ms = volume_merge_ms = 0;
+		volume_acquire_ms = volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = 0;
+		volume_frame_virt_paired = false;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
@@ -2163,7 +2174,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					volume_compare_ms += mstats.volume_compare_ms;
 					volume_merge_ms += mstats.volume_merge_ms;
 					if (any_volume and vol_virt_paired)
-						++volume_win_virt_paired;
+						volume_frame_virt_paired = true;
 					mask_draws += (int)mstats.draws;
 					if (any_volume)
 					{

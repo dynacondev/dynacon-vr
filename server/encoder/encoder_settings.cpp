@@ -26,6 +26,7 @@
 #include "wivrn_packets.h"
 
 #include <magic_enum.hpp>
+#include <span>
 #include <string>
 #include <vulkan/vulkan.hpp>
 
@@ -41,8 +42,6 @@
 
 namespace wivrn
 {
-
-static const double passthrough_bitrate_factor = 0.05;
 
 static const double passthrough_bitrate_factor = 0.05;
 
@@ -316,8 +315,10 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 		// Depth stream (index 3) prefers H.265: lossy-tolerant 8-bit luma
 		// carrying 1cm/LSB virtual depth. If the config did not pin a
-		// codec and H.265 probes cleanly, switch to it.
-		if (i == 3 and not src.codec and dst.codec != wivrn::h265)
+		// codec, the headset advertised H.265, and H.265 probes cleanly
+		// on this backend, switch to it.
+		if (i == 3 and not src.codec and dst.codec != wivrn::h265 and
+		    std::ranges::contains(info.supported_codecs, wivrn::h265, &video_codec_capability::codec))
 		{
 			try
 			{
@@ -361,10 +362,13 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	if (bit_depth and bit_depth != 8 and bit_depth != 10)
 		throw std::runtime_error("invalid bit-depth setting. supported values: 8, 10");
 
-	const bool all_encoders_10bit = std::ranges::all_of(res, [&](const encoder_settings & encoder) {
-		auto it = std::ranges::find(info.supported_codecs, encoder.codec, &video_codec_capability::codec);
-		return it != info.supported_codecs.end() and it->supports_10bit;
-	});
+	// Depth (index 3) is always 8-bit on its own staging image: it must
+	// not veto 10-bit color, nor be probed at 10-bit.
+	const bool all_encoders_10bit = std::ranges::all_of(
+	        std::span(res).first(3), [&](const encoder_settings & encoder) {
+		        auto it = std::ranges::find(info.supported_codecs, encoder.codec, &video_codec_capability::codec);
+		        return it != info.supported_codecs.end() and it->supports_10bit;
+	        });
 
 	if (bit_depth == 10 and not all_encoders_10bit)
 	{
@@ -397,8 +401,10 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 #if WIVRN_USE_VAAPI
 	auto check_vaapi = [&](int bit_depth) {
-		for (const auto & encoder: res)
+		for (const auto [i, encoder]: std::ranges::enumerate_view(res))
 		{
+			if (i == 3)
+				continue; // depth is always 8-bit, probed separately
 			if (encoder.encoder_name == encoder_vaapi)
 			{
 				try

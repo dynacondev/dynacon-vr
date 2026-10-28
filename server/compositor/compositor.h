@@ -74,8 +74,6 @@ public:
 		// 2D views on layer 3: pack target (Y) + neutral-chroma clear (CbCr).
 		vk::raii::ImageView out_y = nullptr;
 		vk::raii::ImageView out_cbcr = nullptr;
-		// First submit transitions from Undefined; later from steady state.
-		bool ready = false;
 	};
 
 private:

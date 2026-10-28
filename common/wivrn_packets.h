@@ -848,7 +848,8 @@ struct video_stream_description
 	std::array<video_codec, 4> codec; // left, right, alpha, depth
 	// Depth SBS dimensions (left|right halves); color width/height above
 	// are per-eye. Fixed 640x320 today, carried explicitly so the client
-	// never hardcodes it.
+	// never hardcodes it. Wire convention: row 0 = scene top, left eye in
+	// x[0..depth_width/2), 8-bit 1cm/LSB luma, 255 = >=2.55m / unknown.
 	uint16_t depth_width = 640;
 	uint16_t depth_height = 320;
 	float frame_rate;

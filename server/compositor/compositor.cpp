@@ -40,6 +40,7 @@
 #include "utils/wivrn_trace.h"
 
 #include <atomic>
+#include <cstring>
 #include <format>
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
@@ -242,7 +243,9 @@ std::array<wivrn::compositor::depth_image, 2> make_depth_images(wivrn::vk_bundle
 	                .mipLevels = 1,
 	                .arrayLayers = 4, // depth lives in layer 3
 	                .samples = vk::SampleCountFlagBits::e1,
-	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
+	                // STORAGE (pack write) + TRANSFER_DST (chroma clear) +
+	                // TRANSFER_SRC (encoder copy-out, like the color image).
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
 	        },
 	        vk::ImageFormatListCreateInfo{
 	                .viewFormatCount = formats.size(),
@@ -863,36 +866,22 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	if (warped)
 	{
 		auto & depth = depth_images[slot];
-		const auto ready = depth.ready;
-		depth.ready = true;
-		const auto depth_start = ready ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
 
+		// Same shape as the color top-of-commit barrier: contents are
+		// fully overwritten every packed frame (Y by the pack dispatch
+		// below, CbCr by the neutral clear), so Undefined discards and
+		// no first-use tracking is needed. Single eColor barrier (both
+		// planes): dst covers the transfer clear and the compute pack.
 		std::array depth_pre{
 		        vk::ImageMemoryBarrier2{
-		                .srcStageMask = ready ? vk::PipelineStageFlagBits2::eComputeShader : vk::PipelineStageFlagBits2::eTopOfPipe,
-		                .srcAccessMask = ready ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2{},
-		                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-		                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-		                .oldLayout = depth_start,
+		                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
+		                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader,
+		                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite,
+		                .oldLayout = vk::ImageLayout::eUndefined,
 		                .newLayout = vk::ImageLayout::eGeneral,
 		                .image = depth.image,
 		                .subresourceRange = {
-		                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
-		                        .levelCount = 1,
-		                        .baseArrayLayer = 3,
-		                        .layerCount = 1,
-		                },
-		        },
-		        vk::ImageMemoryBarrier2{
-		                .srcStageMask = ready ? vk::PipelineStageFlagBits2::eComputeShader : vk::PipelineStageFlagBits2::eTopOfPipe,
-		                .srcAccessMask = ready ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlags2{},
-		                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
-		                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
-		                .oldLayout = depth_start,
-		                .newLayout = vk::ImageLayout::eGeneral,
-		                .image = depth.image,
-		                .subresourceRange = {
-		                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+		                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 		                        .levelCount = 1,
 		                        .baseArrayLayer = 3,
 		                        .layerCount = 1,
@@ -906,9 +895,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 		// Neutral chroma for the luma-only depth payload (GENERAL is a
 		// legal layout for vkCmdClearColorImage; no ping-pong needed).
+		// memcpy: ClearColorValue union members are C arrays here (same
+		// as the splat clear in depth_reprojector), not assignable.
 		vk::ClearColorValue neutral{};
-		const float chroma = 128.0f / 255.0f;
-		neutral.float32 = {{chroma, chroma, 0.0f, 1.0f}};
+		const float chroma[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0.0f, 1.0f};
+		std::memcpy(neutral.float32, chroma, sizeof(chroma));
 		cmd.clearColorImage(
 		        depth.image,
 		        vk::ImageLayout::eGeneral,
@@ -936,44 +927,35 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            *depth.out_y))
 		{
 			auto & depth_enc = encoders[3];
-			std::array depth_post{
-			        vk::ImageMemoryBarrier2{
-			                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
-			                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-			                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-			                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
-			                .oldLayout = vk::ImageLayout::eGeneral,
-			                .newLayout = depth_enc->target_layout,
-			                .srcQueueFamilyIndex = vk.queue.family_index,
-			                .dstQueueFamilyIndex = depth_enc->target_queue,
-			                .image = depth.image,
-			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::ePlane0,
-			                                     .baseMipLevel = 0,
-			                                     .levelCount = 1,
-			                                     .baseArrayLayer = 3,
-			                                     .layerCount = 1},
-			        },
-			        vk::ImageMemoryBarrier2{
-			                .srcStageMask = vk::PipelineStageFlagBits2KHR::eTransfer,
-			                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-			                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-			                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
-			                .oldLayout = vk::ImageLayout::eGeneral,
-			                .newLayout = depth_enc->target_layout,
-			                .srcQueueFamilyIndex = vk.queue.family_index,
-			                .dstQueueFamilyIndex = depth_enc->target_queue,
-			                .image = depth.image,
-			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::ePlane1,
-			                                     .baseMipLevel = 0,
-			                                     .levelCount = 1,
-			                                     .baseArrayLayer = 3,
-			                                     .layerCount = 1},
-			        },
-			};
-			cmd.pipelineBarrier2({
-			        .imageMemoryBarrierCount = depth_post.size(),
-			        .pImageMemoryBarriers = depth_post.data(),
-			});
+			// Mirrors the color encoder handoff: single eColor barrier
+			// over the layer the backend reads, so the release range
+			// matches the backend acquire's eColor range. src covers
+			// the pack (compute) and the neutral clear (transfer).
+			if (depth_enc->need_transfer or depth_enc->target_queue == vk.queue.family_index)
+			{
+				std::array depth_post{
+				        vk::ImageMemoryBarrier2{
+				                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader | vk::PipelineStageFlagBits2KHR::eTransfer,
+				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite,
+				                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+				                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+				                .oldLayout = vk::ImageLayout::eGeneral,
+				                .newLayout = depth_enc->target_layout,
+				                .srcQueueFamilyIndex = vk.queue.family_index,
+				                .dstQueueFamilyIndex = depth_enc->target_queue,
+				                .image = depth.image,
+				                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+				                                     .baseMipLevel = 0,
+				                                     .levelCount = 1,
+				                                     .baseArrayLayer = 3,
+				                                     .layerCount = 1},
+				        },
+				};
+				cmd.pipelineBarrier2({
+				        .imageMemoryBarrierCount = depth_post.size(),
+				        .pImageMemoryBarriers = depth_post.data(),
+				});
+			}
 			images[slot].has_depth = true;
 		}
 	}

@@ -121,12 +121,16 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 
 	// Per video stream (left, right, alpha, depth): same EWMA over the
 	// payload-byte deltas counted on the network thread.
-	static std::array<uint64_t, decoder_count> last_stream_rx{};
 	for (size_t i = 0; i < decoder_count; ++i)
 	{
 		uint64_t cur = stream_rx_bytes[i].load(std::memory_order_relaxed);
-		stream_bandwidth_rx[i] = 0.8f * stream_bandwidth_rx[i] + 0.2f * float(cur - last_stream_rx[i]) / dt * 8.f;
-		last_stream_rx[i] = cur;
+		// A new session restarts the network totals at zero: a delta
+		// against the previous session would spike once, so clamp it.
+		uint64_t last = stream_rx_last[i];
+		if (cur < last)
+			last = cur;
+		stream_bandwidth_rx[i] = 0.8f * stream_bandwidth_rx[i] + 0.2f * float(cur - last) / dt * 8.f;
+		stream_rx_last[i] = cur;
 	}
 
 	// Filter more aggressively for the compact view
@@ -206,8 +210,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             gm.mask_raster_ms * 1e3f,
 			             gm.mask_erode_ms * 1e3f,
 			             gm.mask_blur_ms * 1e3f,
-			             (gm.volume_acquire_ms + gm.volume_raster_ms + gm.volume_compare_ms + gm.volume_merge_ms) * 1e3f,
-			             (gm.volume_raster_gpu_ms + gm.volume_compare_gpu_ms + gm.volume_merge_gpu_ms) * 1e3f,
+			             (gm.volume_acquire_ms + gm.volume_raster_ms + gm.volume_virt_ms + gm.volume_compare_ms + gm.volume_merge_ms) * 1e3f,
+			             (gm.volume_raster_gpu_ms + gm.volume_virt_gpu_ms + gm.volume_compare_gpu_ms + gm.volume_merge_gpu_ms) * 1e3f,
 			             gm.gizmo_ms * 1e3f,
 			             gm.feat_votes,
 			             gm.feat_tags,
@@ -239,8 +243,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             ring_max(&global_metric::mask_raster_ms) * 1e3f,
 			             ring_max(&global_metric::mask_erode_ms) * 1e3f,
 			             ring_max(&global_metric::mask_blur_ms) * 1e3f,
-			             (ring_max(&global_metric::volume_acquire_ms) + ring_max(&global_metric::volume_raster_ms) + ring_max(&global_metric::volume_compare_ms) + ring_max(&global_metric::volume_merge_ms)) * 1e3f,
-			             (ring_max(&global_metric::volume_raster_gpu_ms) + ring_max(&global_metric::volume_compare_gpu_ms) + ring_max(&global_metric::volume_merge_gpu_ms)) * 1e3f,
+			             (ring_max(&global_metric::volume_acquire_ms) + ring_max(&global_metric::volume_raster_ms) + ring_max(&global_metric::volume_virt_ms) + ring_max(&global_metric::volume_compare_ms) + ring_max(&global_metric::volume_merge_ms)) * 1e3f,
+			             (ring_max(&global_metric::volume_raster_gpu_ms) + ring_max(&global_metric::volume_virt_gpu_ms) + ring_max(&global_metric::volume_compare_gpu_ms) + ring_max(&global_metric::volume_merge_gpu_ms)) * 1e3f,
 			             ring_max(&global_metric::gizmo_ms) * 1e3f,
 			             ring_max(&global_metric::fence_wait_ms) * 1e3f,
 			             ring_max(&global_metric::gui_ms) * 1e3f,
@@ -260,6 +264,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		++volume_win_frames;
 		if (volume_raster_ms > 0)
 			++volume_win_sensor;
+		if (volume_frame_virt_paired)
+			++volume_win_virt_paired;
 		volume_win_acquire_ms += volume_acquire_ms;
 		volume_win_raster_ms += volume_raster_ms;
 		volume_win_virt_ms += volume_virt_ms;

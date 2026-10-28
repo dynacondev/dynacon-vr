@@ -78,6 +78,10 @@ Use vaapi hardware encoding, h265 video codec (HEVC).
 ```
 Creates a hardware encoder for left eye and transparency, and a software encoder for right eye.
 
+A list may also have 3 entries (left, right, alpha): the virtual depth
+stream then uses default selection (same backend as configured, H.265
+preferred when the headset supports it).
+
 ### `device`, only for vaapi
 Default value: unset
 

@@ -35,7 +35,11 @@
  * linearize_depth, mirrored here), then 1cm/LSB quantize. 255 is the
  * single far value: >=2.55m, sky (pinned 1.0 in splat), holes, sentinel.
  *
- * The client compares in meters: showReal = sensorM < min(volFarM, virtM).
+ * Row convention: output row 0 = scene top (top-down on the wire, like
+ * the foveated color streams and the client volume canvas). The warp
+ * splat is GL-ordered (row 0 = scene bottom), so source rows are read
+ * flipped. The client compares in D space: showReal = sensorD <
+ * min(volumeD, virtualD).
  */
 
 #version 450
@@ -78,10 +82,16 @@ void main()
 	if (out_xy.x >= out_size.x || out_xy.y >= out_size.y)
 		return;
 
-	bool right = out_xy.x >= 320;
-	ivec2 eye_xy = ivec2(right ? out_xy.x - 320 : out_xy.x, out_xy.y);
+	// Wire convention (see wivrn_packets.h): row 0 = scene top, matching
+	// the volume canvas and the foveated color streams. The warp splat is
+	// GL-ordered (row 0 = scene bottom), so the source window is read
+	// vertically flipped. Geometry derives from the actual image (never
+	// hardcoded): left eye x[0..half), right eye x[half..2*half).
+	int half_w = out_size.x / 2;
+	bool right = out_xy.x >= half_w;
+	ivec2 eye_xy = ivec2(right ? out_xy.x - half_w : out_xy.x, out_size.y - 1 - out_xy.y);
 
-	vec2 scale = pc.src_size / vec2(320.0, 320.0);
+	vec2 scale = pc.src_size / vec2(float(half_w), float(out_size.y));
 	vec2 f0 = vec2(eye_xy) * scale;
 	vec2 f1 = (vec2(eye_xy) + vec2(1.0)) * scale;
 	ivec2 i0 = ivec2(floor(f0));
@@ -112,6 +122,6 @@ void main()
 			virt_m = linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l);
 	}
 
-	uint u8 = uint(clamp(virt_m * CM_PER_UNIT, 0.0, 255.0));
+	uint u8 = uint(clamp(virt_m * CM_PER_UNIT + 0.5, 0.0, 255.0));
 	imageStore(dst_y, out_xy, vec4(float(u8) / 255.0));
 }

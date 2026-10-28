@@ -471,6 +471,9 @@ private:
 	// stream_item_idx): smoothed into per-stream bitrates below.
 	std::array<std::atomic<uint64_t>, decoder_count> stream_rx_bytes{};
 	std::array<float, decoder_count> stream_bandwidth_rx{};
+	// Previous network-thread totals, for the per-stream delta in
+	// accumulate_metrics (member, not static: reset on new session).
+	std::array<uint64_t, decoder_count> stream_rx_last{};
 
 	// Per-frame passthrough accumulators (milliseconds / counts), filled
 	// by update_fiducial_passthrough and the mask record loop below, then
@@ -505,6 +508,7 @@ private:
 	double volume_win_acquire_ms = 0, volume_win_raster_ms = 0;
 	double volume_win_virt_ms = 0, volume_win_virt_gpu = 0;
 	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
+	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
 	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
