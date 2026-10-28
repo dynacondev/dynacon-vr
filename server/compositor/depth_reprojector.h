@@ -66,8 +66,10 @@ struct vk_bundle;
 // Two compute passes per eye: splat forwards each source pixel's depth
 // to the target pose (atomic min wins = foreground), pull warps color
 // backward per target pixel through the splatted depth
-// (premultiplied: valid (rgb, 1), holes black). No hole fill: holes
-// stay black by design.
+// (premultiplied: valid (rgb, 1), holes black). A smear fill then copies
+// the nearest background-depth donor into each hole (verbatim texel:
+// smear instead of blur); holes with no background donor inside the
+// search radius, or no established background reference, stay black.
 //
 // Fixed owned scratch per (slot, eye): warped color + splat depth at
 // full render size — not a pool, no acquire/release. Per-warp
@@ -130,11 +132,20 @@ private:
 	std::array<std::array<vk::raii::ImageView, 2>, num_slots> target_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
 	std::array<std::array<image_allocation, 2>, num_slots> splat_depth;
 	std::array<std::array<vk::raii::ImageView, 2>, num_slots> splat_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
+	// Coarse background reference: one R32_UINT texel per 64x64 block
+	// (perimeter-max splat depth, EMPTY-skipped). Same slot/eye
+	// ownership as splat/target; stays GENERAL between warps.
+	std::array<std::array<image_allocation, 2>, num_slots> bgmax;
+	std::array<std::array<vk::raii::ImageView, 2>, num_slots> bgmax_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
 
 	// Splat: depth sampler + splat UBO + splat storage image.
 	// Pull: color sampler + pull UBO + splat storage image (read) +
-	// color storage target (write). Sets are rewritten per warp (src
-	// views change per app frame); only the UBO contents change
+	// color storage target (write). Bgmax: splat storage image (read) +
+	// coarse reference storage image (write). Fill: splat storage image
+	// (read) + color storage target (read-write) + coarse reference
+	// storage image (read). Splat/pull sets are rewritten per warp (src
+	// views change per app frame); bgmax/fill sets reference only owned
+	// images and are written once. Only the UBO contents change
 	// otherwise. Per-(slot, eye): CPU rewrites are unordered by GPU
 	// barriers, so sharing one set across overlapping submits would race.
 	vk::raii::DescriptorSetLayout splat_ds_layout = nullptr;
@@ -143,9 +154,17 @@ private:
 	vk::raii::DescriptorSetLayout pull_ds_layout = nullptr;
 	vk::raii::PipelineLayout pull_layout = nullptr;
 	vk::raii::Pipeline pull_pipeline = nullptr;
+	vk::raii::DescriptorSetLayout bgmax_ds_layout = nullptr;
+	vk::raii::PipelineLayout bgmax_layout = nullptr;
+	vk::raii::Pipeline bgmax_pipeline = nullptr;
+	vk::raii::DescriptorSetLayout fill_ds_layout = nullptr;
+	vk::raii::PipelineLayout fill_layout = nullptr;
+	vk::raii::Pipeline fill_pipeline = nullptr;
 	vk::raii::DescriptorPool pool = nullptr;
 	std::array<std::array<vk::DescriptorSet, 2>, num_slots> splat_sets;
 	std::array<std::array<vk::DescriptorSet, 2>, num_slots> pull_sets;
+	std::array<std::array<vk::DescriptorSet, 2>, num_slots> bgmax_sets;
+	std::array<std::array<vk::DescriptorSet, 2>, num_slots> fill_sets;
 
 	std::array<std::array<buffer_allocation, 2>, num_slots> splat_ubo;
 	std::array<std::array<buffer_allocation, 2>, num_slots> pull_ubo;

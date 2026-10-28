@@ -240,6 +240,14 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 			        vk, splat_depth[slot][view], vk::Format::eR32Uint,
 			        vk::ImageUsageFlagBits::eStorage,
 			        std::format("reproject splat view {}:{}", slot, view).c_str());
+			bgmax[slot][view] = make_target(
+			        vk, {(target_size.width + 63) / 64, (target_size.height + 63) / 64},
+			        vk::Format::eR32Uint, vk::ImageUsageFlagBits::eStorage,
+			        std::format("reproject bgmax {}:{}", slot, view).c_str());
+			bgmax_view[slot][view] = make_view(
+			        vk, bgmax[slot][view], vk::Format::eR32Uint,
+			        vk::ImageUsageFlagBits::eStorage,
+			        std::format("reproject bgmax view {}:{}", slot, view).c_str());
 			splat_ubo[slot][view] = make_warp_ubo(vk.device, sizeof(reproject_splat_ubo), std::format("reproject splat UBO {}:{}", slot, view).c_str());
 			pull_ubo[slot][view] = make_warp_ubo(vk.device, sizeof(reproject_pull_ubo), std::format("reproject pull UBO {}:{}", slot, view).c_str());
 		}
@@ -312,8 +320,65 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	vk.name(*pull_layout, "reproject pull pipeline layout");
 	pull_pipeline = make_pipeline(vk, *pull_layout, "reproject_pull", "reproject pull pipeline");
 
+	std::array bgmax_bindings{
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 0,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 1,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	};
+	bgmax_ds_layout = make_ds_layout(vk, bgmax_bindings, "reproject bgmax set layout");
+	bgmax_layout = vk::raii::PipelineLayout{
+	        vk.device,
+	        vk::PipelineLayoutCreateInfo{
+	                .setLayoutCount = 1,
+	                .pSetLayouts = &*bgmax_ds_layout,
+	        },
+	};
+	vk.name(*bgmax_layout, "reproject bgmax pipeline layout");
+	bgmax_pipeline = make_pipeline(vk, *bgmax_layout, "reproject_bgmax", "reproject bgmax pipeline");
+
+	std::array fill_bindings{
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 0,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 1,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 2,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
+	};
+	fill_ds_layout = make_ds_layout(vk, fill_bindings, "reproject fill set layout");
+	fill_layout = vk::raii::PipelineLayout{
+	        vk.device,
+	        vk::PipelineLayoutCreateInfo{
+	                .setLayoutCount = 1,
+	                .pSetLayouts = &*fill_ds_layout,
+	        },
+	};
+	vk.name(*fill_layout, "reproject fill pipeline layout");
+	fill_pipeline = make_pipeline(vk, *fill_layout, "reproject_fill", "reproject fill pipeline");
+
 	// Per (slot, eye): splat takes 1 combined + 1 uniform + 1 storage,
-	// pull takes 1 combined + 1 uniform + 2 storage; 4 pairs total.
+	// pull takes 1 combined + 1 uniform + 2 storage, bgmax takes
+	// 2 storage, fill takes 3 storage; 4 pairs total.
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
@@ -325,13 +390,13 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageImage,
-	                .descriptorCount = num_slots * 6,
+	                .descriptorCount = num_slots * 16,
 	        },
 	};
 	pool = vk::raii::DescriptorPool{
 	        vk.device,
 	        vk::DescriptorPoolCreateInfo{
-	                .maxSets = num_slots * 4,
+	                .maxSets = num_slots * 8,
 	                .poolSizeCount = pool_sizes.size(),
 	                .pPoolSizes = pool_sizes.data(),
 	        },
@@ -352,6 +417,20 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	        .descriptorSetCount = pull_layouts.size(),
 	        .pSetLayouts = pull_layouts.data(),
 	});
+	std::array<vk::DescriptorSetLayout, num_slots * 2> bgmax_layouts;
+	bgmax_layouts.fill(*bgmax_ds_layout);
+	auto bgmax_alloc = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+	        .descriptorPool = *pool,
+	        .descriptorSetCount = bgmax_layouts.size(),
+	        .pSetLayouts = bgmax_layouts.data(),
+	});
+	std::array<vk::DescriptorSetLayout, num_slots * 2> fill_layouts;
+	fill_layouts.fill(*fill_ds_layout);
+	auto fill_alloc = vk.device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+	        .descriptorPool = *pool,
+	        .descriptorSetCount = fill_layouts.size(),
+	        .pSetLayouts = fill_layouts.data(),
+	});
 	for (size_t slot = 0; slot < num_slots; ++slot)
 	{
 		for (int view = 0; view < 2; ++view)
@@ -360,6 +439,72 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 			pull_sets[slot][view] = pull_alloc[slot * 2 + view].release();
 			vk.name(splat_sets[slot][view], std::format("reproject splat set {}:{}", slot, view));
 			vk.name(pull_sets[slot][view], std::format("reproject pull set {}:{}", slot, view));
+
+			// Bgmax/fill sets reference only owned images: written
+			// once here, never per warp (unlike splat/pull, whose
+			// source views change per app frame).
+			bgmax_sets[slot][view] = bgmax_alloc[slot * 2 + view].release();
+			fill_sets[slot][view] = fill_alloc[slot * 2 + view].release();
+			vk.name(bgmax_sets[slot][view], std::format("reproject bgmax set {}:{}", slot, view));
+			vk.name(fill_sets[slot][view], std::format("reproject fill set {}:{}", slot, view));
+			vk::DescriptorImageInfo bgmax_splat_info{
+			        .imageView = *splat_view[slot][view],
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			vk::DescriptorImageInfo bgmax_out_info{
+			        .imageView = *bgmax_view[slot][view],
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			vk::DescriptorImageInfo fill_splat_info{
+			        .imageView = *splat_view[slot][view],
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			vk::DescriptorImageInfo fill_target_info{
+			        .imageView = *target_view[slot][view],
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			vk::DescriptorImageInfo fill_bgmax_info{
+			        .imageView = *bgmax_view[slot][view],
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			std::array static_writes{
+			        vk::WriteDescriptorSet{
+			                .dstSet = bgmax_sets[slot][view],
+			                .dstBinding = 0,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &bgmax_splat_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = bgmax_sets[slot][view],
+			                .dstBinding = 1,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &bgmax_out_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = fill_sets[slot][view],
+			                .dstBinding = 0,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &fill_splat_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = fill_sets[slot][view],
+			                .dstBinding = 1,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &fill_target_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = fill_sets[slot][view],
+			                .dstBinding = 2,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &fill_bgmax_info,
+			        },
+			};
+			vk.device.updateDescriptorSets(static_writes, {});
 		}
 	}
 }
@@ -495,16 +640,21 @@ bool depth_reprojector::reproject(
 	device.updateDescriptorSets(writes, {});
 
 	// First warp transitions from Undefined; later warps from the
-	// steady state (splat GENERAL, target SHADER_READ_ONLY).
+	// steady state (splat GENERAL, target SHADER_READ_ONLY, bgmax
+	// GENERAL).
 	const bool ready = warp_ready[slot][view];
 	warp_ready[slot][view] = true;
 	const auto reuse_stage = ready ? vk::PipelineStageFlagBits2::eComputeShader
 	                               : vk::PipelineStageFlagBits2::eTopOfPipe;
 	vk::AccessFlags2 splat_access = ready ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
 	                                      : vk::AccessFlags2{};
-	vk::AccessFlags2 target_access = ready ? vk::AccessFlagBits2::eShaderRead : vk::AccessFlags2{};
+	vk::AccessFlags2 target_access = ready ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
+	                                          : vk::AccessFlags2{};
+	vk::AccessFlags2 bgmax_access = ready ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
+	                                      : vk::AccessFlags2{};
 	const auto splat_start = ready ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
 	const auto target_start = ready ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eUndefined;
+	const auto bgmax_start = ready ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
 
 	std::array pre_barriers{
 	        vk::ImageMemoryBarrier2{
@@ -529,6 +679,20 @@ bool depth_reprojector::reproject(
 	                .oldLayout = target_start,
 	                .newLayout = vk::ImageLayout::eGeneral,
 	                .image = target[slot][view],
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = 1,
+	                },
+	        },
+	        vk::ImageMemoryBarrier2{
+	                .srcStageMask = reuse_stage,
+	                .srcAccessMask = bgmax_access,
+	                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
+	                .oldLayout = bgmax_start,
+	                .newLayout = vk::ImageLayout::eGeneral,
+	                .image = bgmax[slot][view],
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
@@ -607,6 +771,35 @@ bool depth_reprojector::reproject(
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pull_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pull_layout, 0, pull_sets[slot][view], {});
+	cmd.dispatch(groups_x, groups_y, 1);
+
+	// Smear fill: coarse background reference, then nearest-background
+	// donor copy per hole. Only hole pixels are stored, and holes only
+	// read texels no thread writes (splat is read-only here; valid pull
+	// colors are never stored to), so the in-place target update needs
+	// no second buffer — one visibility barrier before the fill covers
+	// pull writes (target) and bgmax writes (reference).
+	const uint32_t bgmax_x = (extent.width + 63) / 64;
+	const uint32_t bgmax_y = (extent.height + 63) / 64;
+	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *bgmax_pipeline);
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *bgmax_layout, 0, bgmax_sets[slot][view], {});
+	cmd.dispatch((bgmax_x + 7) / 8, (bgmax_y + 7) / 8, 1);
+
+	std::array fill_ready_barriers{
+	        vk::MemoryBarrier2{
+	                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+	                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+	        },
+	};
+	cmd.pipelineBarrier2({
+	        .memoryBarrierCount = fill_ready_barriers.size(),
+	        .pMemoryBarriers = fill_ready_barriers.data(),
+	});
+
+	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *fill_pipeline);
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *fill_layout, 0, fill_sets[slot][view], {});
 	cmd.dispatch(groups_x, groups_y, 1);
 
 	// Warp output ends SHADER_READ_ONLY, ready to feed foveation.
