@@ -1260,9 +1260,9 @@ void compositor::send_video_stream_description()
 	to_headset::video_stream_description desc{
 	        .width = uint16_t(images[0].image.info().extent.width),
 	        .height = uint16_t(images[0].image.info().extent.height),
-	        .frame_rate = settings[0].fps,
 	        .depth_width = settings[3].width,
 	        .depth_height = settings[3].height,
+	        .frame_rate = settings[0].fps,
 	};
 	get_display_refresh_rate(&desc.refresh_rate);
 	static_assert(std::tuple_size_v<decltype(settings)> == std::tuple_size_v<decltype(desc.codec)>);
