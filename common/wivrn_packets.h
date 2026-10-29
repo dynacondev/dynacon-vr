@@ -885,6 +885,11 @@ public:
 		std::array<foveation_parameter, 2> foveation;
 		// True when the frame contains an alpha channel
 		bool alpha;
+		// True when the server packed virtual depth for this frame
+		// (stream 3 carries frame_idx-matching depth). Lets the client
+		// tell "no depth by design" from "depth expected but missing"
+		// (wire loss or pairing miss).
+		bool depth_expected = false;
 	};
 	std::optional<view_info_t> view_info;
 

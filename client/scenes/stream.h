@@ -509,6 +509,7 @@ private:
 	double volume_win_virt_ms = 0, volume_win_virt_gpu = 0;
 	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
 	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
+	uint64_t volume_win_virt_missing = 0; // color expected depth (view_info flag) but none paired
 	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;

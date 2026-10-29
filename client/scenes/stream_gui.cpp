@@ -266,6 +266,12 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			++volume_win_sensor;
 		if (volume_frame_virt_paired)
 			++volume_win_virt_paired;
+		// Expected-but-missing: the color frame's view_info says the
+		// server packed depth for this frame_idx, yet strict pairing
+		// found none — wire loss or pairing miss, never by-design.
+		else if (blit_handles.size() > depth_stream_index and blit_handles[0] and not blit_handles[depth_stream_index] and
+		         blit_handles[0]->view_info.depth_expected)
+			++volume_win_virt_missing;
 		volume_win_acquire_ms += volume_acquire_ms;
 		volume_win_raster_ms += volume_raster_ms;
 		volume_win_virt_ms += volume_virt_ms;
@@ -283,7 +289,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		double va = (double)std::max<uint64_t>(volume_win_acquired, 1);
 		double win_s = volume_win_t0 != 0 ? (double)(predicted_display_time - volume_win_t0) * 1e-9 : 5.0;
 		double win_hz = win_s > 0 ? (double)volume_win_new_content / win_s : 0;
-		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m box {:.0f}%% age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/r/v/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/v/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{} virt {}/{}",
+		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m box {:.0f}%% age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/r/v/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/v/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{} virt paired/missing/frames {}/{}/{}",
 		             (double)volume_last_feather, volume_last_tier, volume_last_draws,
 		             volume_last_seed_w, volume_last_seed_h, volume_sensor_w, volume_sensor_h,
 		             (double)volume_sensor_near, (double)volume_sensor_far,
@@ -294,12 +300,12 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		             volume_win_acquire_ms / vf, volume_win_raster_ms / vf, volume_win_virt_ms / vf, volume_win_compare_ms / vf, volume_win_merge_ms / vf,
 		             volume_win_raster_gpu / vf, volume_win_virt_gpu / vf, volume_win_compare_gpu / vf, volume_win_merge_gpu / vf,
 		             volume_win_sensor, volume_win_acquired, volume_win_frames,
-		             volume_win_virt_paired, volume_win_frames);
+		             volume_win_virt_paired, volume_win_virt_missing, volume_win_frames);
 		volume_win_frames = volume_win_sensor = volume_win_acquired = 0;
 		volume_win_new_content = 0;
 		volume_win_acquire_ms = volume_win_raster_ms = 0;
 		volume_win_virt_ms = volume_win_virt_gpu = 0;
-		volume_win_virt_paired = 0;
+		volume_win_virt_paired = volume_win_virt_missing = 0;
 		volume_win_compare_ms = volume_win_merge_ms = 0;
 		volume_win_raster_gpu = volume_win_compare_gpu = volume_win_merge_gpu = 0;
 		volume_win_age_sum = volume_win_age_max = 0;

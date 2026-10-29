@@ -414,8 +414,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	static std::atomic<uint64_t> triage_gap_worst_ns{0};
 	static std::atomic<uint64_t> triage_drop_present{0};
 	static std::atomic<uint64_t> triage_query_miss{0};
-	static std::atomic<uint64_t> triage_presented{0};
-	static std::atomic<uint64_t> triage_skipped_idr{0};
+	// Present outcomes per stream (left, right, alpha, depth): totals
+	// below stay comparable to history, the depth triplet isolates
+	// virtual-depth drops from color behavior.
+	static std::array<std::atomic<uint64_t>, 4> triage_presented{{{0}, {0}, {0}, {0}}};
+	static std::array<std::atomic<uint64_t>, 4> triage_skipped_idr{{{0}, {0}, {0}, {0}}};
+	static std::array<std::atomic<uint64_t>, 4> triage_skipped_busy{{{0}, {0}, {0}, {0}}};
 	static std::atomic<uint64_t> triage_last_frame_id{0};
 	static std::atomic<uint64_t> triage_fid_stall{0};
 	static std::atomic<uint64_t> triage_warp_ns_sum{0};
@@ -455,8 +459,18 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		uint64_t triage_n_gap_worst_ns = triage_gap_worst_ns.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_drop_present = triage_drop_present.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_query_miss = triage_query_miss.exchange(0, std::memory_order_relaxed);
-		uint64_t triage_n_presented = triage_presented.exchange(0, std::memory_order_relaxed);
-		uint64_t triage_n_skipped_idr = triage_skipped_idr.exchange(0, std::memory_order_relaxed);
+		// Per-stream snapshot first (depth triplet), then totals, so the
+		// depth breakdown survives the drain.
+		uint64_t triage_n_stream_presented[4]{}, triage_n_stream_idr[4]{}, triage_n_stream_busy[4]{};
+		for (int i = 0; i < 4; ++i)
+		{
+			triage_n_stream_presented[i] = triage_presented[i].exchange(0, std::memory_order_relaxed);
+			triage_n_stream_idr[i] = triage_skipped_idr[i].exchange(0, std::memory_order_relaxed);
+			triage_n_stream_busy[i] = triage_skipped_busy[i].exchange(0, std::memory_order_relaxed);
+		}
+		uint64_t triage_n_presented = triage_n_stream_presented[0] + triage_n_stream_presented[1] + triage_n_stream_presented[2] + triage_n_stream_presented[3];
+		uint64_t triage_n_skipped_idr = triage_n_stream_idr[0] + triage_n_stream_idr[1] + triage_n_stream_idr[2] + triage_n_stream_idr[3];
+		uint64_t triage_n_skipped_busy = triage_n_stream_busy[0] + triage_n_stream_busy[1] + triage_n_stream_busy[2] + triage_n_stream_busy[3];
 		uint64_t triage_n_fid_stall = triage_fid_stall.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_enc_data = video_encoder::encode_data_frames.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_enc_empty = video_encoder::encode_empty_frames.exchange(0, std::memory_order_relaxed);
@@ -469,7 +483,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		double triage_warp_avg_us = triage_n_warp_samples ? double(triage_n_warp_ns_sum) / double(triage_n_warp_samples) / 1000.0 : 0.0;
 		float triage_warp_gpu_max_us = warp_gpu_window_max_us;
 		warp_gpu_window_max_us = 0;
-		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu presented %llu skipped_idr %llu enc_data %llu enc_empty %llu sender_max %llu sender_empty %llu fid_stall %llu",
+		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu presented %llu skipped_idr %llu skipped_busy %llu depth_presented %llu depth_idr %llu depth_busy %llu enc_data %llu enc_empty %llu sender_max %llu sender_empty %llu fid_stall %llu",
 		        (unsigned long long)triage_n_commits,
 		        (unsigned long long)triage_n_warped,
 		        (unsigned long long)triage_n_straight,
@@ -486,6 +500,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        (unsigned long long)triage_n_wedge,
 		        (unsigned long long)triage_n_presented,
 		        (unsigned long long)triage_n_skipped_idr,
+		        (unsigned long long)triage_n_skipped_busy,
+		        (unsigned long long)triage_n_stream_presented[3],
+		        (unsigned long long)triage_n_stream_idr[3],
+		        (unsigned long long)triage_n_stream_busy[3],
 		        (unsigned long long)triage_n_enc_data,
 		        (unsigned long long)triage_n_enc_empty,
 		        (unsigned long long)triage_n_sender_max,
@@ -959,6 +977,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			images[slot].has_depth = true;
 		}
 	}
+	// Carried on the color frame's view_info (and the depth frame's):
+	// lets the client tell "no depth by design" from "depth expected
+	// but missing" (wire loss or pairing miss). Set after the pack
+	// block above, before the encoder handoff below.
+	images[slot].view_info.depth_expected = images[slot].has_depth;
 
 	for (auto & encoder: encoders)
 	{
@@ -1040,6 +1063,20 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
+		auto count_present = [&](video_encoder::present_outcome outcome) {
+			switch (outcome)
+			{
+				case video_encoder::present_outcome::presented:
+					triage_presented[encoder->stream_idx].fetch_add(1, std::memory_order_relaxed);
+					break;
+				case video_encoder::present_outcome::skipped_idr:
+					triage_skipped_idr[encoder->stream_idx].fetch_add(1, std::memory_order_relaxed);
+					break;
+				case video_encoder::present_outcome::skipped_busy:
+					triage_skipped_busy[encoder->stream_idx].fetch_add(1, std::memory_order_relaxed);
+					break;
+			}
+		};
 		// Non-blocking handoff, fully partitioned per stream: presented
 		// vs IDR-wait vs backpressure. A throw must not strand image
 		// slot either: count the drop and continue, the worker still
@@ -1052,18 +1089,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				continue;
 			try
 			{
-				switch (encoder->present_image(depth_images[slot].image, sem_info, info.frame_id))
-				{
-					case video_encoder::present_outcome::presented:
-						triage_presented.fetch_add(1, std::memory_order_relaxed);
-						break;
-					case video_encoder::present_outcome::skipped_idr:
-						triage_skipped_idr.fetch_add(1, std::memory_order_relaxed);
-						break;
-					case video_encoder::present_outcome::skipped_busy:
-						triage_drop_present.fetch_add(1, std::memory_order_relaxed);
-						break;
-				}
+				count_present(encoder->present_image(depth_images[slot].image, sem_info, info.frame_id));
 			}
 			catch (std::exception & e)
 			{
@@ -1074,18 +1100,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		}
 		try
 		{
-			switch (encoder->present_image(images[slot].image, sem_info, info.frame_id))
-			{
-				case video_encoder::present_outcome::presented:
-					triage_presented.fetch_add(1, std::memory_order_relaxed);
-					break;
-				case video_encoder::present_outcome::skipped_idr:
-					triage_skipped_idr.fetch_add(1, std::memory_order_relaxed);
-					break;
-				case video_encoder::present_outcome::skipped_busy:
-					triage_drop_present.fetch_add(1, std::memory_order_relaxed);
-					break;
-			}
+			count_present(encoder->present_image(images[slot].image, sem_info, info.frame_id));
 		}
 		catch (std::exception & e)
 		{
