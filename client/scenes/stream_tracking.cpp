@@ -168,8 +168,8 @@ public:
 struct origin_correction
 {
 	bool active = false;
-	glm::quat q(1, 0, 0, 0);
-	glm::vec3 p(0, 0, 0);
+	glm::quat q{1, 0, 0, 0};
+	glm::vec3 p{0, 0, 0};
 };
 
 static void apply_origin_pose(const glm::quat & aq, const glm::vec3 & ap, XrPosef & pose)
