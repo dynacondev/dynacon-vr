@@ -65,6 +65,16 @@ wivrn::wivrn_connection::wivrn_connection(std::stop_token stop_token, encryption
 	init(stop_token);
 }
 
+wivrn::wivrn_connection::wivrn_connection(const from_headset::headset_info_packet & info, encryption_state state, std::string pin) :
+        control(),
+        stream(-1),
+        pin(pin),
+        state(state),
+        info_packet(info)
+{
+	active = false;
+}
+
 void wivrn::wivrn_connection::init(std::stop_token stop_token, std::function<void()> tick)
 {
 	active = false;
@@ -290,7 +300,11 @@ void wivrn::wivrn_connection::reset(std::stop_token stop, TCP && tcp, std::funct
 	if (stream)
 		stream = decltype(stream)();
 
-	control = std::move(tcp);
+	// Reconstruct (not fd-swap): the fresh socket carries its own mutex
+	// and empty buffers. Required after a headless dummy connection whose
+	// default-constructed socket has neither, and avoids reusing stale
+	// handshake bytes from a previous connection.
+	control = decltype(control)(std::move(tcp));
 	init(stop, tick);
 }
 

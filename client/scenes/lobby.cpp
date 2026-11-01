@@ -422,7 +422,15 @@ void scenes::lobby::update_server_list()
 	}
 }
 
-void scenes::lobby::connect(const configuration::server_data & data)
+void scenes::lobby::disarm_server_restart_retry()
+{
+	restart_attempts_left = 0;
+	restart_retry_at.reset();
+	has_retry_server = false;
+	async_is_retry = false;
+}
+
+void scenes::lobby::connect(const configuration::server_data & data, bool is_retry)
 {
 	// a pending scene would orphan its session: shut it down first so at
 	// most one connection is ever in flight (reached by manual connect
@@ -432,6 +440,12 @@ void scenes::lobby::connect(const configuration::server_data & data)
 	server_name = data.service.name;
 	async_error.reset();
 	kiosk_dismissed = false;
+
+	if (not is_retry)
+		disarm_server_restart_retry();
+	retry_server_data = data;
+	has_retry_server = true;
+	async_is_retry = is_retry;
 
 	async_session = utils::async<std::unique_ptr<wivrn_session>, std::string>(
 	        [this](auto token, wivrn_discover::service service, bool manual) {
@@ -881,13 +895,37 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 			if (session)
 				next_scene = stream::create(std::move(session), 1'000'000'000.f / frame_state.predictedDisplayPeriod, server_name, *this);
 
+			else if (restart_attempts_left > 0)
+				disarm_server_restart_retry(); // PIN/user cancelled: stop retrying
 			async_session.reset();
 		}
 		catch (std::exception & e)
 		{
 			spdlog::error("Error connecting to server: {}", e.what());
+			bool was_retry = async_is_retry;
 			async_session.cancel();
-			async_error = e.what();
+			if (was_retry and restart_attempts_left > 0 and has_retry_server)
+			{
+				// Server still rebooting after a restart notice: stay quiet and try again.
+				restart_retry_at = frame_state.predictedDisplayTime + server_restart_retry_delay;
+			}
+			else
+			{
+				disarm_server_restart_retry();
+				async_error = e.what();
+			}
+		}
+	}
+
+	// Server-restart redial, due now and with no dial in flight.
+	if (restart_retry_at and frame_state.predictedDisplayTime >= *restart_retry_at and
+	    not async_session.valid() and has_retry_server)
+	{
+		restart_retry_at.reset();
+		if (restart_attempts_left > 0)
+		{
+			--restart_attempts_left;
+			connect(retry_server_data, true);
 		}
 	}
 
@@ -895,9 +933,21 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	{
 		server_hid_forwarding = next_scene->hid_forwarding_enabled();
 
+		// The server is restarting for this headset (early-session spec
+		// conflict): redial it bounded times instead of dropping to the
+		// server list. Attempts only refill here when none remain, so
+		// back-to-back restarts without a successful stream stay bounded.
+		if (next_scene->consume_server_restart_request() and restart_attempts_left == 0)
+		{
+			spdlog::info("Server is restarting for this headset, reconnecting");
+			restart_attempts_left = server_restart_max_attempts;
+			restart_retry_at = frame_state.predictedDisplayTime + server_restart_retry_delay;
+		}
+
 		switch (next_scene->current_state())
 		{
 			case scenes::stream::state::streaming:
+				disarm_server_restart_retry();
 				application::push_scene(next_scene);
 				break;
 
@@ -908,7 +958,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 				// server-list flows that would clear next_scene. Surface
 				// errors in the full GUI, otherwise drop the dead scene and
 				// resume dialling.
-				if (kiosk_wanted() && !kiosk_dismissed && !async_error && !pin_request.lock()->pin_requested)
+				if (kiosk_wanted() && !kiosk_dismissed && !async_error && !pin_request.lock()->pin_requested && restart_attempts_left == 0)
 				{
 					if (auto err = next_scene->pop_stream_error())
 						async_error = err;
@@ -918,6 +968,14 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 						autoconnect_enabled = true;
 					}
 				}
+
+				// A retry dial connected but its stream died before pushing
+				// (e.g. post-restart flakiness) without a new restart
+				// notice: keep consuming the remaining budget instead of
+				// stranding the dead scene with no redial armed while the
+				// error popup stays suppressed.
+				if (restart_attempts_left > 0 and not restart_retry_at and not async_session.valid())
+					restart_retry_at = frame_state.predictedDisplayTime + server_restart_retry_delay;
 				break;
 
 			default:

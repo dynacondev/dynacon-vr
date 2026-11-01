@@ -100,7 +100,7 @@ void scenes::lobby::gui_connecting(locked_notifiable<pin_request_data> & pin_req
 	std::string close_button_label = _("Disconnect");
 
 	std::string status;
-	if (next_scene)
+	if (next_scene and not restart_retry_pending())
 	{
 		current_tab = tab::connected;
 		ImGui::CloseCurrentPopup();
@@ -108,6 +108,8 @@ void scenes::lobby::gui_connecting(locked_notifiable<pin_request_data> & pin_req
 	}
 	else if (async_session.valid())
 		status = async_session.get_progress();
+	else if (restart_retry_pending() and not async_error)
+		status = _S("Server is restarting, reconnecting...");
 	else if (async_error)
 		status = *async_error;
 	else
@@ -143,6 +145,7 @@ void scenes::lobby::gui_connecting(locked_notifiable<pin_request_data> & pin_req
 		next_scene.reset();
 		async_error.reset();
 
+		disarm_server_restart_retry();
 		pin_request->pin_cancelled = true;
 
 		ImGui::CloseCurrentPopup();
@@ -244,6 +247,7 @@ void scenes::lobby::gui_connected(XrTime predicted_display_time)
 	if (next_scene->apps.draw_gui(*imgui_ctx, _("Disconnect")) == app_launcher::Cancel)
 	{
 		next_scene->exit();
+		disarm_server_restart_retry();
 		current_tab = tab::server_list;
 	}
 }
@@ -519,7 +523,7 @@ void scenes::lobby::gui_server_list()
 		ImGui::OpenPopup("delete server");
 
 	// Check if we need to report errors after a disconnect
-	if (next_scene and next_scene->current_state() == scenes::stream::state::shutdown and not ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup))
+	if (next_scene and next_scene->current_state() == scenes::stream::state::shutdown and not ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopup) and not restart_retry_pending())
 		ImGui::OpenPopup("disconnected");
 
 	// Check if an automatic connection has started

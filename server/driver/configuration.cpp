@@ -696,6 +696,9 @@ configuration::configuration()
 				throw std::runtime_error("invalid service publication " + it->get<std::string>());
 		}
 
+		if (auto it = json.find("early-start"); it != json.end())
+			early_start = *it;
+
 		if (auto it = json.find("openvr-compat-path"); it != json.end())
 		{
 			if (it->is_null())

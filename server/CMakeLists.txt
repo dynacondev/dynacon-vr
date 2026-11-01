@@ -122,6 +122,7 @@ if (WIVRN_BUILD_SERVER)
 			driver/clock_offset.cpp
 			driver/configuration.cpp
 			driver/hand_joints_list.cpp
+			driver/headset_cache.cpp
 			driver/pose_list.cpp
 			driver/tracking_control.cpp
 			driver/view_list.cpp

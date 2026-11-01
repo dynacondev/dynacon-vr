@@ -804,6 +804,13 @@ struct server_message
 
 		// displayed in lobby after disconnect (buffered)
 		error,
+
+		// the session is restarting for this headset (buffered):
+		// the client should automatically reconnect. Appended, never
+		// reordered, keeping wire values stable. (Cross-version peers
+		// never reach this switch: the protocol-version handshake
+		// hashes every enum entry, so both sides must match.)
+		restarting,
 	};
 
 	kind kind;

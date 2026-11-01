@@ -24,6 +24,7 @@
 #include "application.h"
 #include "configuration.h"
 #include "driver/app_pacer.h"
+#include "driver/headset_cache.h"
 #include "driver/xrt_cast.h"
 #include "server/ipc_server.h"
 #include "utils/load_icon.h"
@@ -1261,7 +1262,28 @@ struct refresh_rate_adjuster
 
 void wivrn_session::run_net(std::stop_token stop)
 {
-	resume_session();
+	if (not connection->is_active())
+	{
+		// Headless early start: no live headset yet. Wait for the first
+		// connection before resuming; the wait must not quit for missing
+		// OpenXR clients (see reconnect), or the session would exit at
+		// boot when no apps are attached yet.
+		reconnect(stop, true);
+		if (stop.stop_requested())
+			return;
+
+		try
+		{
+			resume_session();
+			U_LOG_I("Headset connected, Session resumed.");
+		}
+		catch (const std::exception & e)
+		{
+			U_LOG_E("Exception on session resume: %s", e.what());
+		}
+	}
+	else
+		resume_session();
 	while (not stop.stop_requested())
 	{
 		try
@@ -1286,7 +1308,7 @@ void wivrn_session::run_net(std::stop_token stop)
 			U_LOG_W("Network exception: %s, Session paused.", e.what());
 			pause_session();
 
-			reconnect(stop);
+			reconnect(stop, false);
 			if (stop.stop_requested())
 				break;
 
@@ -1451,10 +1473,21 @@ std::pair<bool, std::optional<std::string>> wivrn_session::validate_headset_info
 	return std::make_pair(warn, std::nullopt);
 }
 
-void wivrn_session::reconnect(std::stop_token stop)
+void wivrn_session::reconnect(std::stop_token stop, bool first)
 {
 	assert(mnd_ipc_server);
-	U_LOG_I("Waiting for new connection");
+	U_LOG_I(first ? "Waiting for first headset connection" : "Waiting for new connection");
+
+	std::function<void(wivrn_session &)> accept_tick = [](wivrn_session &) {};
+	std::function<void()> reset_tick = []() {};
+	if (not first)
+	{
+		// After a real disconnect with no OpenXR clients left, exit.
+		// The pre-first-connection wait must not do this, or an early
+		// session would suicide at boot when no apps run yet.
+		accept_tick = &wivrn_session::quit_if_no_client;
+		reset_tick = [this]() { quit_if_no_client(); };
+	}
 
 	while (not stop.stop_requested())
 	{
@@ -1462,7 +1495,7 @@ void wivrn_session::reconnect(std::stop_token stop)
 		{
 			// await a new headset connection
 
-			auto tcp = accept_connection(*this, stop, &wivrn_session::quit_if_no_client);
+			auto tcp = accept_connection(*this, stop, accept_tick);
 			if (stop.stop_requested())
 				return;
 			if (not tcp)
@@ -1471,8 +1504,13 @@ void wivrn_session::reconnect(std::stop_token stop)
 				return;
 			}
 
-			connection->reset(stop, std::move(*tcp), [this]() { quit_if_no_client(); });
+			connection->reset(stop, std::move(*tcp), reset_tick);
 			*net_exception.lock() = nullptr;
+
+			// Cache the fresh spec straight away, before the join
+			// decision below: even a refused headset is then guaranteed
+			// to seed the next server start.
+			save_headset_cache(connection->info());
 
 			// validate if headset is compatible with the current session
 
@@ -1483,6 +1521,22 @@ void wivrn_session::reconnect(std::stop_token stop)
 
 			if (refuse_conn)
 			{
+				if (first)
+				{
+					// Headless early session seeded from a stale cache:
+					// adopt the new spec by restarting. The cache was
+					// already updated on receipt, the client
+					// auto-reconnects on this message, and the parent
+					// falls back to a lazy accept for the retry.
+					send_control(to_headset::server_message{
+					        .kind = to_headset::server_message::kind::restarting,
+					        .msg = "Server is restarting for your headset",
+					});
+
+					request_stop();
+					return;
+				}
+
 				send_control(to_headset::server_message{
 				        .kind = to_headset::server_message::kind::error,
 				        .msg = std::format("Headset incompatible with session: {}", *refuse_conn),

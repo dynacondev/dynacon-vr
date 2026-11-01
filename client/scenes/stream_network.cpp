@@ -66,6 +66,16 @@ void scenes::stream::operator()(to_headset::server_message && message)
 
 			break;
 		}
+
+		case to_headset::server_message::kind::restarting: {
+			server_restart_requested_ = true;
+
+			auto toast = gui_toast.lock();
+			toast->emplace(message.msg, true);
+
+			gui_status_last_change = instance.now();
+			break;
+		}
 	}
 }
 
