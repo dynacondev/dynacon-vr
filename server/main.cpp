@@ -325,6 +325,12 @@ void start_server(configuration config)
 
 void kill_server()
 {
+	// A kill may already be pending (e.g. a pairing change right after an
+	// early-start fallback kill): don't arm a second SIGTERM watch that
+	// could outlive this server and hit a later session on PID reuse.
+	if (server_kill_watch)
+		return;
+
 	wivrn_ipc_socket_main_loop->send(to_monado::stop{});
 
 	// Send SIGTERM after 1s if it is still running
@@ -451,7 +457,11 @@ void update_fsm()
 			g_timeout_add(delay_next_try.count(), [](void *) {
 				start_listening();
 				start_publishing();
-				wivrn_server_set_headset_connected(dbus_server, false);
+				// The D-Bus server may not exist yet if the session exited
+				// before the bus name was acquired (e.g. an early start
+				// failing at boot).
+				if (dbus_server)
+					wivrn_server_set_headset_connected(dbus_server, false);
 				return G_SOURCE_REMOVE; }, 0);
 		}
 	}
@@ -562,6 +572,12 @@ gboolean control_received(gint fd, GIOCondition condition, gpointer user_data)
 		                   [&](const wivrn::from_headset::headset_info_packet & info) {
 			                   on_headset_info_packet(info);
 			                   save_headset_cache(info);
+			                   // An early-started session echoes its cached spec at
+			                   // boot, before any headset is present: refresh the UI
+			                   // but don't report a connection or inhibit sleep
+			                   // until a real headset arrives.
+			                   if (early_server and not headset_ever_connected)
+				                   return;
 			                   inhibitor.emplace();
 			                   wivrn_server_set_headset_connected(dbus_server, true);
 		                   },

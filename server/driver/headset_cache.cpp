@@ -22,6 +22,7 @@
 
 #include "util/u_logging.h"
 
+#include <cmath>
 #include <fstream>
 #include <magic_enum.hpp>
 #include <nlohmann/json.hpp>
@@ -227,10 +228,16 @@ std::optional<from_headset::headset_info_packet> load_headset_cache()
 		info.variant = json.at("variant");
 
 		// Plausibility gate: a corrupt cache must never seed a session.
-		if (info.render_eye_width == 0 or info.render_eye_height == 0 or
-		    info.stream_eye_width == 0 or info.stream_eye_height == 0 or
-		    info.available_refresh_rates.empty() or info.supported_codecs.empty() or
-		    info.system_name.empty())
+		bool plausible = info.render_eye_width != 0 and info.render_eye_height != 0 and
+		                 info.stream_eye_width != 0 and info.stream_eye_height != 0 and
+		                 not info.available_refresh_rates.empty() and not info.supported_codecs.empty() and
+		                 not info.system_name.empty() and info.settings.fps_divider != 0;
+		// Rates seed the compositor/refresh logic (default_fps uses back()),
+		// so each must be a sane positive rate; fps_divider == 0 would
+		// divide by zero there and in the settings handler.
+		for (float rate: info.available_refresh_rates)
+			plausible = plausible and std::isfinite(rate) and rate > 0;
+		if (not plausible)
 		{
 			U_LOG_W("Ignoring implausible headset cache");
 			return std::nullopt;
