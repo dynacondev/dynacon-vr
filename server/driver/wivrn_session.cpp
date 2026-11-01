@@ -24,6 +24,7 @@
 #include "application.h"
 #include "configuration.h"
 #include "driver/app_pacer.h"
+#include "driver/headset_cache.h"
 #include "driver/xrt_cast.h"
 #include "server/ipc_server.h"
 #include "utils/load_icon.h"
@@ -1505,6 +1506,11 @@ void wivrn_session::reconnect(std::stop_token stop, bool first)
 
 			connection->reset(stop, std::move(*tcp), reset_tick);
 			*net_exception.lock() = nullptr;
+
+			// Cache the fresh spec straight away, before the join
+			// decision below: even a refused headset is then guaranteed
+			// to seed the next server start.
+			save_headset_cache(connection->info());
 
 			// validate if headset is compatible with the current session
 
