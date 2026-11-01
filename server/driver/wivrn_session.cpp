@@ -1521,6 +1521,22 @@ void wivrn_session::reconnect(std::stop_token stop, bool first)
 
 			if (refuse_conn)
 			{
+				if (first)
+				{
+					// Headless early session seeded from a stale cache:
+					// adopt the new spec by restarting. The cache was
+					// already updated on receipt, the client
+					// auto-reconnects on this message, and the parent
+					// falls back to a lazy accept for the retry.
+					send_control(to_headset::server_message{
+					        .kind = to_headset::server_message::kind::restarting,
+					        .msg = "Server is restarting for your headset",
+					});
+
+					request_stop();
+					return;
+				}
+
 				send_control(to_headset::server_message{
 				        .kind = to_headset::server_message::kind::error,
 				        .msg = std::format("Headset incompatible with session: {}", *refuse_conn),

@@ -804,6 +804,11 @@ struct server_message
 
 		// displayed in lobby after disconnect (buffered)
 		error,
+
+		// the session is restarting for this headset (buffered):
+		// the client should automatically reconnect. Appended, never
+		// reordered: old clients ignore unknown kinds.
+		restarting,
 	};
 
 	kind kind;
