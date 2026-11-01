@@ -609,7 +609,7 @@ void scenes::stream::on_focused()
 	kiosk_chord_left_action = get_action("kiosk_chord_left").first;
 	kiosk_chord_right_action = get_action("kiosk_chord_right").first;
 
-	kiosk_planes_.emplace(*this, layer_controllers);
+	kiosk_planes_.emplace(*this, layer_controllers, layer_trails);
 	recenter_left = get_action("recenter_left").first;
 	recenter_right = get_action("recenter_right").first;
 	gui_distance_left = get_action("gui_distance_left").first;

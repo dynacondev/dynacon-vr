@@ -823,11 +823,8 @@ void scenes::lobby::gui_kiosk()
 	namespace ui = wivrn::ui;
 	const auto & t = ui::current();
 
-	// spinner + title on one row, live connection stage below while dialling
+	// title on its own row, live connection stage below while dialling
 	ImGui::PushFont(nullptr, constants::gui::font_size_large);
-	const float r = ImGui::GetFontSize() * 0.55f;
-	ImSpinner::SpinnerAng("kiosk", r, ui::metrics::app_spinner_thickness, ImColor{t.accent}, ImColor{t.card}, 6, 4.7124f);
-	ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 2);
 	// connected but no video yet: the simulation hasn't started
 	ImGui::TextUnformatted(next_scene ? _S("Waiting for Simulation") : _S("Waiting for Connection"));
 	ImGui::PopFont();
@@ -1084,7 +1081,7 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 
 	// model planes wheeling behind the overlay panel (hidden otherwise)
 	if (kiosk_planes_)
-		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, kiosk_shown);
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, kiosk_shown, kiosk_camera);
 
 	ImGuiStyle & style = ImGui::GetStyle();
 	style.FontScaleMain = wivrn::ui::current().font_scale * wivrn::ui::metrics::font_base;

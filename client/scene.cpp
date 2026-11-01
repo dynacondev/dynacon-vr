@@ -269,6 +269,17 @@ xr::swapchain & scene::get_swapchain(vk::Format format, int32_t width, int32_t h
 	}
 
 	spdlog::info("Creating new swapchain: {}, {}x{}, {} sample(s), {} level(s)", magic_enum::enum_name(format), width, height, sample_count, array_size);
+
+	// Drop swapchains from previous sizes (e.g. while the resolution slider
+	// is dragged): anything not claimed this frame with different parameters
+	// is stale. Images are released every frame in render_end, so destroying
+	// these handles is safe.
+	std::erase_if(swapchains, [&](const swapchain_entry & entry) {
+		return not entry.used and
+		       (entry.format != format or entry.width != width or entry.height != height or
+		        entry.sample_count != sample_count or entry.array_size != array_size);
+	});
+
 	swapchain_entry new_swapchain{
 	        .format = format,
 	        .width = width,

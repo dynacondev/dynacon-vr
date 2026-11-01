@@ -31,6 +31,7 @@
 #include "vk/specialization_constants.h"
 #include <algorithm>
 #include <boost/pfr/core.hpp>
+#include <cstdlib>
 #include <entt/entity/entity.hpp>
 #include <entt/entt.hpp>
 #include <glm/ext/matrix_transform.hpp>
@@ -104,13 +105,136 @@ vk::Format scene_renderer::find_usable_image_format(
 
 			return format;
 		}
-		catch (vk::FormatNotSupportedError &)
+		catch (const vk::FormatNotSupportedError &)
 		{
 			continue;
 		}
 	}
 
 	return vk::Format::eUndefined;
+}
+
+vk::SampleCountFlagBits scene_renderer::preferred_msaa_samples(vk::Format color_format, vk::Format depth_format, bool keep_depth_buffer)
+{
+	constexpr auto e4 = vk::SampleCountFlagBits::e4;
+	constexpr auto sample_zero = vk::ResolveModeFlagBits::eSampleZero;
+
+	// Depth formats with a stencil aspect also resolve stencil: both modes
+	// are SampleZero, which additionally satisfies the independentResolve
+	// VUIDs (identical modes) unconditionally.
+	auto format_has_stencil = [](vk::Format format) {
+		switch (format)
+		{
+			case vk::Format::eD16UnormS8Uint:
+			case vk::Format::eD24UnormS8Uint:
+			case vk::Format::eD32SfloatS8Uint:
+				return true;
+			default:
+				// Note: eX8D24UnormPack32 has 8 unused bits, no stencil aspect.
+				return false;
+		};
+	};
+
+	// Debug override: WIVRN_MSAA=0 forces single-sample, =4 forces 4x (if supported).
+	static const int env_msaa = [] {
+		const char * env = std::getenv("WIVRN_MSAA");
+		if (not env)
+			return -1;
+		char * end = nullptr;
+		long val = std::strtol(env, &end, 10);
+		if (end != env and (val == 0 or val == 4))
+			return (int)val;
+		spdlog::warn("Ignoring invalid WIVRN_MSAA=\"{}\", expected 0 or 4", env);
+		return -1;
+	}();
+
+	if (env_msaa == 0)
+		return vk::SampleCountFlagBits::e1;
+
+	bool want_msaa = env_msaa == 4;
+	if (env_msaa < 0)
+		want_msaa = application::get_config().msaa_enabled;
+	if (not want_msaa)
+		return vk::SampleCountFlagBits::e1;
+
+	auto key = std::make_tuple(color_format, depth_format, keep_depth_buffer);
+	if (auto it = msaa_support_cache.find(key); it != msaa_support_cache.end())
+		return it->second;
+
+	vk::SampleCountFlagBits result = vk::SampleCountFlagBits::e1;
+
+	const auto & limits = physical_device_properties.limits;
+	if (device.getDispatcher()->vkCreateRenderPass2 == nullptr)
+	{
+		spdlog::info("MSAA 4x not supported: vkCreateRenderPass2 unavailable, staying single-sample");
+	}
+	else if ((limits.framebufferColorSampleCounts & e4) == vk::SampleCountFlags{} or
+	         (limits.framebufferDepthSampleCounts & e4) == vk::SampleCountFlags{})
+	{
+		spdlog::info("MSAA 4x not supported by framebuffer sample counts, staying single-sample");
+	}
+	else
+	{
+		try
+		{
+			vk::ImageFormatProperties color_props = physical_device.getImageFormatProperties(
+			        color_format,
+			        vk::ImageType::e2D,
+			        vk::ImageTiling::eOptimal,
+			        vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransientAttachment,
+			        {});
+			vk::ImageFormatProperties depth_props = physical_device.getImageFormatProperties(
+			        depth_format,
+			        vk::ImageType::e2D,
+			        vk::ImageTiling::eOptimal,
+			        vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eTransientAttachment,
+			        {});
+			if ((color_props.sampleCounts & e4) == vk::SampleCountFlags{} or
+			    (depth_props.sampleCounts & e4) == vk::SampleCountFlags{})
+			{
+				spdlog::info(
+				        "MSAA 4x not supported for color {} / depth {}, staying single-sample",
+				        vk::to_string(color_format),
+				        vk::to_string(depth_format));
+			}
+			else if (keep_depth_buffer)
+			{
+				// The swapchain depth image is the resolve target: needs
+				// Vulkan 1.2 depth-stencil resolve with SAMPLE_ZERO mode.
+				auto props = physical_device
+				                     .getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDepthStencilResolveProperties>();
+				auto & resolve_props = props.get<vk::PhysicalDeviceDepthStencilResolveProperties>();
+				const bool depth_ok = (resolve_props.supportedDepthResolveModes & sample_zero) != vk::ResolveModeFlags{};
+				const bool stencil_ok = not format_has_stencil(depth_format) or
+				                        (resolve_props.supportedStencilResolveModes & sample_zero) != vk::ResolveModeFlags{};
+				if (not depth_ok or not stencil_ok)
+				{
+					spdlog::info("MSAA 4x unsupported: depth/stencil resolve SAMPLE_ZERO missing, staying single-sample");
+				}
+				else
+				{
+					result = e4;
+				}
+			}
+			else
+			{
+				result = e4;
+			}
+		}
+		catch (const vk::FormatNotSupportedError &)
+		{
+			spdlog::info(
+			        "MSAA 4x not supported for color {} / depth {}, staying single-sample",
+			        vk::to_string(color_format),
+			        vk::to_string(depth_format));
+		}
+	}
+
+	if (result == e4)
+		spdlog::info("MSAA 4x enabled for color {} / depth {} (keep_depth={})", vk::to_string(color_format), vk::to_string(depth_format), keep_depth_buffer);
+
+	msaa_support_cache[key] = result;
+	return result;
 }
 
 std::shared_ptr<renderer::texture> scene_renderer::create_default_texture(image_loader & loader, std::vector<uint8_t> pixel, const std::string & name)
@@ -338,33 +462,38 @@ scene_renderer::renderpass & scene_renderer::get_renderpass(const renderpass_inf
 	return renderpasses.emplace(info, create_renderpass(info)).first->second;
 }
 
-scene_renderer::renderpass scene_renderer::create_renderpass(const renderpass_info & info_)
+scene_renderer::renderpass scene_renderer::create_renderpass_v1(const renderpass_info & info_)
 {
+	// Legacy path for devices without vkCreateRenderPass2 (pre-1.2 without
+	// VK_KHR_create_renderpass2). MSAA is always disabled there (see
+	// preferred_msaa_samples), so no resolve attachments are needed.
+	assert(info_.msaa_samples == vk::SampleCountFlagBits::e1);
+
 	vk::StructureChain<vk::RenderPassCreateInfo, vk::RenderPassMultiviewCreateInfo> info;
 	scene_renderer::renderpass rp;
 
 	std::vector<vk::AttachmentDescription> attachments;
 
-	rp.color_attachment = {
+	vk::AttachmentReference color_attachment{
 	        .attachment = (uint32_t)attachments.size(),
 	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	attachments.push_back(vk::AttachmentDescription{
 	        .format = info_.color_format,
-	        .samples = info_.msaa_samples,
+	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
 	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	});
 
-	rp.depth_attachment = {
+	vk::AttachmentReference depth_attachment{
 	        .attachment = (uint32_t)attachments.size(),
 	        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
 	};
 	attachments.push_back(vk::AttachmentDescription{
 	        .format = info_.depth_format,
-	        .samples = info_.msaa_samples,
+	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = info_.keep_depth_buffer ? vk::AttachmentStoreOp::eStore : vk::AttachmentStoreOp::eDontCare,
 	        .stencilLoadOp = vk::AttachmentLoadOp::eClear,
@@ -373,38 +502,15 @@ scene_renderer::renderpass scene_renderer::create_renderpass(const renderpass_in
 	        .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
 	});
 
-	// Only used if MSAA is enabled
-	if (info_.msaa_samples != vk::SampleCountFlagBits::e1)
-	{
-		rp.resolve_attachment = {
-		        .attachment = (uint32_t)attachments.size(),
-		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-		};
-		attachments.push_back(vk::AttachmentDescription{
-		        .format = info_.color_format,
-		        .samples = vk::SampleCountFlagBits::e1,
-		        .loadOp = vk::AttachmentLoadOp::eDontCare,
-		        .storeOp = vk::AttachmentStoreOp::eStore,
-		        .stencilLoadOp = vk::AttachmentLoadOp::eClear,
-		        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
-		        .initialLayout = vk::ImageLayout::eUndefined,
-		        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
-		});
-	}
-
 	info.get().setAttachments(attachments);
 
-	vk::SubpassDescription subpasses{
+	vk::SubpassDescription subpass{
 	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
 	        .colorAttachmentCount = 1,
-	        .pColorAttachments = &rp.color_attachment,
-	        .pDepthStencilAttachment = &rp.depth_attachment,
+	        .pColorAttachments = &color_attachment,
+	        .pDepthStencilAttachment = &depth_attachment,
 	};
-
-	if (info_.msaa_samples != vk::SampleCountFlagBits::e1)
-		subpasses.pResolveAttachments = &*rp.resolve_attachment;
-
-	info.get().setSubpasses(subpasses);
+	info.get().setSubpasses(subpass);
 
 	std::array dependencies{
 	        vk::SubpassDependency{
@@ -428,14 +534,166 @@ scene_renderer::renderpass scene_renderer::create_renderpass(const renderpass_in
 	auto & multiview = info.get<vk::RenderPassMultiviewCreateInfo>();
 	multiview.subpassCount = 1;
 
-	std::array view_mask{uint32_t((1 << info_.multiview_count) - 1)};
+	assert(info_.multiview_count > 0 and info_.multiview_count <= 32);
+	std::array view_mask{(1u << info_.multiview_count) - 1u};
 	multiview.setViewMasks(view_mask);
 
-	std::array correlation_mask{uint32_t((1 << info_.multiview_count) - 1)};
+	std::array correlation_mask{(1u << info_.multiview_count) - 1u};
 	multiview.setCorrelationMasks(correlation_mask);
 
+	// Only .attachment is read back from these (see create_output_image_data).
+	rp.color_attachment.attachment = color_attachment.attachment;
+	rp.color_attachment.layout = color_attachment.layout;
+	rp.depth_attachment.attachment = depth_attachment.attachment;
+	rp.depth_attachment.layout = depth_attachment.layout;
 	rp.attachment_count = (uint32_t)attachments.size();
 	rp.renderpass = vk::raii::RenderPass(device, info.get());
+	return rp;
+}
+
+scene_renderer::renderpass scene_renderer::create_renderpass(const renderpass_info & info_)
+{
+	// RenderPassCreateInfo2 (Vulkan 1.2 core): the depth-stencil resolve
+	// attachment is only expressible here (via SubpassDescription2::pNext),
+	// there is no equivalent in the Vulkan 1.0 renderpass API.
+	if (device.getDispatcher()->vkCreateRenderPass2 == nullptr)
+		return create_renderpass_v1(info_);
+
+	scene_renderer::renderpass rp;
+
+	std::vector<vk::AttachmentDescription2> attachments;
+
+	const bool msaa = info_.msaa_samples != vk::SampleCountFlagBits::e1;
+
+	rp.color_attachment = {
+	        .attachment = (uint32_t)attachments.size(),
+	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+	        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	};
+	attachments.push_back(vk::AttachmentDescription2{
+	        .format = info_.color_format,
+	        .samples = info_.msaa_samples,
+	        .loadOp = vk::AttachmentLoadOp::eClear,
+	        // Multisample images are transient and resolved: no need to store them.
+	        .storeOp = msaa ? vk::AttachmentStoreOp::eDontCare : vk::AttachmentStoreOp::eStore,
+	        .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+	        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+	        .initialLayout = vk::ImageLayout::eUndefined,
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	});
+
+	rp.depth_attachment = {
+	        .attachment = (uint32_t)attachments.size(),
+	        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+	};
+	attachments.push_back(vk::AttachmentDescription2{
+	        .format = info_.depth_format,
+	        .samples = info_.msaa_samples,
+	        .loadOp = vk::AttachmentLoadOp::eClear,
+	        // Multisample depth is transient (resolved or discarded): never stored.
+	        .storeOp = msaa ? vk::AttachmentStoreOp::eDontCare
+	                       : (info_.keep_depth_buffer ? vk::AttachmentStoreOp::eStore : vk::AttachmentStoreOp::eDontCare),
+	        .stencilLoadOp = vk::AttachmentLoadOp::eClear,
+	        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+	        .initialLayout = vk::ImageLayout::eUndefined,
+	        .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	});
+
+	// Only used if MSAA is enabled. The OpenXR swapchain images stay
+	// single-sample; MSAA renders into transient images resolved here.
+	if (msaa)
+	{
+		rp.resolve_attachment = {
+		        .attachment = (uint32_t)attachments.size(),
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		        .aspectMask = vk::ImageAspectFlagBits::eColor,
+		};
+		attachments.push_back(vk::AttachmentDescription2{
+		        .format = info_.color_format,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eDontCare,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+		        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		});
+	}
+
+	vk::SubpassDescriptionDepthStencilResolve depth_resolve{
+	        .depthResolveMode = vk::ResolveModeFlagBits::eSampleZero,
+	        .stencilResolveMode = vk::ResolveModeFlagBits::eSampleZero,
+	};
+
+	// Only used if MSAA is enabled with keep_depth_buffer: the swapchain
+	// depth image is the resolve target, a transient multisample image is
+	// the depth attachment.
+	if (msaa and info_.keep_depth_buffer)
+	{
+		rp.depth_resolve_attachment = vk::AttachmentReference2{
+		        .attachment = (uint32_t)attachments.size(),
+		        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		};
+		attachments.push_back(vk::AttachmentDescription2{
+		        .format = info_.depth_format,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eDontCare,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+		        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		        .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		});
+		depth_resolve.pDepthStencilResolveAttachment = &*rp.depth_resolve_attachment;
+	}
+
+	const uint32_t view_mask = (1u << info_.multiview_count) - 1u;
+	assert(info_.multiview_count > 0 and info_.multiview_count <= 32);
+
+	vk::SubpassDescription2 subpass{
+	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	        .viewMask = view_mask,
+	        .colorAttachmentCount = 1,
+	        .pColorAttachments = &rp.color_attachment,
+	        .pDepthStencilAttachment = &rp.depth_attachment,
+	};
+
+	if (msaa)
+		subpass.pResolveAttachments = &*rp.resolve_attachment;
+
+	if (msaa and info_.keep_depth_buffer)
+		subpass.pNext = &depth_resolve;
+
+	std::array dependencies{
+	        vk::SubpassDependency2{
+	                .srcSubpass = vk::SubpassExternal,
+	                .dstSubpass = 0,
+	                .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	                .dstStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	                .srcAccessMask{},
+	                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+	        },
+	        vk::SubpassDependency2{
+	                .srcSubpass = vk::SubpassExternal,
+	                .dstSubpass = 0,
+	                .srcStageMask = vk::PipelineStageFlagBits::eEarlyFragmentTests,
+	                .dstStageMask = vk::PipelineStageFlagBits::eEarlyFragmentTests,
+	                .srcAccessMask{},
+	                .dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+	        }};
+
+	std::array correlation_mask{view_mask};
+
+	vk::RenderPassCreateInfo2 create_info;
+	create_info.setAttachments(attachments);
+	create_info.setSubpasses(subpass);
+	create_info.setDependencies(dependencies);
+	create_info.setCorrelatedViewMasks(correlation_mask);
+
+	rp.attachment_count = (uint32_t)attachments.size();
+	rp.renderpass = vk::raii::RenderPass(device, create_info);
 	return rp;
 }
 
@@ -508,6 +766,50 @@ scene_renderer::output_image scene_renderer::create_output_image_data(const outp
 	                },
 	        });
 
+	// With MSAA + keep_depth_buffer the swapchain depth (depth_view above) is
+	// the resolve target: render depth into a transient multisample image.
+	if (info.renderpass.msaa_samples != vk::SampleCountFlagBits::e1 and info.depth)
+	{
+		out.multisample_depth_image = image_allocation{
+		        device,
+		        vk::ImageCreateInfo{
+		                .imageType = vk::ImageType::e2D,
+		                .format = info.renderpass.depth_format,
+		                .extent = {
+		                        .width = info.output_size.width,
+		                        .height = info.output_size.height,
+		                        .depth = 1,
+		                },
+		                .mipLevels = 1,
+		                .arrayLayers = info.renderpass.multiview_count,
+		                .samples = info.renderpass.msaa_samples,
+		                .tiling = vk::ImageTiling::eOptimal,
+		                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eTransientAttachment,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		                .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+		                .preferredFlags = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT,
+		        }};
+
+		out.multisample_depth_view = vk::raii::ImageView(
+		        device,
+		        vk::ImageViewCreateInfo{
+		                .image = out.multisample_depth_image,
+		                .viewType = vk::ImageViewType::e2DArray,
+		                .format = info.renderpass.depth_format,
+		                .components{},
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		                        .baseMipLevel = 0,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 0,
+		                        .layerCount = info.renderpass.multiview_count,
+		                },
+		        });
+	}
+
 	if (info.renderpass.msaa_samples != vk::SampleCountFlagBits::e1)
 	{
 		out.multisample_image = image_allocation{
@@ -572,32 +874,19 @@ scene_renderer::output_image scene_renderer::create_output_image_data(const outp
 		attachments[rp.color_attachment.attachment] = vk::ImageView{*out.image_view};
 	}
 
-	attachments[rp.depth_attachment.attachment] = vk::ImageView{*out.depth_view};
-
-	fb_info.setAttachments(attachments);
-	out.framebuffer = vk::raii::Framebuffer(device, fb_info);
-	return out;
-
-	if (info.renderpass.msaa_samples != vk::SampleCountFlagBits::e1)
+	if (rp.depth_resolve_attachment)
 	{
-		std::array attachments{
-		        vk::ImageView{*out.multisample_view},
-		        vk::ImageView{*out.depth_view},
-		        vk::ImageView{*out.image_view},
-		};
-		fb_info.setAttachments(attachments);
-		out.framebuffer = vk::raii::Framebuffer(device, fb_info);
+		// MSAA depth renders into the transient image, resolved to the swapchain depth.
+		attachments[rp.depth_attachment.attachment] = vk::ImageView{*out.multisample_depth_view};
+		attachments[rp.depth_resolve_attachment->attachment] = vk::ImageView{*out.depth_view};
 	}
 	else
 	{
-		std::array attachments{
-		        vk::ImageView{*out.image_view},
-		        vk::ImageView{*out.depth_view},
-		};
-		fb_info.setAttachments(attachments);
-		out.framebuffer = vk::raii::Framebuffer(device, fb_info);
+		attachments[rp.depth_attachment.attachment] = vk::ImageView{*out.depth_view};
 	}
 
+	fb_info.setAttachments(attachments);
+	out.framebuffer = vk::raii::Framebuffer(device, fb_info);
 	return out;
 }
 
@@ -705,9 +994,18 @@ vk::raii::Pipeline scene_renderer::create_pipeline(const pipeline_info & info)
 
 vk::Sampler scene_renderer::get_sampler(const renderer::sampler_info & info)
 {
+	// Anisotropic filtering for grazing angles (ground planes). Clamped to
+	// the device limit; disabled entirely without samplerAnisotropy support.
+	// Recreated live when the effective level changes (called every frame).
+	const uint32_t requested_anisotropy = application::get_config().anisotropy_level;
+	const float max_anisotropy = physical_device_properties.limits.maxSamplerAnisotropy;
+	const float anisotropy_level = (application::get_sampler_anisotropy_enabled() and requested_anisotropy > 0 and max_anisotropy > 1)
+	        ? std::min<float>(requested_anisotropy, max_anisotropy)
+	        : 0;
+
 	auto it = samplers.find(info);
-	if (it != samplers.end())
-		return **it->second;
+	if (it != samplers.end() and it->second.anisotropy == anisotropy_level)
+		return **it->second.sampler;
 
 	auto out = std::make_shared<vk::raii::Sampler>(
 	        device,
@@ -717,13 +1015,15 @@ vk::Sampler scene_renderer::get_sampler(const renderer::sampler_info & info)
 	                .mipmapMode = info.min_filter_mipmap,
 	                .addressModeU = info.wrapS,
 	                .addressModeV = info.wrapT,
-	                // .anisotropyEnable = true,
-	                // .maxAnisotropy = 4,
+	                .anisotropyEnable = anisotropy_level > 0,
+	                .maxAnisotropy = anisotropy_level > 0 ? anisotropy_level : 1.0f,
 	                .minLod = 0,
 	                .maxLod = vk::LodClampNone,
 	        });
 
-	samplers.emplace(info, out);
+	spdlog::info("Anisotropic filtering {} for sampler ({}x)", anisotropy_level > 0 ? "enabled" : "disabled", anisotropy_level);
+
+	samplers.insert_or_assign(info, cached_sampler{out, anisotropy_level});
 	return **out;
 }
 
@@ -910,12 +1210,14 @@ void scene_renderer::render(
 
 	// print_scene_hierarchy(scene);
 
+	// The OpenXR swapchain images stay single-sample: MSAA renders into
+	// transient multisample images resolved into the swapchain images.
+	// (Do not pass a sample count > 1 to get_swapchain for this path.)
 	renderpass_info rp_info{
 	        .color_format = color_format,
 	        .depth_format = depth_format,
 	        .keep_depth_buffer = depth_buffer != vk::Image{},
-	        .msaa_samples = vk::SampleCountFlagBits::e1,
-	        // .msaa_samples = vk::SampleCountFlagBits::e4, // FIXME: MSAA does not work
+	        .msaa_samples = preferred_msaa_samples(color_format, depth_format, depth_buffer != vk::Image{}),
 	        .multiview_count = (uint32_t)frames.size(),
 	};
 	vk::raii::RenderPass & renderpass = get_renderpass(rp_info).renderpass;
@@ -1100,6 +1402,7 @@ void scene_renderer::render(
 		        .front_face = primitive.front_face,
 		        .topology = primitive.topology,
 		        .blend_enable = material->blend_enable,
+		        .blend_additive = material->blend_additive,
 
 		        .nb_texcoords = 2, // TODO
 		        .skinning = !node.joints.empty(),

@@ -94,6 +94,9 @@ class lobby : public scene_impl<lobby>
 	static inline const uint32_t layer_lobby = 1 << 0;
 	static inline const uint32_t layer_controllers = 1 << 1;
 	static inline const uint32_t layer_rays = 1 << 2;
+	// Engine trails render only in the below-GUI pass so they can never
+	// cover the overlay panels.
+	static inline const uint32_t layer_trails = 1 << 3;
 
 	uint32_t width;
 	uint32_t height;
@@ -129,6 +132,9 @@ class lobby : public scene_impl<lobby>
 	std::optional<wivrn::kiosk_planes> kiosk_planes_;
 	glm::quat kiosk_orientation{1, 0, 0, 0};
 	bool kiosk_orientation_init = false;
+	// Viewer position cached per frame for the kiosk plane trails (draw_gui
+	// runs after the head pose is located but takes no camera parameter).
+	std::optional<glm::vec3> kiosk_camera;
 	// config half of the kiosk predicate (mode on, server configured);
 	// the session half lives in kiosk_active()
 	bool kiosk_wanted() const;

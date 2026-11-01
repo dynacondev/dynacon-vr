@@ -496,7 +496,29 @@ void settings_post_processing(const settings_context & ctx)
 		flag_combo("##sharpening", _("Sharpening"), _("Improve clarity of high contrast edges and counteract blur. Useful when the input resolution is low compared to the headset display."), {0, XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB, XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB}, &configuration::openxr_post_processing_settings::sharpening);
 	}
 
-	ui::page_header(_S("Post-processing"), _cS("page header subtitle", "OpenXR layer supersampling and sharpening."));
+	{
+		// Client-side texture filtering, independent of the OpenXR layer
+		// post-processing above: always shown, takes effect immediately.
+		const std::array<uint32_t, 5> levels{0, 2, 4, 8, 16};
+		list.push_back({
+		        .id = "##anisotropy",
+		        .label = _C("setting name", "Anisotropic filtering"),
+		        .description = _("Sharpen ground and wall textures viewed at grazing angles. Higher values cost some GPU performance."),
+		        .ui = ui_kind::combo,
+		        .get_int = [&config, levels] { return index(levels, config.anisotropy_level).value_or(3); },
+		        .set_int = [&config, levels](int v) {
+			        config.anisotropy_level = levels[v];
+			        config.save(); },
+		        .options = [] {
+			        return std::vector<std::string>{_("Off"), "2x", "4x", "8x", "16x"}; },
+		        .title = _C("setting name", "Anisotropic filtering"),
+		        .default_int = index(levels, default_config.anisotropy_level).value_or(3),
+		        .enabled = [] { return application::get_sampler_anisotropy_enabled(); },
+		        .disabled_tooltip = _("Anisotropic filtering is not supported by this device."),
+		});
+	}
+
+	ui::page_header(_cS("page header title", "Post-processing"), _cS("page header subtitle", "OpenXR layer supersampling and sharpening, client-side filters."));
 	render_settings(ctx, "##post_processing", list);
 }
 
