@@ -1179,6 +1179,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	bool use_alpha = false;
 
 	std::array<stream_defoveator::input, view_count> images;
+	// Origin alignment counter-shift (inverse of the tracking
+	// correction): the server stamps the generation pose in its
+	// correction-shifted frame, but the video layer below submits into
+	// the headset's unshifted world space. Without this the runtime
+	// timewarp eats the shift (world unmoved, canvas slides with black
+	// edges, masks detach). A is quasi-static (smoothed board/holding),
+	// so the current inverse matches the generation-time A up to filter
+	// motion. Unset when inactive: bit-identical with the feature off.
+	std::optional<std::pair<glm::quat, glm::vec3>> video_unshift;
+	if (auto a = alignment.lock(); a->active)
+	{
+		glm::quat aq(a->correction.orientation.w,
+		             a->correction.orientation.x,
+		             a->correction.orientation.y,
+		             a->correction.orientation.z);
+		glm::vec3 ap(a->correction.position.x, a->correction.position.y, a->correction.position.z);
+		glm::quat iq = glm::conjugate(aq);
+		video_unshift.emplace(iq, iq * -ap);
+	}
 	for (size_t i = 0; i < view_count + use_alpha; ++i)
 	{
 		auto & blit_handle = current_blit_handles[i];
@@ -1250,6 +1269,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			foveation[i] = blit_handle->view_info.foveation[i];
 			pose[i] = blit_handle->view_info.pose[i];
+			if (video_unshift)
+			{
+				auto & [iq, ip] = *video_unshift;
+				glm::quat q(pose[i].orientation.w,
+				            pose[i].orientation.x,
+				            pose[i].orientation.y,
+				            pose[i].orientation.z);
+				glm::vec3 p(pose[i].position.x, pose[i].position.y, pose[i].position.z);
+				glm::quat rq = iq * q;
+				glm::vec3 rp = iq * p + ip;
+				pose[i].orientation = {rq.x, rq.y, rq.z, rq.w};
+				pose[i].position = {rp.x, rp.y, rp.z};
+			}
 			fov[i] = blit_handle->view_info.fov[i];
 			// colour image
 			images[i] = {
