@@ -636,6 +636,19 @@ bool settings_tracking(const settings_context & ctx)
 	if (ctx.system.hand_tracking_supported())
 		feature_toggle("##hand", _C("setting name", "Hand tracking"), _("Track your hands for input when controllers are down."), feature::hand_tracking);
 
+	if (ctx.system.hand_tracking_supported())
+		list.push_back({
+		        .id = "##hands_emulate_controllers",
+		        .label = _C("setting name", "Hands emulate controllers"),
+		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. On: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles)."),
+		        .ui = ui_kind::toggle,
+		        .get_bool = [&config] { return config.hands_emulate_controllers; },
+		        .set_bool = [&config](bool v) { config.hands_emulate_controllers = v; config.save(); },
+		        .default_bool = default_config.hands_emulate_controllers,
+		        .enabled = [&ctx] { return not ctx.in_game; },
+		        .disabled_tooltip = disconnect_tip,
+		});
+
 	if (application::get_eye_gaze_supported())
 		feature_toggle("##eye", _C("setting name", "Eye tracking"), _("Used by foveated encoding to focus quality where you look."), feature::eye_gaze);
 
