@@ -192,6 +192,7 @@ struct configuration
 	int port = wivrn::default_port;
 	std::string hostname = wivrn::hostname();
 	service_publication publication = service_publication::avahi;
+	bool early_start = true;
 
 	// monostate: default value, string: user defined, nullptr: disabled
 	std::variant<std::monostate, std::string, std::nullptr_t> openvr_compat_path;

@@ -165,6 +165,17 @@ How to publish the service over the network, `avahi` or null.
 
 If set to null, service will not be published and address has to be entered manually on the headset.
 
+## `early-start`
+Default value: `true`
+
+Start the OpenXR session at boot from the cached headset spec, so
+applications can target WiVRn as the active runtime before any headset
+is connected. When the first headset connects and its spec differs from
+the cached one, the session refuses the connection (same as a headset
+swap mid-session) until the server is restarted; matching headsets
+resume seamlessly. If no cached spec exists yet (first boot), the server
+falls back to waiting for a headset as usual.
+
 ## `openvr-compat-path`
 Default value: unset
 
