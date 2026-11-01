@@ -968,6 +968,14 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 						autoconnect_enabled = true;
 					}
 				}
+
+				// A retry dial connected but its stream died before pushing
+				// (e.g. post-restart flakiness) without a new restart
+				// notice: keep consuming the remaining budget instead of
+				// stranding the dead scene with no redial armed while the
+				// error popup stays suppressed.
+				if (restart_attempts_left > 0 and not restart_retry_at and not async_session.valid())
+					restart_retry_at = frame_state.predictedDisplayTime + server_restart_retry_delay;
 				break;
 
 			default:

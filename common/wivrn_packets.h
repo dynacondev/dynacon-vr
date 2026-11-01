@@ -807,7 +807,9 @@ struct server_message
 
 		// the session is restarting for this headset (buffered):
 		// the client should automatically reconnect. Appended, never
-		// reordered: old clients ignore unknown kinds.
+		// reordered, keeping wire values stable. (Cross-version peers
+		// never reach this switch: the protocol-version handshake
+		// hashes every enum entry, so both sides must match.)
 		restarting,
 	};
 
