@@ -235,7 +235,7 @@ public:
 private:
 	void run_net(std::stop_token stop);
 	void run_worker(std::stop_token stop);
-	void reconnect(std::stop_token stop);
+	void reconnect(std::stop_token stop, bool first);
 
 	void pause_session();
 	void resume_session();
