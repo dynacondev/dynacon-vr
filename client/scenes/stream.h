@@ -211,6 +211,8 @@ private:
 
 	thread_safe<std::queue<std::string>> stream_error_queue;
 
+	std::atomic<bool> server_restart_requested_{false};
+
 	XrAction kiosk_chord_left_action = XR_NULL_HANDLE;
 	XrAction kiosk_chord_right_action = XR_NULL_HANDLE;
 	XrAction recenter_left = XR_NULL_HANDLE;
@@ -440,6 +442,14 @@ public:
 	bool hid_forwarding_enabled() const
 	{
 		return hid_forwarding;
+	}
+
+	// Set when the server announces a restart for this headset: the
+	// lobby should automatically reconnect (bounded) instead of
+	// dropping to the server list.
+	bool consume_server_restart_request()
+	{
+		return server_restart_requested_.exchange(false);
 	}
 
 	void exit();

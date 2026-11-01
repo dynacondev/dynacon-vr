@@ -66,6 +66,23 @@ class lobby : public scene_impl<lobby>
 	std::string server_name;
 	bool autoconnect_enabled = true;
 
+	// Server-restart auto-reconnect: armed when a stream reports the
+	// server is restarting for this headset (early-session spec
+	// conflict). Redials the last dialled server, bounded, then falls
+	// back to the server list.
+	static constexpr int server_restart_max_attempts = 3;
+	static constexpr XrDuration server_restart_retry_delay = 3'000'000'000LL;
+	configuration::server_data retry_server_data;
+	bool has_retry_server = false;
+	int restart_attempts_left = 0;
+	std::optional<XrTime> restart_retry_at;
+	bool async_is_retry = false;
+	bool restart_retry_pending() const
+	{
+		return restart_attempts_left > 0 or restart_retry_at.has_value();
+	}
+	void disarm_server_restart_retry();
+
 	// Last known uinput forwarding state of the connected server, kept after disconnection so the
 	// settings can warn that forwarded keyboard and mouse will not reach the server.
 	std::optional<bool> server_hid_forwarding;
@@ -274,7 +291,7 @@ class lobby : public scene_impl<lobby>
 
 	void setup_passthrough();
 
-	void connect(const configuration::server_data & data);
+	void connect(const configuration::server_data & data, bool is_retry = false);
 	std::unique_ptr<wivrn_session> connect_to_session(wivrn_discover::service service, bool manual_connection);
 
 	std::optional<glm::vec3> check_recenter_gesture(xr::spaces space, const xr::hand_tracker::joint_array & joints, const std::pair<glm::vec3, glm::quat> & head_pose);
