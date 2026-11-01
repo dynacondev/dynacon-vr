@@ -61,6 +61,10 @@ private:
 
 public:
 	wivrn_connection(std::stop_token stop_token, encryption_state state, std::string pin, TCP && tcp);
+	// Headless connection for early-start: carries a cached headset spec
+	// with no live sockets (inactive). reset() with a real TCP later
+	// performs the usual handshake and replaces the spec.
+	wivrn_connection(const from_headset::headset_info_packet & info, encryption_state state, std::string pin);
 	wivrn_connection(const wivrn_connection &) = delete;
 	wivrn_connection & operator=(const wivrn_connection &) = delete;
 
