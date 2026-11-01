@@ -139,7 +139,9 @@ struct configuration
 
 	// Origin alignment ("alignment" -> "local-origin"): re-base the
 	// headset's outgoing tracking so the PC-side STAGE/LOCAL origin
-	// sits at solvedFiducialPose * offset (yaw + position only).
+	// sits at solvedFiducialPose * offset. Yaw + position are taken
+	// from the measured board frame (headset gravity trusted); the
+	// offset itself applies in full.
 	// Single entry; unset (default) disables.
 	struct alignment_origin
 	{

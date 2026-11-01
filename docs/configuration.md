@@ -330,8 +330,9 @@ Default value: unset (feature disabled)
 Cockpit/rig origin alignment. When set, the headset continuously
 re-bases its outgoing tracking from the resolved fiducial frame, so the
 PC-side OpenXR `STAGE`/`LOCAL` origin sits at
-`solvedFiducialPose * offset` — yaw and position only, headset gravity
-trusted (pitch/roll from the print are discarded). The resolved
+`solvedFiducialPose * offset` — yaw and position of the *measured*
+board frame (headset gravity trusted: print pitch/roll are discarded),
+with the configured `offset` then applying in full. The resolved
 (smoothed) pose feeds the correction directly, same as passthrough
 object placement: while the fiducial is visible the origin servos every
 frame, on loss the last correction holds indefinitely, and before the

@@ -1081,7 +1081,8 @@ struct passthrough_object
 // Referenced fiducial id (single, must exist in fiducials). Offset is
 // fiducial-to-origin, same convention as passthrough objects: position
 // in meters, orientation as xyzw quaternion (parsed from [rx, ry, rz]
-// degrees). Only yaw + position are applied (headset gravity trusted).
+// degrees). Yaw + position are taken from the measured board frame
+// (headset gravity trusted); the offset itself applies in full.
 struct alignment_origin
 {
 	// Referenced fiducial id (single; dangling refs deactivate alignment).
