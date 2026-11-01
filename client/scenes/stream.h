@@ -259,8 +259,15 @@ private:
 	// Kiosk "Waiting for Simulation" overlay: shown over the (idle) video
 	// while connected with no XR application active. Render thread only,
 	// except stream_apps_known which latches on the network thread.
+	// When a sim is detected while the loader is visible in the hidden
+	// tab, it smoothstep-fades the panel out over kiosk_fade_s instead of
+	// popping; stream_kiosk_shown stays true during the fade so layout,
+	// passthrough and chord handling treat it as visible throughout.
 	bool stream_kiosk_dismissed = false;
 	bool stream_kiosk_shown = false;
+	bool stream_kiosk_fading = false;
+	XrTime stream_kiosk_hide_start = 0;
+	float stream_kiosk_alpha = 1.f;
 	bool stream_had_active_app = false;
 	XrTime last_kiosk_app_req = 0;
 	XrTime last_stream_kiosk_toggle = 0;

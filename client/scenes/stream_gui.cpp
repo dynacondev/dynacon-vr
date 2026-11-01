@@ -1070,9 +1070,11 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	wivrn::ui::set_hover_haptic([this] { imgui_ctx->vibrate_on_hover(); });
 	wivrn::ui::set_tooltip_hook([this](const char * text) { imgui_ctx->tooltip(text); });
 
-	// model planes wheeling behind the waiting overlay (hidden otherwise)
+	// model planes wheeling behind the waiting overlay (hidden otherwise).
+	// They snap off the moment the fade starts (still hidden behind the
+	// ~opaque panel); only the panel itself fades.
 	if (kiosk_planes_)
-		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown);
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown && !stream_kiosk_fading);
 
 	ImVec2 viewport_size(imgui_ctx->layers()[0].vp_size.x, imgui_ctx->layers()[0].vp_size.y);
 	ImVec2 content_size{viewport_size - ImVec2{tab_width, 0} - margin_around_window * 2};
@@ -1124,6 +1126,13 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4{th.background.x, th.background.y, th.background.z, bg_alpha});
 
 	ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 0);
+	// Kiosk fade-out: scale the whole panel (background + spinner + text)
+	// via global alpha so the 1s smoothstep works regardless of compositor
+	// color-scale support. stream_kiosk_shown stays true through the fade,
+	// so the centered loader layout above is kept until it completes.
+	const bool kiosk_fade_push = gui_status == stream_tab::hidden && stream_kiosk_shown;
+	if (kiosk_fade_push)
+		ImGui::PushStyleVar(ImGuiStyleVar_Alpha, stream_kiosk_alpha);
 	if (always_auto_resize)
 	{
 		ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {8, 8});
@@ -1346,6 +1355,8 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		wivrn::ui::shell_dividers(top_bar_h, tab_width);
 	}
 	ImGui::End();
+	if (kiosk_fade_push)
+		ImGui::PopStyleVar(); // ImGuiStyleVar_Alpha (kiosk fade-out)
 	ImGui::PopStyleVar(2);  // ImGuiStyleVar_ChildBorderSize, ImGuiStyleVar_WindowPadding
 	ImGui::PopStyleColor(); // ImGuiCol_WindowBg
 	gui_build_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gui_build_t0).count();
