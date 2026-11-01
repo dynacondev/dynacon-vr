@@ -32,6 +32,7 @@
 #include "active_runtime.h"
 #include "avahi_publisher.h"
 #include "driver/configuration.h"
+#include "driver/headset_cache.h"
 #include "driver/wivrn_connection.h"
 #include "exit_codes.h"
 #include "ipc_server_cb.h"
@@ -218,6 +219,14 @@ guint pairing_timeout;
 std::string pin;
 NotifyNotification * pin_notification;
 
+// True while an early-started session (from cached spec, no headset yet)
+// is running. The parent holds no TCP listener in this state: the child
+// accepts the first headset itself via its reconnect path.
+bool early_server = false;
+// Set when a real headset connection reaches a session (child accept).
+// Distinguishes "early server still headless" from later state.
+bool headset_ever_connected = false;
+
 // Delay until the next connection is allowed, increased after each incorrect attempt
 const std::chrono::milliseconds default_delay_next_try = 10ms;
 std::chrono::milliseconds delay_next_try = default_delay_next_try;
@@ -305,11 +314,12 @@ void start_server(configuration config)
 
 			server_watch = 0;
 			server_kill_watch = 0;
+			early_server = false;
 
 			update_fsm(); }, nullptr);
 	}
 
-	if (do_active_runtime)
+	if (do_active_runtime and not runtime_setter)
 		runtime_setter.emplace();
 }
 
@@ -377,6 +387,35 @@ void start_publishing()
 void stop_publishing()
 {
 	publisher.reset();
+}
+
+void try_early_start()
+{
+	configuration config;
+	if (not config.early_start)
+		return;
+
+	auto cached = load_headset_cache();
+	if (not cached)
+	{
+		std::cerr << "No cached headset spec, waiting for headset before starting session" << std::endl;
+		return;
+	}
+
+	std::cerr << "Starting session early from cached headset spec (" << cached->system_name << ")" << std::endl;
+
+	// Handed to the forked child; the parent keeps no use for it.
+	connection = std::make_unique<wivrn_connection>(*cached, enc_state, pin);
+
+	if (do_active_runtime and not runtime_setter)
+		runtime_setter.emplace();
+
+	// Stop listening BEFORE forking: the child inherits the fd and binds
+	// its own listener on first-headset wait; a lingering parent copy
+	// would keep the port bound in the child.
+	stop_listening();
+	start_server(config);
+	early_server = true;
 }
 
 void update_fsm()
@@ -522,12 +561,18 @@ gboolean control_received(gint fd, GIOCondition condition, gpointer user_data)
 		std::visit(utils::overloaded{
 		                   [&](const wivrn::from_headset::headset_info_packet & info) {
 			                   on_headset_info_packet(info);
+			                   save_headset_cache(info);
 			                   inhibitor.emplace();
 			                   wivrn_server_set_headset_connected(dbus_server, true);
 		                   },
 		                   [&](const wivrn::from_headset::settings_changed & settings) {
 			                   wivrn_server_set_preferred_refresh_rate(dbus_server, settings.preferred_refresh_rate);
 			                   wivrn_server_set_bitrate(dbus_server, settings.bitrate_bps);
+			                   if (auto cached = load_headset_cache())
+			                   {
+				                   cached->settings = settings;
+				                   save_headset_cache(*cached);
+			                   }
 		                   },
 		                   [&](const wivrn::from_headset::start_app & request) {
 			                   const auto & apps = list_applications();
@@ -547,6 +592,7 @@ gboolean control_received(gint fd, GIOCondition condition, gpointer user_data)
 			                   stop_publishing();
 			                   inhibitor.emplace();
 			                   wivrn_server_set_headset_connected(dbus_server, true);
+			                   headset_ever_connected = true;
 		                   },
 		                   [&](const from_monado::headset_disconnected &) {
 			                   start_publishing();
@@ -709,6 +755,8 @@ gboolean on_handle_enable_pairing(WivrnServer * skeleton, GDBusMethodInvocation 
 gboolean on_handle_disable_pairing(WivrnServer * skeleton, GDBusMethodInvocation * invocation, gpointer user_data)
 {
 	set_encryption_state(wivrn_connection::encryption_state::enabled);
+	if (early_server and not headset_ever_connected)
+		kill_server();
 	g_dbus_method_invocation_return_value(invocation, nullptr);
 	return G_SOURCE_CONTINUE;
 }
@@ -911,7 +959,13 @@ void on_name_acquired(GDBusConnection * connection, const gchar * name, gpointer
 	                                 NULL);
 
 	if (enc_state != wivrn_connection::encryption_state::disabled and known_keys().empty())
+	{
 		set_encryption_state(wivrn_connection::encryption_state::pairing);
+		// A pairing-state change invalidates the headless crypto state:
+		// fall back to a lazy accept so the next handshake is fresh.
+		if (early_server and not headset_ever_connected)
+			kill_server();
+	}
 	else
 		set_encryption_state(enc_state);
 
@@ -994,6 +1048,11 @@ int inner_main(int argc, char * argv[], bool show_instructions)
 
 	// Initialize listener
 	start_listening();
+
+	// Start the session early from the cached headset spec so OpenXR
+	// apps can target WiVRn before any headset connects. Falls back to
+	// the classic headset-wait when disabled or without cache.
+	try_early_start();
 
 	// Catch SIGINT & SIGTERM
 	g_unix_signal_add(SIGINT, &sigint, (void *)SIGINT);
