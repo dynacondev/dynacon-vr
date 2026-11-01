@@ -18,10 +18,10 @@ Default value: 10-bit if supported by the selected codec, encoder and decoder. 8
 Bit depth of the video. 8-bit is supported by all encoders. 10-bit is supported by `vulkan`, `vaapi` and `nvenc` with `h265` or `av1` codecs.
 
 ## `encoder`
-The encoder to use, either a single string or object applied to all streams, or a list of string or objects with values for left, right and alpha.
+The encoder to use, either a single string or object applied to all streams, or a list of string or objects with values for left, right, alpha and virtual depth (in that order).
 When a string it is used, it is equivalent to the `encoder` item of the object.
 
-WiVRn encodes each eye separately, and the alpha channel as one for both eyes. Each stream is processed independently, this may use resources more effectively and reduce latency.
+WiVRn encodes each eye separately, and the alpha channel as one for both eyes. Each stream is processed independently, this may use resources more effectively and reduce latency. A fourth stream carries the warped virtual depth (640x320 side-by-side, 8-bit 1cm/LSB) for depth-tested passthrough; it prefers `h265` and is pinned to ~5% of the total bitrate.
 
 ### `encoder`
 Default value, in order: `vulkan` if supported, `nvenc` on Nvidia GPU, `vaapi` on all other GPU, else `x264`.
@@ -78,6 +78,10 @@ Use vaapi hardware encoding, h265 video codec (HEVC).
 ```
 Creates a hardware encoder for left eye and transparency, and a software encoder for right eye.
 
+A list may also have 3 entries (left, right, alpha): the virtual depth
+stream then uses default selection (same backend as configured, H.265
+preferred when the headset supports it).
+
 ### `device`, only for vaapi
 Default value: unset
 
@@ -112,6 +116,45 @@ If `false` or unset, WiVRn will use both TCP and UDP.
 ```json
 {
 	"tcp-only": true
+}
+```
+
+## `reprojection`
+Server-side depth reprojection: every frame carrying depth is
+reprojected from its known generation pose to the latest predicted
+pose before encode.
+
+### `enabled`
+Default value: `true`
+
+Master switch for the warp. `false` serves frames straight (no
+reprojection).
+
+### `source-reverse-z`
+Default value: `true`
+
+Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
+Vulkan). Normal-Z apps set `false` explicitly.
+
+### `gpu-priority`
+Default value: `high`
+
+Device-global queue priority for the compositor, transfer and encode
+queues: `high` prefers our submits when the app saturates the GPU (the
+only lever that arbitrates across our Vulkan device and the app's).
+`medium` requests nothing (driver default). `realtime` additionally
+needs OS privilege (CAP_SYS_NICE) and falls back to high, then
+default, when denied — the won tier is logged at startup. Silently
+default when the driver lacks support.
+
+### Example
+```json
+{
+	"reprojection": {
+		"enabled": true,
+		"source-reverse-z": true,
+		"gpu-priority": "high"
+	}
 }
 ```
 

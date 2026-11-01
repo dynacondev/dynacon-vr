@@ -1168,7 +1168,20 @@ void application::initialize_actions()
 		profile.available = std::ranges::all_of(profile.required_extensions, [&](auto & ext) { return xr_instance.has_extension(ext); }) and
 		                    profile.min_version <= api_version;
 
-		if (profile.profile_name.ends_with("khr/simple_controller") and not get_hmd_traits().bind_simple_controller)
+		// Hands-only mode (default): never let hands masquerade as
+		// controllers. The Quest runtime fakes khr/simple_controller when
+		// hand tracking is on, and any runtime with suggested
+		// ext/hand_interaction_ext bindings auto-switches /user/hand/*
+		// between controller and hand profiles, flapping X-Plane between
+		// touch_controller_plus and null on every pinch. Withholding both
+		// profiles keeps hands on the 26-joint hand-tracking path only;
+		// real controllers (touch_*, etc.) are unaffected.
+		const bool hands_emulate_controllers = application::get_config().hands_emulate_controllers;
+		if (profile.profile_name.ends_with("ext/hand_interaction_ext") and not hands_emulate_controllers)
+			profile.available = false;
+
+		if (profile.profile_name.ends_with("khr/simple_controller") and
+		    (not get_hmd_traits().bind_simple_controller or not hands_emulate_controllers))
 			profile.available = false;
 
 		if (!profile.available)
@@ -1233,6 +1246,9 @@ void application::initialize_actions()
 				sources.push_back(source);
 		}
 	}
+
+	if (not application::get_config().hands_emulate_controllers)
+		spdlog::info("Hands-only mode: simple_controller and hand_interaction bindings withheld, hands report joints only");
 
 	// For each possible input source, create a XrAction and add it to the suggested binding
 	std::unordered_map<std::string, XrAction> actions_by_name;

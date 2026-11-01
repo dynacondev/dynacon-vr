@@ -26,6 +26,7 @@
 #include "wivrn_packets.h"
 
 #include <magic_enum.hpp>
+#include <span>
 #include <string>
 #include <vulkan/vulkan.hpp>
 
@@ -44,12 +45,20 @@ namespace wivrn
 
 static const double passthrough_bitrate_factor = 0.05;
 
-static void split_bitrate(std::array<wivrn::encoder_settings, 3> & encoders, uint64_t bitrate)
+// Depth stream (index 3, 640x320 SBS virtual depth) is pinned to 5% of the
+// total bitrate: it is tiny, low-entropy 8-bit luma, and must not starve
+// color. Weights for 0..2 are area-based as before; depth weight is derived
+// from their sum so the final share is exactly depth_share.
+static const double depth_bitrate_share = 0.05;
+
+static void split_bitrate(std::array<wivrn::encoder_settings, 4> & encoders, uint64_t bitrate)
 {
 	assert(bitrate > 0);
-	double total_weight = 0;
+	double color_weight = 0;
 	for (auto [i, encoder]: std::ranges::enumerate_view(encoders))
 	{
+		if (i == 3)
+			continue;
 		double w = encoder.width * encoder.height;
 		if (i == 2)
 			w *= passthrough_bitrate_factor;
@@ -64,8 +73,10 @@ static void split_bitrate(std::array<wivrn::encoder_settings, 3> & encoders, uin
 				break;
 		}
 		encoder.bitrate = w;
-		total_weight += w;
+		color_weight += w;
 	}
+	encoders[3].bitrate = color_weight * depth_bitrate_share / (1.0 - depth_bitrate_share);
+	double total_weight = color_weight + encoders[3].bitrate;
 
 	for (auto & encoder: encoders)
 	{
@@ -74,7 +85,7 @@ static void split_bitrate(std::array<wivrn::encoder_settings, 3> & encoders, uin
 	}
 }
 
-void print_encoders(const std::array<wivrn::encoder_settings, 3> & encoders)
+void print_encoders(const std::array<wivrn::encoder_settings, 4> & encoders)
 {
 	std::stringstream str;
 	str << "Encoder configuration:";
@@ -283,23 +294,43 @@ static uint16_t align(uint16_t value, uint16_t alignment)
 	return ((value + alignment - 1) / alignment) * alignment;
 }
 
-std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, wivrn_session & session)
+std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, wivrn_session & session)
 {
 	configuration config;
 
-	std::array<wivrn::encoder_settings, 3> res;
+	std::array<wivrn::encoder_settings, 4> res;
 	const auto & info = session.get_info();
 	const auto settings = *session.get_settings();
 
 	prober prober{bundle, info};
 
-	for (auto [src, dst]: std::ranges::zip_view(config.encoders, res))
+	for (auto [i, src_dst]: std::ranges::enumerate_view(std::ranges::zip_view(config.encoders, res)))
 	{
+		auto & [src, dst] = src_dst;
 		dst.fps = session.default_fps();
 		dst.options = src.options;
 		dst.device = src.device;
 
 		std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(src);
+
+		// Depth stream (index 3) prefers H.265: lossy-tolerant 8-bit luma
+		// carrying 1cm/LSB virtual depth. If the config did not pin a
+		// codec, the headset advertised H.265, and H.265 probes cleanly
+		// on this backend, switch to it.
+		if (i == 3 and not src.codec and dst.codec != wivrn::h265 and
+		    std::ranges::contains(info.supported_codecs, wivrn::h265, &video_codec_capability::codec))
+		{
+			try
+			{
+				configuration::encoder depth_cfg = src;
+				depth_cfg.codec = wivrn::h265;
+				std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(depth_cfg);
+			}
+			catch (std::exception &)
+			{
+				// Keep the probed fallback (e.g. H.264-only stacks).
+			}
+		}
 	}
 
 	auto width = align(info.stream_eye_width, 64);
@@ -310,6 +341,16 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 	for (auto [i, dst]: std::ranges::enumerate_view(res))
 	{
+		if (i == 3) // virtual depth SBS: fixed 640x320 (L|R halves 320x320)
+		{
+			dst.width = 640;
+			dst.height = 320;
+			uint16_t w = dst.width, h = dst.height;
+			check_video_size(dst.encoder_name, dst.codec, w, h);
+			dst.width = w;
+			dst.height = h;
+			continue;
+		}
 		dst.width = width;
 		dst.height = height;
 		if (i == 2) // alpha channel
@@ -321,10 +362,13 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	if (bit_depth and bit_depth != 8 and bit_depth != 10)
 		throw std::runtime_error("invalid bit-depth setting. supported values: 8, 10");
 
-	const bool all_encoders_10bit = std::ranges::all_of(res, [&](const encoder_settings & encoder) {
-		auto it = std::ranges::find(info.supported_codecs, encoder.codec, &video_codec_capability::codec);
-		return it != info.supported_codecs.end() and it->supports_10bit;
-	});
+	// Depth (index 3) is always 8-bit on its own staging image: it must
+	// not veto 10-bit color, nor be probed at 10-bit.
+	const bool all_encoders_10bit = std::ranges::all_of(
+	        std::span(res).first(3), [&](const encoder_settings & encoder) {
+		        auto it = std::ranges::find(info.supported_codecs, encoder.codec, &video_codec_capability::codec);
+		        return it != info.supported_codecs.end() and it->supports_10bit;
+	        });
 
 	if (bit_depth == 10 and not all_encoders_10bit)
 	{
@@ -357,8 +401,10 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 #if WIVRN_USE_VAAPI
 	auto check_vaapi = [&](int bit_depth) {
-		for (const auto & encoder: res)
+		for (const auto [i, encoder]: std::ranges::enumerate_view(res))
 		{
+			if (i == 3)
+				continue; // depth is always 8-bit, probed separately
 			if (encoder.encoder_name == encoder_vaapi)
 			{
 				try
@@ -402,6 +448,10 @@ std::array<encoder_settings, 3> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 	for (auto & i: res)
 		i.bit_depth = bit_depth.value_or(10);
+	// Virtual depth is defined as 8-bit 1cm/LSB luma regardless of the
+	// color bit depth: forcing 8-bit avoids wasting bits on a 10-bit
+	// depth container no client code reads.
+	res[3].bit_depth = 8;
 
 	split_bitrate(res, settings.bitrate_bps);
 	return res;

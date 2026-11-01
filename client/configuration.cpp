@@ -221,7 +221,7 @@ void configuration::set_feature(feature f, bool state)
 configuration::configuration(xr::system & system, xr::session & session)
 {
 	passthrough_enabled = system.passthrough_supported() == xr::passthrough_type::color;
-	features[feature::hand_tracking] = false;
+	features[feature::hand_tracking] = system.hand_tracking_supported();
 
 	const auto & rates = session.get_refresh_rates();
 	preferred_refresh_rate = rates.empty() ? 0 : rates[0];
@@ -333,6 +333,7 @@ const std::vector<config_field> & configuration::config_fields()
 	        scalar("forward_keyboard", &configuration::forward_keyboard),
 	        scalar("forward_mouse", &configuration::forward_mouse),
 	        scalar("forward_gamepad", &configuration::forward_gamepad),
+	        scalar("hands_emulate_controllers", &configuration::hands_emulate_controllers),
 	        scalar("virtual_keyboard_layout", &configuration::virtual_keyboard_layout),
 	        scalar("override_foveation_enable", &configuration::override_foveation_enable),
 	        scalar("override_foveation_pitch", &configuration::override_foveation_pitch),

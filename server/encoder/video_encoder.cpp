@@ -24,6 +24,7 @@
 
 #include "encoder_settings.h"
 #include "os/os_time.h"
+#include "util/u_logging.h"
 #include "utils/wivrn_trace.h"
 #include "wivrn_config.h"
 
@@ -77,7 +78,14 @@ video_encoder::sender::sender() :
 void video_encoder::sender::push(data && d)
 {
 	std::unique_lock lock(mutex);
+	if (d.span.empty())
+		sender_empty_spans.fetch_add(1, std::memory_order_relaxed);
 	pending.push_back(std::move(d));
+	uint64_t depth = pending.size();
+	uint64_t prev = sender_max_depth.load(std::memory_order_relaxed);
+	while (depth > prev and not sender_max_depth.compare_exchange_weak(prev, depth, std::memory_order_relaxed))
+	{
+	}
 	cv.notify_all();
 }
 
@@ -233,19 +241,31 @@ void video_encoder::set_framerate(float framerate)
 	pending_framerate = framerate;
 }
 
-void video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index)
+video_encoder::present_outcome video_encoder::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo info, uint64_t frame_index)
 {
 	wivrn::trace::scope trace_present(wivrn::trace::cpu_track::encoder, stream_idx, frame_index, "present_image");
-	// Wait for encoder to be done
 	present_slot = (present_slot + 1) % num_slots;
-	state[present_slot].wait(busy);
+	// Non-blocking: if the worker hasn't consumed this slot, skip the
+	// frame (routine backpressure under load, never a park). The poll
+	// precedes should_skip: that call mutates IDR state, and a skip
+	// decided after it would poison the state machine.
+	if (state[present_slot].load(std::memory_order_acquire) != idle)
+	{
+		state[present_slot].store(skip, std::memory_order_release);
+		return present_outcome::skipped_busy;
+	}
 	if (idr->should_skip(frame_index, stream_idx))
 	{
 		state[present_slot] = skip;
-		return;
+		return present_outcome::skipped_idr;
 	}
 	state[present_slot] = busy;
-	return present_image(y_cbcr, info, present_slot, frame_index);
+	if (not try_present_image(y_cbcr, info, present_slot, frame_index))
+	{
+		state[present_slot] = skip;
+		return present_outcome::skipped_busy;
+	}
+	return present_outcome::presented;
 }
 
 void video_encoder::encode(wivrn_session & cnx,
@@ -266,7 +286,12 @@ void video_encoder::encode(wivrn_session & cnx,
 	idle_setter i{state[encode_slot]};
 
 	if (state[encode_slot] == skip)
+	{
+		// Commit-time skip consumed (IDR or backpressure — already
+		// counted at present). Counted here as empty: no bytes follow.
+		encode_empty_frames.fetch_add(1, std::memory_order_relaxed);
 		return;
+	}
 
 	if (shared_sender)
 		shared_sender->wait_idle(this);
@@ -289,15 +314,76 @@ void video_encoder::encode(wivrn_session & cnx,
 	auto data = encode(encode_slot, frame_index);
 	if (data)
 	{
+		encode_data_frames.fetch_add(1, std::memory_order_relaxed);
 		timing_info.encode_end = clock.to_headset(os_monotonic_get_ns());
 		assert(shared_sender);
 		shared_sender->push(std::move(*data));
 	}
+	else
+		encode_empty_frames.fetch_add(1, std::memory_order_relaxed);
+}
+
+void video_encoder::note_frame_kind(uint64_t frame_index, bool warped)
+{
+	std::lock_guard lock(mutex);
+	size_kind_by_frame[frame_index] = warped;
+	// In-flight frames are bounded by the compositor image pool; drop
+	// anything ancient so a lost frame can't grow the map.
+	while (not size_kind_by_frame.empty() and size_kind_by_frame.begin()->first + 16 < frame_index)
+		size_kind_by_frame.erase(size_kind_by_frame.begin());
+	maybe_report_size_locked();
+}
+
+void video_encoder::accumulate_size_locked(uint64_t frame_index, size_t bytes, bool end_of_frame)
+{
+	bool warped = false;
+	if (auto it = size_kind_by_frame.find(frame_index); it != size_kind_by_frame.end())
+		warped = it->second;
+	if (warped)
+		size_w_bytes += bytes;
+	else
+		size_s_bytes += bytes;
+	if (end_of_frame)
+	{
+		if (warped)
+			size_w_frames += 1;
+		else
+			size_s_frames += 1;
+		size_kind_by_frame.erase(frame_index);
+	}
+	maybe_report_size_locked();
+}
+
+void video_encoder::maybe_report_size_locked()
+{
+	uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+	if (size_win_start_ns == 0)
+	{
+		size_win_start_ns = now_ns;
+		return;
+	}
+	if (now_ns - size_win_start_ns < 5'000'000'000ull)
+		return;
+	U_LOG_I("encode size triage (5 s): stream %u warped %llu frames %llu bytes (avg %llu) straight %llu frames %llu bytes (avg %llu)",
+	        stream_idx,
+	        (unsigned long long)size_w_frames,
+	        (unsigned long long)size_w_bytes,
+	        (unsigned long long)(size_w_frames ? size_w_bytes / size_w_frames : 0),
+	        (unsigned long long)size_s_frames,
+	        (unsigned long long)size_s_bytes,
+	        (unsigned long long)(size_s_frames ? size_s_bytes / size_s_frames : 0));
+	size_win_start_ns = now_ns;
+	size_w_frames = 0;
+	size_w_bytes = 0;
+	size_s_frames = 0;
+	size_s_bytes = 0;
 }
 
 void video_encoder::SendData(std::span<uint8_t> data, bool end_of_frame, bool control)
 {
 	std::lock_guard lock(mutex);
+	if (not control)
+		accumulate_size_locked(shard.frame_idx, data.size(), end_of_frame);
 	if (shard.shard_idx == 0)
 	{
 		// One SendData call per NAL; span the whole frame, not each call.

@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <deque>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -85,6 +86,19 @@ public:
 	static const uint8_t num_slots = 2;
 	const double bitrate_multiplier;
 
+	// Shared wedge counter: every backend increments this on a fence
+	// timeout in the worker path (commit-thread present polls don't count
+	// — those are routine backpressure). Read by the compositor triage.
+	static inline std::atomic<uint64_t> wedge_timeouts{0};
+	// Throughput-drain counters (logging only, read by the compositor
+	// triage): worker encode() outcomes, sender queue pressure, and
+	// empty-span pushes (an empty span makes the sender thread spin on
+	// the queue head without popping — this counter proves it absent).
+	static inline std::atomic<uint64_t> encode_data_frames{0};
+	static inline std::atomic<uint64_t> encode_empty_frames{0};
+	static inline std::atomic<uint64_t> sender_max_depth{0};
+	static inline std::atomic<uint64_t> sender_empty_spans{0};
+
 private:
 	using state_t = std::atomic_unsigned_lock_free::value_type;
 	static const state_t idle = 0;
@@ -101,6 +115,20 @@ private:
 
 	// shard to send
 	to_headset::video_stream_data_shard shard;
+
+	// Encoded-size triage (logging only): frame_idx -> warped flag for
+	// in-flight frames, plus per-window byte/frame totals split by
+	// kind. Fed by note_frame_kind on the worker thread, consumed in
+	// SendData (any thread); all under mutex.
+	std::map<uint64_t, bool> size_kind_by_frame;
+	uint64_t size_win_start_ns = 0;
+	uint64_t size_w_frames = 0;
+	uint64_t size_w_bytes = 0;
+	uint64_t size_s_frames = 0;
+	uint64_t size_s_bytes = 0;
+
+	void accumulate_size_locked(uint64_t frame_index, size_t bytes, bool end_of_frame);
+	void maybe_report_size_locked();
 
 	to_headset::video_stream_data_shard::timing_info_t timing_info;
 	clock_offset clock;
@@ -124,9 +152,19 @@ public:
 	video_encoder(vk_bundle &, uint8_t stream_idx, uint32_t target_queue, const encoder_settings & settings, std::unique_ptr<idr_handler>, bool async_send);
 	virtual ~video_encoder();
 
-	void present_image(vk::Image y_cbcr,
-	                   vk::SemaphoreSubmitInfo sem_info,
-	                   uint64_t frame_index);
+	// Outcome of the commit-thread handoff. Both skip variants advance
+	// present_slot/encode_slot in lockstep (the worker consumes skips).
+	// skip (encoder state) == drop (triage): the frame is shed, nothing
+	// is lost. Only skipped_busy counts as backpressure in triage.
+	enum class present_outcome
+	{
+		presented,
+		skipped_idr,
+		skipped_busy,
+	};
+	present_outcome present_image(vk::Image y_cbcr,
+	                            vk::SemaphoreSubmitInfo sem_info,
+	                            uint64_t frame_index);
 
 	void on_feedback(const from_headset::feedback &);
 	void reset();
@@ -140,9 +178,16 @@ public:
 	            const to_headset::video_stream_data_shard::view_info_t & view_info,
 	            uint64_t frame_index);
 
+	// Tags a frame for the encoded-size triage below. Called on the
+	// worker thread before encode() for the same frame.
+	void note_frame_kind(uint64_t frame_index, bool warped);
+
 protected:
-	// called on present to submit command buffers for the image.
-	virtual void present_image(vk::Image y_cbcr,
+	// Called on present to submit command buffers for the image.
+	// Returns false when the slot's previous work hasn't completed (fence
+	// or sender-busy poll miss): the caller marks the frame skipped
+	// without recording or mutating any backend state. Must not block.
+	virtual bool try_present_image(vk::Image y_cbcr,
 	                           vk::SemaphoreSubmitInfo sem_info,
 	                           uint8_t slot,
 	                           uint64_t frame_index) = 0;

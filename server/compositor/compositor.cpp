@@ -31,11 +31,17 @@
 #include "util/u_time.h"
 #include "vk/vk_helpers.h"
 
+#include "driver/configuration.h"
 #include "driver/wivrn_session.h"
 #include "encoder/video_encoder.h"
 #include "inplace_vector.hpp"
+#include "math/m_space.h"
 #include "utils/method.h"
 #include "utils/wivrn_trace.h"
+
+#include <atomic>
+#include <cstring>
+#include <format>
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 #ifdef XRT_FEATURE_RENDERDOC
@@ -87,6 +93,31 @@ const comp_swapchain_image & get_layer_image(const comp_layer & layer, uint32_t 
 	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_swapchain(&layer, swapchain_index))->images[image_index];
 }
 
+const comp_swapchain_image & get_layer_depth_image(const comp_layer & layer, uint32_t swapchain_index, uint32_t image_index)
+{
+	return reinterpret_cast<struct comp_swapchain *>(comp_layer_get_depth_swapchain(&layer, swapchain_index))->images[image_index];
+}
+
+// Server config is startup-read: parsed once here, cached in the
+// compositor members at construction.
+struct reprojection_switches
+{
+	bool enabled;
+	bool source_reverse_z;
+};
+
+const reprojection_switches & cached_reprojection_switches()
+{
+	static const reprojection_switches switches = [] {
+		const auto config = wivrn::configuration();
+		return reprojection_switches{
+		        config.reprojection.enabled,
+		        config.reprojection.source_reverse_z,
+		};
+	}();
+	return switches;
+}
+
 std::array<vk::Format, 3> image_formats(int bit_depth)
 {
 	switch (bit_depth)
@@ -107,7 +138,7 @@ std::array<vk::Format, 3> image_formats(int bit_depth)
 	throw std::runtime_error(std::format("Unsupported bit depth {}", bit_depth));
 }
 
-std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::CommandPool command_pool, std::span<wivrn::encoder_settings> encoders)
+std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, std::span<wivrn::encoder_settings> encoders)
 {
 	auto formats = image_formats(encoders[0].bit_depth);
 
@@ -185,6 +216,98 @@ std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, vk::C
 		                        },
 		                },
 		        }};
+	};
+
+	return {make_image(0), make_image(1)};
+}
+
+// Virtual-depth staging (stream 3): 640x320 SBS YCbCr, depth packed into
+// layer 3 so encoder backends keep indexing baseArrayLayer == stream_idx.
+// Always 8-bit (1cm/LSB luma + neutral chroma), independent of the color
+// bit depth. Own image (not a 4th layer of the color image): different
+// extent and formats.
+std::array<wivrn::compositor::depth_image, 2> make_depth_images(wivrn::vk_bundle & vk, const wivrn::encoder_settings & depth_settings)
+{
+	auto formats = image_formats(8);
+
+	vk::StructureChain image_info{
+	        vk::ImageCreateInfo{
+	                .flags = vk::ImageCreateFlagBits::eExtendedUsage | vk::ImageCreateFlagBits::eMutableFormat,
+	                .imageType = vk::ImageType::e2D,
+	                .format = formats.back(),
+	                .extent = {
+	                        .width = depth_settings.width,
+	                        .height = depth_settings.height,
+	                        .depth = 1,
+	                },
+	                .mipLevels = 1,
+	                .arrayLayers = 4, // depth lives in layer 3
+	                .samples = vk::SampleCountFlagBits::e1,
+	                // STORAGE (pack write) + TRANSFER_DST (chroma clear) +
+	                // TRANSFER_SRC (encoder copy-out, like the color image).
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+	        },
+	        vk::ImageFormatListCreateInfo{
+	                .viewFormatCount = formats.size(),
+	                .pViewFormats = formats.data(),
+	        },
+	};
+#if WIVRN_USE_VULKAN_ENCODE
+	if (
+	        std::get<vk::PhysicalDeviceVideoMaintenance1FeaturesKHR>(vk.feat).videoMaintenance1 and
+	        depth_settings.encoder_name == wivrn::encoder_vulkan)
+	{
+		image_info.get().flags |= vk::ImageCreateFlagBits::eVideoProfileIndependentKHR;
+		image_info.get().usage |= vk::ImageUsageFlagBits::eVideoEncodeSrcKHR;
+	}
+#endif
+
+	auto make_image = [&](int i) {
+		image_allocation image{
+		        vk.device,
+		        image_info.get(),
+		        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
+		        std::format("depth SBS image {}", i),
+		};
+		vk::Image raw{image};
+		vk::ImageViewUsageCreateInfo usage{
+		        .usage = vk::ImageUsageFlagBits::eStorage,
+		};
+		vk::raii::ImageView view_y{
+		        vk.device,
+		        {
+		                .pNext = &usage,
+		                .image = raw,
+		                .viewType = vk::ImageViewType::e2D,
+		                .format = formats[0],
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 3,
+		                        .layerCount = 1,
+		                },
+		        },
+		};
+		vk::raii::ImageView view_cbcr{
+		        vk.device,
+		        {
+		                .pNext = &usage,
+		                .image = raw,
+		                .viewType = vk::ImageViewType::e2D,
+		                .format = formats[1],
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 3,
+		                        .layerCount = 1,
+		                },
+		        },
+		};
+		return wivrn::compositor::depth_image{
+		        .image = std::move(image),
+		        .out_y = std::move(view_y),
+		        .out_cbcr = std::move(view_cbcr),
+		};
 	};
 
 	return {make_image(0), make_image(1)};
@@ -277,23 +400,174 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 {
 	u_graphics_sync_unref(&sync_handle);
 
+	// Reprojection triage (logging only, no behavior change): 5 s
+	// window counting commits, warped vs straight frames, silent
+	// commit-path drops, inter-commit gaps over ~1.5x the display
+	// period, and CPU wall time of the warp block below.
+	static std::atomic<uint64_t> triage_win_start_ns{0};
+	static std::atomic<uint64_t> triage_commits{0};
+	static std::atomic<uint64_t> triage_warped{0};
+	static std::atomic<uint64_t> triage_straight{0};
+	static std::atomic<uint64_t> triage_drop_busy{0};
+	static std::atomic<uint64_t> triage_drop_acquire{0};
+	static std::atomic<uint64_t> triage_gap_over{0};
+	static std::atomic<uint64_t> triage_gap_worst_ns{0};
+	static std::atomic<uint64_t> triage_drop_present{0};
+	static std::atomic<uint64_t> triage_query_miss{0};
+	// Present outcomes per stream (left, right, alpha, depth): totals
+	// below stay comparable to history, the depth triplet isolates
+	// virtual-depth drops from color behavior.
+	static std::array<std::atomic<uint64_t>, 4> triage_presented{{{0}, {0}, {0}, {0}}};
+	static std::array<std::atomic<uint64_t>, 4> triage_skipped_idr{{{0}, {0}, {0}, {0}}};
+	static std::array<std::atomic<uint64_t>, 4> triage_skipped_busy{{{0}, {0}, {0}, {0}}};
+	static std::atomic<uint64_t> triage_last_frame_id{0};
+	static std::atomic<uint64_t> triage_fid_stall{0};
+	static std::atomic<uint64_t> triage_warp_ns_sum{0};
+	static std::atomic<uint64_t> triage_warp_ns_max{0};
+	static std::atomic<uint64_t> triage_warp_samples{0};
+	static std::atomic<uint64_t> triage_last_commit_ns{0};
+
+	uint64_t triage_now_ns = uint64_t(os_monotonic_get_ns());
+	uint64_t triage_last_ns = triage_last_commit_ns.exchange(triage_now_ns, std::memory_order_relaxed);
+	triage_commits.fetch_add(1, std::memory_order_relaxed);
+	uint64_t triage_start_ns = triage_win_start_ns.load(std::memory_order_relaxed);
+	if (triage_start_ns == 0)
+	{
+		triage_win_start_ns.store(triage_now_ns, std::memory_order_relaxed);
+		triage_start_ns = triage_now_ns;
+	}
+	if (triage_last_ns != 0)
+	{
+		uint64_t triage_gap_ns = triage_now_ns - triage_last_ns;
+		uint64_t triage_limit_ns = pacer.get_frame_duration() + pacer.get_frame_duration() / 2;
+		if (triage_gap_ns > triage_limit_ns)
+		{
+			triage_gap_over.fetch_add(1, std::memory_order_relaxed);
+			if (triage_gap_ns > triage_gap_worst_ns.load(std::memory_order_relaxed))
+				triage_gap_worst_ns.store(triage_gap_ns, std::memory_order_relaxed);
+		}
+	}
+	if (triage_now_ns - triage_start_ns > 5'000'000'000ull and
+	    triage_win_start_ns.compare_exchange_strong(triage_start_ns, triage_now_ns, std::memory_order_relaxed))
+	{
+		uint64_t triage_n_commits = triage_commits.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_warped = triage_warped.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight = triage_straight.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_drop_busy = triage_drop_busy.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_drop_acquire = triage_drop_acquire.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_gap_over = triage_gap_over.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_gap_worst_ns = triage_gap_worst_ns.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_drop_present = triage_drop_present.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_query_miss = triage_query_miss.exchange(0, std::memory_order_relaxed);
+		// Per-stream snapshot first (depth triplet), then totals, so the
+		// depth breakdown survives the drain.
+		uint64_t triage_n_stream_presented[4]{}, triage_n_stream_idr[4]{}, triage_n_stream_busy[4]{};
+		for (int i = 0; i < 4; ++i)
+		{
+			triage_n_stream_presented[i] = triage_presented[i].exchange(0, std::memory_order_relaxed);
+			triage_n_stream_idr[i] = triage_skipped_idr[i].exchange(0, std::memory_order_relaxed);
+			triage_n_stream_busy[i] = triage_skipped_busy[i].exchange(0, std::memory_order_relaxed);
+		}
+		uint64_t triage_n_presented = triage_n_stream_presented[0] + triage_n_stream_presented[1] + triage_n_stream_presented[2] + triage_n_stream_presented[3];
+		uint64_t triage_n_skipped_idr = triage_n_stream_idr[0] + triage_n_stream_idr[1] + triage_n_stream_idr[2] + triage_n_stream_idr[3];
+		uint64_t triage_n_skipped_busy = triage_n_stream_busy[0] + triage_n_stream_busy[1] + triage_n_stream_busy[2] + triage_n_stream_busy[3];
+		uint64_t triage_n_fid_stall = triage_fid_stall.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_enc_data = video_encoder::encode_data_frames.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_enc_empty = video_encoder::encode_empty_frames.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_sender_max = video_encoder::sender_max_depth.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_sender_empty = video_encoder::sender_empty_spans.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_wedge = video_encoder::wedge_timeouts.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_warp_ns_sum = triage_warp_ns_sum.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_warp_ns_max = triage_warp_ns_max.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_warp_samples = triage_warp_samples.exchange(0, std::memory_order_relaxed);
+		double triage_warp_avg_us = triage_n_warp_samples ? double(triage_n_warp_ns_sum) / double(triage_n_warp_samples) / 1000.0 : 0.0;
+		float triage_warp_gpu_max_us = warp_gpu_window_max_us;
+		warp_gpu_window_max_us = 0;
+		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu presented %llu skipped_idr %llu skipped_busy %llu depth_presented %llu depth_idr %llu depth_busy %llu enc_data %llu enc_empty %llu sender_max %llu sender_empty %llu fid_stall %llu",
+		        (unsigned long long)triage_n_commits,
+		        (unsigned long long)triage_n_warped,
+		        (unsigned long long)triage_n_straight,
+		        (unsigned long long)triage_n_drop_busy,
+		        (unsigned long long)triage_n_drop_acquire,
+		        (unsigned long long)triage_n_gap_over,
+		        double(triage_n_gap_worst_ns) / 1000000.0,
+		        triage_warp_avg_us,
+		        double(triage_n_warp_ns_max) / 1000.0,
+		        (unsigned long long)triage_n_warp_samples,
+		        double(triage_warp_gpu_max_us),
+		        (unsigned long long)triage_n_drop_present,
+		        (unsigned long long)triage_n_query_miss,
+		        (unsigned long long)triage_n_wedge,
+		        (unsigned long long)triage_n_presented,
+		        (unsigned long long)triage_n_skipped_idr,
+		        (unsigned long long)triage_n_skipped_busy,
+		        (unsigned long long)triage_n_stream_presented[3],
+		        (unsigned long long)triage_n_stream_idr[3],
+		        (unsigned long long)triage_n_stream_busy[3],
+		        (unsigned long long)triage_n_enc_data,
+		        (unsigned long long)triage_n_enc_empty,
+		        (unsigned long long)triage_n_sender_max,
+		        (unsigned long long)triage_n_sender_empty,
+		        (unsigned long long)triage_n_fid_stall);
+		if (triage_n_gap_over)
+		{
+			U_LOG_W("reprojection triage: %llu commit gaps over 1.5x period in 5 s window, worst %.2f ms",
+			        (unsigned long long)triage_n_gap_over,
+			        double(triage_n_gap_worst_ns) / 1000000.0);
+		}
+	}
+
 	// Move waited frame to rendering frame, clear waited.
 	comp_frame_move_and_clear_locked(&frame.rendering, &frame.waited);
 
 	U_LOG_IFL_D(log_level, "frame %ld commit %d layers", frame.rendering.id, layer_accum.layer_count);
 
-	if (encode_request >= 0 // encoders have not picked up the previous frame
-	    or not session.connected() or not session.get_offset())
+	if (encode_request >= 0) // encoders have not picked up the previous frame
+	{
+		triage_drop_busy.fetch_add(1, std::memory_order_relaxed);
+		comp_frame_clear_locked(&frame.rendering);
+		return XRT_SUCCESS;
+	}
+	if (not session.connected() or not session.get_offset())
 	{
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
 	}
 
-	int i = acquire_image();
-	if (i < 0)
+	int slot = acquire_image();
+	if (slot < 0)
 	{
+		triage_drop_acquire.fetch_add(1, std::memory_order_relaxed);
 		comp_frame_clear_locked(&frame.rendering);
 		return XRT_SUCCESS;
+	}
+
+	// Lazy timestamp read for this slot: these queries describe the last
+	// submit that used it, whose completion is implied by image slot
+	// having recycled — so the poll almost always hits and never parks.
+	// A miss means the GPU is more than a frame behind: count it (it
+	// doubles as the wedge detector), never wait for it. Polls before
+	// the resetQueryPool below, which would discard the results.
+	if (query_armed[slot])
+	{
+		auto [qres, ts] = query_pools[slot].getResults<uint64_t>(
+		        0,
+		        4,
+		        4 * sizeof(uint64_t),
+		        sizeof(uint64_t),
+		        vk::QueryResultFlagBits::e64);
+		if (qres == vk::Result::eSuccess)
+		{
+			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
+			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
+			float warp_gpu_us = (ts[2] - ts[1]) * period / 1e3;
+			warp_times.add(warp_gpu_us);
+			if (warp_gpu_us > warp_gpu_window_max_us)
+				warp_gpu_window_max_us = warp_gpu_us;
+			foveation_times.add((ts[3] - ts[2]) * period / 1e3);
+		}
+		else
+			triage_query_miss.fetch_add(1, std::memory_order_relaxed);
 	}
 
 #ifdef XRT_FEATURE_RENDERDOC
@@ -301,8 +575,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		r->StartFrameCapture(NULL, NULL);
 #endif
 
-	auto & view_info = images[i].view_info;
-	images[i].frame_index = frame.rendering.id;
+	auto & view_info = images[slot].view_info;
+	images[slot].frame_index = frame.rendering.id;
 	view_info = {
 	        .display_time = session.get_offset().to_headset(frame.rendering.predicted_display_time_ns),
 	        .alpha = layer_accum.data.env_blend_mode == XRT_BLEND_MODE_ALPHA_BLEND,
@@ -310,16 +584,38 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
-	cmd_pool.reset();
+	// Per-slot frame context: everything this commit records or uploads
+	// lives in this slot, owned until image slot recycles (see TODO.md). Only
+	// this slot's pool is reset; the other slot may still execute.
+	auto & cmd = cmds[slot];
+	auto & query_pool = query_pools[slot];
+	cmd_pools[slot].reset();
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
 
-	cmd.resetQueryPool(*query_pool, 0, 3);
+	cmd.resetQueryPool(*query_pool, 0, 4);
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 0);
 
 	bool flip_y = false;
 	std::array<vk::ImageView, 2> src;
 	std::array<xrt_rect, 2> src_rect;
 	std::array<xrt_fov, 2> src_fov;
+
+	// Depth reprojection inputs, valid only when has_depth_src is set
+	// by the single-layer fast path below. Depth always travels paired
+	// with its color (or the layer is plain PROJECTION): no freshness
+	// tracking, no retained store.
+	std::array<vk::ImageView, 2> src_depth{};
+	std::array<std::array<float, 4>, 2> src_color_nrect{};
+	std::array<std::array<float, 4>, 2> src_depth_nrect{};
+	std::array<float, 2> src_near_z{1, 1};
+	std::array<float, 2> src_far_z{1000, 1000};
+	std::array<xrt_pose, 2> src_pose{};
+	bool has_depth_src = false;
+
+	// Latest predicted warp target, filled by the entry point below and
+	// consumed by the foveation reroute when a warp recorded.
+	std::array<xrt_pose, 2> dst_pose{};
+	std::array<xrt_fov, 2> dst_fov{};
 
 	beman::inplace_vector::inplace_vector<vk::ImageMemoryBarrier2, 3> image_barriers;
 
@@ -329,6 +625,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	     layer_accum.layers[0].data.type == XRT_LAYER_PROJECTION_DEPTH))
 	{
 		const auto & layer = layer_accum.layers[0];
+		has_depth_src = layer.data.type == XRT_LAYER_PROJECTION_DEPTH;
 		for (int view = 0; view < 2; ++view)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
@@ -341,16 +638,47 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			flip_y = layer.data.flip_y;
 			view_info.pose[view] = xrt_cast(data.pose);
 			view_info.fov[view] = xrt_cast(data.fov);
+			src_pose[view] = data.pose;
+			const auto & cnr = data.sub.norm_rect;
+			src_color_nrect[view] = {cnr.x, cnr.y, cnr.w, cnr.h};
+			if (has_depth_src)
+			{
+				const auto & dvd = layer.data.depth.d[view];
+				src_depth[view] = get_image_view(
+				        &get_layer_depth_image(layer, view, dvd.sub.image_index),
+				        layer.data.flags,
+				        dvd.sub.array_index);
+				const auto & dnr = dvd.sub.norm_rect;
+				src_depth_nrect[view] = {dnr.x, dnr.y, dnr.w, dnr.h};
+				src_near_z[view] = dvd.near_z;
+				src_far_z[view] = dvd.far_z;
+			}
 		}
 	}
 	else
 	{
-		// no fast-path, squash layers
+		// no fast-path, squash layers. A depth layer here means the
+		// warp stands down for this commit (throttled note).
+		bool squash_has_depth = false;
+		for (uint32_t li = 0; li < layer_accum.layer_count; ++li)
+			squash_has_depth = squash_has_depth or layer_accum.layers[li].data.type == XRT_LAYER_PROJECTION_DEPTH;
+		if (squash_has_depth)
+		{
+			static std::atomic<uint64_t> last_stand_down_ns{0};
+			uint64_t now_ns = uint64_t(os_monotonic_get_ns());
+			if (now_ns - last_stand_down_ns.load(std::memory_order_relaxed) > 5'000'000'000ull)
+			{
+				last_stand_down_ns.store(now_ns, std::memory_order_relaxed);
+				U_LOG_W("depth reprojection standing down: %u layers (need exactly 1), serving straight",
+				        layer_accum.layer_count);
+			}
+		}
 		std::array<xrt_pose, 2> poses;
 		const auto extent = images[0].image.info().extent;
 		std::tie(poses, src_fov, src_rect) = squasher.do_layers(
 		        vk.device,
 		        cmd,
+		        slot,
 		        session.get_hmd(),
 		        pacer.get_frame_duration(),
 		        frame.rendering,
@@ -382,17 +710,20 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        });
 	}
 
+	// NOTE: the warp block lives below (after q1) so the timestamp
+	// queries bracket squash / warp / foveation in GPU order.
+
 	image_barriers.push_back(
 	        vk::ImageMemoryBarrier2{
 	                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
 	                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
 	                .oldLayout = vk::ImageLayout::eUndefined,
 	                .newLayout = vk::ImageLayout::eGeneral,
-	                .image = images[i].image,
+	                .image = images[slot].image,
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
-	                        .layerCount = images[i].image.info().arrayLayers,
+	                        .layerCount = images[slot].image.info().arrayLayers,
 	                },
 	        });
 
@@ -404,26 +735,260 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
+	// Depth reprojection entry point (v3): a single depth layer warps
+	// from its own generation pose/images to the latest predicted pose,
+	// at most once per commit. Position matters: this records after q1
+	// so the queries bracket squash / warp / foveation in GPU order.
+	// On a recorded warp the foveation call below reads the warp output
+	// with the dst poses; otherwise the frame flows straight unchanged.
+	bool warped = false;
+	bool triage_time_warp = has_depth_src and depth_reprojection_enabled;
+	uint64_t triage_warp_start_ns = triage_time_warp ? uint64_t(os_monotonic_get_ns()) : 0;
+	if (has_depth_src and depth_reprojection_enabled)
+	{
+		// Both planes travel the same import chain, so they share one
+		// row-order decision. Live evidence (v2): a hardcoded depth
+		// flip here rendered warped frames vertically mirrored, so
+		// this follows the color plane — do not "fix" per-plane.
+		const bool flip_color = !flip_y;
+		const bool flip_depth = !flip_y;
+
+		// Latest predicted target: fresh tracker poses/FOV at this
+		// tick's display time. get_view_poses returns head-relative eye
+		// offsets plus the head-in-world relation (Monado device
+		// contract): compose world-space targets here.
+		xrt_space_relation head{};
+		bool dst_ok = session.get_hmd().get_view_poses(
+		        nullptr,
+		        frame.rendering.predicted_display_time_ns,
+		        XRT_VIEW_TYPE_STEREO,
+		        2,
+		        &head,
+		        dst_fov.data(),
+		        dst_pose.data()) == XRT_SUCCESS;
+		if (dst_ok)
+		{
+			for (int view = 0; view < 2; ++view)
+			{
+				xrt_relation_chain xrc{};
+				xrt_space_relation rel = XRT_SPACE_RELATION_ZERO;
+				m_relation_chain_push_pose_if_not_identity(&xrc, &dst_pose[view]);
+				m_relation_chain_push_relation(&xrc, &head);
+				m_relation_chain_resolve(&xrc, &rel);
+				dst_pose[view] = rel.pose;
+			}
+			// Preset true: the per-eye loop below ANDs each result
+			// in, so any single degenerate view serves the whole
+			// frame straight (earlier views' scratch writes are
+			// harmless — scratch only).
+			warped = true;
+			for (int view = 0; view < 2 && warped; ++view)
+			{
+				warped = reprojector.reproject(
+				        vk.device,
+				        cmd,
+				        slot,
+				        view,
+				        src[view],
+				        src_depth[view],
+				        src_color_nrect[view],
+				        src_depth_nrect[view],
+				        flip_color,
+				        flip_depth,
+				        src_pose[view],
+				        src_fov[view],
+				        src_near_z[view],
+				        src_far_z[view],
+				        dst_pose[view],
+				        dst_fov[view]);
+			}
+		}
+	}
+	// Remember for the encoder size triage (present path below).
+	images[slot].warped_frame = warped;
+	if (triage_time_warp)
+	{
+		uint64_t triage_warp_ns = uint64_t(os_monotonic_get_ns()) - triage_warp_start_ns;
+		triage_warp_ns_sum.fetch_add(triage_warp_ns, std::memory_order_relaxed);
+		triage_warp_samples.fetch_add(1, std::memory_order_relaxed);
+		if (triage_warp_ns > triage_warp_ns_max.load(std::memory_order_relaxed))
+			triage_warp_ns_max.store(triage_warp_ns, std::memory_order_relaxed);
+	}
+	if (warped)
+		triage_warped.fetch_add(1, std::memory_order_relaxed);
+	else
+		triage_straight.fetch_add(1, std::memory_order_relaxed);
+
 	if (session.get_info().eye_gaze)
 	{
 		auto now = os_monotonic_get_ns();
 		session.add_tracking_request(device_id::EYE_GAZE, frame.rendering.desired_present_time_ns, now, now);
 	}
-	view_info.foveation = foveation.foveate(
-	        vk.device,
-	        cmd,
-	        images[i].view_y,
-	        images[i].view_cbcr,
-	        flip_y,
-	        src,
-	        src_rect,
-	        src_fov,
-	        view_info.alpha);
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
+
+	if (warped)
+	{
+		// The warp output carries this tick's predicted pose: publish
+		// it and foveate from the warp targets (full-eye, GL-ordered
+		// by construction) instead of the layer images.
+		for (int view = 0; view < 2; ++view)
+		{
+			view_info.pose[view] = xrt_cast(dst_pose[view]);
+			view_info.fov[view] = xrt_cast(dst_fov[view]);
+		}
+		const auto warp_extent = images[0].image.info().extent;
+		const std::array<xrt_rect, 2> warp_rect{
+		        xrt_rect{
+		                .offset = {.w = 0, .h = 0},
+		                .extent = {.w = int(warp_extent.width), .h = int(warp_extent.height)},
+		        },
+		        xrt_rect{
+		                .offset = {.w = 0, .h = 0},
+		                .extent = {.w = int(warp_extent.width), .h = int(warp_extent.height)},
+		        },
+		};
+		view_info.foveation = foveation.foveate(
+		        vk.device,
+		        cmd,
+		        slot,
+		        images[slot].view_y,
+		        images[slot].view_cbcr,
+		        true,
+		        reprojector.get_views(slot),
+		        warp_rect,
+		        dst_fov,
+		        view_info.alpha);
+	}
+	else
+	{
+		view_info.foveation = foveation.foveate(
+		        vk.device,
+		        cmd,
+		        slot,
+		        images[slot].view_y,
+		        images[slot].view_cbcr,
+		        flip_y,
+		        src,
+		        src_rect,
+		        src_fov,
+		        view_info.alpha);
+	}
+
+	// Virtual-depth pack (stream 3): MIN-pool the warp's target-view splat
+	// to 320x320 per eye, linearise, quantize 1cm/LSB into the 640x320 SBS
+	// staging image (layer 3). Runs only on warped frames with valid
+	// near/far; otherwise images[slot].has_depth stays false and the
+	// worker never touches the depth encoder (strict pairing: no stale
+	// virtual depth on the client).
+	images[slot].has_depth = false;
+	if (warped)
+	{
+		auto & depth = depth_images[slot];
+
+		// Same shape as the color top-of-commit barrier: contents are
+		// fully overwritten every packed frame (Y by the pack dispatch
+		// below, CbCr by the neutral clear), so Undefined discards and
+		// no first-use tracking is needed. Single eColor barrier (both
+		// planes): dst covers the transfer clear and the compute pack.
+		std::array depth_pre{
+		        vk::ImageMemoryBarrier2{
+		                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
+		                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader,
+		                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite,
+		                .oldLayout = vk::ImageLayout::eUndefined,
+		                .newLayout = vk::ImageLayout::eGeneral,
+		                .image = depth.image,
+		                .subresourceRange = {
+		                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                        .levelCount = 1,
+		                        .baseArrayLayer = 3,
+		                        .layerCount = 1,
+		                },
+		        },
+		};
+		cmd.pipelineBarrier2({
+		        .imageMemoryBarrierCount = depth_pre.size(),
+		        .pImageMemoryBarriers = depth_pre.data(),
+		});
+
+		// Neutral chroma for the luma-only depth payload (GENERAL is a
+		// legal layout for vkCmdClearColorImage; no ping-pong needed).
+		// memcpy: ClearColorValue union members are C arrays here (same
+		// as the splat clear in depth_reprojector), not assignable.
+		vk::ClearColorValue neutral{};
+		const float chroma[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0.0f, 1.0f};
+		std::memcpy(neutral.float32, chroma, sizeof(chroma));
+		cmd.clearColorImage(
+		        depth.image,
+		        vk::ImageLayout::eGeneral,
+		        neutral,
+		        vk::ImageSubresourceRange{
+		                .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+		                .levelCount = 1,
+		                .baseArrayLayer = 3,
+		                .layerCount = 1,
+		        });
+
+		const auto splat_views = reprojector.get_splat_views(slot);
+		const auto warp_extent = images[0].image.info().extent;
+		if (packer.pack(
+		            vk.device,
+		            cmd,
+		            slot,
+		            splat_views[0],
+		            splat_views[1],
+		            vk::Extent2D{warp_extent.width, warp_extent.height},
+		            src_near_z[0],
+		            src_far_z[0],
+		            src_near_z[1],
+		            src_far_z[1],
+		            *depth.out_y))
+		{
+			auto & depth_enc = encoders[3];
+			// Mirrors the color encoder handoff: single eColor barrier
+			// over the layer the backend reads, so the release range
+			// matches the backend acquire's eColor range. src covers
+			// the pack (compute) and the neutral clear (transfer).
+			if (depth_enc->need_transfer or depth_enc->target_queue == vk.queue.family_index)
+			{
+				std::array depth_post{
+				        vk::ImageMemoryBarrier2{
+				                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader | vk::PipelineStageFlagBits2KHR::eTransfer,
+				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite,
+				                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+				                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+				                .oldLayout = vk::ImageLayout::eGeneral,
+				                .newLayout = depth_enc->target_layout,
+				                .srcQueueFamilyIndex = vk.queue.family_index,
+				                .dstQueueFamilyIndex = depth_enc->target_queue,
+				                .image = depth.image,
+				                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+				                                     .baseMipLevel = 0,
+				                                     .levelCount = 1,
+				                                     .baseArrayLayer = 3,
+				                                     .layerCount = 1},
+				        },
+				};
+				cmd.pipelineBarrier2({
+				        .imageMemoryBarrierCount = depth_post.size(),
+				        .pImageMemoryBarriers = depth_post.data(),
+				});
+			}
+			images[slot].has_depth = true;
+		}
+	}
+	// Carried on the color frame's view_info (and the depth frame's):
+	// lets the client tell "no depth by design" from "depth expected
+	// but missing" (wire loss or pairing miss). Set after the pack
+	// block above, before the encoder handoff below.
+	images[slot].view_info.depth_expected = images[slot].has_depth;
 
 	for (auto & encoder: encoders)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
+		if (encoder->stream_idx == 3)
+			continue; // virtual depth: separate image, wired in depth commit
 		else if (encoder->need_transfer or encoder->target_queue == vk.queue.family_index)
 		{
 			image_barriers.push_back(
@@ -444,7 +1009,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			                .newLayout = encoder->target_layout,
 			                .srcQueueFamilyIndex = vk.queue.family_index,
 			                .dstQueueFamilyIndex = encoder->target_queue,
-			                .image = images[i].image,
+			                .image = images[slot].image,
 			                .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
 			                                     .baseMipLevel = 0,
 			                                     .levelCount = 1,
@@ -458,7 +1023,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	        .imageMemoryBarrierCount = uint32_t(image_barriers.size()),
 	        .pImageMemoryBarriers = image_barriers.data(),
 	});
-	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 2);
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 3);
 
 	cmd.end();
 
@@ -480,21 +1045,71 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        .pSignalSemaphoreInfos = &sem_info,
 		});
 	}
+	query_armed[slot] = true;
 
 	pacer.mark_timing_point(COMP_TARGET_TIMING_POINT_SUBMIT_END, frame.rendering.id, os_monotonic_get_ns());
 	auto info = pacer.present_to_info(frame.rendering.desired_present_time_ns);
+
+	// Frame-ID sanity: the IDR wait-timeout (100 frames) can only fire
+	// while this advances. A stall here would make IDR suppression
+	// infinite-silent — count it so that theory stays falsifiable.
+	{
+		uint64_t prev_fid = triage_last_frame_id.exchange(info.frame_id, std::memory_order_relaxed);
+		if (prev_fid != 0 and info.frame_id <= prev_fid)
+			triage_fid_stall.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	for (auto & encoder: encoders)
 	{
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
-		encoder->present_image(
-		        images[i].image,
-		        sem_info,
-		        info.frame_id);
+		auto count_present = [&](video_encoder::present_outcome outcome) {
+			switch (outcome)
+			{
+				case video_encoder::present_outcome::presented:
+					triage_presented[encoder->stream_idx].fetch_add(1, std::memory_order_relaxed);
+					break;
+				case video_encoder::present_outcome::skipped_idr:
+					triage_skipped_idr[encoder->stream_idx].fetch_add(1, std::memory_order_relaxed);
+					break;
+				case video_encoder::present_outcome::skipped_busy:
+					triage_skipped_busy[encoder->stream_idx].fetch_add(1, std::memory_order_relaxed);
+					break;
+			}
+		};
+		// Non-blocking handoff, fully partitioned per stream: presented
+		// vs IDR-wait vs backpressure. A throw must not strand image
+		// slot either: count the drop and continue, the worker still
+		// recycles the image.
+		// Depth (stream 3) presents from its own staging image, only when
+		// this frame was packed (strict pairing: no depth, no present).
+		if (encoder->stream_idx == 3)
+		{
+			if (not images[slot].has_depth)
+				continue;
+			try
+			{
+				count_present(encoder->present_image(depth_images[slot].image, sem_info, info.frame_id));
+			}
+			catch (std::exception & e)
+			{
+				U_LOG_W("present error: %s", e.what());
+				triage_drop_present.fetch_add(1, std::memory_order_relaxed);
+			}
+			continue;
+		}
+		try
+		{
+			count_present(encoder->present_image(images[slot].image, sem_info, info.frame_id));
+		}
+		catch (std::exception & e)
+		{
+			U_LOG_W("present error: %s", e.what());
+			triage_drop_present.fetch_add(1, std::memory_order_relaxed);
+		}
 	}
 
-	auto j = encode_request.exchange(i);
+	auto j = encode_request.exchange(slot);
 	encode_request.notify_all();
 	assert(j == -1);
 
@@ -505,31 +1120,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	comp_frame_clear_locked(&frame.rendering);
 
-	if (vk.device.waitSemaphores(vk::SemaphoreWaitInfo{
-	                                     .semaphoreCount = 1,
-	                                     .pSemaphores = &*sem,
-	                                     .pValues = &sem_info.value,
-	                             },
-	                             U_TIME_1S_IN_NS) == vk::Result::eTimeout)
-	{
-		U_LOG_IFL_W(log_level, "compositor timeout");
-	}
-	else
-	{
-		auto [res, ts] = query_pool.getResults<uint64_t>(
-		        0,
-		        3,
-		        3 * sizeof(uint64_t),
-		        sizeof(uint64_t),
-		        vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
-
-		if (res == vk::Result::eSuccess)
-		{
-			static const auto period = vk.physical_device.getProperties().limits.timestampPeriod;
-			squasher_times.add((ts[1] - ts[0]) * period / 1e3);
-			foveation_times.add((ts[2] - ts[1]) * period / 1e3);
-		}
-	}
+	// Decoupled: no GPU-progress waits on the commit thread. This slot is
+	// owned until image slot recycles (which strictly postdates this
+	// submit's completion via the encoder semaphore/fifo chain), queries
+	// read lazily at the next acquire, and overload sheds via
+	// drop_busy/drop_acquire/drop_present — so nothing here needs
+	// completion. A slow GPU delays this frame's encode, never the next
+	// tick. (Garbage collection below needs no completion either: it
+	// only pops the app-governed destroy stack.)
 
 	// Now is a good point to garbage collect.
 	comp_swapchain_shared_garbage_collect(&cscs);
@@ -629,17 +1227,43 @@ void compositor::encoder_work(std::stop_token tok)
 
 		wivrn::trace::scope trace_iter(wivrn::trace::cpu_track::compositor, 0, image.frame_index, "encoder_work iter");
 
-		try
+		// Per-encoder errors: one encoder throwing must not stall the
+		// others' encode_slot while their present_slot already advanced
+		// (that would reuse a backend slot still in flight). image.busy
+		// still clears below in all cases.
+		for (auto & encoder: encoders)
 		{
-			for (auto & encoder: encoders)
+			// Depth (stream 3) encodes from its own staging image, only
+			// when this frame was packed (has_depth doubles as
+			// "present was attempted": the encode consumes the
+			// presented/skipped slot in lockstep, like color).
+			if (encoder->stream_idx == 3)
 			{
-				if (encoder->stream_idx < 2 or image.view_info.alpha)
+				if (not image.has_depth)
+					continue;
+				try
+				{
+					encoder->note_frame_kind(image.frame_index, image.warped_frame);
 					encoder->encode(session, image.view_info, image.frame_index);
+				}
+				catch (std::exception & e)
+				{
+					U_LOG_W("encode error: %s", e.what());
+				}
+				continue;
 			}
-		}
-		catch (std::exception & e)
-		{
-			U_LOG_W("encode error: %s", e.what());
+			if (encoder->stream_idx < 2 or image.view_info.alpha)
+			{
+				try
+				{
+					encoder->note_frame_kind(image.frame_index, image.warped_frame);
+					encoder->encode(session, image.view_info, image.frame_index);
+				}
+				catch (std::exception & e)
+				{
+					U_LOG_W("encode error: %s", e.what());
+				}
+			}
 		}
 		image.busy = false;
 	}
@@ -651,6 +1275,8 @@ void compositor::send_video_stream_description()
 	to_headset::video_stream_description desc{
 	        .width = uint16_t(images[0].image.info().extent.width),
 	        .height = uint16_t(images[0].image.info().extent.height),
+	        .depth_width = settings[3].width,
+	        .depth_height = settings[3].height,
 	        .frame_rate = settings[0].fps,
 	};
 	get_display_refresh_rate(&desc.refresh_rate);
@@ -679,23 +1305,43 @@ compositor::compositor(wivrn_session & session) :
         },
         log_level(debug_get_log_option_log()),
         session(session),
-        cmd_pool(vk.device, vk::CommandPoolCreateInfo{
-                                    .flags = vk::CommandPoolCreateFlagBits::eTransient,
-                                    .queueFamilyIndex = vk.queue.family_index,
-                            }),
-        query_pool(vk.device, vk::QueryPoolCreateInfo{
-                                      .queryType = vk::QueryType::eTimestamp,
-                                      .queryCount = 3,
-                              }),
         settings(get_encoder_settings(vk, session)),
-        images{make_images(vk, cmd_pool, settings)},
-        cmd{std::move(vk.device.allocateCommandBuffers({.commandPool = *cmd_pool, .commandBufferCount = 1})[0])},
+        images{make_images(vk, settings)},
         sem{make_semaphore(vk)},
         frame_rate(settings[0].fps),
         pacer(U_TIME_1S_IN_NS / frame_rate),
         squasher(vk, render_extent(session.get_info())),
-        foveation(vk, images[0].image.info().extent)
+        foveation(vk, images[0].image.info().extent),
+        reprojector(
+                vk,
+                vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
+                cached_reprojection_switches().source_reverse_z),
+        packer(vk),
+        depth_reprojection_enabled(cached_reprojection_switches().enabled),
+        depth_images{make_depth_images(vk, settings[3])}
 {
+	// Per-slot frame context (see TODO.md): one pool+buffer+query pool
+	// per compositor image, so the commit for images[slot] only ever resets
+	// and records its own slot while the other slot may still execute.
+	for (size_t slot = 0; slot < num_frame_slots; ++slot)
+	{
+		cmd_pools[slot] = vk::raii::CommandPool(
+		        vk.device,
+		        vk::CommandPoolCreateInfo{
+		                .flags = vk::CommandPoolCreateFlagBits::eTransient,
+		                .queueFamilyIndex = vk.queue.family_index,
+		        });
+		vk.name(cmd_pools[slot], std::format("compositor command pool {}", slot));
+		cmds[slot] = std::move(vk.device.allocateCommandBuffers(
+		        {.commandPool = *cmd_pools[slot], .commandBufferCount = 1})[0]);
+		query_pools[slot] = vk::raii::QueryPool(
+		        vk.device,
+		        vk::QueryPoolCreateInfo{
+		                .queryType = vk::QueryType::eTimestamp,
+		                .queryCount = 4,
+		        });
+		vk.name(query_pools[slot], std::format("compositor query pool {}", slot));
+	}
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers
 	assert(intptr_t(&base) == intptr_t(this));
@@ -755,6 +1401,10 @@ compositor::compositor(wivrn_session & session) :
 	u_var_add_root(this, "Compositor", false);
 	u_var_add_f32_timing(this, &squasher_times.var, "layers processing");
 	u_var_add_f32_timing(this, &foveation_times.var, "foveation");
+	u_var_add_f32_timing(this, &warp_times.var, "warp");
+	U_LOG_I("depth reprojection %s (source-reverse-z %s)",
+	        depth_reprojection_enabled ? "enabled" : "disabled",
+	        cached_reprojection_switches().source_reverse_z ? "true" : "false");
 
 	// Start the thread after everything is initialized
 	encoder_thread = std::jthread{[&](std::stop_token t) { encoder_work(t); }};

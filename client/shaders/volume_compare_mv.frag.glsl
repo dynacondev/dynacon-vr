@@ -63,6 +63,11 @@ pc;
 
 layout(set = 0, binding = 0) uniform sampler2DArray sensor_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray volume_tex;
+// Virtual-depth D canvas (same 320px 2-layer shape as volume_tex):
+// sensor-compatible D, 1.0 = far/no-virtual. Unpaired frames rebind the
+// volume canvas here, so min(v, v) = v reproduces the legacy sensor <
+// volume test bit-identically (no null descriptors, no shader variant).
+layout(set = 0, binding = 2) uniform sampler2DArray virt_tex;
 
 void main()
 {
@@ -104,6 +109,10 @@ void main()
 		vec2 suv0 = s;
 		float d0 = texture(sensor_tex, vec3(suv0, vi)).r;
 		float v = texture(volume_tex, vec3(uvi, vi)).r;
+		// Virtual occluder in the same D space: min() folds virtual and
+		// volume far walls into one occluder. Unpaired frames rebind the
+		// volume canvas (w == v), so the legacy test is bit-identical.
+		float w = texture(virt_tex, vec3(uvi, vi)).r;
 		// k guard per sub (see above for why it can't be shared).
 		float k_sens = ka * d0 + kb;
 		float k_vol = (v > 0.0) ? ka * v + kb : 0.0;
@@ -113,8 +122,13 @@ void main()
 		float d = texture(sensor_tex, vec3(suv1, vi)).r;
 
 		// Binary vote, hard guards (far d, empty v): the 4-level average
-		// IS the antialiasing, no band tuning involved.
-		inside += ok * (1.0 - step(v, d)) * step(1e-6, v) * (1.0 - step(0.9999, d));
+		// IS the antialiasing, no band tuning involved. The occluder is
+		// the nearer of the volume far wall and the virtual depth (both
+		// sensor-compatible D); 1.0 in either is far. The empty-volume
+		// gate stays on v alone: virt must never passthrough outside a
+		// volume (occ would be min(0, w) = 0 there anyway).
+		float occ = min(v, w);
+		inside += ok * (1.0 - step(occ, d)) * step(1e-6, v) * (1.0 - step(0.9999, d));
 	}
 	out_color = vec4(inside * 0.25);
 }

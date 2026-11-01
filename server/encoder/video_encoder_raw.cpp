@@ -63,7 +63,9 @@ wivrn::video_encoder_raw::video_encoder_raw(
 		throw std::runtime_error("Raw encoding is only supported for 8 bit");
 
 	vk::DeviceSize buffer_size = extent.width * extent.height;
-	if (stream_idx < 2)
+	// Alpha (stream 2) is luma-only; depth (stream 3) packs luma + neutral
+	// chroma like color.
+	if (stream_idx != 2)
 		buffer_size += buffer_size / 2;
 
 	auto command_buffers = vk.device.allocateCommandBuffers(
@@ -89,13 +91,15 @@ wivrn::video_encoder_raw::video_encoder_raw(
 	}
 }
 
-void wivrn::video_encoder_raw::present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
+bool wivrn::video_encoder_raw::try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t)
 {
-	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
-	{
-		U_LOG_E("Timeout on stream %d", stream_idx);
-		return;
-	}
+	// Polls, never park: fence guards the GPU copy, sender_busy guards
+	// the async sender thread (which has no fence). Both precede any
+	// recording into this slot.
+	if (vk.device.waitForFences(*in[slot].fence, true, 0) != vk::Result::eSuccess)
+		return false;
+	if (in[slot].sender_busy.load(std::memory_order_acquire))
+		return false;
 
 	auto & cmd = in[slot].cmd;
 	cmd.begin({.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit});
@@ -152,7 +156,7 @@ void wivrn::video_encoder_raw::present_image(vk::Image y_cbcr, vk::SemaphoreSubm
 	        vk::ImageLayout::eGeneral,
 	        in[slot].buffer,
 	        std::span(regions.data(),
-	                  stream_idx < 2 ? 2 : 1));
+	                  stream_idx != 2 ? 2 : 1));
 
 	cmd.end();
 
@@ -171,6 +175,7 @@ void wivrn::video_encoder_raw::present_image(vk::Image y_cbcr, vk::SemaphoreSubm
 	                               .pCommandBufferInfos = &cmd_info,
 	                       },
 	                       *in[slot].fence);
+	return true;
 }
 
 std::optional<wivrn::video_encoder::data> wivrn::video_encoder_raw::encode(uint8_t slot, uint64_t frame_id)
@@ -178,11 +183,23 @@ std::optional<wivrn::video_encoder::data> wivrn::video_encoder_raw::encode(uint8
 	if (vk.device.waitForFences(*in[slot].fence, true, 1'000'000'000) == vk::Result::eTimeout)
 	{
 		U_LOG_W("Timeout on stream %d", stream_idx);
+		wedge_timeouts.fetch_add(1, std::memory_order_relaxed);
 		return {};
 	}
 
+	// The sender thread transmits this span asynchronously: hold the
+	// slot until it is done, exactly like the vulkan busy flag.
+	in[slot].sender_busy.store(true, std::memory_order_release);
 	return wivrn::video_encoder::data{
 	        .encoder = this,
 	        .span = std::span<uint8_t>((uint8_t *)in[slot].buffer.map(), in[slot].buffer.info().size),
+	        // No waiter today (present polls via load); the notify is
+	        // kept for symmetry with the vulkan busy flag.
+	        .mem = std::shared_ptr<void>(
+	                &in[slot].sender_busy,
+	                [](auto * b) {
+				b->store(false, std::memory_order_release);
+				b->notify_all();
+			}),
 	};
 }

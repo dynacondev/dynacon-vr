@@ -245,7 +245,8 @@ decoder::decoder(vk::raii::Device & device,
         physical_device(physical_device),
         weak_scene(scene),
         accumulator(accumulator),
-        extent{description.width, description.height / (stream_index == 2 ? 2u : 1u)},
+        extent{stream_index == 3 ? description.depth_width : description.width,
+               stream_index == 3 ? description.depth_height : description.height / (stream_index == 2 ? 2u : 1u)},
         codec_type(description.codec[stream_index]),
         vk_queue_family_index(vk_queue_family_index)
 {

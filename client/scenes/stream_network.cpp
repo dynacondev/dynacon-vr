@@ -73,6 +73,10 @@ void scenes::stream::operator()(to_headset::video_stream_data_shard && shard)
 {
 	std::shared_lock lock(decoder_mutex);
 	uint8_t idx = shard.stream_item_idx;
+	// Per-stream payload accounting (network thread, atomics): smoothed
+	// into per-stream bitrates in accumulate_metrics (render thread).
+	if (idx < stream_rx_bytes.size())
+		stream_rx_bytes[idx].fetch_add(shard.payload.size(), std::memory_order_relaxed);
 	if (idx >= decoders.size())
 	{
 		// We don't know (yet?) about this stream, ignore packet

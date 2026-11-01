@@ -87,6 +87,14 @@ public:
 	bool forward_mouse = false;
 	bool forward_gamepad = false;
 
+	// Hands-only mode (default): hands are reported as 26-joint hand
+	// tracking only, never as controller input on /user/hand/*. When
+	// false, simple_controller and hand_interaction bindings are withheld
+	// so the runtime cannot promote hands to controllers; hand joints
+	// still stream via XrHandTracker. Set true to restore legacy
+	// hand-as-controller emulation (pinch driving controller input).
+	bool hands_emulate_controllers = false;
+
 	std::underlying_type_t<wivrn::from_headset::body_part_mask> body_part_mask = ~0;
 
 	bool enable_stream_gui = true;

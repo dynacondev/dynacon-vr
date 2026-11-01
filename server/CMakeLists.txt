@@ -49,7 +49,7 @@ set(XRT_FEATURE_OPENXR_INTERACTION_VIVE_FOCUS3   ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PRO     ON)
 set(XRT_FEATURE_OPENXR_INTERACTION_TOUCH_PLUS    ON)
 set(XRT_FEATURE_OPENXR_LAYER_COLOR_SCALE_BIAS    ON)
-set(XRT_FEATURE_OPENXR_LAYER_DEPTH              OFF)
+set(XRT_FEATURE_OPENXR_LAYER_DEPTH               ON)
 set(XRT_FEATURE_OPENXR_VARJO_QUAD_VIEWS         OFF)
 
 set(XRT_HAVE_BLUETOOTH               OFF)
@@ -107,6 +107,8 @@ if (WIVRN_BUILD_SERVER)
 			audio/audio_setup.cpp
 
 			compositor/compositor.cpp
+			compositor/depth_packer.cpp
+			compositor/depth_reprojector.cpp
 			compositor/layer_squasher.cpp
 			compositor/foveation.cpp
 			compositor/pacer.cpp
@@ -272,6 +274,11 @@ if (WIVRN_BUILD_SERVER)
 		SHADERS
 			"${_monado_src}/src/xrt/auxiliary/render/shaders/layer.comp"
 			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/foveation.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_splat.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_pull.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_bgmax.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/reproject_fill.comp"
+			"${CMAKE_CURRENT_SOURCE_DIR}/compositor/shaders/depth_pack.comp"
 		)
 
 	target_compile_definitions(wivrn-server PRIVATE JSON_DIAGNOSTICS=1)

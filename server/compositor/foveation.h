@@ -48,18 +48,24 @@ class foveation
 	float eye_x[2] = {}; // eye x position
 	xrt_quat gaze = {};
 	from_headset::override_foveation_center manual_foveation = {};
-	std::array<to_headset::foveation_parameter, 2> params;
+	// Per-slot solved parameters (slot == compositor image index): the
+	// cache-hit path returns these without recomputing, so sharing one
+	// copy would hand slot A's metadata to slot B's frame.
+	static constexpr size_t num_slots = 2;
+	std::array<std::array<to_headset::foveation_parameter, 2>, num_slots> params;
 
-	buffer_allocation gpu_buffer;
 	vk::raii::Sampler sampler;
 
 	vk::raii::DescriptorSetLayout ds_layout;
 	vk::raii::PipelineLayout layout;
 	std::array<vk::raii::Pipeline, 2> pipeline;
 	vk::raii::DescriptorPool descriptor_pool;
-	vk::DescriptorSet descriptor_set;
+	// Per-slot upload/read state (slot == compositor image index).
+	std::array<buffer_allocation, num_slots> gpu_buffers;
+	std::array<vk::DescriptorSet, num_slots> descriptor_sets;
 
-	// parameters used for last computation
+	// parameters used for last computation, per slot (a shared cache
+	// would false-skip uploads against another slot's buffer).
 	struct P
 	{
 		xrt_quat gaze = {};
@@ -70,13 +76,13 @@ class foveation
 
 		from_headset::override_foveation_center manual_foveation = {};
 	};
-	P last;
+	std::array<P, num_slots> last;
 
 	// must hold lock on mutex to call it
-	void compute_params();
+	void compute_params(int slot);
 
 	void update_ubo(
-	        vk::raii::CommandBuffer & cmd,
+	        int slot,
 	        bool flip_y,
 	        std::array<xrt_rect, 2> src_rect,
 	        std::array<xrt_fov, 2> src_fov);
@@ -91,6 +97,7 @@ public:
 	std::array<to_headset::foveation_parameter, 2> foveate(
 	        vk::raii::Device &,
 	        vk::raii::CommandBuffer & cmd,
+	        int slot,
 	        vk::ImageView y,
 	        vk::ImageView cbcr,
 	        bool flip_y,

@@ -1,0 +1,150 @@
+/*
+ * Donor-smear hole fill (pass 3 of the compute warp).
+ *
+ * One thread per target pixel: valid pull pixels are left untouched
+ * (the pull output needs no un-premultiply: valid is already (rgb,1)).
+ * Hole pixels run an expanding-ring search (R = SMEAR_RADIUS) for the
+ * nearest valid texel whose splat depth matches the hole's coarse
+ * background reference, and copy its color verbatim. Smear instead of
+ * blur: no averaging, so a wrong donor shows up starkly (which is also
+ * what makes this a good diagnostic for donor selection).
+ *
+ * The background gate is what keeps foreground out: the reference is
+ * the perimeter-max depth of the hole's BGMAX_CELL block (see
+ * reproject_bgmax.comp), i.e. the surrounding layer at occluder-exceeding
+ * scale. Taps shallower than reference - TOL are occluders, never
+ * donors. Taps also need a valid pull color (alpha test: suv outside
+ * the source marks holes in pull even with a valid splat).
+ *
+ * Only hole pixels are ever stored, and holes only read texels no
+ * thread writes (splat is read-only here; valid pull colors are never
+ * stored to), so the in-place target update is race-free without a
+ * second buffer. Holes with no background donor inside R (or no
+ * established reference) stay black: honest fallback, same as before.
+ */
+
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D splatDepth;
+layout(set = 0, binding = 1, rgba8) uniform image2D dstImg;
+layout(set = 0, binding = 2, r32ui) uniform readonly uimage2D bgMax;
+
+#define SPLAT_EMPTY 0xffffffffu
+#define DEPTH_SCALE 16777215.0
+#define VALID_EPS (0.5 / 255.0)
+// Source must match reproject_bgmax.comp (coarse block size).
+#define BGMAX_CELL 64
+// Background gate width, nonlinear 0..1 depth units: taps this much
+// shallower than the coarse reference are occluders, never donors
+// (same order as the 0.02 depth tolerances used across the warp).
+#define SMEAR_DEPTH_TOL 0.02
+// Search radius in pixels: bands up to ~2*R wide fill completely.
+#define SMEAR_RADIUS 16
+
+void main()
+{
+	ivec2 xy = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 size = imageSize(dstImg);
+	if (xy.x >= size.x || xy.y >= size.y)
+		return;
+
+	vec4 v = imageLoad(dstImg, xy);
+	if (v.a >= VALID_EPS)
+		return; // valid: leave untouched (race-free: never stored to)
+
+	uint ref = imageLoad(bgMax, xy / BGMAX_CELL).x;
+	if (ref == SPLAT_EMPTY) {
+		imageStore(dstImg, xy, vec4(0.0));
+		return;
+	}
+	float refDepth = float(ref) / DEPTH_SCALE;
+
+	// Function-scope search state (block-scope loop-carried
+	// initializers read back stale on some drivers).
+	float donorDist2 = 1e30;
+	vec3 donorRgb = vec3(0.0);
+	bool done = false;
+	for (int r = 1; r <= SMEAR_RADIUS && !done; r++) {
+		bool ringFound = false;
+		// Top and bottom rows of the ring (corners included once).
+		for (int ox = -r; ox <= r; ox++) {
+			ivec2 sxy = xy + ivec2(ox, -r);
+			if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < size.x && sxy.y < size.y) {
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY && float(e) / DEPTH_SCALE >= refDepth - SMEAR_DEPTH_TOL) {
+					vec4 t = imageLoad(dstImg, sxy);
+					if (t.a >= VALID_EPS) {
+						vec2 d = vec2(sxy - xy);
+						float dist2 = dot(d, d);
+						if (dist2 < donorDist2) {
+							donorDist2 = dist2;
+							donorRgb = t.rgb;
+							ringFound = true;
+						}
+					}
+				}
+			}
+			sxy = xy + ivec2(ox, r);
+			if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < size.x && sxy.y < size.y) {
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY && float(e) / DEPTH_SCALE >= refDepth - SMEAR_DEPTH_TOL) {
+					vec4 t = imageLoad(dstImg, sxy);
+					if (t.a >= VALID_EPS) {
+						vec2 d = vec2(sxy - xy);
+						float dist2 = dot(d, d);
+						if (dist2 < donorDist2) {
+							donorDist2 = dist2;
+							donorRgb = t.rgb;
+							ringFound = true;
+						}
+					}
+				}
+			}
+		}
+		// Left and right columns, corners excluded.
+		for (int oy = -r + 1; oy <= r - 1; oy++) {
+			ivec2 sxy = xy + ivec2(-r, oy);
+			if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < size.x && sxy.y < size.y) {
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY && float(e) / DEPTH_SCALE >= refDepth - SMEAR_DEPTH_TOL) {
+					vec4 t = imageLoad(dstImg, sxy);
+					if (t.a >= VALID_EPS) {
+						vec2 d = vec2(sxy - xy);
+						float dist2 = dot(d, d);
+						if (dist2 < donorDist2) {
+							donorDist2 = dist2;
+							donorRgb = t.rgb;
+							ringFound = true;
+						}
+					}
+				}
+			}
+			sxy = xy + ivec2(r, oy);
+			if (sxy.x >= 0 && sxy.y >= 0 && sxy.x < size.x && sxy.y < size.y) {
+				uint e = imageLoad(splatDepth, sxy).x;
+				if (e != SPLAT_EMPTY && float(e) / DEPTH_SCALE >= refDepth - SMEAR_DEPTH_TOL) {
+					vec4 t = imageLoad(dstImg, sxy);
+					if (t.a >= VALID_EPS) {
+						vec2 d = vec2(sxy - xy);
+						float dist2 = dot(d, d);
+						if (dist2 < donorDist2) {
+							donorDist2 = dist2;
+							donorRgb = t.rgb;
+							ringFound = true;
+						}
+					}
+				}
+			}
+		}
+		if (ringFound)
+			done = true;
+	}
+	if (!done) {
+		imageStore(dstImg, xy, vec4(0.0));
+		return;
+	}
+	// Donor color cached during the search (no second load).
+	imageStore(dstImg, xy, vec4(donorRgb, 1.0));
+}

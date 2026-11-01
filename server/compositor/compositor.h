@@ -25,6 +25,8 @@
 #include "util/u_logging.h"
 
 #include "encoder/encoder_settings.h"
+#include "depth_packer.h"
+#include "depth_reprojector.h"
 #include "foveation.h"
 #include "layer_squasher.h"
 #include "pacer.h"
@@ -54,6 +56,24 @@ public:
 		vk::raii::ImageView view_cbcr;
 		to_headset::video_stream_data_shard::view_info_t view_info{};
 		uint64_t frame_index;
+		// Set at commit for the encoder size triage (warped content
+		// defeats inter-frame prediction differently than repeats).
+		bool warped_frame = false;
+		// Set when the depth pack + present was attempted for this frame
+		// (warped with valid near/far): the worker must call the depth
+		// encoder even on present skips (skip bookkeeping is per-encoder).
+		bool has_depth = false;
+	};
+
+	// Virtual-depth staging for stream 3: 640x320 SBS YCbCr, depth in
+	// layer 3 (so encoder backends keep indexing baseArrayLayer 3).
+	// Paired 1:1 with the color slots above (shared busy lifetime).
+	struct depth_image
+	{
+		image_allocation image;
+		// 2D views on layer 3: pack target (Y) + neutral-chroma clear (CbCr).
+		vk::raii::ImageView out_y = nullptr;
+		vk::raii::ImageView out_cbcr = nullptr;
 	};
 
 private:
@@ -78,15 +98,21 @@ private:
 	const u_logging_level log_level;
 	timings squasher_times;
 	timings foveation_times;
+	timings warp_times;
+	float warp_gpu_window_max_us = 0;
 	wivrn_session & session;
 	vk_bundle vk;
-	vk::raii::CommandPool cmd_pool;
-	vk::raii::QueryPool query_pool;
+	static constexpr size_t num_frame_slots = 2;
+	std::array<vk::raii::CommandPool, num_frame_slots> cmd_pools{nullptr, nullptr};
+	std::array<vk::raii::QueryPool, num_frame_slots> query_pools{nullptr, nullptr};
+	// Set once the slot's first submit has recorded timestamps: avoids
+	// counting a poll-miss on a pool that was never written.
+	std::array<bool, num_frame_slots> query_armed = {};
 
-	std::array<encoder_settings, 3> settings;
+	std::array<encoder_settings, 4> settings;
 
-	std::array<image, 2> images;
-	vk::raii::CommandBuffer cmd;
+	std::array<image, num_frame_slots> images;
+	std::array<vk::raii::CommandBuffer, num_frame_slots> cmds{nullptr, nullptr};
 	vk::raii::Semaphore sem;
 	uint64_t sem_value = 0;
 
@@ -96,8 +122,16 @@ private:
 
 	layer_squasher squasher;
 	wivrn::foveation foveation;
+	depth_reprojector reprojector;
+	depth_packer packer;
 
-	std::array<std::unique_ptr<video_encoder>, 3> encoders;
+	// Cached at construction: server config is startup-read.
+	const bool depth_reprojection_enabled;
+
+	// Depth staging images (stream 3), one per color slot.
+	std::array<depth_image, num_frame_slots> depth_images;
+
+	std::array<std::unique_ptr<video_encoder>, 4> encoders;
 
 #ifdef __cpp_lib_atomic_lock_free_type_aliases
 	using status_type = std::atomic_signed_lock_free;

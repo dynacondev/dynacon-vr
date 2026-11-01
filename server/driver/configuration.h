@@ -51,7 +51,7 @@ struct configuration
 		std::optional<std::string> device;
 	};
 
-	std::array<encoder, 3> encoders; // left, right, alpha
+	std::array<encoder, 4> encoders; // left, right, alpha, depth
 	std::optional<uint8_t> bit_depth;
 	std::optional<std::array<float, 3>> grip_surface;
 	std::vector<std::string> application;
@@ -154,6 +154,34 @@ struct configuration
 	// target latches, in seconds (default 2). 0 = instant release.
 	// Applies to the until-lock transition only, nothing else.
 	float passthrough_fade_time_s = 2.0f;
+
+	struct reprojection
+	{
+		// Master switch for server-side depth reprojection: every
+		// frame carrying depth is reprojected from its known
+		// generation pose to the latest predicted pose.
+		bool enabled = true;
+		// Depth encoding of the submitting app: true = reverse-Z
+		// (1 at near, X-Plane 12 Vulkan). No in-band signal carries
+		// this, so the default encodes the pipeline assumption;
+		// normal-Z apps set it false explicitly.
+		bool source_reverse_z = true;
+		// Device-global queue priority for our compositor, transfer
+		// and encode queues: high prefers our submits when the app
+		// saturates the GPU. This is the only lever that arbitrates
+		// across our VkDevice and the app's device; medium requests
+		// nothing (driver default).
+		enum class gpu_priority
+		{
+			medium,
+			high,
+			// Privilege-gated (CAP_SYS_NICE): falls back to high,
+			// then default, when denied.
+			realtime,
+		};
+		gpu_priority gpu_priority = gpu_priority::high;
+	};
+	reprojection reprojection;
 
 	bool debug_gui = false;
 	bool use_steamvr_lh = false;

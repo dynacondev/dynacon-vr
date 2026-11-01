@@ -643,6 +643,46 @@ configuration::configuration()
 		if (auto it = json.find("tcp-only"); it != json.end())
 			tcp_only = *it;
 
+		if (auto it = json.find("reprojection"); it != json.end())
+		{
+			if (not it->is_object())
+				U_LOG_W("reprojection must be an object, ignoring");
+			else
+			{
+				if (auto jt = it->find("enabled"); jt != it->end())
+				{
+					if (jt->is_boolean())
+						reprojection.enabled = jt->get<bool>();
+					else
+						U_LOG_W("reprojection.enabled must be a boolean, ignoring");
+				}
+				if (auto jt = it->find("source-reverse-z"); jt != it->end())
+				{
+					if (jt->is_boolean())
+						reprojection.source_reverse_z = jt->get<bool>();
+					else
+						U_LOG_W("reprojection.source-reverse-z must be a boolean, ignoring");
+				}
+				if (auto jt = it->find("gpu-priority"); jt != it->end())
+				{
+					if (not jt->is_string())
+						U_LOG_W("reprojection.gpu-priority must be a string, ignoring");
+					else
+					{
+						const auto value = jt->get<std::string>();
+						if (value == "medium")
+							reprojection.gpu_priority = configuration::reprojection::gpu_priority::medium;
+						else if (value == "high")
+							reprojection.gpu_priority = configuration::reprojection::gpu_priority::high;
+						else if (value == "realtime")
+							reprojection.gpu_priority = configuration::reprojection::gpu_priority::realtime;
+						else
+							U_LOG_W("reprojection.gpu-priority must be \"medium\", \"high\" or \"realtime\", ignoring");
+					}
+				}
+			}
+		}
+
 		if (auto it = json.find("port"); it != json.end())
 			port = *it;
 
