@@ -215,6 +215,12 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 	if (not map.passthrough_until_lock.empty())
 		spdlog::info("passthrough-until-lock: full passthrough until \"{}\" locks (fade {:.1f}s)",
 		             map.passthrough_until_lock, (double)std::max(0.f, map.passthrough_fade_time_s));
+	if (map.local_origin)
+		spdlog::info("alignment local-origin: fiducial \"{}\" offset pos(%.1f,%.1f,%.1f)mm",
+		             map.local_origin->fiducial,
+		             (double)(map.local_origin->position[0] * 1000.f),
+		             (double)(map.local_origin->position[1] * 1000.f),
+		             (double)(map.local_origin->position[2] * 1000.f));
 	*fiducial_map.lock() = std::move(map);
 
 	// Server-pushed Meta boundary default (top-level config, no

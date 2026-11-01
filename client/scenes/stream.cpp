@@ -3378,7 +3378,18 @@ void scenes::stream::on_xr_event(const xr::event & event)
 	{
 		case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
 			if (event.space_changed_pending.referenceSpaceType == XrReferenceSpaceType::XR_REFERENCE_SPACE_TYPE_LOCAL)
-				recenter_requested = true;
+			{
+				// Suppressed whenever a local-origin is configured (even
+				// before lock): the rig frame owns the PC origin, a user
+				// recenter must not move it. The OS-level change only
+				// touches the headset's own LOCAL space anyway; the
+				// STAGE-relative correction below re-absorbs any drift
+				// on the next solved frame regardless.
+				if (alignment.lock()->configured)
+					spdlog::info("recenter event suppressed (alignment local-origin configured)");
+				else
+					recenter_requested = true;
+			}
 			break;
 		case XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB:
 			network_session->send_control(from_headset::refresh_rate_changed{

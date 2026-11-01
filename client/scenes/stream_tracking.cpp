@@ -26,6 +26,11 @@
 #include "xr/face_tracker.h"
 #include "xr/fb_body_tracker.h"
 #include "xr/to_string.h"
+#include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <magic_enum.hpp>
 #include <magic_enum_containers.hpp>
 #include <ranges>
@@ -154,6 +159,63 @@ public:
 };
 
 } // namespace
+
+// Origin alignment (alignment -> local-origin): rigid correction A with
+// reported = A * raw. Applies to every pose expressed in the tracking
+// reference space: device poses (except view-relative eye gaze), hand
+// joints and absolute body joints. Relative poses (eye gaze, derived,
+// root-relative joint offsets) only rotate, never translate.
+struct origin_correction
+{
+	bool active = false;
+	glm::quat q(1, 0, 0, 0);
+	glm::vec3 p(0, 0, 0);
+};
+
+static void apply_origin_pose(const glm::quat & aq, const glm::vec3 & ap, XrPosef & pose)
+{
+	glm::quat q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+	glm::vec3 p(pose.position.x, pose.position.y, pose.position.z);
+	glm::quat rq = aq * q;
+	glm::vec3 rp = aq * p + ap;
+	pose.orientation = {rq.x, rq.y, rq.z, rq.w};
+	pose.position = {rp.x, rp.y, rp.z};
+}
+
+static void apply_origin_point(const glm::quat & aq, const glm::vec3 & ap, XrVector3f & point)
+{
+	glm::vec3 p(point.x, point.y, point.z);
+	p = aq * p + ap;
+	point = {p.x, p.y, p.z};
+}
+
+static void apply_origin_vel(const glm::quat & aq, XrVector3f & lin, XrVector3f & ang)
+{
+	glm::vec3 l(lin.x, lin.y, lin.z);
+	glm::vec3 a(ang.x, ang.y, ang.z);
+	l = aq * l;
+	a = aq * a;
+	lin = {l.x, l.y, l.z};
+	ang = {a.x, a.y, a.z};
+}
+
+static XrQuaternionf apply_origin_quat(const glm::quat & aq, const packed_quaternion & pq)
+{
+	XrQuaternionf q = pq;
+	glm::quat g(q.w, q.x, q.y, q.z);
+	g = aq * g;
+	return {g.x, g.y, g.z, g.w};
+}
+
+static void apply_origin_packed_rel(const glm::quat & aq, int16_t & x, int16_t & y, int16_t & z)
+{
+	// Root-relative joint offset, 10th of mm: rotate only, clamp for safety.
+	glm::vec3 r(x / 10'000.f, y / 10'000.f, z / 10'000.f);
+	r = aq * r;
+	x = (int16_t)std::clamp<long>(std::lround(r.x * 10'000.f), -32768, 32767);
+	y = (int16_t)std::clamp<long>(std::lround(r.y * 10'000.f), -32768, 32767);
+	z = (int16_t)std::clamp<long>(std::lround(r.z * 10'000.f), -32768, 32767);
+}
 
 static std::optional<std::array<from_headset::hand_tracking::pose, XR_HAND_JOINT_COUNT_EXT>> locate_hands(xr::hand_tracker & hand, XrSpace space, XrTime time)
 {
@@ -312,9 +374,14 @@ void scenes::stream::tracking()
 	{
 		try
 		{
-			if (float offset = config.get_height_offset(); offset != applied_height_offset)
+			// Origin alignment bypasses the height offset: the fiducial
+			// offset already places the origin exactly, the seated
+			// default would double-apply. Suppressed whenever a
+			// local-origin is configured (even before lock).
+			float want_height_offset = alignment.lock()->configured ? 0 : config.get_height_offset();
+			if (want_height_offset != applied_height_offset)
 			{
-				applied_height_offset = offset;
+				applied_height_offset = want_height_offset;
 				height_offset_space = make_height_offset_space(applied_height_offset);
 				locate_spaces = locate_spaces_functor{instance, height_offset_space};
 			}
@@ -539,6 +606,84 @@ void scenes::stream::tracking()
 					}
 				}
 				locate_spaces.resolve(session, tracking.timestamp, tracking.device_poses);
+
+				// Origin alignment: re-base outgoing poses so the PC
+				// origin sits at the rig frame. Eye gaze stays
+				// view-relative (unaffected); face weights carry no
+				// pose; derived poses are inter-device relative.
+				origin_correction origin{};
+				{
+					auto a = alignment.lock();
+					if (a->active)
+					{
+						origin.active = true;
+						origin.q = glm::quat(a->correction.orientation.w,
+						                     a->correction.orientation.x,
+						                     a->correction.orientation.y,
+						                     a->correction.orientation.z);
+						origin.p = glm::vec3(a->correction.position.x,
+						                     a->correction.position.y,
+						                     a->correction.position.z);
+					}
+				}
+				if (origin.active)
+				{
+					for (auto & dp: tracking.device_poses)
+					{
+						if (dp.device == device_id::EYE_GAZE)
+							continue;
+						apply_origin_pose(origin.q, origin.p, dp.pose);
+						apply_origin_vel(origin.q, dp.linear_velocity, dp.angular_velocity);
+					}
+					for (auto & h: hands)
+					{
+						if (not h.joints)
+							continue;
+						for (auto & j: *h.joints)
+						{
+							apply_origin_point(origin.q, origin.p, j.position);
+							j.orientation = pack(apply_origin_quat(origin.q, j.orientation));
+							apply_origin_vel(origin.q, j.linear_velocity, j.angular_velocity);
+						}
+					}
+					for (auto & b: body)
+					{
+						std::visit(
+						        utils::overloaded{
+						                [&](from_headset::meta_body & m) {
+							                std::visit(
+							                        utils::overloaded{
+							                                [](std::monostate &) {},
+							                                [&](auto & js) {
+								                                apply_origin_point(origin.q, origin.p, js.root.position);
+								                                js.root.orientation = pack(apply_origin_quat(origin.q, js.root.orientation));
+								                                for (auto & j: js.joints)
+								                                {
+									                                apply_origin_packed_rel(origin.q, j.position.x, j.position.y, j.position.z);
+									                                j.orientation = pack(apply_origin_quat(origin.q, j.orientation));
+								                                }
+							                                },
+							                        },
+							                        m.joints);
+						                },
+						                [&](from_headset::bd_body & p) {
+							                for (auto & j: p.joints)
+							                {
+								                apply_origin_point(origin.q, origin.p, j.position);
+								                j.orientation = pack(apply_origin_quat(origin.q, j.orientation));
+							                }
+						                },
+						                [&](from_headset::htc_body & t) {
+							                for (auto & j: t.poses)
+							                {
+								                apply_origin_pose(origin.q, origin.p, j.pose);
+								                apply_origin_vel(origin.q, j.linear_velocity, j.angular_velocity);
+							                }
+						                },
+						        },
+						        b);
+					}
+				}
 			}
 			catch (const std::system_error & e)
 			{
