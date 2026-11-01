@@ -701,8 +701,6 @@ configuration::configuration()
 						U_LOG_W("alignment local-origin \"%s\" matches no fiducial id, ignoring", a.fiducial.c_str());
 						continue;
 					}
-					if (alignment_local_origin)
-						U_LOG_W("duplicate alignment local-origin, overwriting");
 					alignment_local_origin = std::move(a);
 				}
 			}
