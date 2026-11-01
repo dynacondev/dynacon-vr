@@ -26,6 +26,8 @@
 #include <fstream>
 #include <magic_enum.hpp>
 #include <nlohmann/json.hpp>
+#include <string>
+#include <unistd.h>
 
 namespace wivrn
 {
@@ -152,8 +154,11 @@ void save_headset_cache(const from_headset::headset_info_packet & info)
 		auto file = headset_cache_file();
 		std::filesystem::create_directories(file.parent_path());
 
+		// The forked session child and the parent main loop both save
+		// this file: use a per-process tmp name so concurrent saves
+		// can't interleave in one shared tmp file before the rename.
 		auto tmp = file;
-		tmp += ".new";
+		tmp += ".new-" + std::to_string(getpid());
 		{
 			std::ofstream out(tmp);
 			out.exceptions(std::ofstream::failbit);
@@ -168,6 +173,13 @@ void save_headset_cache(const from_headset::headset_info_packet & info)
 	catch (const std::exception & e)
 	{
 		U_LOG_W("Failed to save headset cache: %s", e.what());
+	}
+	catch (...)
+	{
+		// Keep the save non-throwing: reconnect() calls it outside any
+		// try block that could absorb a non-std exception, and a throw
+		// here must never mask the reset() outcome above.
+		U_LOG_W("Failed to save headset cache");
 	}
 }
 
