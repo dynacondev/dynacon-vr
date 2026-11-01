@@ -137,6 +137,22 @@ struct configuration
 	};
 	std::vector<passthrough_object> passthrough_objects;
 
+	// Origin alignment ("alignment" -> "local-origin"): re-base the
+	// headset's outgoing tracking so the PC-side STAGE/LOCAL origin
+	// sits at solvedFiducialPose * offset (yaw + position only).
+	// Single entry; unset (default) disables.
+	struct alignment_origin
+	{
+		// Referenced fiducial id (dangling refs deactivate alignment).
+		std::string fiducial;
+		// Fiducial-to-origin offset: yaw + position applied, headset
+		// gravity trusted. Position in meters, orientation as xyzw
+		// quaternion (parsed from [rx, ry, rz] degrees).
+		std::array<float, 3> position = {0, 0, 0};
+		std::array<float, 4> orientation = {0, 0, 0, 1};
+	};
+	std::optional<alignment_origin> alignment_local_origin;
+
 	// Meta (OS) boundary visibility while our passthrough is shown: true
 	// (default) requests suppression, false leaves the OS boundary
 	// visible. Pushed to the headset (no in-headset toggle); a request

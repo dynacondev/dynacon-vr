@@ -1076,10 +1076,29 @@ struct passthrough_object
 	float transition_distance_m = 0.3f;
 };
 
+// Origin alignment (headset-side): re-base outgoing tracking so the
+// PC-side STAGE/LOCAL origin sits at solvedFiducialPose * offset.
+// Referenced fiducial id (single, must exist in fiducials). Offset is
+// fiducial-to-origin, same convention as passthrough objects: position
+// in meters, orientation as xyzw quaternion (parsed from [rx, ry, rz]
+// degrees). Only yaw + position are applied (headset gravity trusted).
+struct alignment_origin
+{
+	// Referenced fiducial id (single; dangling refs deactivate alignment).
+	std::string fiducial;
+	std::array<float, 3> position;
+	std::array<float, 4> orientation;
+};
+
 struct fiducial_map
 {
 	std::vector<fiducial_entry> fiducials;
 	std::vector<passthrough_object> objects;
+	// Cockpit/rig origin alignment: when set, the headset continuously
+	// re-bases its outgoing tracking so the PC-side STAGE/LOCAL origin
+	// sits at solvedFiducialPose * offset (yaw + position only, headset
+	// gravity trusted). Held indefinitely on loss, identity before lock.
+	std::optional<alignment_origin> local_origin;
 	// Suppress the Meta (OS) boundary while our passthrough is shown.
 	// Server-pushed (top-level config, no in-headset toggle); a request
 	// only, the runtime may refuse. Always sent, even with an empty map.

@@ -324,6 +324,59 @@ only — boundary zones and everything else are untouched (zones still
 hold passthrough independently via min-combine: either source can
 demand it). `0` releases instantly.
 
+## `alignment`
+Default value: unset (feature disabled)
+
+Cockpit/rig origin alignment. When set, the headset continuously
+re-bases its outgoing tracking from the resolved fiducial frame, so the
+PC-side OpenXR `STAGE`/`LOCAL` origin sits at
+`solvedFiducialPose * offset` — yaw and position only, headset gravity
+trusted (pitch/roll from the print are discarded). The resolved
+(smoothed) pose feeds the correction directly, same as passthrough
+object placement: while the fiducial is visible the origin servos every
+frame, on loss the last correction holds indefinitely, and before the
+first sighting tracking streams unmodified (identity).
+
+The single sub element `local-origin` takes a single fiducial id (not a
+list) plus `position`/`orientation` offsets in the usual conventions
+(meters, `[rx, ry, rz]` degrees, same fixed-frame
+convention as markers and passthrough objects):
+
+```json
+{
+	"fiducials": [
+		{
+			"id": "rig",
+			"markers": [
+				{"marker-data": "wivrn:rig", "marker-size-m": 0.12}
+			]
+		}
+	],
+	"alignment": {
+		"local-origin": {
+			"fiducial": "rig",
+			"position": [0, 0, 0],
+			"orientation": [0, 0, 0]
+		}
+	}
+}
+```
+
+Notes:
+
+- The configured height offset is bypassed while `local-origin` is
+  configured: the fiducial offset already places the origin exactly,
+  and the seated default would double-apply.
+- User recenter gestures (OS long-press forward reset) are suppressed
+  while configured: the event is swallowed instead of forwarded, so
+  neither the PC origin nor the correction moves. An OS-level recenter
+  that ever leaked through `STAGE` would be re-absorbed on the next
+  solved frame anyway.
+- Pairs naturally with `passthrough-until-lock` on the same fiducial:
+  full passthrough until the rig is sighted, then aligned VR.
+- A dangling `fiducial` reference warns and deactivates alignment
+  (same as `passthrough-until-lock`).
+
 A fiducial with several markers fuses them into one 6DoF frame: every
 sighted marker votes its board hypothesis (observed pose composed with
 its offset), and a robust estimator (Cauchy IRLS with leave-one-out
