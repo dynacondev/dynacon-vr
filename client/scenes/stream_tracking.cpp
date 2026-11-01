@@ -612,8 +612,10 @@ void scenes::stream::tracking()
 				// view-relative (unaffected); face weights carry no
 				// pose; derived poses are inter-device relative.
 				origin_correction origin{};
+				bool align_configured = false;
 				{
 					auto a = alignment.lock();
+					align_configured = a->configured;
 					if (a->active)
 					{
 						origin.active = true;
@@ -682,6 +684,24 @@ void scenes::stream::tracking()
 						                },
 						        },
 						        b);
+					}
+				}
+				else if (align_configured)
+				{
+					// TEMP-DEBUG (revert before merge): pin the HMD pose to
+					// identity until the local-origin fiducial locks, so
+					// the app renders from a fixed origin pre-lock and the
+					// lock snap is isolated. HEAD only (hands/controllers
+					// keep streaming, visibly detached); velocities zeroed,
+					// flags kept as-located so the app treats it as live.
+					for (auto & dp: tracking.device_poses)
+					{
+						if (dp.device != device_id::HEAD)
+							continue;
+						dp.pose.orientation = {0, 0, 0, 1};
+						dp.pose.position = {0, 0, 0};
+						dp.linear_velocity = {0, 0, 0};
+						dp.angular_velocity = {0, 0, 0};
 					}
 				}
 			}
