@@ -122,13 +122,6 @@ constexpr float fade_duration = 0.25;
 constexpr float urgent_fade_delay = 5;
 constexpr ImVec4 urgent_border_color = {8.f, .6f, 0.f, .8f};
 
-// Kiosk "Waiting for Simulation" overlay: fast poll while the kiosk is up
-// (or its state is still unknown), slow watchdog otherwise so an app stop
-// while hidden is still noticed. Fade-out once a sim is detected.
-constexpr XrDuration kiosk_poll_fast_ns = 500'000'000LL;
-constexpr XrDuration kiosk_poll_slow_ns = 2'000'000'000LL;
-constexpr double kiosk_fade_s = 1.0;
-
 // Dimming for the streamed video when the GUI is interactable
 constexpr float dimming_scale = 0.4;
 constexpr float dimming_bias = 0.01;

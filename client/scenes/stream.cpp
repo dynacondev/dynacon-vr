@@ -898,14 +898,9 @@ void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 	// the chord that would reveal it is dead too
 	const bool allowed = config.kiosk_mode and config.enable_stream_gui;
 
-	// Fast 500ms poll while the kiosk is up (or still unknown) so a sim
-	// start is noticed quickly; the applications tab polls itself when
-	// visible, and the slow watchdog below covers the hidden/active case
-	// (needed to notice an app stop and bring the overlay back).
-	const bool need_data = not stream_apps_known or stream_kiosk_shown or stream_kiosk_fading;
-	const XrDuration poll_ns = need_data ? constants::stream::kiosk_poll_fast_ns
-	                                     : constants::stream::kiosk_poll_slow_ns;
-	if (allowed and predicted_display_time - last_kiosk_app_req > poll_ns)
+	// keep the running-apps picture fresh while the overlay may show; the
+	// applications tab polls itself when visible, this covers the overlay
+	if (allowed and predicted_display_time - last_kiosk_app_req > 2'000'000'000LL)
 	{
 		last_kiosk_app_req = predicted_display_time;
 		network_session->send_control(from_headset::get_running_applications{});
@@ -916,53 +911,8 @@ void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 		stream_kiosk_dismissed = false; // app stopped: waiting overlay returns
 	stream_had_active_app = has_active;
 
-	const bool want_shown = allowed and not stream_kiosk_dismissed and
-	                        stream_apps_known and not has_active and not is_gui_interactable();
-
-	if (gui_status != stream_tab::hidden || !allowed)
-	{
-		// The loader only ever renders in the hidden tab (overlay_only /
-		// compact draw their own content), and never when disabled: snap
-		// off, never fade. Checked first so overlay/compact tabs can't
-		// latch shown (they're non-interactable, so want_shown below can
-		// be true there) and a mid-show disable hides instantly.
-		stream_kiosk_shown = false;
-		stream_kiosk_fading = false;
-		stream_kiosk_alpha = 1.f;
-	}
-	else if (want_shown)
-	{
-		// Instant show; cancels any in-progress fade (sim stopped mid-fade).
-		if (not stream_kiosk_shown)
-			spdlog::info("Kiosk waiting overlay shown (no active simulation)");
-		stream_kiosk_shown = true;
-		stream_kiosk_fading = false;
-		stream_kiosk_alpha = 1.f;
-	}
-	else if (stream_kiosk_shown and not stream_kiosk_fading)
-	{
-		// Sim detected while the loader is visible: smoothstep-fade the
-		// panel out. Chord-to-settings cancels explicitly in render().
-		spdlog::info("Kiosk waiting overlay fading out (simulation active)");
-		stream_kiosk_fading = true;
-		stream_kiosk_hide_start = predicted_display_time;
-	}
-
-	// Advance the fade; shown stays true until it completes so layout,
-	// passthrough and the chord below all treat it as visible throughout.
-	if (stream_kiosk_fading)
-	{
-		double t = double(predicted_display_time - stream_kiosk_hide_start) * 1e-9 /
-		           constants::stream::kiosk_fade_s;
-		t = std::clamp(t, 0.0, 1.0);
-		stream_kiosk_alpha = float(1.0 - t * t * (3.0 - 2.0 * t));
-		if (t >= 1.0)
-		{
-			stream_kiosk_shown = false;
-			stream_kiosk_fading = false;
-			stream_kiosk_alpha = 1.f;
-		}
-	}
+	stream_kiosk_shown = allowed and not stream_kiosk_dismissed and
+	                     stream_apps_known and not has_active and not is_gui_interactable();
 }
 
 void scenes::stream::render(const XrFrameState & frame_state)
@@ -1023,10 +973,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if (stream_kiosk_shown)
 			{
 				stream_kiosk_dismissed = true;
-				// Snap off any in-progress fade: settings owns the screen now.
-				stream_kiosk_shown = false;
-				stream_kiosk_fading = false;
-				stream_kiosk_alpha = 1.f;
 				next_gui_status = stream_tab::settings;
 			}
 			else if (is_gui_interactable())
