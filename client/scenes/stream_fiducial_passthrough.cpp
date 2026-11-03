@@ -669,6 +669,20 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	map_key += ';';
 	map_key += std::to_string(map->passthrough_fade_time_s);
 	map_key += ';';
+	// Alignment identity: any local-origin edit resets the solved frames
+	// below (and the correction with them).
+	map_key += 'A';
+	if (map->local_origin)
+	{
+		map_key += map->local_origin->fiducial;
+		map_key += ';';
+		for (float v: map->local_origin->position)
+			map_key += std::to_string(v) + ',';
+		map_key += ';';
+		for (float v: map->local_origin->orientation)
+			map_key += std::to_string(v) + ',';
+		map_key += ';';
+	}
 	// Trackers run every frame, independent of consumers (their state
 	// feeds the status UI below).
 	sync_fiducial_trackers(*map);
@@ -701,6 +715,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 		until_lock_fading = false;
 		until_lock_time = 0;
 		until_lock_fade_s = std::max(0.f, map->passthrough_fade_time_s);
+		// Alignment correction resets with the solved frames (identity
+		// until the local-origin fiducial is sighted).
+		*alignment.lock() = alignment_correction{};
 		if (not map->passthrough_until_lock.empty())
 		{
 			bool known = std::ranges::any_of(map->fiducials, [&](const to_headset::fiducial_entry & f) {
@@ -981,6 +998,63 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 	fid_solve_ms = fid_elapsed_ms();
 	fid_tags = tags_total;
 	fid_t0 = std::chrono::steady_clock::now();
+
+	// ---- origin alignment: correction from the resolved board pose ----
+	// Configured whenever the map carries a local-origin (height bypass
+	// + recenter suppression key off this even before lock). The
+	// correction advances only on fresh board poses (live, reseat-clean);
+	// on loss the last value holds indefinitely, before lock it stays
+	// identity. Same resolved output as object placement, no extra
+	// smoothing: origin = yawOnly(board) * offset, correction = inverse.
+	if (map->local_origin)
+	{
+		const auto & lo = *map->local_origin;
+		{
+			auto a = alignment.lock();
+			if (not a->configured)
+			{
+				a->configured = true;
+				a->fiducial = lo.fiducial;
+				spdlog::info("alignment local-origin: configured for fiducial \"{}\", height offset bypassed, recenter suppressed",
+				             lo.fiducial);
+			}
+		}
+		if (auto bpit = board_poses.find(lo.fiducial);
+		    bpit != board_poses.end() and not bpit->second.needs_reseat)
+		{
+			// Yaw-only board frame: swing-twist about world Y keeps
+			// headset gravity, discarding print pitch/roll. Degenerate
+			// (board upside down, w == y == 0) falls back to 180° yaw.
+			glm::quat bq(bpit->second.pose.orientation.w, bpit->second.pose.orientation.x,
+			             bpit->second.pose.orientation.y, bpit->second.pose.orientation.z);
+			glm::vec3 bp(bpit->second.pose.position.x, bpit->second.pose.position.y,
+			             bpit->second.pose.position.z);
+			glm::quat yaw(bq.w, 0, bq.y, 0);
+			if (glm::length(yaw) < 1e-6f)
+				yaw = glm::quat(0, 0, 1, 0);
+			else
+				yaw = glm::normalize(yaw);
+			glm::quat oq(lo.orientation[3], lo.orientation[0], lo.orientation[1], lo.orientation[2]);
+			glm::vec3 op(lo.position[0], lo.position[1], lo.position[2]);
+			glm::quat mq = yaw * oq;
+			glm::vec3 mp = bp + yaw * op;
+			glm::quat aq = glm::conjugate(mq);
+			glm::vec3 ap = aq * -mp;
+			auto a = alignment.lock();
+			bool was = a->active;
+			a->active = true;
+			a->correction = {.orientation = {aq.x, aq.y, aq.z, aq.w}, .position = {ap.x, ap.y, ap.z}};
+			a->last_update = now;
+			if (not was)
+				spdlog::info("alignment local-origin: locked to fiducial \"{}\"", lo.fiducial);
+		}
+	}
+	else
+	{
+		auto a = alignment.lock();
+		if (a->configured)
+			*a = alignment_correction{};
+	}
 
 	// ---- behavior objects: first referenced board pose wins ----
 	for (auto oit = passthrough_objects.begin(); oit != passthrough_objects.end();)
@@ -1397,6 +1471,33 @@ void scenes::stream::gui_fiducial_status()
 			ImGui::Text("%s %.40s", _S("Passthrough unlocked by"), until_lock_target.c_str());
 		else
 			ImGui::Text("%s %.40s (%s)", _S("Full passthrough until"), until_lock_target.c_str(), _S("waiting"));
+	}
+	{
+		auto a = alignment.lock();
+		if (a->configured)
+		{
+			auto bpit = board_poses.find(a->fiducial);
+			bool live = bpit != board_poses.end() and bpit->second.live;
+			if (a->active)
+			{
+				double stale_s = (instance.now() - a->last_update) * 1e-9;
+				ImVec4 dot = live ? ImVec4{0.2f, 0.9f, 0.3f, 1.0f} : ImVec4{0.9f, 0.7f, 0.2f, 1.0f};
+				ImGui::TextColored(dot, "%s", live ? "[o]" : "[~]");
+				ImGui::SameLine();
+				ImGui::Text("%s %.40s: %s (stale %.1fs)",
+				            _S("Origin alignment"),
+				            a->fiducial.c_str(),
+				            live ? _S("aligned") : _S("holding last correction"),
+				            stale_s);
+				ImGui::Text("  %s: (%.3f, %.3f, %.3f)",
+				            _S("Correction pos m"),
+				            (double)a->correction.position.x,
+				            (double)a->correction.position.y,
+				            (double)a->correction.position.z);
+			}
+			else
+				ImGui::Text("%s %.40s: %s", _S("Origin alignment"), a->fiducial.c_str(), _S("seeking"));
+		}
 	}
 	for (const auto & f: map->fiducials)
 	{

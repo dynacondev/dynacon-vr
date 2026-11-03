@@ -761,6 +761,23 @@ private:
 	float until_lock_fade_s = 2.0f;
 	XrTime until_lock_time = 0; // latch time; 0 = not fading
 	bool until_lock_fading = false;
+	// Origin alignment (alignment -> local-origin): render thread derives
+	// the correction from the resolved board pose every frame, tracking
+	// thread applies it to outgoing poses. configured = map carries a
+	// local-origin (height offset bypassed, recenter suppressed);
+	// active = locked at least once (correction holds last value on
+	// loss, identity before lock). Render thread only writes fresh
+	// solutions (holds last on loss), tracking thread reads.
+	struct alignment_correction
+	{
+		bool configured = false;
+		bool active = false;
+		// A: reported = A * raw (STAGE). Identity when inactive.
+		XrPosef correction{{0, 0, 0, 1}, {0, 0, 0}};
+		std::string fiducial;
+		XrTime last_update = 0; // last frame the correction advanced
+	};
+	thread_safe<alignment_correction> alignment;
 	// Headset presence (XR_EXT_user_presence, render thread only): true
 	// while worn. Loss arms a soft filter reseat per fiducial (see
 	// handle_user_presence); transitions only, repeats ignored.

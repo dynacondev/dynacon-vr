@@ -640,6 +640,72 @@ configuration::configuration()
 			}
 		}
 
+		if (auto it = json.find("alignment"); it != json.end())
+		{
+			if (not it->is_object())
+				U_LOG_W("alignment must be an object, ignoring");
+			else
+			{
+				for (auto & [key, sub]: it->items())
+				{
+					if (key != "local-origin")
+					{
+						U_LOG_W("alignment: unknown sub element \"%s\", ignoring", key.c_str());
+						continue;
+					}
+					if (not sub.is_object())
+					{
+						U_LOG_W("alignment local-origin must be an object, ignoring");
+						continue;
+					}
+					alignment_origin a;
+					for (auto & [skey, sval]: sub.items())
+					{
+						if (skey != "fiducial" and skey != "position" and skey != "orientation")
+							U_LOG_W("alignment local-origin: unknown key \"%s\", ignoring", skey.c_str());
+						(void)sval;
+					}
+					if (sub.contains("fiducial"))
+					{
+						if (sub["fiducial"].is_string())
+							a.fiducial = sub["fiducial"];
+						else
+							U_LOG_W("alignment local-origin: fiducial must be a fiducial id string, ignoring");
+					}
+					if (sub.contains("position"))
+					{
+						const auto & p = sub["position"];
+						if (p.is_array() and p.size() == 3 and p[0].is_number() and p[1].is_number() and p[2].is_number())
+							a.position = {p[0].get<float>(), p[1].get<float>(), p[2].get<float>()};
+						else
+							U_LOG_W("alignment local-origin: invalid position, expected [x, y, z] meters, ignoring");
+					}
+					if (sub.contains("orientation"))
+					{
+						try
+						{
+							a.orientation = parse_orientation(sub["orientation"], "alignment local-origin");
+						}
+						catch (std::exception & e)
+						{
+							U_LOG_W("alignment local-origin: %s, ignoring", e.what());
+						}
+					}
+					if (a.fiducial.empty())
+					{
+						U_LOG_W("alignment local-origin without fiducial, skipping");
+						continue;
+					}
+					if (not std::ranges::any_of(fiducials, [&](const fiducial_entry & e) { return e.id == a.fiducial; }))
+					{
+						U_LOG_W("alignment local-origin \"%s\" matches no fiducial id, ignoring", a.fiducial.c_str());
+						continue;
+					}
+					alignment_local_origin = std::move(a);
+				}
+			}
+		}
+
 		if (auto it = json.find("tcp-only"); it != json.end())
 			tcp_only = *it;
 
