@@ -32,11 +32,12 @@ struct vk_bundle;
 // Input: the warp's per-eye target-view splat images (R32Uint,
 // DEPTH_SCALE-encoded NDC, sentinel = no splat) at full render size, plus
 // the dst frustum near/far per eye. Output: the Y plane (2D view on layer
-// 3) of the 640x320 SBS staging image — left eye x[0..320), right eye
-// x[320..640), 8-bit 1cm/LSB, 255 = >=2.55m / sky / hole.
+// 3) of the SBS staging image — left eye x[0..half), right eye
+// x[half..2*half), 10-bit 2mm/LSB, 1023 = >=2.046m / sky / hole, where
+// half/height track half the stream resolution per eye.
 //
 // Resample (MIN-pool, foreground wins) runs before linearisation, in the
-// encoded domain; linearisation + quantize run at 320x320. See
+// encoded domain; linearisation + quantize run at depth resolution. See
 // shaders/depth_pack.comp.
 //
 // Slot ownership mirrors depth_reprojector: one descriptor set per commit
@@ -46,16 +47,13 @@ struct vk_bundle;
 class depth_packer
 {
 public:
-	static constexpr uint32_t sbs_width = 640;
-	static constexpr uint32_t sbs_height = 320;
-	static constexpr uint32_t eye_width = 320;
-
 	depth_packer(vk_bundle & vk);
 
 	// Records the pack into cmd. Returns false on degenerate input
 	// (nothing recorded). The caller owns layout/barrier transitions of
 	// dst_y (GENERAL on entry); splat inputs must be visible for shader
 	// read (the warp's own barriers cover this when recorded after fill).
+	// dst_extent sizes the dispatch and must match the dst_y image.
 	bool pack(vk::raii::Device & device,
 	          vk::raii::CommandBuffer & cmd,
 	          int slot,
@@ -66,7 +64,8 @@ public:
 	          float far_l,
 	          float near_r,
 	          float far_r,
-	          vk::ImageView dst_y);
+	          vk::ImageView dst_y,
+	          vk::Extent2D dst_extent);
 
 private:
 	struct push

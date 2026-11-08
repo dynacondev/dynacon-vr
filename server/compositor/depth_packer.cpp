@@ -122,11 +122,14 @@ bool depth_packer::pack(vk::raii::Device & device,
                         float far_l,
                         float near_r,
                         float far_r,
-                        vk::ImageView dst_y)
+                        vk::ImageView dst_y,
+                        vk::Extent2D dst_extent)
 {
 	if (slot < 0 or slot >= int(num_slots))
 		return false;
 	if (not(src_extent.width > 0 and src_extent.height > 0))
+		return false;
+	if (not(dst_extent.width > 0 and dst_extent.height > 0))
 		return false;
 	if (not(near_l > 0 and far_l > near_l and near_r > 0 and far_r > near_r))
 		return false;
@@ -182,7 +185,7 @@ bool depth_packer::pack(vk::raii::Device & device,
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pipe_layout, 0, sets[slot], {});
 	cmd.pushConstants<push>(*pipe_layout, vk::ShaderStageFlagBits::eCompute, 0, pc);
-	cmd.dispatch((sbs_width + 7) / 8, (sbs_height + 7) / 8, 1);
+	cmd.dispatch((dst_extent.width + 7) / 8, (dst_extent.height + 7) / 8, 1);
 	return true;
 }
 

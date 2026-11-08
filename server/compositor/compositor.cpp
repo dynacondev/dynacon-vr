@@ -221,14 +221,14 @@ std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, std::
 	return {make_image(0), make_image(1)};
 }
 
-// Virtual-depth staging (stream 3): 640x320 SBS YCbCr, depth packed into
+// Virtual-depth staging (stream 3): SBS YCbCr, depth packed into
 // layer 3 so encoder backends keep indexing baseArrayLayer == stream_idx.
-// Always 8-bit (1cm/LSB luma + neutral chroma), independent of the color
+// 10-bit (2mm/LSB luma + neutral chroma), independent of the color
 // bit depth. Own image (not a 4th layer of the color image): different
 // extent and formats.
 std::array<wivrn::compositor::depth_image, 2> make_depth_images(wivrn::vk_bundle & vk, const wivrn::encoder_settings & depth_settings)
 {
-	auto formats = image_formats(8);
+	auto formats = image_formats(depth_settings.bit_depth);
 
 	vk::StructureChain image_info{
 	        vk::ImageCreateInfo{
@@ -875,9 +875,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	}
 
 	// Virtual-depth pack (stream 3): MIN-pool the warp's target-view splat
-	// to 320x320 per eye, linearise, quantize 1cm/LSB into the 640x320 SBS
-	// staging image (layer 3). Runs only on warped frames with valid
-	// near/far; otherwise images[slot].has_depth stays false and the
+	// to half stream resolution per eye, linearise, quantize 2mm/LSB into
+	// the SBS staging image (layer 3). Runs only on warped frames with
+	// valid near/far; otherwise images[slot].has_depth stays false and the
 	// worker never touches the depth encoder (strict pairing: no stale
 	// virtual depth on the client).
 	images[slot].has_depth = false;
@@ -916,7 +916,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// memcpy: ClearColorValue union members are C arrays here (same
 		// as the splat clear in depth_reprojector), not assignable.
 		vk::ClearColorValue neutral{};
-		const float chroma[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0.0f, 1.0f};
+		const float chroma[4] = {0.5f, 0.5f, 0.0f, 1.0f};
 		std::memcpy(neutral.float32, chroma, sizeof(chroma));
 		cmd.clearColorImage(
 		        depth.image,
@@ -942,7 +942,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            src_far_z[0],
 		            src_near_z[1],
 		            src_far_z[1],
-		            *depth.out_y))
+		            *depth.out_y,
+		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height}))
 		{
 			auto & depth_enc = encoders[3];
 			// Mirrors the color encoder handoff: single eColor barrier

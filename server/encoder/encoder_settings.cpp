@@ -45,11 +45,12 @@ namespace wivrn
 
 static const double passthrough_bitrate_factor = 0.05;
 
-// Depth stream (index 3, 640x320 SBS virtual depth) is pinned to 5% of the
-// total bitrate: it is tiny, low-entropy 8-bit luma, and must not starve
-// color. Weights for 0..2 are area-based as before; depth weight is derived
-// from their sum so the final share is exactly depth_share.
-static const double depth_bitrate_share = 0.05;
+// Depth stream (index 3, half-res SBS virtual depth) is pinned to 15% of
+// the total bitrate: it is larger than before but low-entropy 10-bit
+// luma, and must not starve color. Weights for 0..2 are area-based as
+// before; depth weight is derived from their sum so the final share is
+// exactly depth_share.
+static const double depth_bitrate_share = 0.15;
 
 static void split_bitrate(std::array<wivrn::encoder_settings, 4> & encoders, uint64_t bitrate)
 {
@@ -313,24 +314,20 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 		std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(src);
 
-		// Depth stream (index 3) prefers H.265: lossy-tolerant 8-bit luma
-		// carrying 1cm/LSB virtual depth. If the config did not pin a
-		// codec, the headset advertised H.265, and H.265 probes cleanly
-		// on this backend, switch to it.
-		if (i == 3 and not src.codec and dst.codec != wivrn::h265 and
-		    std::ranges::contains(info.supported_codecs, wivrn::h265, &video_codec_capability::codec))
+		// Depth stream (index 3) requires H.265 Main10: 10-bit luma
+		// carrying 2mm/LSB virtual depth. If the config did not pin a
+		// codec, the headset must advertise H.265 and H.265 must probe
+		// cleanly on this backend; there is no 8-bit fallback.
+		if (i == 3 and not src.codec and dst.codec != wivrn::h265)
 		{
-			try
-			{
-				configuration::encoder depth_cfg = src;
-				depth_cfg.codec = wivrn::h265;
-				std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(depth_cfg);
-			}
-			catch (std::exception &)
-			{
-				// Keep the probed fallback (e.g. H.264-only stacks).
-			}
+			if (not std::ranges::contains(info.supported_codecs, wivrn::h265, &video_codec_capability::codec))
+				throw std::runtime_error("depth stream requires H.265 support on the headset");
+			configuration::encoder depth_cfg = src;
+			depth_cfg.codec = wivrn::h265;
+			std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(depth_cfg);
 		}
+		if (i == 3 and dst.codec != wivrn::h265)
+			throw std::runtime_error("depth stream requires H.265 codec");
 	}
 
 	auto width = align(info.stream_eye_width, 64);
@@ -341,10 +338,13 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 	for (auto [i, dst]: std::ranges::enumerate_view(res))
 	{
-		if (i == 3) // virtual depth SBS: fixed 640x320 (L|R halves 320x320)
+		if (i == 3) // virtual depth SBS: half stream resolution per eye
+		            // (SBS width = full stream width, height = half).
+		            // width/height are 64-aligned above, so both stay
+		            // %32 for NVENC.
 		{
-			dst.width = 640;
-			dst.height = 320;
+			dst.width = width;
+			dst.height = height / 2;
 			uint16_t w = dst.width, h = dst.height;
 			check_video_size(dst.encoder_name, dst.codec, w, h);
 			dst.width = w;
@@ -362,8 +362,9 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	if (bit_depth and bit_depth != 8 and bit_depth != 10)
 		throw std::runtime_error("invalid bit-depth setting. supported values: 8, 10");
 
-	// Depth (index 3) is always 8-bit on its own staging image: it must
-	// not veto 10-bit color, nor be probed at 10-bit.
+	// Depth (index 3) is always 10-bit on its own staging image: it must
+	// not veto 10-bit color, and its H.265 Main10 requirement is enforced
+	// separately above (no fallback).
 	const bool all_encoders_10bit = std::ranges::all_of(
 	        std::span(res).first(3), [&](const encoder_settings & encoder) {
 		        auto it = std::ranges::find(info.supported_codecs, encoder.codec, &video_codec_capability::codec);
@@ -403,8 +404,8 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	auto check_vaapi = [&](int bit_depth) {
 		for (const auto [i, encoder]: std::ranges::enumerate_view(res))
 		{
-			if (i == 3)
-				continue; // depth is always 8-bit, probed separately
+			// Depth (index 3) is always 10-bit; color rides bit_depth.
+			int depth = (i == 3) ? 10 : bit_depth;
 			if (encoder.encoder_name == encoder_vaapi)
 			{
 				try
@@ -417,13 +418,13 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 					                .codec = encoder.codec,
 					                .fps = 60,
 					                .bitrate = 50'000'000,
-					                .bit_depth = bit_depth,
+					                .bit_depth = depth,
 					        },
 					        0};
 				}
 				catch (std::exception & e)
 				{
-					U_LOG_I("vaapi not supported for %s %d bits", std::string(magic_enum::enum_name(encoder.codec)).c_str(), bit_depth);
+					U_LOG_I("vaapi not supported for %s %d bits", std::string(magic_enum::enum_name(encoder.codec)).c_str(), depth);
 					return false;
 				}
 			}
@@ -445,13 +446,19 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	{
 		U_LOG_W("GPU does not have sufficient support for 8-bit images");
 	}
+	// Depth (index 3) still needs its own 10-bit VAAPI probe when color
+	// settled at 8-bit (the check above only probed depth at 10 when
+	// color was 10).
+	if (bit_depth == 8 and not check_vaapi(8))
+	{
+		throw std::runtime_error("GPU does not support 10-bit VAAPI encode required for the depth stream");
+	}
 
 	for (auto & i: res)
 		i.bit_depth = bit_depth.value_or(10);
-	// Virtual depth is defined as 8-bit 1cm/LSB luma regardless of the
-	// color bit depth: forcing 8-bit avoids wasting bits on a 10-bit
-	// depth container no client code reads.
-	res[3].bit_depth = 8;
+	// Virtual depth is defined as 10-bit 2mm/LSB luma regardless of the
+	// color bit depth.
+	res[3].bit_depth = 10;
 
 	split_bitrate(res, settings.bitrate_bps);
 	return res;
