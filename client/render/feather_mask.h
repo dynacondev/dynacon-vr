@@ -156,6 +156,17 @@ public:
 		double volume_merge_ms = 0;
 		float volume_box_frac = 1; // merge-box area fraction of the seed
 		// (0-1); drives the renderArea scissor economics, logged.
+		// VR-occlusion stages (3d-passthrough windows in this group):
+		// nearest-point object raster at 320px, eye-space virt<object
+		// flatten, upscale+MIN merge into the seed ahead of erode (and
+		// ahead of the volume MAX above, so a real reveal there can
+		// still win where the sensor is nearer than VR). Zero when the
+		// group carries no VR draws (no paired virtual depth).
+		double vr_raster_ms = 0;
+		double vr_compare_ms = 0;
+		double vr_merge_ms = 0;
+		float vr_box_frac = 1; // merge-box area fraction of the seed
+		// (0-1), same scissor economics as the volume box above.
 	};
 
 	// Record silhouettes + blur chain for both eyes into the layers of an
@@ -183,9 +194,17 @@ public:
 	// meters->D with near_z/far_z) and the compare tests
 	// sensor < min(volume, virtual) in D space. Null/invalid = legacy
 	// sensor < volume behavior for that frame (strict: no stale virtual).
+	// The VR-occlusion path below samples the same canvas in eye space
+	// (virt < object, no sensor remap), so one conversion serves both.
 	struct volume_input
 	{
 		std::vector<instance_draw> draws; // depth objects, eye MVP space
+		// VR occluders: 3d-passthrough positives in this group, eye MVP
+		// space (same MVPs as the silhouette draws, reversed excluded).
+		// Rasterized nearest-point at 320px and tested eye-space
+		// virt < object; the seed MIN-cuts where VR wins. Empty (or no
+		// paired virtual depth) = no VR occlusion in this group.
+		std::vector<instance_draw> vr_draws;
 		vk::ImageView sensor_view = nullptr; // runtime D16 2-layer array
 		float near_z = 0.1f; // depth frustum the raster must match
 		float far_z = 10.f;
@@ -404,6 +423,15 @@ private:
 	vk::raii::RenderPass volume_raster_renderpass{nullptr};
 	vk::raii::PipelineLayout volume_raster_layout{nullptr};
 	vk::raii::Pipeline volume_raster_pipeline{nullptr};
+	// VR-occlusion object raster: same shaders (volume.vert +
+	// volume_raster.frag encode eye depth as sensor-compatible D) and
+	// push layout as the volume raster above, but nearest-point state:
+	// cull-nothing + MIN blend over a far (1.0) clear, so the closest
+	// surface wins order-independently. Cull-nothing (not back) keeps
+	// single-sided windows visible from either side; closed meshes still
+	// resolve to the front wall. The compare gates on <0.9999, so the
+	// far clear reads back as empty, never as geometry.
+	vk::raii::Pipeline vr_raster_pipeline{nullptr};
 	// Compare (fullscreen _mv, 2 samplers: sensor D16 + volume R16).
 	// Dedicated CLEAR renderpass over volume_bin.blur_fb_mv (same R8 MV
 	// shape as the blur intermediates; loadOp is not part of render-pass
@@ -427,6 +455,17 @@ private:
 		glm::vec4 corr[2]{};
 	};
 	vk::raii::Pipeline compare_pipeline_mv{nullptr};
+	// VR-occlusion compare (fullscreen _mv, 2 samplers: object R16 +
+	// virtual D canvas). Eye-space virt < object, no sensor remap, no
+	// push constants (both inputs are already D). Renders into the same
+	// volume_bin.blur_fb_mv scratch under the shared R8 MV CLEAR pass
+	// (sequential with the volume compare: VR runs first, the volume
+	// overwrites after), then presmooths + MIN-merges below.
+	vk::raii::DescriptorSetLayout vr_compare_set_layout{nullptr};
+	vk::raii::PipelineLayout vr_compare_pipe_layout{nullptr};
+	vk::raii::DescriptorPool vr_compare_pool{nullptr};
+	vk::raii::DescriptorSet vr_compare_set{nullptr};
+	vk::raii::Pipeline vr_compare_pipeline_mv{nullptr};
 	// Linear sampler for the compare taps (sensor + volume depth):
 	// deliberate coverage-AA. Bilinear ramps the depth across edge texels
 	// so the d<v crossing slides sub-texel instead of stepping on the
@@ -459,7 +498,16 @@ private:
 	vk::raii::Pipeline volume_max_r8_pipeline{nullptr};
 	vk::raii::RenderPass volume_max_rgb8_renderpass{nullptr};
 	vk::raii::Pipeline volume_max_rgb8_pipeline{nullptr};
+	// Upscale+MIN merge for VR occlusion (LOAD, preserves the silhouette
+	// + reversed-cut result, clears where VR wins). Same blur shaders
+	// with spread 0 and same renderpasses as the MAX merges above (loadOp
+	// is not part of compatibility); only the blend op differs.
+	vk::raii::Pipeline vr_min_r8_pipeline{nullptr};
+	vk::raii::Pipeline vr_min_rgb8_pipeline{nullptr};
 	blur_target volume_depth; // R16 furthest-D canvas (320, 2 layers)
+	blur_target vr_depth; // R16 nearest-D canvas (320, 2 layers):
+	// object depth for the VR-occlusion compare above. Far (1.0) clear,
+	// MIN blend, cull-nothing (see vr_raster_pipeline).
 	blur_target volume_virt; // R16 virtual-depth D canvas (320, 2 layers):
 	// SBS meters->D conversion output, cleared to far, sampled by the
 	// compare pass alongside volume_depth. Own MV framebuffer

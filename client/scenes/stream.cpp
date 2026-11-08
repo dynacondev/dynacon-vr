@@ -1566,6 +1566,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
 		volume_acquire_ms = volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = 0;
+		vr_raster_ms = vr_compare_ms = vr_merge_ms = 0;
 		volume_frame_virt_paired = false;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
@@ -2113,9 +2114,34 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					// Reversed-only draws rasterize to a provable no-op, so a
 					// group with no positive draws is skipped exactly like an
-					// empty one.
+					// empty one. VR occlusion needs positives + paired
+					// virtual depth (resolved below); it rides the same
+					// positives, so no extra culling pass.
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					if ((draws.empty() or not any_positive) and not any_volume)
+					// Strict virtual-depth pairing (shared by the volume
+					// reveal and the VR occlusion): null when the color
+					// frame had no depth warp.
+					bool virt_paired = false;
+					vk::ImageView virt_view = nullptr;
+					vk::Sampler virt_sampler = nullptr;
+					if (auto & dh = current_blit_handles[depth_stream_index])
+					{
+						virt_view = dh->image_view;
+						virt_sampler = decoders[depth_stream_index].decoder->sampler();
+						virt_paired = true;
+					}
+					std::vector<feather_mask_renderer::instance_draw> vr_draws;
+					bool any_vr = false;
+					if (virt_paired and any_positive)
+					{
+						for (const auto & d: draws)
+						{
+							if (!d.reverse)
+								vr_draws.push_back(d);
+						}
+						any_vr = not vr_draws.empty();
+					}
+					if ((draws.empty() or not any_positive) and not any_volume and not any_vr)
 					{
 						g.active = false;
 						// Mesh-pipeline edge forensics: draws present ->
@@ -2160,11 +2186,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					g.active = true;
 					g.extent = {(int32_t)gw, (int32_t)gh};
 					feather_mask_renderer::mask_stage_cpu mstats{};
-					bool vol_virt_paired = false;
 					try
 					{
 						feather_mask_renderer::volume_input vol_in;
-						if (any_volume)
+						bool use_vol_in = any_volume or any_vr;
+						if (use_vol_in)
 						{
 							vol_in.draws = volume_draws;
 							vol_in.remap_cols = volume_remap;
@@ -2172,22 +2198,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							vol_in.sensor_view = volume_sensor;
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
-							// Virtual depth: strict pairing already resolved
-							// in current_blit_handles[3] (null when the
-							// color frame had no depth warp).
-							if (auto & dh = current_blit_handles[depth_stream_index])
+							// Virtual depth (shared by the volume reveal and
+							// the VR occlusion): strict pairing resolved
+							// above, null when the color frame had no depth
+							// warp. Near/far ride the sensor frustum so both
+							// D canvases agree.
+							if (virt_paired)
 							{
-								vol_in.virt_view = dh->image_view;
-								vol_in.virt_sampler = decoders[depth_stream_index].decoder->sampler();
+								vol_in.virt_view = virt_view;
+								vol_in.virt_sampler = virt_sampler;
 								vol_in.virt_valid = true;
-								vol_virt_paired = true;
 							}
-							if (*volume_query_pool)
+							if (any_vr)
+								vol_in.vr_draws = vr_draws;
+							if (any_volume and *volume_query_pool)
 								vol_in.timestamp_pool = *volume_query_pool;
 						}
 						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
 						                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
-						                   any_volume ? &vol_in : nullptr);
+						                   use_vol_in ? &vol_in : nullptr);
 					}
 					catch (std::exception & e)
 					{
@@ -2205,7 +2234,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					volume_virt_ms += mstats.volume_virt_ms;
 					volume_compare_ms += mstats.volume_compare_ms;
 					volume_merge_ms += mstats.volume_merge_ms;
-					if (any_volume and vol_virt_paired)
+					vr_raster_ms += mstats.vr_raster_ms;
+					vr_compare_ms += mstats.vr_compare_ms;
+					vr_merge_ms += mstats.vr_merge_ms;
+					if (virt_paired and (any_volume or any_vr))
 						volume_frame_virt_paired = true;
 					mask_draws += (int)mstats.draws;
 					if (any_volume)

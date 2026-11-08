@@ -168,6 +168,9 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.volume_raster_ms = (float)(volume_raster_ms * 1e-3);
 	gm.volume_compare_ms = (float)(volume_compare_ms * 1e-3);
 	gm.volume_merge_ms = (float)(volume_merge_ms * 1e-3);
+	gm.vr_raster_ms = (float)(vr_raster_ms * 1e-3);
+	gm.vr_compare_ms = (float)(vr_compare_ms * 1e-3);
+	gm.vr_merge_ms = (float)(vr_merge_ms * 1e-3);
 	gm.volume_raster_gpu_ms = last_volume_gpu.raster;
 	gm.volume_compare_gpu_ms = last_volume_gpu.compare;
 	gm.volume_merge_gpu_ms = last_volume_gpu.merge;
@@ -191,7 +194,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		if (predicted_display_time - last_stats_log > 5'000'000'000LL)
 		{
 			last_stats_log = predicted_display_time;
-			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s (l/r/a/d {:.1f}/{:.1f}/{:.1f}/{:.1f}) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms vol={:.2f}ms volg={:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
+			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s (l/r/a/d {:.1f}/{:.1f}/{:.1f}/{:.1f}) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms vol={:.2f}ms volg={:.2f}ms vr={:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
 			             gm.cpu_time * 1e3f,
 			             gm.gpu_time * 1e3f,
 			             gm.defoveate_gpu_ms * 1e3f,
@@ -212,6 +215,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             gm.mask_blur_ms * 1e3f,
 			             (gm.volume_acquire_ms + gm.volume_raster_ms + gm.volume_virt_ms + gm.volume_compare_ms + gm.volume_merge_ms) * 1e3f,
 			             (gm.volume_raster_gpu_ms + gm.volume_virt_gpu_ms + gm.volume_compare_gpu_ms + gm.volume_merge_gpu_ms) * 1e3f,
+			             (gm.vr_raster_ms + gm.vr_compare_ms + gm.vr_merge_ms) * 1e3f,
 			             gm.gizmo_ms * 1e3f,
 			             gm.feat_votes,
 			             gm.feat_tags,
@@ -230,7 +234,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 					m = std::max(m, g.*field);
 				return m;
 			};
-			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms vol={:.2f}ms volg={:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
+			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms vol={:.2f}ms volg={:.2f}ms vr={:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
 			             ring_max(&global_metric::cpu_time) * 1e3f,
 			             ring_max(&global_metric::gpu_time) * 1e3f,
 			             ring_max(&global_metric::defoveate_gpu_ms) * 1e3f,
@@ -245,6 +249,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             ring_max(&global_metric::mask_blur_ms) * 1e3f,
 			             (ring_max(&global_metric::volume_acquire_ms) + ring_max(&global_metric::volume_raster_ms) + ring_max(&global_metric::volume_virt_ms) + ring_max(&global_metric::volume_compare_ms) + ring_max(&global_metric::volume_merge_ms)) * 1e3f,
 			             (ring_max(&global_metric::volume_raster_gpu_ms) + ring_max(&global_metric::volume_virt_gpu_ms) + ring_max(&global_metric::volume_compare_gpu_ms) + ring_max(&global_metric::volume_merge_gpu_ms)) * 1e3f,
+			             (ring_max(&global_metric::vr_raster_ms) + ring_max(&global_metric::vr_compare_ms) + ring_max(&global_metric::vr_merge_ms)) * 1e3f,
 			             ring_max(&global_metric::gizmo_ms) * 1e3f,
 			             ring_max(&global_metric::fence_wait_ms) * 1e3f,
 			             ring_max(&global_metric::gui_ms) * 1e3f,
@@ -399,6 +404,9 @@ void scenes::stream::gui_performance_metrics()
 	                                {_("Vol virt"),    &global_metric::volume_virt_ms},
 	                                {_("Vol compare"), &global_metric::volume_compare_ms},
 	                                {_("Vol merge"),   &global_metric::volume_merge_ms},
+	                                {_("VR raster"),  &global_metric::vr_raster_ms},
+	                                {_("VR compare"), &global_metric::vr_compare_ms},
+	                                {_("VR merge"),    &global_metric::vr_merge_ms},
 	                                {_("Vol paired"),  &global_metric::virt_paired},
 	                                {_("Gizmos"),       &global_metric::gizmo_ms}}, "s"),
 
