@@ -23,6 +23,7 @@
 #include <android_native_app_glue.h>
 #endif
 
+#include <optional>
 #include <vector>
 #include <vulkan/vulkan_raii.hpp>
 #include <openxr/openxr.h>
@@ -83,6 +84,7 @@ public:
 	}
 
 	XrSystemProperties properties() const;
+	std::optional<XrColorSpaceFB> native_color_space() const;
 	XrSystemHandTrackingPropertiesEXT hand_tracking_properties() const;
 	XrSystemEyeGazeInteractionPropertiesEXT eye_gaze_interaction_properties() const;
 	XrSystemUserPresencePropertiesEXT user_presence_properties() const;
