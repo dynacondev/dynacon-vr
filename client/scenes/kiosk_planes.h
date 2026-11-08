@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include "render/room_mesh.h"
 #include "render/scene_components.h"
 #include <entt/entity/fwd.hpp>
 #include <glm/vec3.hpp>
@@ -46,14 +47,23 @@ namespace wivrn
 class kiosk_planes
 {
 public:
-	kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_layer_mask);
+	kiosk_planes(::scene & scene, xr::instance & instance, xr::session & session, uint32_t layer_mask, uint32_t trail_layer_mask);
 
 	// anchor is the overlay panel pose sampled this frame: used for fresh
 	// spawns and, as it moves, to steer newly chained segments back toward
 	// the centre. Inactive planes are hidden and frozen.
 	// camera is the viewer position for billboarding the trails; without
 	// it the ribbons fall back to facing up.
-	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera);
+	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera, XrSpace world);
+
+	// Route scene lifetime events here (room mesh query results etc.).
+	void on_xr_event(const xr::event & event);
+
+	// Room mesh status line for the lobby settings row; capture launches
+	// the system room-setup flow (only when the provider offers it).
+	std::string room_mesh_status();
+	bool can_capture_room();
+	void request_room_capture();
 
 private:
 	struct flight
@@ -132,9 +142,19 @@ private:
 	};
 
 	::scene & scene_;
+	room_mesh room_mesh_;
+	// Latest viewer head position (world space) for the human-sized
+	// keep-out box. Set each update from the camera hook; empty when the
+	// scene has no head pose (box skipped, mesh still applies).
+	std::optional<glm::vec3> head_;
 	std::vector<flight> flights_;
 	std::mt19937 rng_;
 	bool was_active_ = false;
+	// Room-data gate: pre-decision segments may be wall-blind, so the
+	// fleet stays hidden (then restarts staggered) until the first room
+	// query settles or a 20 s grace expires.
+	bool mesh_gate_open_ = false;
+	XrTime gate_t0_ = 0;
 
 	// Shared engine-trail ribbon: one node/primitive holding every flight's
 	// camera-facing strip, rebuilt on the CPU each frame.
@@ -149,14 +169,28 @@ private:
 
 	void respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient);
 	// Chain the next segment onto the live flight: C¹-continuous with the
-	// frozen curve (same end point and tangent), steered at the live
-	// anchor so the fleet meanders around a moving centre. Trail, livery
-	// and lifetime are untouched — only the path, its pacing and the
-	// segment's maneuver are refreshed.
-	void extend(flight & f, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient);
-	// Fresh segment contents: control points (chained or launched), arc
-	// table, pacing and the segment's maneuver pick.
-	void build_segment(flight & f, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool fresh);
+	// flown motion (same point and tangent — taken from the rendered
+	// position and direction the caller passes, which already include the
+	// keep-out backstop, so there is no stick-then-jump at the joint),
+	// deflected back toward the live anchor so the fleet meanders around
+	// a moving centre. Trail, livery and lifetime are untouched — only
+	// the path, its pacing and the segment's maneuver are refreshed.
+	void extend(flight & f,
+	            const glm::vec3 & anchor_pos,
+	            const glm::quat & anchor_orient,
+	            const glm::vec3 & chain_pos,
+	            const glm::vec3 & chain_dir);
+	// Fresh segment contents: control points (launched, or chained off
+	// chain_pos/chain_dir), arc table, pacing and the segment's maneuver
+	// pick. A chained segment without an explicit chain frame falls back
+	// to the previous control polygon (the expiry path always passes the
+	// flown frame).
+	void build_segment(flight & f,
+	                   const glm::vec3 & anchor_pos,
+	                   const glm::quat & anchor_orient,
+	                   bool fresh,
+	                   const glm::vec3 * chain_pos = nullptr,
+	                   const glm::vec3 * chain_dir = nullptr);
 	// Maneuver pick for the current segment (distance-scheduled).
 	void pick_maneuver(flight & f);
 	static glm::vec3 bezier(const flight & f, double t);
@@ -164,6 +198,12 @@ private:
 	static glm::vec3 bezier_acc(const flight & f, double t);
 
 	void build_trail(const std::optional<glm::vec3> & camera, XrTime now);
+
+	// Room mesh + head box keep-out for sampled control points.
+	bool point_is_open(const glm::vec3 & p) const;
+	// Whole flown curve (16 bezier samples) and loop disc openness.
+	bool path_is_open(const flight & f) const;
+	bool loop_is_open(const flight & f) const;
 };
 
 } // namespace wivrn

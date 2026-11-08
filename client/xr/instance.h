@@ -46,6 +46,10 @@ union event
 	XrEventDataVisibilityMaskChangedKHR visibility_mask_changed;
 	XrEventDataUserPresenceChangedEXT user_presence_changed;
 	XrEventDataBoundaryVisibilityChangedMETA boundary_visibility_changed;
+	XrEventDataSpaceQueryResultsAvailableFB space_query_results_available;
+	XrEventDataSpaceQueryCompleteFB space_query_complete;
+	XrEventDataSpaceSetStatusCompleteFB space_set_status_complete;
+	XrEventDataSceneCaptureCompleteFB scene_capture_complete;
 };
 class instance : public utils::handle<XrInstance, xrDestroyInstance>
 {

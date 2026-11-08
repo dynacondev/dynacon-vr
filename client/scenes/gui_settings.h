@@ -54,6 +54,10 @@ struct settings_context
 
 	std::optional<bool> server_hid_forwarding;
 
+	// room mesh (kiosk obstacle avoidance), empty when the scene has no kiosk
+	std::function<std::string()> room_mesh_status; // one-line mesh state
+	std::function<void()> request_room_capture;    // system setup flow; empty when unavailable
+
 	// in-stream hooks, empty in the lobby
 	std::function<void()> on_streaming_changed;          // refresh rate / spacewarp / bitrate
 	std::function<void()> enter_foveation_adjust;        // thumbstick foveation sub-mode

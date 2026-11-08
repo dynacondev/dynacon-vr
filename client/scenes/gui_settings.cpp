@@ -731,6 +731,23 @@ bool settings_tracking(const settings_context & ctx)
 	render_settings(ctx, "##tracking", list);
 	render_settings(ctx, "##posture", posture_items);
 
+	if (ctx.room_mesh_status)
+	{
+		std::vector<setting> room_mesh_items;
+		room_mesh_items.push_back({
+		        .id = "##room_mesh",
+		        .label = _C("setting name", "Room mesh"),
+		        .description = ctx.room_mesh_status(),
+		        .ui = ui_kind::button,
+		        .button_label = _C("setting name", "Set up room"),
+		        .on_click = ctx.request_room_capture ? ctx.request_room_capture : std::function<void()>{},
+		        .enabled = [ctx] { return (bool)ctx.request_room_capture; },
+		        .disabled_tooltip = _C("tooltip", "Room mesh active, or capture unavailable on this device."),
+		});
+		ui::page_header(_cS("page header title", " Waiting area"), _cS("page header subtitle", "Model planes avoid walls when the room is set up."));
+		render_settings(ctx, "##room_mesh", room_mesh_items);
+	}
+
 	return changed;
 }
 

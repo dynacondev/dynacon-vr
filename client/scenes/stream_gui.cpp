@@ -636,6 +636,12 @@ void scenes::stream::gui_settings(float)
 			wivrn::gui::settings_devices(ctx);
 			break;
 		case settings_page::tracking:
+			if (kiosk_planes_)
+			{
+				ctx.room_mesh_status = [this] { return kiosk_planes_->room_mesh_status(); };
+				if (kiosk_planes_->can_capture_room())
+					ctx.request_room_capture = [this] { kiosk_planes_->request_room_capture(); };
+			}
 			if (wivrn::gui::settings_tracking(ctx))
 				send_settings_changed_packet(session, network_session.get(), ctx.config);
 			break;
@@ -1028,7 +1034,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			const auto & p = live_views[0].pose.position;
 			camera = glm::vec3(p.x, p.y, p.z);
 		}
-		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown, camera);
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown, camera, application::space(xr::spaces::world));
 	}
 
 	ImVec2 viewport_size(imgui_ctx->layers()[0].vp_size.x, imgui_ctx->layers()[0].vp_size.y);

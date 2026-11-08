@@ -1257,6 +1257,10 @@ void scenes::lobby::on_focused()
 {
 	recenter_gui = true;
 
+	// Spatial permission for the kiosk room mesh (no-op when granted):
+	// the runtime gate keeps the query path inert until the user agrees.
+	scenes::stream::request_spatial_permissions();
+
 	auto views = system.view_configuration_views(viewconfig);
 	assert(views.size() == 2); // FIXME
 	stream_view = application::get_hmd_traits().override_view(views[0]);
@@ -1500,7 +1504,7 @@ void scenes::lobby::on_focused()
 	setup_passthrough();
 	discover.emplace();
 
-	kiosk_planes_.emplace(*this, layer_controllers, layer_trails);
+	kiosk_planes_.emplace(*this, instance, session, layer_controllers, layer_trails);
 
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
@@ -1560,6 +1564,8 @@ void scenes::lobby::on_unfocused()
 
 void scenes::lobby::on_xr_event(const xr::event & event)
 {
+	if (kiosk_planes_)
+		kiosk_planes_->on_xr_event(event);
 	switch (event.header.type)
 	{
 		case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:

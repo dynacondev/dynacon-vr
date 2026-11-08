@@ -54,6 +54,12 @@ constexpr float min_cruise_speed = 0.15f;
 // Loiter behaviour: inside this radius legs meander freely; beyond it
 // sampling homes hard back toward the live centre.
 constexpr float loiter_radius = 1.0f;
+// Room mesh keep-out: control points stay this far off any mesh surface,
+// plus a human-sized box around the viewer head (same margin).
+constexpr float mesh_margin = 0.3f;
+constexpr float head_half_width = 0.35f;
+constexpr float head_below = 1.5f;
+constexpr float head_above = 0.4f;
 constexpr double fade_in = 1.2;
 // End-of-segment margin: figures are scheduled clear of the joint so a
 // loop never overruns into the next chained segment.
@@ -88,7 +94,6 @@ constexpr float launch_pitch_dev = 0.5f;
 // flights swing by the user instead of diffusing away forever. The
 // exclusion cone still trims anything inside 15 deg into a near miss.
 constexpr float homing_prob = 0.5f;
-constexpr float homing_blend = 0.55f;
 // Yaw sampling bias: legs always turn at least this fraction of the limit
 // so flights wiggle constantly instead of sneaking in near-straight legs.
 constexpr float min_turn_fraction = 0.25f;
@@ -163,6 +168,24 @@ double maneuver_angle(double phase, double turns, double ramp)
 	return turns * 2. * std::numbers::pi * integral / (1. - ramp);
 }
 
+// Rotate d toward target by at most max_angle, magnitude preserved.
+// Heading persists instead of snapping, so avoidance bends the path
+// instead of reversing it. (Mixing opposed headings collapses to a
+// near-zero vector whose normalization flips unpredictably — that
+// flip-flop was the ping-pong.)
+glm::vec3 deflect_toward(glm::vec3 d, glm::vec3 target, float max_angle)
+{
+	float dl = glm::length(d), tl = glm::length(target);
+	if (dl < 1e-6f || tl < 1e-6f || max_angle <= 0.f)
+		return d;
+	glm::vec3 dn = d / dl, tn = target / tl;
+	float angle = std::acos(std::clamp(glm::dot(dn, tn), -1.f, 1.f));
+	if (angle <= max_angle || angle < 1e-4f)
+		return tn * dl;
+	float t = max_angle / angle;
+	return glm::normalize(dn * (1.f - t) + tn * t) * dl;
+}
+
 // Energy-shaped loop speed: full entry speed at the bottom, `top` fraction
 // at the apex, full again at exit — like trading airspeed for altitude and
 // back. Rate and along-track acceleration both vanish at bottom and apex,
@@ -223,8 +246,10 @@ constexpr size_t trail_vert_bytes = trail_max_verts * sizeof(trail_vertex);
 namespace wivrn
 {
 
-kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_layer_mask) :
-        scene_(scene), rng_(std::random_device{}())
+kiosk_planes::kiosk_planes(::scene & scene, xr::instance & instance, xr::session & session, uint32_t layer_mask, uint32_t trail_layer_mask) :
+        scene_(scene),
+        room_mesh_(instance, session),
+        rng_(std::random_device{}())
 {
 	std::vector<size_t> livery_bag{2, 2, 1, 3, 0}; // orange-heavy, one of each
 	std::shuffle(livery_bag.begin(), livery_bag.end(), rng_);
@@ -434,7 +459,13 @@ glm::vec3 kiosk_planes::bezier_acc(const flight & f, double t)
 	return 6.f * float(u) * (f.p2 - 2.f * f.p1 + f.p0) + 6.f * float(t) * (f.p3 - 2.f * f.p2 + f.p1);
 }
 
-void kiosk_planes::build_segment(flight & f, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool fresh)
+void kiosk_planes::build_segment(
+        flight & f,
+        const glm::vec3 & anchor_pos,
+        const glm::quat & anchor_orient,
+        bool fresh,
+        const glm::vec3 * chain_pos,
+        const glm::vec3 * chain_dir)
 {
 	glm::mat3 R = glm::mat3_cast(anchor_orient);
 	std::uniform_real_distribution<float> lateral(-0.3f, 0.3f);
@@ -456,14 +487,24 @@ void kiosk_planes::build_segment(flight & f, const glm::vec3 & anchor_pos, const
 		// here so later panel motion never perturbs the flight
 		f.p0 = anchor_pos + R * glm::vec3(lateral(rng_), vertical(rng_), -0.2f);
 	}
+	else if (chain_pos && chain_dir && glm::length(*chain_dir) > 1e-6f)
+	{
+		// Chain onto the flown motion: the caller passes the rendered
+		// position (post-backstop) and direction, so the new segment
+		// starts exactly where the plane is instead of where the buried
+		// control polygon said it would be. The entry-leg cap below trims
+		// p1 back into open space when the plane slid along a wall.
+		f.p0 = *chain_pos;
+		f.p1 = f.p0 + glm::normalize(*chain_dir);
+	}
 	else
 	{
-		// Chain onto the live curve end: same point, same tangent
-		// direction — but capped at 1 m. The full old leg (up to 5 m when
-		// stretched) would lunge far outward before the home-biased legs
-		// yank back: that out-and-back slalom read as flying away. The cap
-		// only reshapes the curve (arc-walk speed is distance-based), so
-		// continuity is unaffected.
+		// No flown frame (should not happen — every extend passes one):
+		// fall back to the previous control polygon, capped at 1 m. The
+		// full old leg (up to 5 m when stretched) would lunge far outward
+		// before the home-biased legs yank back: that out-and-back slalom
+		// read as flying away. The cap only reshapes the curve (arc-walk
+		// speed is distance-based), so continuity is unaffected.
 		f.p0 = f.p3;
 		glm::vec3 old_leg = f.p3 - f.p2;
 		float old_len = glm::length(old_leg);
@@ -504,51 +545,109 @@ void kiosk_planes::build_segment(flight & f, const glm::vec3 & anchor_pos, const
 		return std::acos(std::clamp(glm::dot(a / la, b / lb), -1.f, 1.f));
 	};
 
+	// Every candidate gets the same treatment: range ball, exclusion
+	// cone, height band, mesh push-out, head box. Validated after, by
+	// leg_ok.
+	auto finalize = [&](glm::vec3 raw) {
+		glm::vec3 off = raw - anchor_pos;
+		if (glm::length(off) > max_flight_range)
+			raw = anchor_pos + off / glm::length(off) * (max_flight_range * 0.95f);
+		raw = clamp_height(push_outside_cone(raw));
+		room_mesh_.push_out(raw, mesh_margin);
+		if (head_)
+		{
+			glm::vec3 d = raw - *head_;
+			if (std::abs(d.x) < head_half_width + mesh_margin && std::abs(d.z) < head_half_width + mesh_margin &&
+			    d.y > -(head_below + mesh_margin) && d.y < head_above + mesh_margin)
+				raw.y = head_->y + head_above + mesh_margin;
+		}
+		return raw;
+	};
+
+	// The chained entry leg is committed, not sampled: keep it legal by
+	// construction. Shorten back toward the (open) chain position until
+	// the point tests open; the chain position itself was the rendered,
+	// pushed-out position, so the walk always terminates.
+	if (not fresh && not point_is_open(f.p1))
+	{
+		glm::vec3 dir1 = f.p1 - f.p0;
+		float len1 = glm::length(dir1);
+		if (len1 > 1e-6f)
+		{
+			dir1 /= len1;
+			for (float l = len1; l >= 0.2f; l -= 0.2f)
+			{
+				glm::vec3 cand = finalize(f.p0 + dir1 * l);
+				if (point_is_open(cand))
+				{
+					f.p1 = cand;
+					break;
+				}
+			}
+		}
+		else
+			f.p1 = f.p0; // degenerate entry: the sampler crawls out below
+	}
+
 	// Sample each control point chained tip-to-tail off the previous point,
 	// steering around the previous leg direction: the achieved turn then
 	// matches the sampled one by construction (the old code sampled around
 	// the anchor, so the turn check measured a different vector than the
 	// sampler produced and the fallback kept invalid legs). Cone push and
-	// height clamp are verified after the fact with a few retries; the
-	// fallback flies straight, which always satisfies the turn limits.
-	// Loiter steering: near the centre legs meander freely; straying past
-	// the loiter radius homes every leg back toward the live anchor, so the
-	// fleet hangs around a moving centre instead of diffusing away. The pull
-	// stays gentle on purpose: a hard blend would demand a >limit U-turn,
-	// fail leg_ok on every attempt, and drop to the straight fallback (the
-	// escape bug). Feasible intermediate headings turn home progressively.
-	float homing_p = homing_prob, homing_b = homing_blend;
-	float yaw_scale = 1.f;
+	// height clamp are verified after the fact with a few retries.
+	// Loiter steering is a limited deflection, not a U-turn demand: near
+	// the centre legs meander freely with a gentle home bias; straying
+	// past the loiter radius deflects every leg homeward by up to ~70 deg,
+	// so the fleet curves back over two legs instead of whipping around in
+	// one. The old full-strength mix of opposed headings collapsed to a
+	// near-zero vector whose normalization flipped unpredictably: that
+	// flip-flop was the ping-pong.
+	float deflect_p = homing_prob, deflect_m = 0.6f;
 	if (not fresh)
 	{
 		float d = glm::distance(f.p1, anchor_pos);
-		if (d > loiter_radius)
+		float over = std::clamp((d - loiter_radius) / loiter_radius, 0.f, 1.f);
+		if (over > 0.f)
 		{
-			homing_p = 1.f;
-			homing_b = 0.6f;
-			yaw_scale = 1.4f;
+			deflect_p = 1.f;
+			deflect_m = 0.6f + 0.6f * over;
 		}
 		else if (d > loiter_radius * 0.6f)
 		{
-			homing_p = 0.8f;
-			homing_b = 0.7f;
+			deflect_p = 0.8f;
+			deflect_m = 0.7f;
 		}
 	}
-	auto sample_point = [&](const glm::vec3 & base, const glm::vec3 & prev2, const glm::vec3 & prev1, bool check_turn, auto & dist_rng, float yaw_lim, float pitch_lim, float hp, float hb, const glm::vec3 * launch_dir = nullptr) {
-		auto gen = [&]() {
+	auto sample_point = [&](const glm::vec3 & base,
+	                        const glm::vec3 & prev2,
+	                        const glm::vec3 & prev1,
+	                        bool check_turn,
+	                        auto & dist_rng,
+	                        float yaw_lim,
+	                        float pitch_lim,
+	                        float deflect_p,
+	                        float deflect_m,
+	                        float len_scale,
+	                        const glm::vec3 * launch_dir = nullptr) {
+		// Turn limits need an entry leg to turn from: from a standstill
+		// any direction is legal, otherwise the escape hatch below could
+		// never fire.
+		bool can_turn = glm::length(prev1 - prev2) >= min_leg_len;
+		auto gen = [&](float scale) {
 			glm::vec3 pd = launch_dir ? *launch_dir : prev1 - prev2;
 			float pp = launch_dir ? 0.f : leg_pitch(pd);
 			float p = std::clamp(pp + std::uniform_real_distribution<float>(-pitch_lim, pitch_lim)(rng_), -max_abs_pitch, max_abs_pitch);
 			float u = std::uniform_real_distribution<float>(-1.f, 1.f)(rng_);
 			float y = std::atan2(pd.x, pd.z) + (u >= 0.f ? 1.f : -1.f) * (min_turn_fraction + (1.f - min_turn_fraction) * std::abs(u)) * yaw_lim;
 			glm::vec3 d{std::cos(p) * std::sin(y), std::sin(p), std::cos(p) * std::cos(y)};
-			if (not launch_dir and std::uniform_real_distribution<float>(0.f, 1.f)(rng_) < hp)
+			if (not launch_dir and std::uniform_real_distribution<float>(0.f, 1.f)(rng_) < deflect_p)
 			{
 				glm::vec3 to_anchor = anchor_pos - base;
 				if (glm::length(to_anchor) > 1e-3f)
-					d = glm::normalize(glm::mix(d, to_anchor / glm::length(to_anchor), hb));
+					d = deflect_toward(d, to_anchor, deflect_m);
 			}
-			return base + d * dist_rng(rng_);
+			float len = std::clamp(dist_rng(rng_) * scale, min_leg_len * 1.05f, dist_rng.max());
+			return base + d * len;
 		};
 		auto leg_ok = [&](const glm::vec3 & cand) {
 			glm::vec3 d1 = cand - prev1;
@@ -556,11 +655,19 @@ void kiosk_planes::build_segment(flight & f, const glm::vec3 & anchor_pos, const
 				return false;
 			if (glm::length(cand - anchor_pos) > max_flight_range)
 				return false;
-			if (check_turn)
+			if (not point_is_open(cand))
+				return false;
+			// Midpoint probes: a long leg can bow through a wall between
+			// checked endpoints (Bezier stays near its chord, checked at
+			// thirds). Cheap insurance against tunneling at segment scale.
+			for (double ttm: {1. / 3., 2. / 3.})
+			{
+				if (not point_is_open(prev1 + (cand - prev1) * float(ttm)))
+					return false;
+			}
+			if (check_turn && can_turn)
 			{
 				glm::vec3 d0 = prev1 - prev2;
-				if (glm::length(d0) < min_leg_len)
-					return false;
 				float yaw = yaw_change(d0, d1);
 				if (yaw > max_yaw_turn)
 					return false;
@@ -573,45 +680,139 @@ void kiosk_planes::build_segment(flight & f, const glm::vec3 & anchor_pos, const
 			}
 			return true;
 		};
-		glm::vec3 p = clamp_height(push_outside_cone(gen()));
+		glm::vec3 p = finalize(gen(len_scale));
 		for (int attempt = 0; attempt < 12 and not leg_ok(p); ++attempt)
-			p = clamp_height(push_outside_cone(gen()));
+			p = finalize(gen(len_scale));
 		if (not leg_ok(p))
 		{
-			// Last resort: fly straight — but clamped into the range ball
-			// around the live anchor, so a sampler failure can never
-			// become an escape. (An unclamped straight fallback here was
-			// the fly-away bug: far-out U-turns fail leg_ok, and straight
-			// carried the plane ever farther.)
+			// Homeward-only fallbacks, most heading-persistent first:
+			// bending around a wall beats reversing off it. (The old list
+			// led with the outward straight — flying away, then U-turning
+			// home next segment: half the ping-pong.)
 			glm::vec3 pd = launch_dir ? *launch_dir : prev1 - prev2;
 			float pl = glm::length(pd);
-			glm::vec3 dn = pl > 1e-6f ? pd / pl : glm::vec3{0.f, 0.f, -1.f};
-			glm::vec3 fb = base + dn * dist_rng.max();
-			glm::vec3 off = fb - anchor_pos;
-			if (glm::length(off) > max_flight_range)
-				fb = anchor_pos + off / glm::length(off) * (max_flight_range * 0.95f);
-			p = clamp_height(push_outside_cone(fb));
+			glm::vec3 heading = pl > 1e-6f ? pd / pl : glm::vec3{0.f, 0.f, -1.f};
+			glm::vec3 to_home = anchor_pos - base;
+			glm::vec3 home = glm::length(to_home) > 1e-3f ? to_home / glm::length(to_home) : heading;
+			float fb_len = std::clamp(dist_rng.max() * len_scale, min_leg_len * 1.05f, dist_rng.max());
+			glm::vec3 bent = deflect_toward(heading, home, 1.0f);
+			glm::vec3 cands[4] = {
+			        base + bent * fb_len,
+			        base + home * fb_len,
+			        base + bent * (fb_len * 0.5f) + glm::vec3{0.f, 0.3f, 0.f},
+			        base + home * (fb_len * 0.4f),
+			};
+			bool found = false;
+			for (const glm::vec3 & raw: cands)
+			{
+				glm::vec3 fb = finalize(raw);
+				if (leg_ok(fb))
+				{
+					p = fb;
+					found = true;
+					break;
+				}
+			}
+			if (not found)
+			{
+				// Escape hatch: scan a heading-ordered fan for the most
+				// open direction with the turn limits lifted — any turn
+				// beats a hover. Scoring by clearance bends the path along
+				// walls instead of bouncing off them; with no room data
+				// every score ties and the heading-first order holds the
+				// course.
+				float yaw0 = std::atan2(heading.x, heading.z);
+				float esc_len = std::max(min_leg_len * 1.1f, fb_len * 0.5f);
+				float best_score = -1.f;
+				for (int k = 0; k < 8; ++k)
+				{
+					// 0, ±45, ±90, ±135, 180 deg: persistence first.
+					float off = (k % 2 == 0) ? float(k / 2) * std::numbers::pi_v<float> / 4.f
+					                         : -float((k + 1) / 2) * std::numbers::pi_v<float> / 4.f;
+					glm::vec3 dir{std::sin(yaw0 + off), 0.f, std::cos(yaw0 + off)};
+					glm::vec3 cand = finalize(base + dir * esc_len);
+					glm::vec3 d1 = cand - prev1;
+					if (glm::length(d1) < min_leg_len or std::abs(leg_pitch(d1)) > max_abs_pitch)
+						continue;
+					if (glm::length(cand - anchor_pos) > max_flight_range)
+						continue;
+					if (not point_is_open(cand))
+						continue;
+					float score = room_mesh_.clearance(cand, 1.5f);
+					if (score > best_score)
+					{
+						best_score = score;
+						p = cand;
+						found = true;
+					}
+				}
+			}
+			if (not found)
+			{
+				// Total failure: short homeward crawl, force-accepted —
+				// the per-frame push-out below is the backstop. Never a
+				// zero-length hover (that stalls the next leg into a pivot
+				// the turn check then rejects forever).
+				glm::vec3 crawl = finalize(base + home * 0.3f);
+				if (glm::length(crawl - prev1) >= min_leg_len * 0.5f)
+					p = crawl;
+				else
+					p = base + home * 0.3f;
+			}
 		}
 		return p;
 	};
+	auto build_arc = [&]() {
+		f.total_len = 0.f;
+		glm::vec3 prev = bezier(f, 0.);
+		f.arclen[0] = 0.f;
+		for (size_t i = 1; i < f.arclen.size(); ++i)
+		{
+			glm::vec3 p = bezier(f, double(i) / double(f.arclen.size() - 1));
+			f.total_len += glm::distance(p, prev);
+			f.arclen[i] = f.total_len;
+			prev = p;
+		}
+	};
 	const glm::vec3 launch_dir = R * glm::vec3{0.f, 0.f, -1.f};
 	if (fresh)
-		f.p1 = sample_point(f.p0, f.p0, f.p0, false, near_dist, launch_yaw_dev, launch_pitch_dev, homing_p, homing_b, &launch_dir);
-	f.p2 = sample_point(f.p1, f.p0, f.p1, true, mid_dist, max_yaw_turn * yaw_scale, max_pitch_change, homing_p, homing_b);
-	f.p3 = sample_point(f.p2, f.p1, f.p2, true, far_dist, max_yaw_turn * yaw_scale, max_pitch_change, homing_p, homing_b);
-
-	// Arc-length table for constant-speed flight: with clustered control
-	// points gone the curve is well-behaved, and walking it by distance
-	// (not time) removes the slow-down into what is left of the turns.
-	f.total_len = 0.f;
-	glm::vec3 prev = bezier(f, 0.);
-	f.arclen[0] = 0.f;
-	for (size_t i = 1; i < f.arclen.size(); ++i)
+		f.p1 = sample_point(f.p0, f.p0, f.p0, false, near_dist, launch_yaw_dev, launch_pitch_dev, 0.f, 0.f, 1.f, &launch_dir);
+	// Fit the legs to the free space around the entry: a 2 m leg in a
+	// 1.5 m gap can never test open, so scale down with the clearance
+	// instead of burning all 8 attempts at full stretch. With no room data
+	// clearance reads wide open and the scale stays 1.
+	float space_scale = std::clamp(room_mesh_.clearance(f.p1, 1.5f) / 1.5f, 0.4f, 1.0f);
+	// Endpoints-open is not enough: the cubic bows off its chord toward
+	// the control polygon, and furniture makes the room non-convex, so a
+	// straight-chord check can pass while the flown curve clips a box.
+	// Resample whole (p2, p3) sets until the actual curve tests open,
+	// shrinking the legs each round so confined rooms converge.
+	bool accepted = false;
+	for (int attempt = 0; attempt < 8; ++attempt)
 	{
-		glm::vec3 p = bezier(f, double(i) / double(f.arclen.size() - 1));
-		f.total_len += glm::distance(p, prev);
-		f.arclen[i] = f.total_len;
-		prev = p;
+		float shrink = space_scale * std::pow(0.92f, float(attempt));
+		f.p2 = sample_point(f.p1, f.p0, f.p1, true, mid_dist, max_yaw_turn, max_pitch_change, deflect_p, deflect_m, shrink);
+		f.p3 = sample_point(f.p2, f.p1, f.p2, true, far_dist, max_yaw_turn, max_pitch_change, deflect_p, deflect_m, shrink);
+		build_arc();
+		if (f.total_len < 1e-3f)
+			continue;
+		if (path_is_open(f))
+		{
+			accepted = true;
+			break;
+		}
+	}
+	if (not accepted)
+	{
+		// Safe crawl: short homeward legs near the (previously safe) p1.
+		// Force-accepted — per-frame push-out below is the backstop.
+		glm::vec3 to_home = anchor_pos - f.p1;
+		glm::vec3 dn = glm::length(to_home) > 1e-3f ? to_home / glm::length(to_home) : launch_dir;
+		f.p2 = clamp_height(push_outside_cone(f.p1 + dn * 0.4f));
+		room_mesh_.push_out(f.p2, mesh_margin);
+		f.p3 = clamp_height(push_outside_cone(f.p2 + dn * 0.4f));
+		room_mesh_.push_out(f.p3, mesh_margin);
+		build_arc();
 	}
 
 	// Segment pacing from an evolving cruise: no velocity step at joints.
@@ -636,11 +837,18 @@ void kiosk_planes::respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos,
 	f.bank_sm = 0.f;
 }
 
-void kiosk_planes::extend(flight & f, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient)
+void kiosk_planes::extend(
+        flight & f,
+        const glm::vec3 & anchor_pos,
+        const glm::quat & anchor_orient,
+        const glm::vec3 & chain_pos,
+        const glm::vec3 & chain_dir)
 {
 	// New segment, same flight: trail keeps flowing, livery stays, the
 	// lifetime clock keeps running. Only path, pacing and figure refresh.
-	build_segment(f, anchor_pos, anchor_orient, false);
+	// The chain frame is the flown motion (rendered position + direction),
+	// so the joint never jumps.
+	build_segment(f, anchor_pos, anchor_orient, false, &chain_pos, &chain_dir);
 }
 
 void kiosk_planes::pick_maneuver(flight & f)
@@ -734,6 +942,20 @@ void kiosk_planes::pick_maneuver(flight & f)
 					f.loop_top = std::min(f.loop_top + 0.08, 0.7);
 				}
 			}
+			if (placed && !loop_is_open(f))
+			{
+				// The circle leaves the room (wall/ceiling/furniture):
+				// shrink twice, else drop the figure. The flight is
+				// never stretched, so cruise stays intact.
+				for (int shrink = 0; shrink < 2 && !loop_is_open(f); ++shrink)
+					f.loop_r *= 0.7f;
+				if (!loop_is_open(f))
+				{
+					f.man = flight::maneuver::none;
+					man_name = "none";
+					placed = false;
+				}
+			}
 			if (!placed)
 			{
 				f.man = flight::maneuver::none;
@@ -744,8 +966,12 @@ void kiosk_planes::pick_maneuver(flight & f)
 	}
 }
 
-void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera)
+void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera, XrSpace world)
 {
+	head_ = camera;
+	// Room mesh state machine: fires the async query once permission and
+	// extensions are ready, relocates when the world space changes.
+	room_mesh_.ensure(world, now);
 	if (active && !was_active_)
 	{
 		// (re)opening: respawn planes that never flew or expired, staggered
@@ -767,12 +993,30 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 	}
 	was_active_ = active;
 
+	if (gate_t0_ == 0)
+		gate_t0_ = now;
+	if (not mesh_gate_open_ && (room_mesh_.decided() || double(now - gate_t0_) * 1e-9 > 20.))
+	{
+		// Room data decided (or 20 s grace for a grant that never
+		// resolves): clean restart with staggered launches instead of
+		// popping mid-flight planes into view. Pre-decision segments may
+		// have been sampled wall-blind, so nothing carries over.
+		mesh_gate_open_ = true;
+		std::uniform_real_distribution<double> gate_jitter(0., 0.5);
+		size_t gate_slot = 0;
+		for (auto & f: flights_)
+		{
+			respawn(f, now, anchor_pos, anchor_orient);
+			f.t0 = now + XrTime((double(gate_slot++) + gate_jitter(rng_)) * 1.5e9);
+		}
+	}
+
 	for (auto & f: flights_)
 	{
 		auto * node = scene_.world.try_get<components::node>(f.root);
 		if (not node)
 			continue;
-		node->visible = active;
+		node->visible = active && mesh_gate_open_;
 		if (not active)
 			continue;
 
@@ -781,10 +1025,16 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			age = 0.;
 		if (f.dist_flown >= f.total_len && !f.loop_active)
 		{
-			// Segment flown: chain the next one onto the live flight
-			// (same point/tangent, steered at the live centre) and keep
-			// flying this frame on the fresh arc table.
-			extend(f, anchor_pos, anchor_orient);
+			// Segment flown: chain the next one onto the flown motion
+			// (rendered position + end tangent, steered at the live
+			// centre) and keep flying this frame on the fresh arc table.
+			// Chaining from the rendered position matters: the backstop
+			// may have slid the plane along a wall mid-segment, and the
+			// buried control endpoint no longer matches where it is.
+			glm::vec3 end_tan = bezier_vel(f, 1.0);
+			glm::vec3 end_dir = glm::length(end_tan) > 1e-6f ? end_tan / glm::length(end_tan)
+			                                                  : glm::vec3{0.f, 0.f, -1.f};
+			extend(f, anchor_pos, anchor_orient, node->position, end_dir);
 		}
 		// Arc-length walk with climb-coupled airspeed: the plane works
 		// uphill and swoops downhill instead of holding exact constant
@@ -997,6 +1247,48 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 				node->orientation = orient;
 			}
 		}
+		// Final backstop: planning can always be stale (re-locate, head
+		// move, loop apex), so the rendered position never sits inside
+		// the keep-out. Small per-frame steps stay on the entry side of
+		// thin walls instead of tunneling.
+		glm::vec3 unpushed = pos;
+		room_mesh_.push_out(pos, mesh_margin);
+		if (head_)
+		{
+			glm::vec3 d = pos - *head_;
+			if (std::abs(d.x) < head_half_width + mesh_margin && std::abs(d.z) < head_half_width + mesh_margin &&
+			    d.y > -(head_below + mesh_margin) && d.y < head_above + mesh_margin)
+				pos.y = head_->y + head_above + mesh_margin;
+		}
+		if (!in_loop && have_fwd && f.loop_exit_t < 0. && f.dist_flown > 0.4f &&
+		    f.total_len > 1e-3f && f.dist_flown > 0.15f * f.total_len && f.dist_flown < f.total_len)
+		{
+			// Mid-segment wall check: the committed curve can still corner
+			// into furniture the endpoint sampler missed (or the anchor
+			// moved the goalposts). When the ~0.5 s lookahead probe — or
+			// the backstop above — reports a wall, re-chain right here
+			// from the pushed position instead of grinding along it until
+			// expiry. The progress guard stops a boxed-in plane from
+			// re-chaining every frame; loops and handoffs are exempt.
+			glm::vec3 ahead = pos + fwd * std::max(v * 0.5f, 0.25f);
+			if (glm::distance(pos, unpushed) > 0.15f || !point_is_open(ahead))
+			{
+				extend(f, anchor_pos, anchor_orient, pos, fwd);
+				// Restart on the fresh arc table at the chain point: no
+				// pop (p0 == pos), pacing and maneuver already refreshed.
+				v_cruise = f.total_len / std::max(f.seg_T, 1e-3f);
+				tt = 0.f;
+				pos = f.p0;
+				glm::vec3 chained = f.p1 - f.p0;
+				if (glm::length(chained) > 1e-6f)
+				{
+					fwd = chained / glm::length(chained);
+					have_fwd = true;
+				}
+				else
+					have_fwd = false;
+			}
+		}
 		node->position = pos;
 
 		float alpha = float(smoothstep(0., fade_in, age));
@@ -1120,6 +1412,7 @@ void kiosk_planes::build_trail(const std::optional<glm::vec3> & camera, XrTime n
 
 			// Soft across-width profile: transparent edges, bright core.
 			constexpr float across[5] = {-1.f, -0.5f, 0.f, 0.5f, 1.f};
+
 			constexpr float across_alpha[5] = {0.f, 0.6f, 1.f, 0.6f, 0.f};
 			for (size_t k = 0; k < 5; ++k)
 			{
@@ -1131,6 +1424,83 @@ void kiosk_planes::build_trail(const std::optional<glm::vec3> & camera, XrTime n
 			}
 		}
 	}
+}
+
+bool kiosk_planes::path_is_open(const flight & f) const
+{
+	// The flown curve, not its chord: 16 samples catch bows through
+	// furniture that endpoint + chord-third checks miss.
+	for (int i = 0; i <= 16; ++i)
+	{
+		if (not point_is_open(bezier(f, double(i) / 16.)))
+			return false;
+	}
+	return true;
+}
+
+bool kiosk_planes::loop_is_open(const flight & f) const
+{
+	// Entry frame exactly as update() builds it, then the disc.
+	float dist = float(f.loop_start_d) * f.total_len;
+	float s = std::clamp(dist, 0.f, f.total_len);
+	size_t seg = 1;
+	while (seg < f.arclen.size() - 1 and f.arclen[seg] < s)
+		++seg;
+	float s0 = f.arclen[seg - 1], s1 = f.arclen[seg];
+	double tt = (double(seg - 1) + (s1 > s0 ? (s - s0) / (s1 - s0) : 0.)) / double(f.arclen.size() - 1);
+	glm::vec3 entry_pos = bezier(f, tt);
+	glm::vec3 entry_vel = bezier_vel(f, tt);
+	glm::vec3 f0 = glm::length(entry_vel) > 1e-6f ? glm::normalize(entry_vel) : glm::vec3{0.f, 0.f, -1.f};
+	glm::vec3 world_up{0.f, 1.f, 0.f};
+	glm::vec3 u = world_up - f0 * glm::dot(world_up, f0);
+	u = glm::length(u) > 1e-4f ? glm::normalize(u) : world_up;
+	for (int k = 0; k < 12; ++k)
+	{
+		double th = 2. * std::numbers::pi * double(k) / 12.;
+		float c = float(std::cos(th)), e = float(std::sin(th));
+		glm::vec3 pos = entry_pos + f.loop_r * ((1.f - c) * u + e * f0);
+		if (not point_is_open(pos))
+			return false;
+	}
+	return true;
+}
+
+bool kiosk_planes::point_is_open(const glm::vec3 & p) const
+{
+	// clear_of fails closed while committed room data is still unbaked
+	// (locate pending/failed), so sampling never flies blind through
+	// walls that are merely unplaced. No data at all still flies free.
+	if (not room_mesh_.clear_of(p, mesh_margin))
+		return false;
+	if (head_)
+	{
+		// Human-sized box around the viewer head, world space.
+		glm::vec3 d = p - *head_;
+		if (std::abs(d.x) < head_half_width + mesh_margin && std::abs(d.z) < head_half_width + mesh_margin &&
+		    d.y > -(head_below + mesh_margin) && d.y < head_above + mesh_margin)
+			return false;
+	}
+	return true;
+}
+
+void kiosk_planes::on_xr_event(const xr::event & event)
+{
+	room_mesh_.on_xr_event(event);
+}
+
+std::string kiosk_planes::room_mesh_status()
+{
+	return room_mesh_.status();
+}
+
+bool kiosk_planes::can_capture_room()
+{
+	return room_mesh_.can_capture();
+}
+
+void kiosk_planes::request_room_capture()
+{
+	room_mesh_.request_capture();
 }
 
 } // namespace wivrn

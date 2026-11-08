@@ -1402,6 +1402,41 @@ void application::initialize()
 	        XR_FB_SWAPCHAIN_UPDATE_STATE_EXTENSION_NAME,
 	        XR_FB_TRIANGLE_MESH_EXTENSION_NAME,
 
+#ifdef XR_FB_SPATIAL_ENTITY_EXTENSION_NAME
+	        // Room mesh for kiosk obstacle avoidance (Quest): query-only
+	        // scene anchors + triangle mesh, no capture. Probed like all
+	        // opt extensions; absent runtimes/headers are unaffected.
+	        XR_FB_SPATIAL_ENTITY_EXTENSION_NAME,
+#endif
+#ifdef XR_FB_SPATIAL_ENTITY_QUERY_EXTENSION_NAME
+	        // Provides xrQuerySpacesFB/xrRetrieveSpaceQueryResultsFB (the
+	        // query half lives here, not in XR_FB_spatial_entity itself).
+	        XR_FB_SPATIAL_ENTITY_QUERY_EXTENSION_NAME,
+#endif
+#ifdef XR_FB_SCENE_EXTENSION_NAME
+	        // Room planes/volumes fallback (walls/floor/ceiling/furniture
+	        // bounds + semantic labels) when the room has no triangle mesh.
+	        XR_FB_SCENE_EXTENSION_NAME,
+#endif
+#ifdef XR_FB_SPATIAL_ENTITY_STORAGE_EXTENSION_NAME
+	        // Hard dependency of XR_FB_spatial_entity_query: the query
+	        // structs fail validation unless storage is enabled too, even
+	        // though we never call its save/erase functions.
+	        XR_FB_SPATIAL_ENTITY_STORAGE_EXTENSION_NAME,
+#endif
+#ifdef XR_META_SPATIAL_ENTITY_SEMANTIC_LABEL_EXTENSION_NAME
+	        XR_META_SPATIAL_ENTITY_SEMANTIC_LABEL_EXTENSION_NAME,
+#endif
+#ifdef XR_META_SPATIAL_ENTITY_ROOM_MESH_EXTENSION_NAME
+	        XR_META_SPATIAL_ENTITY_ROOM_MESH_EXTENSION_NAME,
+#endif
+#ifdef XR_FB_SCENE_CAPTURE_EXTENSION_NAME
+	        // System room-setup flow, only launched from the settings
+	        // "Set up room" button when no mesh is available. Never
+	        // auto-triggered.
+	        XR_FB_SCENE_CAPTURE_EXTENSION_NAME,
+#endif
+
 	        XR_HTC_PASSTHROUGH_EXTENSION_NAME,
 	        XR_HTC_PATH_ENUMERATION_EXTENSION_NAME,
 	        XR_HTC_FACIAL_TRACKING_EXTENSION_NAME,

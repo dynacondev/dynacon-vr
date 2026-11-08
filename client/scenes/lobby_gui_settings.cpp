@@ -70,7 +70,14 @@ void scenes::lobby::gui_devices()
 
 void scenes::lobby::gui_tracking()
 {
-	wivrn::gui::settings_tracking(lobby_settings_context(instance, session, system, *imgui_ctx, stream_view, server_hid_forwarding));
+	auto ctx = lobby_settings_context(instance, session, system, *imgui_ctx, stream_view, server_hid_forwarding);
+	if (kiosk_planes_)
+	{
+		ctx.room_mesh_status = [this] { return kiosk_planes_->room_mesh_status(); };
+		if (kiosk_planes_->can_capture_room())
+			ctx.request_room_capture = [this] { kiosk_planes_->request_room_capture(); };
+	}
+	wivrn::gui::settings_tracking(ctx);
 }
 
 void scenes::lobby::gui_system()

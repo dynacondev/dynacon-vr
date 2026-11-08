@@ -63,6 +63,11 @@ namespace scenes
 class stream : public scene_impl<stream>, public std::enable_shared_from_this<stream>
 {
 public:
+	// Eager USE_SCENE runtime-permission request (Android): manifest presence
+	// makes the spatial extensions enumerable, but tracking data needs the
+	// user grant. Process-once; the result feeds the status-tab hint.
+	// Static so the lobby can request at app start too.
+	static void request_spatial_permissions();
 	enum class state
 	{
 		initializing,
@@ -803,10 +808,6 @@ private:
 	void gui_fiducial_status();
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period, std::span<const XrView> live_views = {});
 
-	// Eager USE_SCENE runtime-permission request (Android): manifest presence
-	// makes the spatial extensions enumerable, but tracking data needs the
-	// user grant. Process-once; the result feeds the status-tab hint.
-	void request_spatial_permissions();
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
 	void update_fiducial_passthrough(XrTime predicted_display_time);
 	bool surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const;
