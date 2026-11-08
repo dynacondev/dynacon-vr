@@ -1522,7 +1522,7 @@ void application::initialize()
 	default_config.emplace(xr_system_id, xr_session);
 
 	// XR_FB_color_space is session-global: log what the runtime reports and
-	// apply the persisted mode (or the first enumerated mode on fresh installs)
+	// apply the persisted mode (P3 on fresh installs when reported)
 	if (xr_instance.has_extension(XR_FB_COLOR_SPACE_EXTENSION_NAME))
 	{
 		auto supported = xr_session.get_color_spaces();

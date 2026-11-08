@@ -125,7 +125,7 @@ public:
 	openxr_post_processing_settings openxr_post_processing{};
 
 	// XR_FB_color_space session color space, persisted enum value,
-	// -1 = unset (first runtime-enumerated mode is used)
+	// -1 = unset (P3 when reported, else first enumerated mode)
 	int64_t color_space = -1;
 
 	std::string virtual_keyboard_layout = "QWERTY";

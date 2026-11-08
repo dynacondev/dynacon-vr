@@ -54,14 +54,20 @@ inline const char * color_space_name(XrColorSpaceFB color_space)
 }
 
 // Resolve a persisted color space value against the runtime-enumerated list:
-// returns the persisted value when still supported, otherwise the first
-// enumerated mode. The extension has no getter and the runtime default is not
-// queryable, so callers treat enumerated[0] as the presumed default.
+// returns the persisted value when still supported, otherwise P3 (Meta's
+// recommended mastering space) when reported, otherwise the first enumerated
+// mode. The extension has no getter and the runtime default is not
+// queryable, so fresh installs cannot preserve the untouched runtime default.
 inline XrColorSpaceFB resolve_color_space(int64_t configured, const std::vector<XrColorSpaceFB> & supported)
 {
 	for (auto mode: supported)
 	{
 		if ((int64_t)mode == configured)
+			return mode;
+	}
+	for (auto mode: supported)
+	{
+		if (mode == XR_COLOR_SPACE_P3_FB)
 			return mode;
 	}
 	if (not supported.empty())
