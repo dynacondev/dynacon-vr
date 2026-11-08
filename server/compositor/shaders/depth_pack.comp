@@ -116,7 +116,7 @@ void main()
 	float virt_m;
 	if (best == DEPTH_SENTINEL)
 	{
-		virt_m = 1e9; // hole: clamps to 255 below
+		virt_m = 1e9; // hole: clamps to 1023 below
 	}
 	else
 	{

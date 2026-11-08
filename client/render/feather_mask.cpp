@@ -2875,29 +2875,38 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// per conversion, sequential in one command buffer). Billed to
 		// volume_virt_ms either way.
 		bool low_virt_done = false, vr_virt_done = false;
+		// Descriptor set update once per record: both conversions sample
+		// the same decoded view, so the first conversion binds it and
+		// the second reuses the binding (same-CB draws would otherwise
+		// all read the last update).
+		bool virt_desc_updated = false;
 		auto convert_virt_canvas = [&](blur_target & virt, vk::raii::Framebuffer & virt_fb, vk::Extent2D ve, bool & done) {
 			if (done or not volume or not volume->virt_valid)
 				return;
 			done = true;
 			section_clock virt_clk(&ms_volume_virt);
-			vk::DescriptorImageInfo virt_info{
-			        .sampler = volume->virt_sampler,
-			        .imageView = volume->virt_view,
-			        // Decoded depth arrives GENERAL (same barrier
-			        // discipline as color in the stream scene).
-			        .imageLayout = vk::ImageLayout::eGeneral,
-			};
-			std::array<vk::CopyDescriptorSet, 0> no_virt_copies{};
-			std::array<vk::WriteDescriptorSet, 1> virt_writes = {{
-			        {
-			                .dstSet = *volume_virt_set,
-			                .dstBinding = 0,
-			                .descriptorCount = 1,
-			                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-			                .pImageInfo = &virt_info,
-			        },
-			}};
-			device.updateDescriptorSets(virt_writes, no_virt_copies);
+			if (not virt_desc_updated)
+			{
+				virt_desc_updated = true;
+				vk::DescriptorImageInfo virt_info{
+				        .sampler = volume->virt_sampler,
+				        .imageView = volume->virt_view,
+				        // Decoded depth arrives GENERAL (same barrier
+				        // discipline as color in the stream scene).
+				        .imageLayout = vk::ImageLayout::eGeneral,
+				};
+				std::array<vk::CopyDescriptorSet, 0> no_virt_copies{};
+				std::array<vk::WriteDescriptorSet, 1> virt_writes = {{
+				        {
+				                .dstSet = *volume_virt_set,
+				                .dstBinding = 0,
+				                .descriptorCount = 1,
+				                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+				                .pImageInfo = &virt_info,
+				        },
+				}};
+				device.updateDescriptorSets(virt_writes, no_virt_copies);
+			}
 			vk::ClearValue vfar{};
 			const float far1[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 			std::memcpy(vfar.color.float32, far1, sizeof(far1));
@@ -2914,7 +2923,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			std::array<vk::DescriptorSet, 1> virt_sets{*volume_virt_set};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *volume_virt_layout, 0, virt_sets, no_offsets);
 			cmd.pushConstants<volume_virt_push>(*volume_virt_layout, vk::ShaderStageFlagBits::eFragment, 0,
-			                                    volume_virt_push{.near_z = volume->near_z, .far_z = volume->far_z});
+			                                    volume_virt_push{.near_z = volume->near_z, .far_z = volume->far_z, .legacy = volume->virt_legacy ? 1.f : 0.f});
 			cmd.draw(3, 1, 0, 0);
 			cmd.endRenderPass();
 			make_readable(*virt.image);
@@ -2930,6 +2939,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// (cut-before-add).
 		auto run_vr_occlusion = [&](vk::Image seed_img, vk::Framebuffer seed_fb, vk::Extent2D seed_ext, bool seed_is_rgb8) {
 			vk::Extent2D ve = volume->virt_eye_extent;
+			// Presmooth spread scales with canvas width (texels at
+			// depth res): same angular pre-blur as the 320px volume
+			// path instead of a ~3x narrower one.
+			float vr_spread = volume_smooth_spread * float(ve.width) / float(volume_size);
 			ensure_vr_targets(ve);
 			{
 				section_clock raster_clk(&ms_vr_raster);
@@ -3053,7 +3066,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
 				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[5]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_h_sets, no_offsets);
-				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, volume_smooth_spread, 0};
+				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, vr_spread, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_h);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
@@ -3096,7 +3109,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				update_source(*vr_smooth.view_array, 7);
 				std::array<vk::DescriptorSet, 1> min_sets{*descriptor_sets[7]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, min_sets, no_offsets);
-				blur_push min_push{{1.f / ve.width, 1.f / ve.height}, {0, 1}, volume_smooth_spread, 0};
+				blur_push min_push{{1.f / ve.width, 1.f / ve.height}, {0, 1}, vr_spread, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, min_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();

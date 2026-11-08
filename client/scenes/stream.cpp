@@ -2224,6 +2224,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									        uint32_t(video_stream_description->depth_width / 2),
 									        uint32_t(video_stream_description->depth_height),
 									};
+									// Pre-10-bit servers advertise the fixed 640x320
+									// SBS: decode those codes as 8-bit 1cm/LSB.
+									vol_in.virt_legacy = video_stream_description->depth_width == 640 &&
+									    video_stream_description->depth_height == 320;
 								}
 							}
 							if (any_vr)

@@ -881,7 +881,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// worker never touches the depth encoder (strict pairing: no stale
 	// virtual depth on the client).
 	images[slot].has_depth = false;
-	if (warped)
+	if (warped and settings[3].enabled)
 	{
 		auto & depth = depth_images[slot];
 
@@ -1084,9 +1084,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// recycles the image.
 		// Depth (stream 3) presents from its own staging image, only when
 		// this frame was packed (strict pairing: no depth, no present).
+		// A disabled depth stream never presents.
 		if (encoder->stream_idx == 3)
 		{
-			if (not images[slot].has_depth)
+			if (not settings[3].enabled or not images[slot].has_depth)
 				continue;
 			try
 			{
@@ -1237,10 +1238,11 @@ void compositor::encoder_work(std::stop_token tok)
 			// Depth (stream 3) encodes from its own staging image, only
 			// when this frame was packed (has_depth doubles as
 			// "present was attempted": the encode consumes the
-			// presented/skipped slot in lockstep, like color).
+			// presented/skipped slot in lockstep, like color). A
+			// disabled depth stream never encodes.
 			if (encoder->stream_idx == 3)
 			{
-				if (not image.has_depth)
+				if (not settings[3].enabled or not image.has_depth)
 					continue;
 				try
 				{
@@ -1276,6 +1278,9 @@ void compositor::send_video_stream_description()
 	to_headset::video_stream_description desc{
 	        .width = uint16_t(images[0].image.info().extent.width),
 	        .height = uint16_t(images[0].image.info().extent.height),
+	        // Advertised even when the depth stream is disabled (the
+	        // client sizes an idle decoder); a disabled stream simply
+	        // never sends frames, and depth_expected stays false.
 	        .depth_width = settings[3].width,
 	        .depth_height = settings[3].height,
 	        .frame_rate = settings[0].fps,

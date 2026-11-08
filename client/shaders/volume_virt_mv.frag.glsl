@@ -47,6 +47,9 @@ layout(push_constant) uniform Push
 {
 	float near_z;
 	float far_z;
+	// Legacy pre-10-bit server (640x320 SBS): 8-bit 1cm/LSB codes with
+	// 255 = far. Sized from the stream description; 1 when set.
+	float legacy;
 }
 pc;
 
@@ -56,20 +59,24 @@ void main()
 	vec2 vuv = vec2(uv.x * 0.5 + vi * 0.5, uv.y);
 	float vd = texture(virt_tex, vuv).g;
 
+	// Branchless format select (mix, never a ternary): 10-bit 2mm/LSB
+	// (1023 = far) vs legacy 8-bit 1cm/LSB (255 = far).
+	float far_t = mix(1020.5 / 1023.0, 253.5 / 255.0, pc.legacy);
+	float max_m = mix(2.046, 2.55, pc.legacy);
 	float D;
-	// 1022.5/1023 threshold, not 1022: the 709-full-range Y'CbCr
-	// conversion reads neutral chroma slightly low through green, and
-	// lossy ringing near silhouettes costs a few more LSBs. Sacrificing
-	// ~1mm of range buys real margin against phantom-near speckles that
+	// ~2.5 LSB guard (10-bit): the 709-full-range Y'CbCr conversion
+	// reads neutral chroma slightly low through green, and lossy
+	// ringing near silhouettes costs a few more LSBs. Sacrificing ~5mm
+	// of range buys real margin against phantom-near speckles that
 	// would wrongly kill far passthrough.
-	if (vd >= 1022.5 / 1023.0)
+	if (vd >= far_t)
 	{
 		// far/unknown/sky/hole: no virtual occluder (min no-op).
 		D = 1.0;
 	}
 	else
 	{
-		float m = max(vd * 2.046, 1e-3);
+		float m = max(vd * max_m, 1e-3);
 		float n = pc.near_z;
 		float f = pc.far_z;
 		if (!(f > n) || f > 1e9)
