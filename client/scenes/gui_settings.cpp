@@ -33,6 +33,7 @@
 #include "render/ui_widgets.h"
 #include "stream.h"
 #include "utils/i18n.h"
+#include "xr/color_space.h"
 #include "xr/instance.h"
 #include "xr/session.h"
 #include "xr/system.h"
@@ -494,6 +495,47 @@ void settings_post_processing(const settings_context & ctx)
 
 		flag_combo("##supersampling", _("Supersampling"), _("Reduce flicker for high contrast edges. Useful when the input resolution is high compared to the headset display."), {0, XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SUPER_SAMPLING_BIT_FB, XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SUPER_SAMPLING_BIT_FB}, &configuration::openxr_post_processing_settings::super_sampling);
 		flag_combo("##sharpening", _("Sharpening"), _("Improve clarity of high contrast edges and counteract blur. Useful when the input resolution is low compared to the headset display."), {0, XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB, XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB}, &configuration::openxr_post_processing_settings::sharpening);
+	}
+
+	if (ctx.session.color_space_supported())
+	{
+		auto spaces = ctx.session.get_color_spaces();
+		if (not spaces.empty())
+		{
+			auto native = ctx.system.native_color_space();
+			auto active = ctx.session.get_active_color_space().value_or(spaces.front());
+			std::string stats = fmt::format(_F("Native: {}, active: {} (of {} reported by the runtime). Session-wide: affects video, interface and lobby. Only remaps gamut; brightness, contrast and gamma are unchanged."),
+			                                native ? xr::color_space_name(*native) : _("unknown"),
+			                                xr::color_space_name(active),
+			                                spaces.size());
+			list.push_back({
+			        .id = "##color_space",
+			        .label = _C("setting name", "Color space"),
+			        .description = _("Declares the color gamut of the submitted frames.") + "\n" + stats,
+			        .ui = ui_kind::combo,
+			        .get_int = [&ctx, spaces] {
+				        auto current = ctx.session.get_active_color_space().value_or(spaces.front());
+				        return index(spaces, current).value_or(0);
+			        },
+			        .set_int = [&ctx, &config, spaces](int v) {
+				        if (v < 0 or v >= (int)spaces.size())
+					        return;
+				        if (ctx.session.set_color_space(spaces[v]))
+				        {
+					        config.color_space = static_cast<int64_t>(spaces[v]);
+					        config.save();
+				        }
+			        },
+			        .options = [spaces] {
+				        std::vector<std::string> o;
+				        for (auto s: spaces)
+					        o.push_back(xr::color_space_name(s));
+				        return o;
+			        },
+			        .title = _C("setting name", "Color space"),
+			        .default_int = index(spaces, xr::resolve_color_space(default_config.color_space, spaces)).value_or(0),
+			});
+		}
 	}
 
 	ui::page_header(_S("Post-processing"), _cS("page header subtitle", "OpenXR layer supersampling and sharpening."));

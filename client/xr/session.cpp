@@ -19,6 +19,7 @@
 
 #include "session.h"
 
+#include "color_space.h"
 #include "details/enumerate.h"
 #include "openxr/openxr.h"
 #include "utils/contains.h"
@@ -60,6 +61,12 @@ xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance &
 
 	if (inst.has_extension(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME))
 		xrPerfSettingsSetPerformanceLevelEXT = inst.get_proc<PFN_xrPerfSettingsSetPerformanceLevelEXT>("xrPerfSettingsSetPerformanceLevelEXT");
+
+	if (inst.has_extension(XR_FB_COLOR_SPACE_EXTENSION_NAME))
+	{
+		xrEnumerateColorSpacesFB = inst.get_proc<PFN_xrEnumerateColorSpacesFB>("xrEnumerateColorSpacesFB");
+		xrSetColorSpaceFB = inst.get_proc<PFN_xrSetColorSpaceFB>("xrSetColorSpaceFB");
+	}
 
 	if (inst.has_extension(XR_META_BOUNDARY_VISIBILITY_EXTENSION_NAME) and sys.boundary_visibility_properties().supportsBoundaryVisibility)
 		xrRequestBoundaryVisibilityMETA = inst.get_proc<PFN_xrRequestBoundaryVisibilityMETA>("xrRequestBoundaryVisibilityMETA");
@@ -330,6 +337,44 @@ void xr::session::set_refresh_rate(float refresh_rate)
 		if (auto res = xrRequestDisplayRefreshRateFB(id, refresh_rate); res != XR_SUCCESS)
 			spdlog::warn("Refresh rate change failed: {}", xr::to_string(res));
 	}
+}
+
+bool xr::session::color_space_supported() const
+{
+	return xrEnumerateColorSpacesFB and xrSetColorSpaceFB;
+}
+
+std::vector<XrColorSpaceFB> xr::session::get_color_spaces()
+{
+	if (not color_space_supported())
+		return {};
+	if (not color_spaces_queried)
+	{
+		try
+		{
+			color_spaces_cache = xr::details::enumerate<XrColorSpaceFB>(xrEnumerateColorSpacesFB, id);
+			color_spaces_queried = true;
+		}
+		catch (...)
+		{
+			// Return no available color space in case of error, retry next time
+		}
+	}
+	return color_spaces_cache;
+}
+
+bool xr::session::set_color_space(XrColorSpaceFB color_space)
+{
+	if (not color_space_supported())
+		return false;
+	if (auto res = xrSetColorSpaceFB(id, color_space); res != XR_SUCCESS)
+	{
+		spdlog::warn("Color space change failed: {}", xr::to_string(res));
+		return false;
+	}
+	active_color_space = color_space;
+	spdlog::info("set color space to {}", color_space_name(color_space));
+	return true;
 }
 
 void xr::session::sync_actions(std::span<XrActionSet> action_sets)

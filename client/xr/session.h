@@ -22,6 +22,7 @@
 #include "utils/handle.h"
 #include "utils/thread_safe.h"
 #include <chrono>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -50,6 +51,17 @@ class session : public utils::handle<XrSession, xrDestroySession>
 	PFN_xrGetDisplayRefreshRateFB xrGetDisplayRefreshRateFB = nullptr;
 	PFN_xrEnumerateDisplayRefreshRatesFB xrEnumerateDisplayRefreshRatesFB = nullptr;
 	PFN_xrRequestDisplayRefreshRateFB xrRequestDisplayRefreshRateFB = nullptr;
+
+	PFN_xrEnumerateColorSpacesFB xrEnumerateColorSpacesFB = nullptr;
+	PFN_xrSetColorSpaceFB xrSetColorSpaceFB = nullptr;
+	// Enumerated once: the runtime must return identical contents for the
+	// lifetime of the session. Written during init / first GUI build,
+	// read-only afterwards (init happens-before the render/GUI loop).
+	std::vector<XrColorSpaceFB> color_spaces_cache;
+	bool color_spaces_queried = false;
+	// Last mode successfully applied via set_color_space, nullopt when the
+	// runtime default was never overridden (the extension has no getter).
+	std::optional<XrColorSpaceFB> active_color_space;
 
 	PFN_xrPerfSettingsSetPerformanceLevelEXT xrPerfSettingsSetPerformanceLevelEXT = nullptr;
 
@@ -101,6 +113,16 @@ public:
 	float get_current_refresh_rate();
 	std::vector<float> get_refresh_rates();
 	void set_refresh_rate(float);
+
+	// XR_FB_color_space: empty list when the extension is unavailable
+	bool color_space_supported() const;
+	std::vector<XrColorSpaceFB> get_color_spaces();
+	// Returns false (leaving the active mode unchanged) when unsupported or rejected
+	bool set_color_space(XrColorSpaceFB color_space);
+	std::optional<XrColorSpaceFB> get_active_color_space() const
+	{
+		return active_color_space;
+	}
 
 	void sync_actions(XrActionSet action_set, XrPath subaction_path = XR_NULL_PATH);
 	void sync_actions(XrActionSet action_set, const std::string & subaction_path);

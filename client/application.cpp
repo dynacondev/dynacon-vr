@@ -32,6 +32,7 @@
 #include "wivrn_config.h"
 #include "xr/actionset.h"
 #include "xr/check.h"
+#include "xr/color_space.h"
 #include "xr/htc_exts.h"
 #include "xr/htc_face_tracker.h"
 #include "xr/to_string.h"
@@ -1404,6 +1405,7 @@ void application::initialize()
 	        XR_FB_COMPOSITION_LAYER_ALPHA_BLEND_EXTENSION_NAME,
 	        XR_FB_COMPOSITION_LAYER_DEPTH_TEST_EXTENSION_NAME,
 	        XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME,
+	        XR_FB_COLOR_SPACE_EXTENSION_NAME,
 	        XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME,
 	        XR_FB_FACE_TRACKING2_EXTENSION_NAME,
 	        XR_FB_PASSTHROUGH_EXTENSION_NAME,
@@ -1518,6 +1520,29 @@ void application::initialize()
 
 	config.emplace(xr_system_id, xr_session, application::get_config_path() / "client.json");
 	default_config.emplace(xr_system_id, xr_session);
+
+	// XR_FB_color_space is session-global: log what the runtime reports and
+	// apply the persisted mode (P3 on fresh installs when reported)
+	if (xr_instance.has_extension(XR_FB_COLOR_SPACE_EXTENSION_NAME))
+	{
+		auto supported = xr_session.get_color_spaces();
+		auto native = xr_system_id.native_color_space();
+		std::string modes;
+		for (auto mode: supported)
+			modes += (modes.empty() ? "" : ", ") + std::string(xr::color_space_name(mode));
+		spdlog::info("Color spaces (XR_FB_color_space): native {}, supported [{}]",
+		             native ? xr::color_space_name(*native) : "unknown",
+		             modes);
+		if (not supported.empty())
+		{
+			XrColorSpaceFB target = xr::resolve_color_space(config->color_space, supported);
+			if (xr_session.set_color_space(target) and config->color_space != static_cast<int64_t>(target))
+			{
+				config->color_space = target;
+				config->save();
+			}
+		}
+	}
 
 	xr_session.set_passthrough_boundary_enabled(config->passthrough_boundary_enabled);
 
