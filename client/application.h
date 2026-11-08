@@ -137,6 +137,9 @@ private:
 	bool session_running = false;
 	bool session_focused = false;
 	bool session_visible = false;
+	// Budget of automatic refresh-rate restores per focused session, see
+	// poll_events DISPLAY_REFRESH_RATE_CHANGED handler.
+	int refresh_rate_restores = 0;
 	std::optional<std::chrono::steady_clock::time_point> timestamp_unsynchronized; // Timestamp when session_synchronized becomes false
 
 	bool debug_extensions_found = false;
@@ -444,6 +447,11 @@ public:
 	{
 		return instance().session_state;
 	}
+
+	// Request the configured refresh rate if set and not already active. Returns
+	// true when a request was issued. No-op when the extension is unavailable
+	// or rate is Auto (0).
+	static bool apply_preferred_refresh_rate();
 
 	static boost::locale::gnu_gettext::messages_info & get_messages_info()
 	{

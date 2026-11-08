@@ -1313,6 +1313,11 @@ void scenes::lobby::on_focused()
 
 	auto & config = application::get_config();
 
+	// The runtime starts at its own default (72Hz on Quest) and nothing sets
+	// it until a stream starts or the setting is toggled. Re-applied on every
+	// focus to also cover returning from a stream that changed the rate.
+	application::apply_preferred_refresh_rate();
+
 	try
 	{
 		lobby_entity = add_gltf(config.environment_model, layer_lobby).first;

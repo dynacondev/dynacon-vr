@@ -222,6 +222,13 @@ public:
 	virtual void render(const XrFrameState &) = 0;
 	virtual void on_xr_event(const xr::event &);
 
+	// True when the scene drives the display refresh rate itself (server-chosen
+	// rate): application-level preferred-rate restores must stand down.
+	virtual bool manages_refresh_rate() const
+	{
+		return false;
+	}
+
 	virtual bool on_input_key_down(uint8_t key_code);
 	virtual bool on_input_key_up(uint8_t key_code);
 	virtual bool on_input_mouse_move(float x, float y);

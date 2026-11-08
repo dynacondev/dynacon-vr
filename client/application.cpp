@@ -2105,6 +2105,19 @@ void application::haptic_stop(XrAction action, XrPath subpath)
 	xrStopHapticFeedback(application::instance().xr_session, &action_info);
 }
 
+bool application::apply_preferred_refresh_rate()
+{
+	auto & self = instance();
+	if (not self.config or self.config->preferred_refresh_rate == 0)
+		return false;
+	if (not self.xr_instance.has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
+		return false;
+	if (self.xr_session.get_current_refresh_rate() == self.config->preferred_refresh_rate)
+		return false;
+	self.xr_session.set_refresh_rate(self.config->preferred_refresh_rate);
+	return true;
+}
+
 void application::session_state_changed(XrSessionState new_state, XrTime timestamp)
 {
 	// See HandleSessionStateChangedEvent
@@ -2131,6 +2144,15 @@ void application::session_state_changed(XrSessionState new_state, XrTime timesta
 		case XR_SESSION_STATE_FOCUSED:
 			session_visible = true;
 			session_focused = true;
+			refresh_rate_restores = 0;
+			// The runtime resets the display rate around session start (back to
+			// its default on Quest), undoing any earlier request: re-apply the
+			// configured rate now that the session is up, the same thing a
+			// manual toggle does. Skipped when already active to avoid request
+			// spam. Stood down while the stream scene owns the rate
+			// (server-chosen).
+			if (std::shared_ptr<scene> s = current_scene(); not s or not s->manages_refresh_rate())
+				apply_preferred_refresh_rate();
 			break;
 
 		case XR_SESSION_STATE_STOPPING:
@@ -2178,6 +2200,24 @@ void application::poll_events()
 				spdlog::info("Refresh rate changed from {} to {}",
 				             e.refresh_rate_changed.fromDisplayRefreshRate,
 				             e.refresh_rate_changed.toDisplayRefreshRate);
+				// The runtime resets the rate around session start, after any
+				// proactive request: restore the configured rate once the
+				// reset lands. Bounded per focused session so a runtime that
+				// enforces another rate (or a deliberate system-side change)
+				// is not fought forever; each honored restore ends the
+				// cycle since to == preferred stops further restores. Stood
+				// down while the stream scene owns the rate.
+				if (config and config->preferred_refresh_rate != 0 and
+				    e.refresh_rate_changed.toDisplayRefreshRate != config->preferred_refresh_rate and
+				    refresh_rate_restores < 3)
+				{
+					std::shared_ptr<scene> s = current_scene();
+					if (not s or not s->manages_refresh_rate())
+					{
+						if (apply_preferred_refresh_rate())
+							++refresh_rate_restores;
+					}
+				}
 			}
 			break;
 			case XR_TYPE_EVENT_DATA_PASSTHROUGH_STATE_CHANGED_FB: {

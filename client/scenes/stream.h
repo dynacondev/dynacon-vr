@@ -400,6 +400,13 @@ public:
 	void on_unfocused() override;
 	void on_xr_event(const xr::event &) override;
 
+	// The server owns the display rate while streaming (video description +
+	// XR-app requests): preferred-rate restores stand down.
+	bool manages_refresh_rate() const override
+	{
+		return true;
+	}
+
 	bool on_input_key_down(uint8_t key_code) override;
 	bool on_input_key_up(uint8_t key_code) override;
 	bool on_input_mouse_move(float x, float y) override;
