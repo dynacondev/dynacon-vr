@@ -2939,10 +2939,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// (cut-before-add).
 		auto run_vr_occlusion = [&](vk::Image seed_img, vk::Framebuffer seed_fb, vk::Extent2D seed_ext, bool seed_is_rgb8) {
 			vk::Extent2D ve = volume->virt_eye_extent;
-			// Presmooth spread scales with canvas width (texels at
-			// depth res): same angular pre-blur as the 320px volume
-			// path instead of a ~3x narrower one.
-			float vr_spread = volume_smooth_spread * float(ve.width) / float(volume_size);
 			ensure_vr_targets(ve);
 			{
 				section_clock raster_clk(&ms_vr_raster);
@@ -3066,7 +3062,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
 				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[5]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_h_sets, no_offsets);
-				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, vr_spread, 0};
+				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, vr_smooth_spread, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_h);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
@@ -3109,7 +3105,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				update_source(*vr_smooth.view_array, 7);
 				std::array<vk::DescriptorSet, 1> min_sets{*descriptor_sets[7]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, min_sets, no_offsets);
-				blur_push min_push{{1.f / ve.width, 1.f / ve.height}, {0, 1}, vr_spread, 0};
+				blur_push min_push{{1.f / ve.width, 1.f / ve.height}, {0, 1}, vr_smooth_spread, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, min_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
