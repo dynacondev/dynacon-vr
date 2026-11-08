@@ -124,6 +124,10 @@ public:
 	};
 	openxr_post_processing_settings openxr_post_processing{};
 
+	// XR_FB_color_space session color space, persisted enum value,
+	// -1 = unset (first runtime-enumerated mode is used)
+	int64_t color_space = -1;
+
 	std::string virtual_keyboard_layout = "QWERTY";
 
 	std::string environment_model = "assets://ground.glb";

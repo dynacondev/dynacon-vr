@@ -298,6 +298,9 @@ configuration::configuration(xr::system & system, xr::session & session, const s
 				openxr_post_processing.sharpening = v.get_int64();
 		}
 
+		if (auto v = root["color_space"]; v.is_int64())
+			color_space = v.get_int64();
+
 		// feature flags, keyed by enum name
 		for (const auto & [f, name]: magic_enum::enum_entries<feature>())
 			if (auto val = root[name]; val.is_bool())
@@ -393,6 +396,8 @@ void configuration::save()
 	// nested object
 	json << ",\"openxr_post_processing\":{\"super_sampling\":" << openxr_post_processing.super_sampling;
 	json << ",\"sharpening\":" << openxr_post_processing.sharpening << "}";
+
+	json << ",\"color_space\":" << color_space;
 
 	// feature flags, keyed by enum name
 	for (auto & [key, value]: features)
