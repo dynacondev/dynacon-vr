@@ -2771,6 +2771,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// (per-group for now): SBS meters->D into volume_virt, cleared to
 		// far. Both the volume reveal and the VR occlusion sample the
 		// same canvas; the first caller converts, the second reuses.
+		// Billed to volume_virt_ms either way (one shared pass, no
+		// per-consumer split).
 		bool virt_done = false;
 		auto ensure_virt_canvas = [&](vk::Extent2D ve) {
 			if (virt_done or not volume or not volume->virt_valid)
@@ -2922,13 +2924,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				section_clock merge_clk(&ms_vr_merge);
 				// Presmooth + V-folded MIN merge, mirroring the volume
 				// merge below (same scratch, sequential: VR first, volume
-				// overwrites after). CLEAR is 1 (keep): box-scissored
-				// tiles outside the footprint must MIN-keep the seed,
-				// opposite polarity to the volume's 0-clear MAX path.
+				// overwrites after). Renderpass loadOp is DONT_CARE, so
+				// outside the box is stale — but the box covers total
+				// downstream support by construction (margin + rounding),
+				// and the box-scissored merge below never writes outside
+				// it. Opposite polarity to the volume path: the compare
+				// above ran fullscreen so every bin texel outside the
+				// object footprint reads back keep (1).
 				vk::ClearValue keep_clear{};
 				keep_clear.color.float32.fill(1);
 				vk::Rect2D smooth_box = pass_scissor(ve);
-				update_source(*volume_bin.view_array, 0);
+				update_source(*volume_bin.view_array, 3);
 				make_writable(*volume_smooth.image);
 				vk::RenderPassBeginInfo begin_smooth_h{
 				        .renderPass = *blur_r8_renderpass_mv,
@@ -2941,13 +2947,16 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(ve);
 				cmd.setScissor(0, smooth_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
-				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[0]};
+				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[3]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_h_sets, no_offsets);
 				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, volume_smooth_spread, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_h);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
-				make_readable(*volume_bin.image);
+				// Smooth written above (COLOR_OPTIMAL) -> readable for the
+				// merge upscale below (bin was already made readable after
+				// the compare and is not written by the H pass).
+				make_readable(*volume_smooth.image);
 				vk::ImageLayout seed_layout = seed_is_rgb8 ? vk::ImageLayout::eGeneral : vk::ImageLayout::eColorAttachmentOptimal;
 				vk::ImageMemoryBarrier merge_barrier{
 				        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
@@ -3056,6 +3065,13 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// above converts first when both run; this becomes a no-op.
 			// Unpaired frames skip (compare rebinds the volume canvas).
 			ensure_virt_canvas(ve);
+			if (use_vr)
+			{
+				// The VR presmooth above sampled volume_bin; order those
+				// fragment reads before this compare discards/overwrites
+				// it (same-CB write-after-read, fence does not cover it).
+				make_writable(*volume_bin.image);
+			}
 			volume_stamp(2);
 			{
 				section_clock compare_clk(&ms_volume_compare);
@@ -3143,12 +3159,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// shimmering through the upscale. CPU and GPU cost land in
 				// the merge spans by construction.
 				// H: bin -> smooth. Box-sized render area (like the merge
-				// below): LOAD/STORE skip tiles outside the footprint, so
-				// presmooth scales with object area. CLEAR zeroes outside
-				// the box (same discipline as the compare pass), so edge
-				// taps read defined 0 instead of tile garbage.
+				// below): the renderpass loadOp is DONT_CARE, so outside
+				// the box is stale — but the box covers total downstream
+				// support by construction (margin + rounding), and the
+				// box-scissored merge below never writes outside it.
 				vk::Rect2D smooth_box = pass_scissor(ve);
-				update_source(*volume_bin.view_array, 0);
+				update_source(*volume_bin.view_array, 3);
 				make_writable(*volume_smooth.image);
 				vk::RenderPassBeginInfo begin_smooth_h{
 					        .renderPass = *blur_r8_renderpass_mv,
@@ -3161,13 +3177,16 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(ve);
 				cmd.setScissor(0, smooth_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
-				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[0]};
+				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[3]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_h_sets, no_offsets);
 				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, volume_smooth_spread, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_h);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
-				make_readable(*volume_bin.image);
+				// Smooth written above (COLOR_OPTIMAL) -> readable for the
+				// merge upscale below (bin was already made readable after
+				// the compare and is not written by the H pass).
+				make_readable(*volume_smooth.image);
 				// LOAD-after-write ordering, same as the cutout punch
 				// barrier below: without it a tile GPU may MAX against
 				// stale seed tiles.

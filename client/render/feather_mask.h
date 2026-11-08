@@ -196,6 +196,8 @@ public:
 	// sensor < volume behavior for that frame (strict: no stale virtual).
 	// The VR-occlusion path below samples the same canvas in eye space
 	// (virt < object, no sensor remap), so one conversion serves both.
+	// GPU timestamps cover the volume chain only (timestamp_pool); VR
+	// stages report CPU timings, their GPU cost folds into the mask span.
 	struct volume_input
 	{
 		std::vector<instance_draw> draws; // depth objects, eye MVP space
@@ -343,8 +345,11 @@ private:
 	// that complete before submit, so every draw would otherwise read the
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
-	// Index: 0 = blur-H, 1 = volume upscale+MAX merge, 2 = blur-V
-	// upscale; 4,6,8 = downsample levels 1..3; 10 = erode-H, 12 = erode-V.
+	// Index: 0 = blur-H, 1 = upscale merges (blur-V source, volume MAX,
+	// VR MIN — triple never touches it), 2 = blur-V upscale; 3 = depth
+	// presmooth-H (VR + volume, sequential: VR first, volume overwrites
+	// after — must NOT be 0, which the triple blur-H overwrites below);
+	// 4,6,8 = downsample levels 1..3; 10 = erode-H, 12 = erode-V.
 	// One set per pass (not
 	// per eye): the multiview passes sample the array view, so eye-1
 	// slots stay unused. Erosion needs two sets because its H and V

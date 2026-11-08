@@ -2126,9 +2126,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					vk::Sampler virt_sampler = nullptr;
 					if (auto & dh = current_blit_handles[depth_stream_index])
 					{
-						virt_view = dh->image_view;
-						virt_sampler = decoders[depth_stream_index].decoder->sampler();
-						virt_paired = true;
+						// Decoder teardown races the hot path: a non-null
+						// handle with a torn-down decoder must not crash.
+						if (auto & dec = decoders[depth_stream_index].decoder)
+						{
+							virt_view = dh->image_view;
+							virt_sampler = dec->sampler();
+							virt_paired = true;
+						}
 					}
 					std::vector<feather_mask_renderer::instance_draw> vr_draws;
 					bool any_vr = false;
@@ -2195,6 +2200,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							vol_in.draws = volume_draws;
 							vol_in.remap_cols = volume_remap;
 							vol_in.remap_corr = volume_remap_corr;
+							// May be null in VR-only groups (no sensor this
+							// frame): use_volume stays false there, so the
+							// view is never sampled.
 							vol_in.sensor_view = volume_sensor;
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
@@ -2281,8 +2289,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// flag above; tier-0 has no scissored passes to report).
 					if (log_boxes and mstats.tier > 0)
 					{
-						spdlog::info("MaskBox: feather {}px union {} box {:.0f}% tier {} draws {}",
-						             f, proj ? "A" : "B", mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
+						if (any_vr)
+							spdlog::info("MaskBox: feather {}px union {} box {:.0f}% tier {} draws {} vrbox {:.0f}%",
+							             f, proj ? "A" : "B", mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws,
+							             mstats.vr_box_frac * 100.f);
+						else
+							spdlog::info("MaskBox: feather {}px union {} box {:.0f}% tier {} draws {}",
+							             f, proj ? "A" : "B", mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
 					}
 					if (not mask_split_written)
 					{
