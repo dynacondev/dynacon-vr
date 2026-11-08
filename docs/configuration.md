@@ -415,7 +415,9 @@ Each `passthrough` entry has:
 
 - `type`: behavior type (required). `"3d-passthrough"` renders the
   model as a surface-projected passthrough cutout; unknown types are
-  skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
+  skipped with a warning. Where a warped virtual-depth frame is paired,
+  VR content also occludes the cutout eye-space (`virt < object` at
+  half stream resolution, feathered like a silhouette edge). `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each
   pixel). `"3d-depth-passthrough"` reveals the flat feed where the

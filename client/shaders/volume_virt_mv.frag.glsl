@@ -20,9 +20,10 @@
 
 #extension GL_EXT_multiview : require
 
-// Virtual-depth SBS (640x320, one decoded stream-3 frame) to
-// sensor-compatible D (R16, 320px, per-eye layers). Fullscreen _mv:
-// one draw broadcasts to both layers, gl_ViewIndex selects the SBS half.
+// Virtual-depth SBS (half-res, one decoded stream-3 frame) to
+// sensor-compatible D (R16, per-eye layers at depth resolution).
+// Fullscreen _mv: one draw broadcasts to both layers, gl_ViewIndex
+// selects the SBS half.
 // Note: decoder samplers are linear, so taps at the SBS seam (u ~= 0.5)
 // blend L/R eyes over ~1 texel — subsumed by the downstream feather,
 // no inset applied.
@@ -32,7 +33,7 @@
 // guarantee): meters->D runs here, where near/far ride a tiny push.
 //
 // Sampling: green channel. The decoder's Y'CbCr sampler converts to RGB
-// (709 full-range here); with the server's neutral chroma (128) all
+// (709 full-range here); with the server's neutral chroma (~0.5) all
 // channels equal luma, and green has the smallest chroma-crosstalk gain
 // (R: +1.57Cr', B: +1.86Cb' vs G: -0.19Cb' -0.47Cr'), so lossy chroma
 // wobble perturbs depth least through green.
@@ -56,19 +57,19 @@ void main()
 	float vd = texture(virt_tex, vuv).g;
 
 	float D;
-	// 253.5/255 threshold, not 254.5: the forced 709-full-range Y'CbCr
-	// conversion reads neutral chroma ~0.65 LSB low through green, and
+	// 1022.5/1023 threshold, not 1022: the 709-full-range Y'CbCr
+	// conversion reads neutral chroma slightly low through green, and
 	// lossy ringing near silhouettes costs a few more LSBs. Sacrificing
-	// the top 1.5cm of range (2.535m vs 2.55m) buys real margin against
-	// phantom-near speckles that would wrongly kill far passthrough.
-	if (vd >= 253.5 / 255.0)
+	// ~1mm of range buys real margin against phantom-near speckles that
+	// would wrongly kill far passthrough.
+	if (vd >= 1022.5 / 1023.0)
 	{
 		// far/unknown/sky/hole: no virtual occluder (min no-op).
 		D = 1.0;
 	}
 	else
 	{
-		float m = max(vd * 2.55, 1e-3);
+		float m = max(vd * 2.046, 1e-3);
 		float n = pc.near_z;
 		float f = pc.far_z;
 		if (!(f > n) || f > 1e9)

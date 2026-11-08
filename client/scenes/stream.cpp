@@ -2210,12 +2210,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// the VR occlusion): strict pairing resolved
 							// above, null when the color frame had no depth
 							// warp. Near/far ride the sensor frustum so both
-							// D canvases agree.
+							// D canvases agree. Eye extent comes from the
+							// stream description and sizes the high-res VR
+							// canvases (the sensor path stays at 320px).
 							if (virt_paired)
 							{
 								vol_in.virt_view = virt_view;
 								vol_in.virt_sampler = virt_sampler;
 								vol_in.virt_valid = true;
+								if (video_stream_description and video_stream_description->depth_width >= 2)
+								{
+									vol_in.virt_eye_extent = {
+									        uint32_t(video_stream_description->depth_width / 2),
+									        uint32_t(video_stream_description->depth_height),
+									};
+								}
 							}
 							if (any_vr)
 								vol_in.vr_draws = vr_draws;

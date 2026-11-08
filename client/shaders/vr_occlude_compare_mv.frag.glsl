@@ -30,12 +30,12 @@ layout(location = 0) out vec4 out_color;
 // preserves silhouettes + reversed cuts), so the cut feathers exactly like
 // a silhouette edge.
 //
-// Both canvases live in display-eye UV space (320px, 2 layers), so no
-// sensor reprojection is needed: the same eye UV taps both. Binary
-// virt < object test, evaluated 2x2 per texel (quarter-texel eye-UV
-// offsets, averaged) for true geometric coverage — the same AA rationale
-// as volume_compare_mv.frag: per-texel softening can only fade whole
-// texels, only a finer evaluation rate moves contour vertices between
+// Both canvases live in display-eye UV space (per-eye depth resolution,
+// 2 layers), so no sensor reprojection is needed: the same eye UV taps
+// both. Binary virt < object test, evaluated 2x2 per texel (quarter-texel
+// eye-UV offsets, averaged) for true geometric coverage — the same AA
+// rationale as volume_compare_mv.frag: per-texel softening can only fade
+// whole texels, only a finer evaluation rate moves contour vertices between
 // texels and de-staircases diagonals. Both taps are LINEAR-filtered (host
 // sampler), so the verdict slides sub-texel.
 //
@@ -51,7 +51,7 @@ layout(set = 0, binding = 1) uniform sampler2DArray virt_tex;
 void main()
 {
 	float vi = float(gl_ViewIndex);
-	const float q = 0.25 / 320.0;
+	const float q = 0.25 / float(textureSize(object_tex, 0).x);
 	float keep = 0.0;
 	for (int i = 0; i < 4; ++i)
 	{
