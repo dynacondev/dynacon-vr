@@ -1536,7 +1536,7 @@ void application::initialize()
 		if (not supported.empty())
 		{
 			XrColorSpaceFB target = xr::resolve_color_space(config->color_space, supported);
-			if (xr_session.set_color_space(target) and config->color_space != (int64_t)target)
+			if (xr_session.set_color_space(target) and config->color_space != static_cast<int64_t>(target))
 			{
 				config->color_space = target;
 				config->save();

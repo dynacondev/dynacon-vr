@@ -85,18 +85,22 @@ std::optional<XrColorSpaceFB> xr::system::native_color_space() const
 {
 	if (!id or !inst->has_extension(XR_FB_COLOR_SPACE_EXTENSION_NAME))
 		return std::nullopt;
+	if (not color_space_queried)
+	{
+		XrSystemColorSpacePropertiesFB color_space_prop{
+		        .type = XR_TYPE_SYSTEM_COLOR_SPACE_PROPERTIES_FB,
+		};
 
-	XrSystemColorSpacePropertiesFB color_space_prop{
-	        .type = XR_TYPE_SYSTEM_COLOR_SPACE_PROPERTIES_FB,
-	};
+		XrSystemProperties prop{
+		        .type = XR_TYPE_SYSTEM_PROPERTIES,
+		        .next = &color_space_prop,
+		};
+		CHECK_XR(xrGetSystemProperties(*inst, id, &prop));
 
-	XrSystemProperties prop{
-	        .type = XR_TYPE_SYSTEM_PROPERTIES,
-	        .next = &color_space_prop,
-	};
-	CHECK_XR(xrGetSystemProperties(*inst, id, &prop));
-
-	return color_space_prop.colorSpace;
+		color_space_cache = color_space_prop.colorSpace;
+		color_space_queried = true;
+	}
+	return color_space_cache;
 }
 
 XrSystemHandTrackingPropertiesEXT xr::system::hand_tracking_properties() const

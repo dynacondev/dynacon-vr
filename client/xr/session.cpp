@@ -350,14 +350,14 @@ std::vector<XrColorSpaceFB> xr::session::get_color_spaces()
 		return {};
 	if (not color_spaces_queried)
 	{
-		color_spaces_queried = true;
 		try
 		{
 			color_spaces_cache = xr::details::enumerate<XrColorSpaceFB>(xrEnumerateColorSpacesFB, id);
+			color_spaces_queried = true;
 		}
 		catch (...)
 		{
-			// Return no available color space in case of error
+			// Return no available color space in case of error, retry next time
 		}
 	}
 	return color_spaces_cache;

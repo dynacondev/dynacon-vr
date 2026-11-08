@@ -55,7 +55,8 @@ class session : public utils::handle<XrSession, xrDestroySession>
 	PFN_xrEnumerateColorSpacesFB xrEnumerateColorSpacesFB = nullptr;
 	PFN_xrSetColorSpaceFB xrSetColorSpaceFB = nullptr;
 	// Enumerated once: the runtime must return identical contents for the
-	// lifetime of the session.
+	// lifetime of the session. Written during init / first GUI build,
+	// read-only afterwards (init happens-before the render/GUI loop).
 	std::vector<XrColorSpaceFB> color_spaces_cache;
 	bool color_spaces_queried = false;
 	// Last mode successfully applied via set_color_space, nullopt when the

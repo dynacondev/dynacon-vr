@@ -504,13 +504,13 @@ void settings_post_processing(const settings_context & ctx)
 		{
 			auto native = ctx.system.native_color_space();
 			auto active = ctx.session.get_active_color_space().value_or(spaces.front());
-			std::string stats = fmt::format(_("Native: {}, active: {} (of {} reported by the runtime). Session-wide: affects video, interface and lobby. Only remaps gamut; brightness, contrast and gamma are unchanged."),
+			std::string stats = fmt::format(_F("Native: {}, active: {} (of {} reported by the runtime). Session-wide: affects video, interface and lobby. Only remaps gamut; brightness, contrast and gamma are unchanged."),
 			                                native ? xr::color_space_name(*native) : _("unknown"),
 			                                xr::color_space_name(active),
 			                                spaces.size());
 			list.push_back({
 			        .id = "##color_space",
-			        .label = _("Color space"),
+			        .label = _C("setting name", "Color space"),
 			        .description = _("Declares the color gamut of the submitted frames.") + "\n" + stats,
 			        .ui = ui_kind::combo,
 			        .get_int = [&ctx, spaces] {
@@ -522,7 +522,7 @@ void settings_post_processing(const settings_context & ctx)
 					        return;
 				        if (ctx.session.set_color_space(spaces[v]))
 				        {
-					        config.color_space = (int64_t)spaces[v];
+					        config.color_space = static_cast<int64_t>(spaces[v]);
 					        config.save();
 				        }
 			        },
@@ -532,8 +532,8 @@ void settings_post_processing(const settings_context & ctx)
 					        o.push_back(xr::color_space_name(s));
 				        return o;
 			        },
-			        .title = _("Color space"),
-			        .default_int = 0,
+			        .title = _C("setting name", "Color space"),
+			        .default_int = index(spaces, xr::resolve_color_space(default_config.color_space, spaces)).value_or(0),
 			});
 		}
 	}

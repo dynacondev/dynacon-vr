@@ -62,6 +62,8 @@ class system
 {
 	instance * inst = nullptr;
 	XrSystemId id = XR_NULL_SYSTEM_ID;
+	mutable std::optional<XrColorSpaceFB> color_space_cache;
+	mutable bool color_space_queried = false;
 	bool hand_tracking_supported_ = false;
 	bool hand_mesh_fb_supported_ = false;
 	passthrough_type passthrough;
@@ -84,6 +86,8 @@ public:
 	}
 
 	XrSystemProperties properties() const;
+	// Null when XR_FB_color_space is unavailable. Result is cached: system
+	// properties are static for the lifetime of the process.
 	std::optional<XrColorSpaceFB> native_color_space() const;
 	XrSystemHandTrackingPropertiesEXT hand_tracking_properties() const;
 	XrSystemEyeGazeInteractionPropertiesEXT eye_gaze_interaction_properties() const;
