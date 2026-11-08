@@ -2923,7 +2923,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			std::array<vk::DescriptorSet, 1> virt_sets{*volume_virt_set};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *volume_virt_layout, 0, virt_sets, no_offsets);
 			cmd.pushConstants<volume_virt_push>(*volume_virt_layout, vk::ShaderStageFlagBits::eFragment, 0,
-			                                    volume_virt_push{.near_z = volume->near_z, .far_z = volume->far_z, .legacy = volume->virt_legacy ? 1.f : 0.f});
+			                                    volume_virt_push{.near_z = volume->near_z, .far_z = volume->far_z});
 			cmd.draw(3, 1, 0, 0);
 			cmd.endRenderPass();
 			make_readable(*virt.image);

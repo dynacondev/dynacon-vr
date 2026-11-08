@@ -222,11 +222,6 @@ public:
 		vk::ImageView virt_view = nullptr;
 		vk::Sampler virt_sampler = nullptr;
 		bool virt_valid = false;
-		// Legacy pre-10-bit server: depth_width == 640 &&
-		// depth_height == 320 means 8-bit 1cm/LSB codes (255 = far)
-		// instead of 10-bit 2mm/LSB. Rides the conversion push flag so
-		// mismatched pairs degrade to a rescale instead of a 0.8x bias.
-		bool virt_legacy = false;
 		// Per-eye virtual-depth resolution (SBS width/2 x height), from
 		// the stream description. Sizes the high-res VR-occlusion
 		// canvases; the sensor path stays at volume_size below.
@@ -506,8 +501,6 @@ private:
 	{
 		float near_z = 0.1f;
 		float far_z = 10.f;
-		// 1 = legacy 8-bit 1cm/LSB decode, 0 = 10-bit 2mm/LSB.
-		float legacy = 0.f;
 	};
 	vk::raii::RenderPass volume_virt_renderpass{nullptr};
 	vk::raii::PipelineLayout volume_virt_layout{nullptr};
