@@ -437,7 +437,7 @@ private:
 	// pre-blur for a near-hard edge (~4 seed px, just the 2x linear) —
 	// sharper but risks shimmer on sub-texel motion, as tier-0 groups
 	// have no downstream smoothing to catch it.
-	static constexpr float vr_smooth_spread = 1.4f;
+	static constexpr float vr_smooth_spread = 0.8f;
 	struct volume_push
 	{
 		glm::mat4 mvp;

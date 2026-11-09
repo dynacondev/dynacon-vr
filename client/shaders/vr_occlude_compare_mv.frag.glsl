@@ -42,6 +42,9 @@ layout(location = 0) out vec4 out_color;
 // Guards: object empty (far clear 1.0) never cuts — the seed is already 0
 // outside the silhouette, and far-plane geometry (~0.99) is kept. Virtual
 // far (1.0 = far/unknown/sky/hole from volume_virt_mv.frag) never cuts.
+// Object coverage is dilated by 1 texel (nearest surface wins the depth
+// test): the half-res object canvas otherwise falls ~1 texel short of the
+// full-res silhouette and leaves a passthrough rim where VR wins.
 // No epsilon on the comparison itself: the 4-level average IS the
 // antialiasing.
 
@@ -51,12 +54,27 @@ layout(set = 0, binding = 1) uniform sampler2DArray virt_tex;
 void main()
 {
 	float vi = float(gl_ViewIndex);
+	vec3 base = vec3(uv, vi);
+	vec2 texel = 1.0 / vec2(textureSize(object_tex, 0));
+	// Coverage dilation: nearest surface within 1 texel. The object
+	// canvas renders at depth resolution while the silhouette it cuts
+	// lives at seed resolution, so the two discretizations always
+	// disagree by ~1 texel along the limb; without this the cut falls
+	// short and a passthrough rim survives where VR wins (the reverse
+	// error is invisible: seed outside the silhouette is already 0).
+	// The depth test still uses real depths (dilated min), so overcut
+	// is bounded by 1 texel and only ever favors genuinely-nearer VR.
+	// Shared across the 4 subsamples (12 taps/texel total, not 20).
+	float v_dilate = min(min(texture(object_tex, base + vec3(texel.x, 0.0, 0.0)).r,
+	                         texture(object_tex, base - vec3(texel.x, 0.0, 0.0)).r),
+	                     min(texture(object_tex, base + vec3(0.0, texel.y, 0.0)).r,
+	                         texture(object_tex, base - vec3(0.0, texel.y, 0.0)).r));
 	const float q = 0.25 / float(textureSize(object_tex, 0).x);
 	float keep = 0.0;
 	for (int i = 0; i < 4; ++i)
 	{
 		vec2 uvi = uv + (vec2(float(i & 1), float((i >> 1) & 1)) - 0.5) * (2.0 * q);
-		float v = texture(object_tex, vec3(uvi, vi)).r;
+		float v = min(texture(object_tex, vec3(uvi, vi)).r, v_dilate);
 		float w = texture(virt_tex, vec3(uvi, vi)).r;
 		float obj_present = 1.0 - step(0.9999, v);
 		float virt_present = 1.0 - step(0.9999, w);
