@@ -357,9 +357,10 @@ private:
 	// Index: 0 = blur-H, 1 = upscale merges (blur-V source, volume MAX —
 	// triple never touches it), 2 = blur-V upscale; 3 = volume
 	// presmooth-H (must NOT be 0, which the triple blur-H overwrites);
-	// 4,6,8 = downsample levels 1..3; 5 = VR presmooth-H, 7 = VR
-	// MIN-merge upscale (split from 3/1: the VR chain samples different
-	// high-res images than the volume chain in the same command buffer);
+	// 4,6,8 = downsample levels 1..3; 7 = VR MIN-merge upscale (split
+	// from 1: the VR chain samples a different high-res image than the
+	// volume chain in the same command buffer). 5 retired (was VR
+	// presmooth, removed: smoothing reintroduced the rim).
 	// 10 = erode-H, 12 = erode-V.
 	// One set per pass (not
 	// per eye): the multiview passes sample the array view, so eye-1
@@ -430,14 +431,6 @@ private:
 	// Presmooth radius (blur-spread units = texels at 320): stairs
 	// smaller than ~2x this vanish into a stable gradient. 4 -> ~8px.
 	static constexpr float volume_smooth_spread = 1.4f;
-	// VR-occlusion presmooth radius, in texels at depth resolution
-	// (NOT scaled with resolution: the artifact it smooths is the
-	// 4-level compare quantization, which is 1 texel at any working
-	// res). Tuned down from the volume path's 1.4 for a harder cut
-	// edge; 0 disables the pre-blur entirely (~4 seed px, just the 2x
-	// linear) but risks shimmer on sub-texel motion, as tier-0 groups
-	// have no downstream smoothing to catch it.
-	static constexpr float vr_smooth_spread = 0.8f;
 	struct volume_push
 	{
 		glm::mat4 mvp;
@@ -550,12 +543,14 @@ private:
 	// as the 320px volume chain above, sized at the per-eye depth
 	// resolution (virt_eye_extent) and rebuilt if it changes. vr_depth
 	// rasterizes the object nearest-D, vr_virt converts the SBS depth,
-	// vr_bin holds the 4-level keep field, vr_smooth the presmooth
-	// workspace. Created once per depth size (format-fixed).
+	// vr_bin holds the 4-level keep field merged straight (spread-0
+	// upscale) into the seed — no presmooth: any VR smoothing would
+	// bleed keep back up at the dilated rim, and feathering is the
+	// seed chain's job. Created once per depth size (format-fixed).
 	blur_target vr_virt; // R16 virtual-depth D canvas (depth-res, 2 layers)
 	vk::raii::Framebuffer vr_virt_fb_mv{nullptr};
-	blur_target vr_bin; // R8 coverage canvas (depth-res, 2 layers)
-	blur_target vr_smooth; // R8 presmooth workspace (depth-res, 2 layers)
+	blur_target vr_bin; // R8 coverage canvas (depth-res, 2 layers):
+	// compare output, MIN-merged straight into the seed
 	vk::Extent2D vr_extent{0, 0};
 	bool vr_targets_ready = false;
 	void ensure_vr_targets(vk::Extent2D eye);

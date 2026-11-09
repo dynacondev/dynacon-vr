@@ -2154,7 +2154,6 @@ void feather_mask_renderer::ensure_vr_targets(vk::Extent2D eye)
 	vr_depth = blur_target{};
 	vr_virt = blur_target{};
 	vr_bin = blur_target{};
-	vr_smooth = blur_target{};
 	vr_virt_fb_mv = nullptr;
 	auto make_target_image = [&](vk::Format fmt) {
 		vk::ImageCreateInfo image_info{
@@ -2259,20 +2258,6 @@ void feather_mask_renderer::ensure_vr_targets(vk::Extent2D eye)
 	                .renderPass = *blur_r8_renderpass_mv,
 	                .attachmentCount = 1,
 	                .pAttachments = &raw_vr_bin_array,
-	                .width = eye.width,
-	                .height = eye.height,
-	                .layers = 2,
-	        });
-
-	// Presmooth workspace (R8, same shape as vr_bin).
-	std::tie(vr_smooth.image, vr_smooth.memory) = make_target_image(blur_format);
-	vr_smooth.view_array = make_array_view(*vr_smooth.image, blur_format);
-	vk::ImageView raw_vr_smooth_array = *vr_smooth.view_array;
-	vr_smooth.blur_fb_mv = vk::raii::Framebuffer(device,
-	        vk::FramebufferCreateInfo{
-	                .renderPass = *blur_r8_renderpass_mv,
-	                .attachmentCount = 1,
-	                .pAttachments = &raw_vr_smooth_array,
 	                .width = eye.width,
 	                .height = eye.height,
 	                .layers = 2,
@@ -3034,42 +3019,18 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*vr_bin.image);
 			{
 				section_clock merge_clk(&ms_vr_merge);
-				// Presmooth + V-folded MIN merge, mirroring the volume
-				// merge below over the VR scratch (vr_bin/vr_smooth, no
-				// aliasing with the volume chain). Renderpass loadOp is
-				// DONT_CARE, so outside the box is stale — but the box
-				// covers total downstream support by construction
-				// (margin + rounding), and the box-scissored merge below
-				// never writes outside it. Opposite polarity to the
-				// volume path: the compare above ran fullscreen so every
-				// bin texel outside the object footprint reads back
+				// Direct MIN merge, no presmooth: the dilated keep field
+				// upscales (2x linear) straight into the seed. Any VR
+				// smoothing here would bleed keep back up at the rim the
+				// dilation just cut; feathering is the seed chain's job
+				// (erode/blur below at feather > 0, nothing at 0).
+				// Renderpass loadOp is DONT_CARE, so outside the box is
+				// stale — but the box covers total downstream support by
+				// construction (margin + rounding), and the box-scissored
+				// merge below never writes outside it. Opposite polarity
+				// to the volume path: the compare above ran fullscreen so
+				// every bin texel outside the object footprint reads back
 				// keep (1).
-				vk::ClearValue keep_clear{};
-				keep_clear.color.float32.fill(1);
-				vk::Rect2D smooth_box = pass_scissor(ve);
-				update_source(*vr_bin.view_array, 5);
-				make_writable(*vr_smooth.image);
-				vk::RenderPassBeginInfo begin_smooth_h{
-				        .renderPass = *blur_r8_renderpass_mv,
-				        .framebuffer = *vr_smooth.blur_fb_mv,
-				        .renderArea = smooth_box,
-				        .clearValueCount = 1,
-				        .pClearValues = &keep_clear,
-				};
-				cmd.beginRenderPass(begin_smooth_h, vk::SubpassContents::eInline);
-				set_full_viewport(ve);
-				cmd.setScissor(0, smooth_box);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *blur_r8_pipeline_mv);
-				std::array<vk::DescriptorSet, 1> smooth_h_sets{*descriptor_sets[5]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, smooth_h_sets, no_offsets);
-				blur_push smooth_h{{1.f / ve.width, 1.f / ve.height}, {1, 0}, vr_smooth_spread, 0};
-				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, smooth_h);
-				cmd.draw(3, 1, 0, 0);
-				cmd.endRenderPass();
-				// Smooth written above (COLOR_OPTIMAL) -> readable for the
-				// merge upscale below (bin was already made readable after
-				// the compare and is not written by the H pass).
-				make_readable(*vr_smooth.image);
 				vk::ImageLayout seed_layout = seed_is_rgb8 ? vk::ImageLayout::eGeneral : vk::ImageLayout::eColorAttachmentOptimal;
 				vk::ImageMemoryBarrier merge_barrier{
 				        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
@@ -3102,10 +3063,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(seed_ext);
 				cmd.setScissor(0, merge_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, seed_is_rgb8 ? *vr_min_rgb8_pipeline : *vr_min_r8_pipeline);
-				update_source(*vr_smooth.view_array, 7);
+				update_source(*vr_bin.view_array, 7);
 				std::array<vk::DescriptorSet, 1> min_sets{*descriptor_sets[7]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, min_sets, no_offsets);
-				blur_push min_push{{1.f / ve.width, 1.f / ve.height}, {0, 1}, vr_smooth_spread, 0};
+				// Spread 0: plain bilinear upscale under MIN, no blur.
+				blur_push min_push{{1.f / ve.width, 1.f / ve.height}, {0, 1}, 0, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, min_push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
