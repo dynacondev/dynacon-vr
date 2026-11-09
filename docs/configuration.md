@@ -479,7 +479,7 @@ Each `passthrough` entry has:
   or swapchains: exiting saturates the existing flat feed to fullscreen.
 - `surface-projected`: the headset projects camera imagery onto this
   object's mesh instead of the flat reconstruction feed (default
-  `true`; opt out per object with `false`, plus a live in-headset
+  `false`; opt in per object with `true`, plus a live in-headset
   override in the Passthrough tab). Ignored for
   `3d-passthrough-reversed`, `3d-boundary(-reversed)` or
   `3d-depth-passthrough` (warned + ignored): zones never map camera

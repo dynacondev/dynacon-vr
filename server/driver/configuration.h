@@ -125,10 +125,10 @@ struct configuration
 		float feather_px = 24;
 		// Surface-projected mapping: the headset projects camera imagery
 		// onto this object's mesh instead of the flat reconstruction feed.
-		// Enabled by default; opt out per object with false (plus a live
+		// Disabled by default; opt in per object with true (plus a live
 		// in-headset override). Ignored for 3d-passthrough-reversed and
 		// 3d-boundary(-reversed) (warned).
-		bool surface_projected = true;
+		bool surface_projected = false;
 		// Boundary fade width in meters (3d-boundary(-reversed) only):
 		// the scene cross-fades over +/- this distance around the mesh
 		// surface (symmetric smoothstep, 0.5 at the surface). 0 = hard
