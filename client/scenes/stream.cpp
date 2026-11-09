@@ -1175,7 +1175,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	update_video_stall_status(video_starved and ever_received_video);
 	std::array<XrPosef, view_count> pose{};
 	std::array<XrFovf, view_count> fov{};
-	std::array<wivrn::to_headset::foveation_parameter, view_count> foveation;
+	std::array<wivrn::to_headset::foveation_parameter, view_count> foveation{};
 	bool use_alpha = false;
 
 	std::array<stream_defoveator::input, view_count> images;
@@ -1507,10 +1507,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Sync timebase: the mask alpha composites with server video, so
 		// projected-geometry transforms ride the server display time
 		// (one common warp). Tracking/filtering itself stays live.
-		// Eye-0 time: both eyes share frame_index on the common path.
+		// Eye-0 time: both eyes share frame_index on the common path;
+		// fallback scans for the first paired eye below.
 		XrTime sync_display_time = frame_state.predictedDisplayTime;
-		if (current_blit_handles[0])
-			sync_display_time = current_blit_handles[0]->view_info.display_time;
+		for (const auto & h: current_blit_handles)
+		{
+			if (h)
+			{
+				sync_display_time = h->view_info.display_time;
+				break;
+			}
+		}
 		update_fiducial_passthrough(frame_state.predictedDisplayTime, sync_display_time);
 
 		// Depth-volume objects (3d-depth-passthrough) need the runtime
