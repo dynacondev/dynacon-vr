@@ -216,9 +216,11 @@ public:
 		float far_z = 10.f;
 		// Virtual depth SBS (decoded stream 3): single image holding both
 		// eyes side by side, left eye x[0..w/2), right eye x[w/2..w),
-		// 10-bit 2mm/LSB luma with 1023 = far. Sampled with the decoder's
-		// own sampler (Y'CbCr); green channel (least chroma crosstalk
-		// under 709) carries luma.
+		// 10-bit 2mm/LSB luma clamped at 2.040m (code 1020, so
+		// beyond-range VR reads as near and occludes); 1021+ decodes
+		// as far (lossy-overshoot guard only). Sampled with the
+		// decoder's own sampler (Y'CbCr); green channel (least chroma
+		// crosstalk under 709) carries luma.
 		vk::ImageView virt_view = nullptr;
 		vk::Sampler virt_sampler = nullptr;
 		bool virt_valid = false;

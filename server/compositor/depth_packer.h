@@ -33,7 +33,9 @@ struct vk_bundle;
 // DEPTH_SCALE-encoded NDC, sentinel = no splat) at full render size, plus
 // the dst frustum near/far per eye. Output: the Y plane (2D view on layer
 // 3) of the SBS staging image — left eye x[0..half), right eye
-// x[half..2*half), 10-bit 2mm/LSB, 1023 = >=2.046m / sky / hole, where
+// x[half..2*half), 10-bit 2mm/LSB codes 0-1020 clamped at 2.040m
+// (beyond-range VR reads as near and occludes passthrough);
+// 1021-1023 = lossy-overshoot guard, decoded as far, where
 // half/height track half the stream resolution per eye.
 //
 // Resample (MIN-pool, foreground wins) runs before linearisation, in the

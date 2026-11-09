@@ -875,8 +875,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	}
 
 	// Virtual-depth pack (stream 3): MIN-pool the warp's target-view splat
-	// to half stream resolution per eye, linearise, quantize 2mm/LSB into
-	// the SBS staging image (layer 3). Runs only on warped frames with
+	// to half stream resolution per eye, linearise, quantize 2mm/LSB
+	// clamped at ~2.04m (beyond-range VR reads as near and occludes
+	// passthrough) into the SBS staging image (layer 3). Runs only on warped frames with
 	// valid near/far; otherwise images[slot].has_depth stays false and the
 	// worker never touches the depth encoder (strict pairing: no stale
 	// virtual depth on the client).

@@ -59,12 +59,13 @@ void main()
 	float D;
 	// ~2.5 LSB guard (10-bit): the 709-full-range Y'CbCr conversion
 	// reads neutral chroma slightly low through green, and lossy
-	// ringing near silhouettes costs a few more LSBs. Sacrificing ~5mm
-	// of range buys real margin against phantom-near speckles that
-	// would wrongly kill far passthrough.
+	// ringing near silhouettes costs a few more LSBs. The server clamps
+	// beyond-range VR to code 1020 (~2.04m, reads as near so VR
+	// occludes); only lossy overshoot into 1021+ lands here as far.
 	if (vd >= 1020.5 / 1023.0)
 	{
-		// far/unknown/sky/hole: no virtual occluder (min no-op).
+		// far (lossy overshoot past the server clamp), unknown, or
+		// unpaired: no virtual occluder (min no-op).
 		D = 1.0;
 	}
 	else

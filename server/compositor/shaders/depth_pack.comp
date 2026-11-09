@@ -34,8 +34,11 @@
  * Linearisation runs only at depth resolution (~1M px/eye at 2K stream,
  * not ~4M): zt back to eye meters via the dst frustum near/far (same
  * math as depth_viz's linearize_depth, mirrored here), then 2mm/LSB
- * quantize. 1023 is the single far value: >=2.046m, sky (pinned 1.0 in
- * splat), holes, sentinel.
+ * quantize CLAMPED at 2.040m (code 1020): beyond-range content (sky
+ * pinned at 1.0, holes, sentinel) reads as a near wall, so VR occludes
+ * passthrough there instead of flagging far (which would let
+ * passthrough win over far VR). Codes 1021-1023 are a guard band for
+ * lossy overshoot; the client decodes them as far.
  *
  * Row convention: output row 0 = scene top (top-down on the wire, like
  * the foveated color streams and the client volume canvas). The warp
@@ -69,6 +72,11 @@ pc;
 #define DEPTH_SENTINEL 0xffffffffu
 #define LSB_PER_M 500.0
 #define DEPTH_MAX_CODE 1023u
+// Clamp: beyond-range VR reads as a near wall (occludes passthrough)
+// instead of flagging far. Codes above this are a guard band for lossy
+// overshoot, decoded as far client-side.
+#define DEPTH_CLAMP_CODE 1020u
+#define MAX_VIRT_M 2.040
 
 float linearize(float d, float n, float f)
 {
@@ -116,17 +124,17 @@ void main()
 	float virt_m;
 	if (best == DEPTH_SENTINEL)
 	{
-		virt_m = 1e9; // hole: clamps to 1023 below
+		virt_m = MAX_VIRT_M; // hole: clamps to near-max, VR wins
 	}
 	else
 	{
 		float zt = float(best) / DEPTH_SCALE;
 		if (zt >= 1.0)
-			virt_m = 1e9; // sky pinned at far
+			virt_m = MAX_VIRT_M; // sky pinned at far: clamp, VR wins
 		else
-			virt_m = linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l);
+			virt_m = min(linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l), MAX_VIRT_M);
 	}
 
-	uint u10 = uint(clamp(virt_m * LSB_PER_M + 0.5, 0.0, float(DEPTH_MAX_CODE)));
+	uint u10 = uint(clamp(virt_m * LSB_PER_M + 0.5, 0.0, float(DEPTH_CLAMP_CODE)));
 	imageStore(dst_y, out_xy, vec4(float(u10) / float(DEPTH_MAX_CODE)));
 }

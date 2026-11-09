@@ -849,15 +849,17 @@ struct video_stream_description
 	// dimensions of the video stream per eye
 	// alpha is half resolution
 	// depth is a side-by-side (left|right) 10-bit virtual-depth
-	// channel at half stream resolution per eye, 2mm/LSB, 1023 = >=2.046m / unknown
+	// channel at half stream resolution per eye, 2mm/LSB, clamped at
+	// 2.040m (code 1020) so beyond-range VR occludes passthrough;
+	// 1021+ is a lossy-overshoot guard band, decoded as far
 	uint16_t width;
 	uint16_t height;
 	std::array<video_codec, 4> codec; // left, right, alpha, depth
 	// Depth SBS dimensions (left|right halves); color width/height above
 	// are per-eye. Half stream resolution per eye, carried explicitly so
 	// the client never hardcodes it. Wire convention: row 0 = scene top,
-	// left eye in x[0..depth_width/2), 10-bit 2mm/LSB luma,
-	// 1023 = >=2.046m / unknown.
+	// left eye in x[0..depth_width/2), 10-bit 2mm/LSB luma clamped
+	// at 2.040m (code 1020); 1021+ decodes as far (lossy guard).
 	uint16_t depth_width = 640;
 	uint16_t depth_height = 320;
 	float frame_rate;

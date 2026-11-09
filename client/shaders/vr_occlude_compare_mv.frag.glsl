@@ -41,7 +41,8 @@ layout(location = 0) out vec4 out_color;
 //
 // Guards: object empty (far clear 1.0) never cuts — the seed is already 0
 // outside the silhouette, and far-plane geometry (~0.99) is kept. Virtual
-// far (1.0 = far/unknown/sky/hole from volume_virt_mv.frag) never cuts.
+// far (1.0: lossy overshoot past the server's 2.040m clamp, or unpaired
+// frames rebinding the volume canvas here) never cuts.
 // Object coverage is dilated by 1 texel (nearest surface wins the depth
 // test): the half-res object canvas otherwise falls ~1 texel short of the
 // full-res silhouette and leaves a passthrough rim where VR wins.
