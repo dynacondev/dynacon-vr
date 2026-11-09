@@ -63,8 +63,12 @@ void main()
 	// short and a passthrough rim survives where VR wins (the reverse
 	// error is invisible: seed outside the silhouette is already 0).
 	// The depth test still uses real depths (dilated min), so overcut
-	// is bounded by 1 texel and only ever favors genuinely-nearer VR.
-	// Shared across the 4 subsamples (12 taps/texel total, not 20).
+	// is bounded by 1 texel. Tradeoff, accepted: near a nearer object
+	// edge the min can suppress a legitimate cut (VR sandwiched between
+	// two object depths loses ~1 texel of cut) — conservative direction,
+	// and rare next to the always-on rim this fixes.
+	// Shared across the 4 subsamples (8 object taps, 12 total; naive
+	// per-subsample dilation would be 20 object / 24 total).
 	float v_dilate = min(min(texture(object_tex, base + vec3(texel.x, 0.0, 0.0)).r,
 	                         texture(object_tex, base - vec3(texel.x, 0.0, 0.0)).r),
 	                     min(texture(object_tex, base + vec3(0.0, texel.y, 0.0)).r,

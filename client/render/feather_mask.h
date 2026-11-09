@@ -433,9 +433,9 @@ private:
 	// VR-occlusion presmooth radius, in texels at depth resolution
 	// (NOT scaled with resolution: the artifact it smooths is the
 	// 4-level compare quantization, which is 1 texel at any working
-	// res). Same 1.4 as the volume path. EXPERIMENT: 0 disables the
-	// pre-blur for a near-hard edge (~4 seed px, just the 2x linear) —
-	// sharper but risks shimmer on sub-texel motion, as tier-0 groups
+	// res). Tuned down from the volume path's 1.4 for a harder cut
+	// edge; 0 disables the pre-blur entirely (~4 seed px, just the 2x
+	// linear) but risks shimmer on sub-texel motion, as tier-0 groups
 	// have no downstream smoothing to catch it.
 	static constexpr float vr_smooth_spread = 0.8f;
 	struct volume_push
