@@ -1173,8 +1173,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 	update_video_stall_status(video_starved and ever_received_video);
-	std::array<XrPosef, view_count> pose;
-	std::array<XrFovf, view_count> fov;
+	std::array<XrPosef, view_count> pose{};
+	std::array<XrFovf, view_count> fov{};
 	std::array<wivrn::to_headset::foveation_parameter, view_count> foveation;
 	bool use_alpha = false;
 
@@ -1410,12 +1410,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 	// Sync eye for everything that composites with server video: the
 	// video layer's own pose/fov (pose[]/fov[] above), i.e. the eye the
-	// server rendered. Falls back to live when no server frame paired
-	// (starved first frames). Static-world caveat: latest fused object
-	// poses are reused here; moving boards would need a pose history.
-	bool have_server_eye = current_blit_handles[0] != nullptr;
-	std::array<XrPosef, view_count> sync_pose = have_server_eye ? pose : mask_pose;
-	std::array<XrFovf, view_count> sync_fov = have_server_eye ? fov : mask_fov;
+	// server rendered. Per-eye fallback to live when that eye unpaired
+	// (partial pairing / teardown races). Static-world caveat: latest
+	// fused object poses and live vote positions reused here; moving
+	// boards would need a pose history.
+	std::array<XrPosef, view_count> sync_pose{};
+	std::array<XrFovf, view_count> sync_fov{};
+	for (uint32_t view = 0; view < view_count; ++view)
+	{
+		bool have_eye = view < current_blit_handles.size() and current_blit_handles[view] != nullptr;
+		sync_pose[view] = have_eye ? pose[view] : mask_pose[view];
+		sync_fov[view] = have_eye ? fov[view] : mask_fov[view];
+	}
 
 	// Eye velocity history for the depth time-bias test slider: finite
 	// difference of consecutive predicted mask poses (world frame).
@@ -1501,6 +1507,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Sync timebase: the mask alpha composites with server video, so
 		// projected-geometry transforms ride the server display time
 		// (one common warp). Tracking/filtering itself stays live.
+		// Eye-0 time: both eyes share frame_index on the common path.
 		XrTime sync_display_time = frame_state.predictedDisplayTime;
 		if (current_blit_handles[0])
 			sync_display_time = current_blit_handles[0]->view_info.display_time;
@@ -1555,6 +1562,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					env_depth->start();
 					auto acq_t0 = std::chrono::steady_clock::now();
+					// Live acquire: sensor pose rides predicted time; H
+					// absorbs the server-eye delta at compare time.
 					bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, shared_depth);
 					double acq_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acq_t0).count();
 					if (need_volume_depth and mask_frame)
