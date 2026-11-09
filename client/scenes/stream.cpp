@@ -1381,13 +1381,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
-	// Mask record/submit views: located live at predicted display time,
-	// not the video frame's pose. The video layer keeps its own pose (and
-	// its own runtime warp); masks warped from a stale video pose trail
-	// live geometry (projected instances) and live camera under head
-	// motion (black trailing edge). Each layer warps independently, so a
-	// fresher mask pose strictly reduces warp error. Falls back to the
-	// video pose when locating fails.
+	// Mask record/submit views: server eye timebase, not live predicted.
+	// The mask alpha composites with server video (and the VR-occlusion
+	// compare tests server virtual depth against the object raster), so
+	// raster + submit share the video frame's pose/fov and the runtime
+	// applies one common warp to display. Live views stay live for GUI,
+	// gizmos and the depth debug viz (independent overlays).
+	// Falls back to the live pose when no server frame is paired.
 	std::array<XrPosef, view_count> mask_pose = pose;
 	std::array<XrFovf, view_count> mask_fov = fov;
 	// Located once per frame and reused by draw_gui below (same time +
@@ -1407,6 +1407,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		live_views_for_gui = std::move(live_views);
 	}
+
+	// Sync eye for everything that composites with server video: the
+	// video layer's own pose/fov (pose[]/fov[] above), i.e. the eye the
+	// server rendered. Falls back to live when no server frame paired
+	// (starved first frames). Static-world caveat: latest fused object
+	// poses are reused here; moving boards would need a pose history.
+	bool have_server_eye = current_blit_handles[0] != nullptr;
+	std::array<XrPosef, view_count> sync_pose = have_server_eye ? pose : mask_pose;
+	std::array<XrFovf, view_count> sync_fov = have_server_eye ? fov : mask_fov;
 
 	// Eye velocity history for the depth time-bias test slider: finite
 	// difference of consecutive predicted mask poses (world frame).
@@ -1489,7 +1498,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		// Marker tracking runs every frame: solved frames feed the
 		// record phase below (cutouts, gizmos) and the status UI.
-		update_fiducial_passthrough(frame_state.predictedDisplayTime);
+		// Sync timebase: the mask alpha composites with server video, so
+		// projected-geometry transforms ride the server display time
+		// (one common warp). Tracking/filtering itself stays live.
+		XrTime sync_display_time = frame_state.predictedDisplayTime;
+		if (current_blit_handles[0])
+			sync_display_time = current_blit_handles[0]->view_info.display_time;
+		update_fiducial_passthrough(frame_state.predictedDisplayTime, sync_display_time);
 
 		// Depth-volume objects (3d-depth-passthrough) need the runtime
 		// depth feed this frame: placed + mesh ready, any feather. The
@@ -1651,14 +1666,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					return glm::mat3(glm::vec3(P[0][0], P[0][1], P[0][3]), glm::vec3(P[1][0], P[1][1], P[1][3]),
 					                   glm::vec3(P[2][0], P[2][1], P[2][3]));
 				};
-				glm::mat3 Qe = Q_of(scene::projection_matrix(mask_fov[view]));
+				glm::mat3 Qe = Q_of(scene::projection_matrix(sync_fov[view]));
 				glm::mat3 Qd = Q_of(scene::projection_matrix(shared_depth.fov[view]));
 				if (std::abs(glm::determinant(Qe)) < 1e-9f or std::abs(glm::determinant(Qd)) < 1e-9f)
 				{
 					h_ok = false;
 					break;
 				}
-				glm::mat3 Rew = glm::mat3(scene::view_matrix(mask_pose[view]));
+				glm::mat3 Rew = glm::mat3(scene::view_matrix(sync_pose[view]));
 				glm::mat3 Rcw = glm::mat3(scene::view_matrix(depth_pose[view]));
 				glm::mat3 H = Suv * Qd * Rcw * glm::inverse(Rew) * glm::inverse(Qe) * E1;
 				for (int c = 0; c < 3; ++c)
@@ -1667,7 +1682,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// forward (qt.z) deliberately dropped here. a, b give
 				// 1/depth = a*D + b for the sensor D encoding.
 				{
-					const auto & pe = mask_pose[view].position;
+					const auto & pe = sync_pose[view].position;
 					const auto & pcap = depth_pose[view].position;
 					glm::vec3 dw(pe.x - pcap.x, pe.y - pcap.y, pe.z - pcap.z);
 					glm::vec3 tc = Rcw * dw;
@@ -1718,12 +1733,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			volume_compare_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - remap_t0).count();
 		}
 
-		// View-only transforms for the mask record below. Live
-		// predicted views (mask_pose/mask_fov), not the video frame's
-		// pose: see the mask_pose block above.
+		// View-only transforms for the mask record below. Server eye
+		// (sync_pose/sync_fov): the video frame's pose, so the silhouette
+		// raster, VR/volume draws and cutout punch share the eye the
+		// server rendered (one common warp). world_mvp stays live for
+		// gizmos/debug viz (independent overlays).
 		std::array<glm::mat4, view_count> world_mvp;
 		for (uint32_t view = 0; view < view_count; ++view)
 			world_mvp[view] = scene::projection_matrix(mask_fov[view]) * scene::view_matrix(mask_pose[view]);
+		std::array<glm::mat4, view_count> server_mvp;
+		for (uint32_t view = 0; view < view_count; ++view)
+			server_mvp[view] = scene::projection_matrix(sync_fov[view]) * scene::view_matrix(sync_pose[view]);
 
 		// Mask record phase, factored to run at two points: async on
 		// its own command buffer ahead of the video wait (masks need
@@ -1750,7 +1770,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					++volume_win_acquired;
 					if (shared_depth.capture_time != 0)
 					{
-						double age_ms = (frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6;
+						// Sync (server) eye timebase: age relative to the
+						// display time the raster actually targets.
+						double age_ms = (sync_display_time - shared_depth.capture_time) * 1e-6;
 						volume_last_age_ms = (float)age_ms;
 						volume_win_age_sum += age_ms;
 						volume_win_age_max = std::max(volume_win_age_max, age_ms);
@@ -2073,7 +2095,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
 						std::array<glm::mat4, 2> mvp;
 						for (uint32_t view = 0; view < view_count; ++view)
-							mvp[view] = world_mvp[view] * model;
+							mvp[view] = server_mvp[view] * model;
 						constexpr float op = 1;
 						if (not draw_visible(oid, mvp))
 							return;
@@ -2232,7 +2254,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								vol_in.timestamp_pool = *volume_query_pool;
 						}
 						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
+						                   true, f, proj ? no_cutouts : cutouts, server_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
 						                   use_vol_in ? &vol_in : nullptr);
 					}
 					catch (std::exception & e)
@@ -2271,9 +2293,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// Depth-vs-eye pose divergence at record time: the
 						// time-difference the future delay compensation
 						// must absorb (eye 0; both eyes share the warp).
+						// Measured against the sync (server) eye the raster
+						// actually used.
 						{
 							const auto & dp = shared_depth.pose[0];
-							const auto & mp = mask_pose[0];
+							const auto & mp = sync_pose[0];
 							float ex = dp.position.x - mp.position.x;
 							float ey = dp.position.y - mp.position.y;
 							float ez = dp.position.z - mp.position.z;
@@ -2363,7 +2387,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// punch needs no blur intermediates.
 							vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
 							g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, {}, true, 0,
-							                   cutouts, world_mvp, &mstats, mex);
+							                   cutouts, server_mvp, &mstats, mex);
 						}
 						catch (std::exception & e)
 						{
@@ -3048,8 +3072,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						mask_views[view] = {
 						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-						        .pose = mask_pose[view],
-						        .fov = mask_fov[view],
+						        .pose = sync_pose[view],
+						        .fov = sync_fov[view],
 						        .subImage = {
 						                .swapchain = g.swapchain,
 						                .imageRect = {
@@ -3090,8 +3114,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						mask_views[view] = {
 						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-						        .pose = mask_pose[view],
-						        .fov = mask_fov[view],
+						        .pose = sync_pose[view],
+						        .fov = sync_fov[view],
 						        .subImage = {
 						                .swapchain = g.swapchain,
 						                .imageRect = {

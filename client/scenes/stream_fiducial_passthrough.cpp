@@ -613,7 +613,7 @@ void scenes::stream::log_board_tuning(const std::string & fid, const std::vector
 	}
 }
 
-void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
+void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, XrTime sync_display_time)
 {
 	XrSpace world_space = application::space(xr::spaces::world);
 	auto map = fiducial_map.lock();
@@ -1174,7 +1174,12 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time)
 			{
 				try
 				{
-					session.update_projected_instance_transform(oid, world_space, predicted_display_time,
+					// Server eye timebase: the projected geometry gates the
+					// same video frame as the mask alpha, so its transform
+					// rides the server display time (one common warp to
+					// display). Static-world caveat: latest fused pose is
+					// reused; moving boards would need a pose history.
+					session.update_projected_instance_transform(oid, world_space, sync_display_time,
 					                                            ost.fused.world_pose, ost.fused.world_scale);
 				}
 				catch (std::exception & e)

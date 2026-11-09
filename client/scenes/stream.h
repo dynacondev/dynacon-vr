@@ -862,7 +862,7 @@ private:
 	// user grant. Process-once; the result feeds the status-tab hint.
 	void request_spatial_permissions();
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
-	void update_fiducial_passthrough(XrTime predicted_display_time);
+	void update_fiducial_passthrough(XrTime predicted_display_time, XrTime sync_display_time);
 	bool surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const;
 	// update_boundary_fade: per-frame scene opacity from placed boundary
 	// zones (head point in world space). Writes boundary_s/veil/any plus
