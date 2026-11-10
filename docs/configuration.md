@@ -448,9 +448,11 @@ Each `passthrough` entry has:
   for open meshes); keep them simple (room-size boxes are ideal, ~5k
   triangles budget). Both eyes fade together from a single per-frame
   headset distance. `"3d-passthrough-hidden"` renders the model as a
-  hard-edged always-on passthrough cutout on its own mask layer:
-  reversed cuts never apply to it (safety: hidden always wins), and it
-  needs `model-path` like boundary zones.
+  hard-edged always-on passthrough cutout on its own mask layer, plus a
+  dot-grid overlay in `grid-color` over the revealed feed (front faces
+  only, so hidden meshes read best as **closed volumes** like boundary
+  meshes): reversed cuts never apply to it (safety: hidden always wins),
+  and it needs `model-path` like boundary zones.
 - `id`: stable identifier (required, must be unique); `tag`:
   display-only label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required;
@@ -491,14 +493,15 @@ Each `passthrough` entry has:
   zones never map camera
   onto geometry, depth volumes always reveal the flat feed, and hidden
   objects always reveal the flat feed on their own layer.
-- `grid-scale`: reserved for future use (`3d-passthrough-hidden` only,
-  default `0.1`). Parsed and forwarded but currently unused; edits do
-  not reset tracking.
-- `grid-color`: hidden warning matte color as a `"#RRGGBB"` hex string
+- `grid-scale`: hidden dot pitch in meters
+  (`3d-passthrough-hidden` only, default `0.1`, clamped to
+  `[0.01, 1]`, applied live). Fixed world-size dots wrapping the mesh
+  faces; all hidden objects share one layer, so the pitch is per-object
+  at draw time.
+- `grid-color`: hidden warning color as a `"#RRGGBB"` hex string
   (`3d-passthrough-hidden` only, default light blue `#80D4FF`, applied
-  live). An opaque twin of the cutout renders in this color below the
-  flat feed; all hidden objects share one layer, so the lowest-id
-  placed object wins.
+  live). Tints the heartbeat matte and the dot overlay; all hidden
+  objects share one layer each, so the lowest-id placed object wins.
 - `trigger-distance`: proximity trigger distance in meters
   (`3d-passthrough-hidden` only, default `0.5`). Unused for now
   (hidden objects are always-on in stage 1); reserved for the

@@ -1045,8 +1045,9 @@ struct passthrough_object
 	// runtime depth map resolves inside the model volume (depth-tested
 	// volume, feathered like a normal window). "3d-passthrough-hidden"
 	// renders the model as a hard-edged always-on passthrough cutout on
-	// its own mask layer (reversed cuts never apply). Unknown types are
-	// skipped
+	// its own mask layer (reversed cuts never apply), plus a dot-grid
+	// overlay in the config color over the revealed feed. Unknown types
+	// are skipped
 	// client-side (forward-compat).
 	std::string type = "3d-passthrough";
 	std::string id;
