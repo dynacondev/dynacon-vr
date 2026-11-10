@@ -28,6 +28,7 @@
 #include "render/debug_lines.h"
 #include "render/depth_overlay.h"
 #include "render/feather_mask.h"
+#include "render/hidden_grid.h"
 #include "render/imgui_impl.h"
 #include "render/passthrough_mesh.h"
 #include "scene.h"
@@ -745,6 +746,25 @@ private:
 	// (they punch camera with no geometry to map it onto, so the flat
 	// feed must stay submitted). Read by the submit phase below.
 	bool cutouts_punched = false;
+
+	// Hidden passthrough objects (3d-passthrough-hidden): hard-edged cutout
+	// on a dedicated mask layer plus the warning grid overlay above.
+	// The mask reuses the feather renderer at tier 0 (direct raster, no
+	// blur chain) but lives outside mask_groups: its own swapchain, never
+	// feathered, never cut by reversed draws (hidden always wins). Union B
+	// (flat) semantics at submit. Render thread only.
+	mask_group hidden_group;
+	// Warning grid overlay over the revealed camera feed. Own swapchain,
+	// submitted after the flat layer, before gizmos. -1 = inactive.
+	std::unique_ptr<hidden_grid_renderer> hidden_grid;
+	int hidden_grid_image = -1;
+	bool hidden_grid_active = false;
+	// Uploaded grid meshes by object id (hash compare avoids re-upload;
+	// mirrors hidden_group.mesh_hashes for the mask side).
+	std::map<std::string, std::string> hidden_grid_hashes;
+	// One-shot log when hidden objects exist but the runtime has no mask
+	// path (no alpha blend: hidden stays unrevealed, never flashes).
+	bool hidden_nomask_warned = false;
 
 	// Global boundary-veil state (3d-boundary(-reversed) zones):
 	// scene opacity from the headset distance to placed zone meshes

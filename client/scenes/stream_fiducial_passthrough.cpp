@@ -255,9 +255,10 @@ bool scenes::stream::surface_projected_effective(const std::string & oid, const 
 	// Boundary zones never map camera onto geometry: they drive the
 	// global scene fade through the flat union's floor instead.
 	// Depth volumes reveal the flat reconstruction feed, never the
-	// projected layer.
+	// projected layer. Hidden objects always reveal the flat feed on
+	// their own layer, never projected.
 	if (ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed" or
-	    ost.def.type == "3d-depth-passthrough")
+	    ost.def.type == "3d-depth-passthrough" or ost.def.type == "3d-passthrough-hidden")
 		return false;
 	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
 		return it->second;
@@ -650,6 +651,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 	}
 	// Fingerprint: object identity (id/type/flags/model). Tags excluded
 	// (display-only); geometry/pose ride the soup + placements below.
+	// Hidden grid style rides the fingerprint too so live edits reset.
 	for (const auto & o: map->objects)
 	{
 		map_key += 'O';
@@ -662,6 +664,13 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		map_key += o.surface_projected ? 'P' : 'F';
 		map_key += ';';
 		map_key += std::to_string(o.feather_px);
+		map_key += ';';
+		map_key += std::to_string(o.grid_scale_m);
+		map_key += ';';
+		for (float v: o.grid_color)
+			map_key += std::to_string(v) + ',';
+		map_key += ';';
+		map_key += std::to_string(o.trigger_distance_m);
 		map_key += ';';
 	}
 	map_key += 'L';
@@ -1072,15 +1081,16 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		// the distance query); only the veil submit uses them.
 		bool is_boundary = def.type == "3d-boundary" or def.type == "3d-boundary-reversed";
 		bool is_depth = def.type == "3d-depth-passthrough";
-		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_depth)
+		bool is_hidden = def.type == "3d-passthrough-hidden";
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_depth and not is_hidden)
 		{
 			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
 			continue;
 		}
 		auto & ost = passthrough_objects[def.id];
 		ost.def = def;
-		if (is_boundary and def.model_hash.empty())
-			ost.status = "no model configured (boundary needs model-path)";
+		if ((is_boundary or is_hidden) and def.model_hash.empty())
+			ost.status = "no model configured (boundary/hidden needs model-path)";
 		// Model geometry upload (shared across this object's instances).
 		if (not def.model_hash.empty())
 		{
@@ -1649,7 +1659,7 @@ void scenes::stream::gui_fiducial_status()
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
 		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed" and
 		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed" and
-		    ost.def.type != "3d-depth-passthrough")
+		    ost.def.type != "3d-depth-passthrough" and ost.def.type != "3d-passthrough-hidden")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
@@ -1683,8 +1693,15 @@ void scenes::stream::gui_fiducial_status()
 		}
 		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
 		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
-		ImGui::Text("%s %.40s%s%s%s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), depth_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		std::string hidden_tag;
+		if (ost.def.type == "3d-passthrough-hidden")
+		{
+			char buf[64];
+			snprintf(buf, sizeof(buf), " (hidden grid %.2fm)", (double)ost.def.grid_scale_m);
+			hidden_tag = buf;
+		}
+		ImGui::Text("%s %.40s%s%s%s%s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), depth_tag.c_str(), hidden_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}
 	if (fiducial_trackers.empty())
 	{

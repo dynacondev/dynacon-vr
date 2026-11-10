@@ -1520,6 +1520,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		update_fiducial_passthrough(frame_state.predictedDisplayTime, sync_display_time);
 
+		// Hidden objects need the mask path (alpha blend): without it they
+		// stay unrevealed rather than flashing. One-shot log.
+		if (not mask_frame)
+		{
+			bool any_hidden = false;
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				(void)oid;
+				if (ost.def.type == "3d-passthrough-hidden" and ost.soup_ready and ost.fused.placed)
+				{
+					any_hidden = true;
+					break;
+				}
+			}
+			if (any_hidden and not hidden_nomask_warned)
+			{
+				hidden_nomask_warned = true;
+				spdlog::warn("Hidden passthrough objects placed but the mask path is unavailable on this runtime, staying unrevealed");
+			}
+		}
+
 		// Depth-volume objects (3d-depth-passthrough) need the runtime
 		// depth feed this frame: placed + mesh ready, any feather. The
 		// sensor acquire runs at the top of the mask record phase below
@@ -2425,6 +2446,171 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				else
 					debug_group.active = false;
+				// Hidden objects (3d-passthrough-hidden): dedicated hard-edged
+				// mask on its own layer (union B, flat). Separate renderer +
+				// swapchain from the feather groups (tier 0 direct raster, no
+				// blur chain, no cutouts); reversed draws are never appended,
+				// so hidden always wins for safety.
+				{
+					bool have_hidden = false;
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						(void)oid;
+						if (ost.def.type == "3d-passthrough-hidden" and ost.soup_ready and ost.fused.placed)
+						{
+							have_hidden = true;
+							break;
+						}
+					}
+					auto & g = hidden_group;
+					g.feather_px = 0;
+					g.projected = false;
+					if (not have_hidden)
+					{
+						g.active = false;
+						if (g.renderer)
+						{
+							for (auto & [key, _]: g.mesh_hashes)
+								g.renderer->remove_mesh(key);
+							g.mesh_hashes.clear();
+						}
+					}
+					else
+					{
+						if (not g.renderer)
+							g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+						if (not g.swapchain or g.swapchain.width() != mw or g.swapchain.height() != mh)
+						{
+							// Rare path (first frame, video resize): nothing
+							// outstanding (previous images released last
+							// frame), mirroring the feather groups.
+							device.waitIdle();
+							g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, view_count);
+							g.renderer->reset_targets();
+							g.extent = {(int32_t)mw, (int32_t)mh};
+							spdlog::info("Hidden mask swapchain: {}x{} ({} images)", mw, mh, g.swapchain.image_count());
+						}
+						g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+						for (auto & [oid, ost]: passthrough_objects)
+						{
+							if (ost.def.type != "3d-passthrough-hidden")
+								continue;
+							bool member = ost.soup_ready and ost.fused.placed;
+							auto mhit = g.mesh_hashes.find(oid);
+							if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash))
+							{
+								g.renderer->set_mesh(oid, ost.soup);
+								g.mesh_hashes[oid] = ost.soup_hash;
+							}
+							else if (not member and mhit != g.mesh_hashes.end())
+							{
+								g.renderer->remove_mesh(oid);
+								g.mesh_hashes.erase(mhit);
+							}
+						}
+						std::vector<feather_mask_renderer::instance_draw> draws;
+						for (auto & [oid, ost]: passthrough_objects)
+						{
+							if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+								continue;
+							const auto & fu = ost.fused;
+							glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+							            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+							glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+							glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+							                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+							std::array<glm::mat4, 2> mvp;
+							for (uint32_t view = 0; view < view_count; ++view)
+								mvp[view] = server_mvp[view] * model;
+							// Frustum skip (1px margin, hard edge: no feather
+							// bleed to preserve).
+							bool visible = true;
+							if (auto bounds = g.renderer->mesh_bounds(oid))
+							{
+								visible = false;
+								for (uint32_t view = 0; view < 2 and not visible; ++view)
+								{
+									bool any_front = false, any_behind = false, any_inside = false;
+									for (int corner = 0; corner < 8; ++corner)
+									{
+										glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+										               (corner & 2) ? bounds->second.y : bounds->first.y,
+										               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+										glm::vec4 c = mvp[view] * q4;
+										if (c.w < 0)
+										{
+											any_behind = true;
+											continue;
+										}
+										any_front = true;
+										if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)mw * 0.5f)) and
+										    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)mh * 0.5f)) and c.z >= 0 and c.z <= c.w)
+											any_inside = true;
+									}
+									visible = any_front and (any_behind or any_inside);
+								}
+							}
+							if (not visible)
+								continue;
+							draws.push_back({oid, mvp, 1, false});
+						}
+						if (draws.empty())
+						{
+							g.active = false;
+							if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+							{
+								g.last_draws_log = instance.now();
+								spdlog::info("Hidden mask draws lost");
+							}
+							g.had_draws = false;
+						}
+						else
+						{
+							g.had_draws = true;
+							int mask_index = g.swapchain.acquire();
+							// Paired from acquisition (mirrors the feather
+							// groups): the release list owns it from here.
+							acquired_groups.push_back(&g);
+							if (not g.swapchain.wait(100'000'000))
+							{
+								g.swapchain.release();
+								acquired_groups.pop_back();
+								g.active = false;
+								if (not g.wait_warned)
+								{
+									g.wait_warned = true;
+									spdlog::warn("Hidden mask image wait timed out, skipping frame");
+								}
+							}
+							else
+							{
+								g.wait_warned = false;
+								g.acquired = true;
+								g.active = true;
+								g.extent = {(int32_t)mw, (int32_t)mh};
+								feather_mask_renderer::mask_stage_cpu mstats{};
+								try
+								{
+									// Full-res submit (feather 0 = tier 0):
+									// hard edge, no blur intermediates.
+									vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
+									g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, draws,
+									                   true, 0, no_cutouts, server_mvp, &mstats, mex);
+								}
+								catch (std::exception & e)
+								{
+									spdlog::warn("Hidden mask record failed: {}", e.what());
+									g.swapchain.release();
+									acquired_groups.pop_back();
+									g.acquired = false;
+									g.active = false;
+								}
+								mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
+								mask_draws += (int)mstats.draws;
+							}
+						}
+					}
+				}
 			}
 		};
 
@@ -2791,6 +2977,124 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
 		}
 
+		// Hidden warning grid overlay: world-space triplanar lines + fresnel
+		// rim over the revealed camera feed. Records on the main command
+		// buffer (after the video wait, so a video stall never leaks the
+		// acquisition). Server eye timebase (server_mvp/sync_pose): the grid
+		// must register with the mask silhouette it annotates.
+		hidden_grid_image = -1;
+		hidden_grid_active = false;
+		if (mask_frame)
+		{
+			bool have_hidden_grid = false;
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				(void)oid;
+				if (ost.def.type == "3d-passthrough-hidden" and ost.soup_ready and ost.fused.placed)
+				{
+					have_hidden_grid = true;
+					break;
+				}
+			}
+			if (have_hidden_grid)
+			{
+				auto grid_t0 = std::chrono::steady_clock::now();
+				if (not hidden_grid)
+					hidden_grid = std::make_unique<hidden_grid_renderer>(device, physical_device);
+				hidden_grid->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+				for (auto hit = hidden_grid_hashes.begin(); hit != hidden_grid_hashes.end();)
+				{
+					auto oit = passthrough_objects.find(hit->first);
+					bool member = oit != passthrough_objects.end() and
+					        oit->second.def.type == "3d-passthrough-hidden" and oit->second.soup_ready and
+					        oit->second.fused.placed and oit->second.soup_hash == hit->second;
+					if (not member)
+					{
+						hidden_grid->remove_mesh(hit->first);
+						hit = hidden_grid_hashes.erase(hit);
+					}
+					else
+						++hit;
+				}
+				std::vector<hidden_grid_renderer::instance_draw> grid_draws;
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					auto ghit = hidden_grid_hashes.find(oid);
+					if (ghit == hidden_grid_hashes.end() or ghit->second != ost.soup_hash)
+					{
+						hidden_grid->set_mesh(oid, ost.soup);
+						hidden_grid_hashes[oid] = ost.soup_hash;
+					}
+					const auto & fu = ost.fused;
+					glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+					            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+					glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+					glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+					                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+					hidden_grid_renderer::instance_draw d;
+					d.mesh = oid;
+					for (uint32_t view = 0; view < view_count; ++view)
+					{
+						d.mvp[view] = server_mvp[view] * model;
+						const auto & sp = sync_pose[view].position;
+						d.cam_pos[view] = glm::vec3(sp.x, sp.y, sp.z);
+					}
+					d.obj_pos = t;
+					d.obj_quat = q;
+					d.obj_scale = fu.world_scale.x;
+					d.grid_color = glm::vec3(ost.def.grid_color[0], ost.def.grid_color[1], ost.def.grid_color[2]);
+					d.grid_scale = std::max(0.01f, ost.def.grid_scale_m);
+					d.line_width_px = 1.5f;
+					// Frustum skip (1px margin, like the hidden mask).
+					bool visible = true;
+					if (auto bounds = hidden_grid->mesh_bounds(oid))
+					{
+						visible = false;
+						for (uint32_t view = 0; view < 2 and not visible; ++view)
+						{
+							bool any_front = false, any_behind = false, any_inside = false;
+							for (int corner = 0; corner < 8; ++corner)
+							{
+								glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+								               (corner & 2) ? bounds->second.y : bounds->first.y,
+								               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+								glm::vec4 c = d.mvp[view] * q4;
+								if (c.w < 0)
+								{
+									any_behind = true;
+									continue;
+								}
+								any_front = true;
+								if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)extents[view].width * 0.5f)) and
+								    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)extents[view].height * 0.5f)) and c.z >= 0 and c.z <= c.w)
+									any_inside = true;
+							}
+							visible = any_front and (any_behind or any_inside);
+						}
+					}
+					if (not visible)
+						continue;
+					grid_draws.push_back(std::move(d));
+				}
+				if (not grid_draws.empty())
+				{
+					int idx = hidden_grid->acquire();
+					if (idx >= 0)
+					{
+						std::array<vk::Extent2D, 2> grid_ext;
+						for (uint32_t view = 0; view < view_count; ++view)
+							grid_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+						hidden_grid->record(command_buffer, (size_t)idx, grid_ext, grid_draws);
+						hidden_grid_image = idx;
+						hidden_grid_active = true;
+					}
+				}
+				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - grid_t0).count();
+			}
+		}
+
 		// Environment-depth debug overlay: records the fullscreen
 		// false-color viz from the shared frame (acquired once above) into
 		// its own transparent swapchain. Provider cost is bound to the
@@ -3001,6 +3305,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					break;
 				}
 			}
+			// Hidden objects reveal the flat feed on their own layer.
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				(void)oid;
+				if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+					continue;
+				need_flat = true;
+				break;
+			}
 			if (cutouts_punched)
 				need_flat = true;
 			bool have_projected = session.has_projected_instances();
@@ -3015,6 +3328,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					++b_active;
 			}
 			if (debug_group.active)
+				++b_active;
+			if (hidden_group.active)
 				++b_active;
 			// Boundary veil (fresh values: update_fiducial_passthrough ran
 			// just above): lift the flat union's floor by (1 - s) through
@@ -3050,11 +3365,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				static bool last_submit_flat = true;
 				static bool last_submit_projected = false;
-				if (submit_flat != last_submit_flat or submit_projected != last_submit_projected)
+				static bool last_hidden = false;
+				bool hidden_on = hidden_group.active or hidden_grid_active;
+				if (submit_flat != last_submit_flat or submit_projected != last_submit_projected or hidden_on != last_hidden)
 				{
 					last_submit_flat = submit_flat;
 					last_submit_projected = submit_projected;
-					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={} depth_full={} effects_full={})",
+					last_hidden = hidden_on;
+					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} H={} cutouts={} depth_full={} effects_full={})",
 					             (submit_flat and submit_projected) ? "projected+flat"
 					             : submit_flat                      ? "flat"
 					             : submit_projected                 ? "projected"
@@ -3063,6 +3381,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					             have_projected,
 					             a_active,
 					             b_active,
+					             hidden_on ? "on" : "off",
 					             cutouts_punched,
 					             depth_full,
 					             effects_full_inner);
@@ -3158,6 +3477,47 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					first_group = false;
 				}
+				// Union B also carries the hidden-object mask: dedicated
+				// hard-edged layer, same REPLACE/ADD discipline as the rest
+				// of the union (first submits REPLACE, the rest ADD). It
+				// only ever adds coverage — reversed draws never rasterize
+				// into it — so hidden wins overlaps for safety.
+				if (not proj_union and hidden_group.active)
+				{
+					auto & g = hidden_group;
+					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
+					for (uint32_t view = 0; view < view_count; ++view)
+					{
+						mask_views[view] = {
+						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+						        .pose = sync_pose[view],
+						        .fov = sync_fov[view],
+						        .subImage = {
+						                .swapchain = g.swapchain,
+						                .imageRect = {
+						                        .offset = {0, 0},
+						                        .extent = {g.extent.width, g.extent.height},
+						                },
+						                .imageArrayIndex = view,
+						        },
+						};
+					}
+					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+					                     application::space(xr::spaces::world),
+					                     mask_views);
+					if (first_group)
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					else
+						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
+					if (veil_lift and not proj_union)
+					{
+						if (first_group)
+							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
+						else
+							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
+					}
+					first_group = false;
+				}
 				// Each union's camera layer consumes its own alpha: A feeds
 				// projected, then B REPLACEs the alpha and feeds flat, so
 				// flat wins overlaps.
@@ -3180,6 +3540,39 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				}
 			}
+		}
+
+		// Hidden warning grid: ONE transparent projection layer over the
+		// revealed camera feed (server eye timebase, like the masks),
+		// below gizmos and GUI quads. Same discipline as the debug lines:
+		// standard alpha blend, no FB extensions.
+		if (hidden_grid_active and hidden_grid_image >= 0 and hidden_grid)
+		{
+			std::array<XrCompositionLayerProjectionView, view_count> grid_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				grid_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = sync_pose[view],
+				        .fov = sync_fov[view],
+				        .subImage = {
+				                .swapchain = hidden_grid->swapchain(),
+				                .imageRect = {
+				                        .offset = {0, 0},
+				                        .extent = extents[view],
+				                },
+				                .imageArrayIndex = view,
+				        },
+				};
+			}
+			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     grid_views);
+			// Paired with the acquire in the record phase above: the
+			// compositor takes the last released image; release after submit.
+			hidden_grid->release();
+			hidden_grid_active = false;
+			hidden_grid_image = -1;
 		}
 
 		// Debug gizmo layer: ONE transparent projection layer for all debug
