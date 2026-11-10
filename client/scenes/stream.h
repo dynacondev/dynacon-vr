@@ -29,6 +29,7 @@
 #include "render/depth_overlay.h"
 #include "render/feather_mask.h"
 #include "render/hidden_dots.h"
+#include "render/union_merge.h"
 #include "render/imgui_impl.h"
 #include "render/passthrough_mesh.h"
 #include "scene.h"
@@ -597,6 +598,12 @@ private:
 		// (preemption/contention inflates both halves together).
 		float mask_first_gpu_time = 0;
 		float mask_rest_gpu_time = 0;
+		// Union-B merge span: async = mask-pool q4-q3, inline =
+		// main-pool q6-q5 (spare slots past the q0..q4 plan above).
+		// One fullscreen full-res pass. Stamped unconditionally (zero
+		// span when the merge sits out) so the poll range never covers
+		// an unwritten query. Read spikes by span (TopOfPipe caveat).
+		float merge_gpu_time = 0;
 	};
 
 	// Last successfully polled GPU timestamps: the query readback is a
@@ -641,6 +648,7 @@ private:
 		float gizmo_gpu_ms = 0;
 		float mask_first_gpu_ms = 0;
 		float mask_rest_gpu_ms = 0;
+		float merge_gpu_ms = 0;
 		// Frame-phase waits (seconds): fence wait at frame top, GUI,
 		// and render_end submit (end_frame IPC). Names CPU stalls the
 		// section timers above can't see.
@@ -715,6 +723,11 @@ private:
 		bool wait_warned = false; // image-wait timeout already reported
 		XrExtent2Di extent{0, 0}; // submitted size (tier-selected)
 		bool active = false; // submitting this frame
+		// Acquired swapchain image this frame (-1 = none): lets the
+		// union-B merge borrow the recorded image + its array view
+		// after the record loop. Set on acquire, cleared on
+		// wait-timeout / record-throw / release.
+		int image_index = -1;
 		bool had_draws = false; // draws present last frame (edge forensics)
 		XrTime last_draws_log = 0; // throttle for the edge log below
 		// Uploaded object soups by object id (hash compare avoids
@@ -756,6 +769,16 @@ private:
 	// NOTE: hidden_group.feather_px/projected intentionally untouched
 	// (stale defaults): the hidden record passes tier/behavior literals.
 	mask_group hidden_group;
+	// Union-B merge (single submitted alpha layer for the flat feed):
+	// MAX-combines every active B contributor (feather B groups +
+	// debug + hidden) into one full-res image, submitted once with
+	// REPLACE. merge_image is the acquired target (-1 = none);
+	// merge_this_frame is evaluated ONCE at record time (B activity,
+	// not submit_flat/cutouts_punched) and read back at submit, so
+	// record and submit cannot disagree. Render thread only.
+	std::unique_ptr<union_merge_renderer> merge_renderer;
+	int merge_image = -1;
+	bool merge_this_frame = false;
 	// Dot overlay over the revealed camera feed: fixed world-size dots in
 	// the config color, front faces only, sampled-depth occlusion (no
 	// depth attachment in the dots pass). Own swapchain, submitted after

@@ -479,7 +479,10 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	        self->device,
 	        vk::QueryPoolCreateInfo{
 	                .queryType = vk::QueryType::eTimestamp,
-	                .queryCount = 3,
+	                // q0 start, q1 after first group, q2 end, q3/q4
+	                // union-B merge bracket (stamped unconditionally,
+	                // zero span when the merge sits out).
+	                .queryCount = 5,
 	        });
 
 	// Volume GPU brackets (raster/virt/compare/merge boundaries, 5 queries).
@@ -1059,16 +1062,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// the render thread.
 	if (query_pool_filled)
 	{
-		// Only the five written queries (0..4): the pool is sized for
-		// the whole struct but the spare queries are never written,
-		// and waiting on an unwritten query blocks forever (black
-		// screen: the render thread stalls here after exactly one
-		// frame).
+		// Only the written queries: the pool is sized for the whole
+		// struct but unwritten queries block forever (black screen:
+		// the render thread stalls here after exactly one frame).
 		// q4 (post-first-group) is written only on inline frames; on
 		// async frames the mask spans come from the mask pool below.
-		// Either way only written queries are read (never wait on an
-		// unwritten query).
-		uint32_t main_qcount = use_async_masks ? 4 : 5;
+		// q5/q6 (union-B merge bracket) are written on inline mask
+		// frames only, unconditionally (zero span when the merge sits
+		// out). Non-mask runtimes never write them (the mask condition
+		// is a session constant: extension support + stereo), so the
+		// read range follows it. Either way only written queries are
+		// read (never wait on an unwritten query).
+		bool mask_path = composition_layer_alpha_blend_supported and view_count == 2;
+		uint32_t main_qcount = use_async_masks ? 4 : (mask_path ? 7 : 5);
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
 		        main_qcount,
@@ -1087,6 +1093,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				last_gpu_timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
 				last_gpu_timestamps.mask_first_gpu_time = (timestamps2[4] - timestamps2[3]) * period;
 				last_gpu_timestamps.mask_rest_gpu_time = (timestamps2[1] - timestamps2[4]) * period;
+				last_gpu_timestamps.merge_gpu_time = (timestamps2[6] - timestamps2[5]) * period;
 			}
 		}
 	}
@@ -1126,8 +1133,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		auto [mres, mtimestamps] = mask_query_pool.getResults<uint64_t>(
 		        0,
-		        3,
-		        3 * sizeof(uint64_t),
+		        5,
+		        5 * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64);
 
@@ -1137,6 +1144,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			last_gpu_timestamps.mask_gpu_time = (mtimestamps[2] - mtimestamps[0]) * period;
 			last_gpu_timestamps.mask_first_gpu_time = (mtimestamps[1] - mtimestamps[0]) * period;
 			last_gpu_timestamps.mask_rest_gpu_time = (mtimestamps[2] - mtimestamps[1]) * period;
+			last_gpu_timestamps.merge_gpu_time = (mtimestamps[4] - mtimestamps[3]) * period;
 		}
 	}
 
@@ -1936,7 +1944,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				hidden_silhouettes.push_back(std::move(s));
 			}
 		};
-		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit) {
+		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit, uint32_t qmerge) {
 			// Volume sensor from the shared frame (acquired once above).
 			// Content age + index rate feed the Volume heartbeat: age is
 			// the deferred pose-correction signal, the index rate is the
@@ -2368,6 +2376,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					g.had_draws = true;
 					int mask_index = g.swapchain.acquire();
+					g.image_index = mask_index;
 					// (wait clocked below: mask image waits are silent
 					// below timeout and sit inside the cpu measurement)
 					// Paired from acquisition: the group joins the release
@@ -2384,6 +2393,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.swapchain.release();
 						acquired_groups.pop_back();
 						g.active = false;
+						g.image_index = -1;
 						if (not g.wait_warned)
 						{
 							g.wait_warned = true;
@@ -2447,6 +2457,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						acquired_groups.pop_back();
 						g.acquired = false;
 						g.active = false;
+						g.image_index = -1;
 					}
 					// Cutout punch (debug-only) folds into raster.
 					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
@@ -2546,10 +2557,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.renderer->reset_targets();
 					}
 					int mask_index = g.swapchain.acquire();
+					g.image_index = mask_index;
 					if (not g.swapchain.wait(100'000'000))
 					{
 						g.swapchain.release();
 						g.active = false;
+						g.image_index = -1;
 						cutouts_punched = false;
 						if (not g.wait_warned)
 						{
@@ -2579,6 +2592,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							acquired_groups.erase(std::remove(acquired_groups.begin(), acquired_groups.end(), &g), acquired_groups.end());
 							g.acquired = false;
 							g.active = false;
+							g.image_index = -1;
 							cutouts_punched = false;
 						}
 						mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
@@ -2878,6 +2892,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							{
 								g.had_draws = true;
 								int mask_index = g.swapchain.acquire();
+								g.image_index = mask_index;
 								// Paired from acquisition (mirrors the feather
 								// groups): the release list owns it from here.
 								acquired_groups.push_back(&g);
@@ -2886,6 +2901,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									g.swapchain.release();
 									acquired_groups.pop_back();
 									g.active = false;
+									g.image_index = -1;
 									if (not g.wait_warned)
 									{
 										g.wait_warned = true;
@@ -2931,6 +2947,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										acquired_groups.pop_back();
 										g.acquired = false;
 										g.active = false;
+										g.image_index = -1;
 										// Fail the frame: the command buffer
 										// may be half-open (inside a render
 										// pass) — never submit it.
@@ -3073,6 +3090,127 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
 					}
 				}
+				// Union-B merge: MAX-combine every active B contributor
+				// (feather B groups in map order, then debug, then hidden)
+				// into ONE full-res image, submitted once with REPLACE below.
+				// merge_this_frame is evaluated HERE (B activity at record
+				// time) and read back at submit — never recomputed there, so
+				// record and submit cannot disagree. The GPU bracket
+				// (qmerge/qmerge+1) is stamped unconditionally so the poll
+				// range never covers an unwritten query on either pool.
+				rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qmerge);
+				merge_this_frame = false;
+				merge_image = -1;
+				{
+					// Hard-outside veil submits opaque flat with no masks at
+					// all (submit skips the B union): the merge sits out too,
+					// even with B contributors active. Same formula as
+					// submit (mask_frame is true throughout this lambda).
+					bool merge_depth_full = depth_fullscreen_passthrough();
+					bool merge_effects_full = session.effects_fullscreen_passthrough();
+					bool merge_full_demo = merge_depth_full or merge_effects_full;
+					float merge_veil_s = std::clamp(boundary_s, 0.f, 1.f);
+					if (merge_full_demo)
+						merge_veil_s = 0;
+					bool merge_hard_out = ((boundary_veil or merge_full_demo) and merge_veil_s < 0.5f) and not composition_layer_color_scale_bias_supported;
+					if ((boundary_veil or merge_full_demo) and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
+						merge_hard_out = true;
+					if (not merge_hard_out)
+					{
+						// Multiview broadcasts one draw to both layers: both
+						// eyes must share the extent (dots precedent) — a
+						// mismatch would silently misalign one eye. Loud here.
+						assert(extents[0].width == extents[1].width and extents[0].height == extents[1].height);
+						auto push_merge_input = [&](mask_group & g, bool general_layout, std::vector<union_merge_renderer::input> & out) {
+							if (g.image_index < 0 or (size_t)g.image_index >= g.swapchain.image_count())
+							{
+								// Defensive only (active groups always hold
+								// an acquisition): skipping coverage
+								// under-reveals, so refuse loudly rather
+								// than submit a partial union.
+								spdlog::error("Union merge dropping group with no acquired image (active={}, index={})", g.active, g.image_index);
+								return;
+							}
+							vk::Image img = g.swapchain.image((size_t)g.image_index);
+							out.push_back(union_merge_renderer::input{
+							        .image = img,
+							        .view_array = g.renderer->submitted_view_array(img),
+							        .general_layout = general_layout,
+							});
+						};
+						std::vector<union_merge_renderer::input> merge_inputs;
+						size_t merge_b_count = 0;
+						for (auto & [key, g]: mask_groups)
+						{
+							if (key.second)
+								continue; // union A untouched
+							if (not g.active)
+								continue;
+							++merge_b_count;
+							// Cap: documented max_inputs (8). Extras are
+							// counted, dropped with an error below, never a
+							// fallback path — >8 B groups under-reveals by
+							// construction, so the error must stay visible.
+							if (merge_inputs.size() < union_merge_renderer::max_inputs)
+								push_merge_input(g, true, merge_inputs);
+						}
+						if (debug_group.active)
+						{
+							++merge_b_count;
+							if (merge_inputs.size() < union_merge_renderer::max_inputs)
+								push_merge_input(debug_group, true, merge_inputs);
+						}
+						if (hidden_group.active)
+						{
+							++merge_b_count;
+							if (merge_inputs.size() < union_merge_renderer::max_inputs)
+								push_merge_input(hidden_group, false, merge_inputs);
+						}
+						if (merge_b_count > union_merge_renderer::max_inputs)
+						{
+							static XrTime last_merge_cap_log = 0;
+							XrTime merge_now = instance.now();
+							if (merge_now - last_merge_cap_log > 1'000'000'000LL)
+							{
+								last_merge_cap_log = merge_now;
+								spdlog::error("Union merge input cap exceeded: {} B contributors, merging first {} and DROPPING {} (no fallback; raise union_merge_renderer::max_inputs)",
+								              merge_b_count, union_merge_renderer::max_inputs,
+								              merge_b_count - union_merge_renderer::max_inputs);
+							}
+						}
+						if (not merge_inputs.empty())
+						{
+							if (not merge_renderer)
+								merge_renderer = std::make_unique<union_merge_renderer>(device, physical_device);
+							merge_renderer->ensure(instance, session, swapchain.format(), mw, mh);
+							int merge_idx = merge_renderer->acquire();
+							if (merge_idx >= 0)
+							{
+								try
+								{
+									vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
+									if (merge_renderer->record(rec_cmd, (size_t)merge_idx, merge_ext, merge_inputs))
+									{
+										merge_image = merge_idx;
+										merge_this_frame = true;
+									}
+									else
+										merge_renderer->release();
+								}
+								catch (std::exception & e)
+								{
+									// Internal-catch, never rethrow past
+									// acquired images (a throw out of the
+									// phase leaks in-flight acquisitions):
+									// the B union drops this frame, loudly.
+									spdlog::error("Union merge record failed: {} (B union dropped this frame)", e.what());
+									merge_renderer->release();
+								}
+							}
+						}
+					}
+				}
+				rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qmerge + 1);
 			}
 		};
 
@@ -3090,7 +3228,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			});
 			mask_command_buffer.resetQueryPool(*mask_query_pool, 0, 3);
 			mask_command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *mask_query_pool, 0);
-			record_masks_phase(mask_command_buffer, mask_query_pool, 1);
+			record_masks_phase(mask_command_buffer, mask_query_pool, 1, 3);
 			mask_command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *mask_query_pool, 2);
 			mask_command_buffer.end();
 			vk::SubmitInfo mask_submit_info;
@@ -3135,6 +3273,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				for (auto * g: acquired_groups)
 				{
 					g->acquired = false;
+					g->image_index = -1;
 					g->swapchain.release();
 				}
 				acquired_groups.clear();
@@ -3146,6 +3285,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					hidden_dots_image = -1;
 					hidden_dots_active = false;
 				}
+				// Union-B merge acquisition: same pairing (the merge
+				// records in the mask phase, ahead of the video wait).
+				if (merge_image >= 0 and merge_renderer)
+				{
+					merge_renderer->release();
+					merge_image = -1;
+					merge_this_frame = false;
+				}
+			}
+			// Inline-recorded merge on the video-timeout path (the block
+			// above only covers async): the mask groups share this gap
+			// pre-existing, but the merge releases unconditionally —
+			// one leaked image per timeout frame would drain its pool.
+			if (merge_image >= 0 and merge_renderer)
+			{
+				merge_renderer->release();
+				merge_image = -1;
+				merge_this_frame = false;
 			}
 			session.end_frame(frame_state.predictedDisplayTime, {});
 			return;
@@ -3503,7 +3660,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					spdlog::info("Mask submit: inline fallback (mask fence busy)");
 				}
 			}
-			record_masks_phase(command_buffer, query_pool, 4);
+			record_masks_phase(command_buffer, query_pool, 4, 5);
 			mask_results_in_mask_pool = false;
 			volume_ts_async = false;
 		}
@@ -3554,6 +3711,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		for (auto * g: acquired_groups)
 		{
 			g->acquired = false;
+			g->image_index = -1;
 			g->swapchain.release();
 		}
 		acquired_groups.clear();
@@ -3736,13 +3894,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					             effects_full_inner);
 				}
 			}
-			// One mask submit pass per union (A then B): each union's first
-			// active group REPLACEs, the rest ADD.
+			// One mask submit pass per union: A submits its groups (first
+			// REPLACEs, the rest ADD); B submits the merged mask once
+			// (always REPLACE).
 			for (bool proj_union: {true, false})
 			{
 				// Opaque hard-outside flat needs no masks at all.
 				if (veil_hard_out and not proj_union)
+				{
+					// The record phase already sat the merge out under
+					// the same formula, so this is unreachable — but a
+					// leaked merge image drains its pool in pool-depth
+					// frames, so release defensively rather than reason
+					// about it.
+					if (merge_image >= 0 and merge_renderer)
+					{
+						merge_renderer->release();
+						merge_image = -1;
+						merge_this_frame = false;
+					}
 					continue;
+				}
 				bool first_group = true;
 				// Union A: window groups with projected=true (none yet).
 				for (auto & [key, g]: mask_groups)
@@ -3789,10 +3961,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					first_group = false;
 				}
-				// Union B also carries the local debug cutout group.
-				if (not proj_union and debug_group.active)
+				// Union B is the merged mask: the record phase
+				// MAX-combined every active B contributor (feather B
+				// groups, debug cutouts, hidden) into the merge target
+				// (merge_this_frame, evaluated once at record — never
+				// recomputed here). ONE layer, always first-group
+				// REPLACE (which resets the alpha the projected layer
+				// consumed, so flat reads only B), veil bias once. The
+				// old per-group REPLACE/ADD chain is gone with the
+				// layers it cost (~10pp each on Quest 3).
+				if (not proj_union and merge_this_frame and merge_image >= 0 and merge_renderer)
 				{
-					auto & g = debug_group;
+					XrExtent2Di merge_rect{(int32_t)merge_renderer->swapchain().width(),
+					                        (int32_t)merge_renderer->swapchain().height()};
 					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
 					for (uint32_t view = 0; view < view_count; ++view)
 					{
@@ -3801,71 +3982,34 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						        .pose = sync_pose[view],
 						        .fov = sync_fov[view],
 						        .subImage = {
-						                .swapchain = g.swapchain,
+						                .swapchain = merge_renderer->swapchain(),
 						                .imageRect = {
 						                        .offset = {0, 0},
-						                        .extent = {g.extent.width, g.extent.height},
+						                        .extent = merge_rect,
 						                },
 						                .imageArrayIndex = view,
 						        },
 						};
 					}
+					// imageIndex is implicit: the compositor uses the last
+					// released image, which the merge record acquired above.
 					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
 					                     application::space(xr::spaces::world),
 					                     mask_views);
-					if (first_group)
-						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-					else
-						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
-					if (veil_lift and not proj_union)
+					set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+					if (veil_lift)
 					{
-						if (first_group)
-							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
-						else
-							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
+						// Coverage·s + (1−s), once: max() and the lift
+						// commute (s ≥ 0), so lifting after the merge
+						// equals lifting every input before it. RGB
+						// untouched (ignored downstream anyway).
+						set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
 					}
-					first_group = false;
-				}
-				// Union B also carries the hidden-object mask: dedicated
-				// hard-edged layer, same REPLACE/ADD discipline as the rest
-				// of the union (first submits REPLACE, the rest ADD). It
-				// only ever adds coverage — reversed draws never rasterize
-				// into it — so hidden wins overlaps for safety.
-				if (not proj_union and hidden_group.active)
-				{
-					auto & g = hidden_group;
-					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
-					for (uint32_t view = 0; view < view_count; ++view)
-					{
-						mask_views[view] = {
-						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-						        .pose = sync_pose[view],
-						        .fov = sync_fov[view],
-						        .subImage = {
-						                .swapchain = g.swapchain,
-						                .imageRect = {
-						                        .offset = {0, 0},
-						                        .extent = {g.extent.width, g.extent.height},
-						                },
-						                .imageArrayIndex = view,
-						        },
-						};
-					}
-					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
-					                     application::space(xr::spaces::world),
-					                     mask_views);
-					if (first_group)
-						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-					else
-						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
-					if (veil_lift and not proj_union)
-					{
-						if (first_group)
-							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
-						else
-							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
-					}
-					first_group = false;
+					// Paired with the acquire in the record phase above:
+					// release after submit, like the dots acquisition.
+					merge_renderer->release();
+					merge_image = -1;
+					merge_this_frame = false;
 				}
 				// Each union's camera layer consumes its own alpha: A feeds
 				// projected, then B REPLACEs the alpha and feeds flat, so
@@ -4150,6 +4294,9 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	// Same for the hidden dots (one trivial pipeline): first-visible
 	// hidden frames must only rasterize.
 	hidden_dots_renderer::warm_pipelines(device, physical_device, swapchain.format());
+	// Same for the union-B merge (one fullscreen pipeline): first
+	// revealing frames must only rasterize, not driver-compile.
+	union_merge_renderer::warm_pipelines(device, physical_device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()
