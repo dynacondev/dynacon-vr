@@ -18,10 +18,10 @@
 
 #version 450
 
-// World-space triplanar warning grid + fresnel rim. Face normals come from
+// World-space triplanar warning grid lines. Face normals come from
 // screen-space derivatives of the world position (flat facets, no normal
 // attributes needed). Grid lines wrap the mesh faces (triplanar blend by
-// dominant normal axis); the rim defines the silhouette. No fill by design.
+// dominant normal axis). No fill, no rim by design: lines only.
 layout(location = 0) in vec3 vWorld;
 
 layout(location = 0) out vec4 out_color;
@@ -32,12 +32,9 @@ layout(push_constant) uniform PushConstants
 	vec4 obj_pos_scale;
 	vec4 obj_quat;
 	vec4 grid_col_scale; // rgb: grid color, w: grid spacing (m)
-	vec4 cam_pos_width; // xyz: eye world position (m), w: line width (px)
+	vec4 cam_pos_width; // w: line width (px); xyz reserved (push layout)
 }
 pc;
-
-// Hardcoded concern rim (stage 1): red, same pixel thickness as the grid.
-const vec3 rim_color = vec3(1.0, 0.16, 0.10);
 
 // Grid-line distance in pixels for one 2D coordinate pair.
 float grid_px(vec2 q)
@@ -50,9 +47,6 @@ float grid_px(vec2 q)
 void main()
 {
 	vec3 n = normalize(cross(dFdx(vWorld), dFdy(vWorld)));
-	vec3 to_cam = pc.cam_pos_width.xyz - vWorld;
-	float cam_dist = length(to_cam);
-	vec3 v = to_cam / max(cam_dist, 1e-5);
 
 	float spacing = max(pc.grid_col_scale.w, 1e-4);
 	vec3 gp = vWorld / spacing;
@@ -66,16 +60,8 @@ void main()
 	float wpx = max(pc.cam_pos_width.w, 0.5);
 	float line = 1.0 - smoothstep(wpx - 1.0, wpx, line_d);
 
-	// Fresnel rim, same pixel thickness. Pixel distance to the silhouette
-	// is (1-fres)/fwidth: fres is 0 at the facing center (rim 0) and 1
-	// at the edge (rim 1).
-	float fres = pow(1.0 - abs(dot(n, v)), 3.0);
-	float rim_d = (1.0 - fres) / max(fwidth(fres), 1e-4);
-	float rim = 1.0 - smoothstep(wpx - 1.0, wpx, rim_d);
-
-	float rc = clamp(rim, 0.0, 1.0);
-	float a = max(line, rc);
-	if (a <= 0.001)
-		discard;
-	out_color = vec4(mix(pc.grid_col_scale.rgb, rim_color, rc), a);
+	// No discard: alpha-0 fragments still write depth, so the full
+	// silhouette occludes backfaces (sparse lines alone would leave the
+	// depth behind them empty and backfaces would show through).
+	out_color = vec4(pc.grid_col_scale.rgb, line);
 }

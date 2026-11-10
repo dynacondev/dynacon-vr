@@ -308,13 +308,17 @@ void hidden_grid_renderer::init_pipelines(vk::Format format)
 	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
 	};
 
-	// Self-occluding silhouette: GREATER, not LESS. scene::projection_matrix
-	// is reversed-Z (near = 1, far = 0, matching scene_renderer and the
-	// feather depth path); LESS here would invert the occlusion.
+	// Self-occluding silhouette: GREATER_OR_EQUAL, not GREATER.
+	// scene::projection_matrix is reversed-Z (near = 1, far = 0, matching
+	// scene_renderer and the feather depth path); LESS here would invert
+	// the occlusion. OR_EQUAL (not strict) so same-surface ties pass:
+	// every covered fragment writes depth (no discard in the fragment
+	// shader), so adjacent triangles at near-identical depth must not
+	// drop pixels. Backfaces are strictly farther and still fail.
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil{
 	        .depthTestEnable = VK_TRUE,
 	        .depthWriteEnable = VK_TRUE,
-	        .depthCompareOp = vk::CompareOp::eGreater,
+	        .depthCompareOp = vk::CompareOp::eGreaterOrEqual,
 	};
 
 	// Straight alpha blend over transparent.

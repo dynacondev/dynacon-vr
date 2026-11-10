@@ -19,7 +19,7 @@
 #pragma once
 
 // Hidden-object warning grid overlay (3d-passthrough-hidden): world-space
-// triplanar grid lines + fresnel rim rendered over the revealed camera feed.
+// triplanar grid lines rendered over the revealed camera feed.
 //
 // Composited as ONE transparent projection layer (standard alpha blend,
 // above the flat passthrough, below gizmos/GUI) so the maxLayerCount
