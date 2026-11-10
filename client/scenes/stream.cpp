@@ -3105,6 +3105,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// (qmerge/qmerge+1) is stamped unconditionally so the poll
 				// range never covers an unwritten query on either pool.
 				rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qmerge);
+				// Self-healing reset: a held image here is definitionally
+				// leaked (submit always consumes it), so release before
+				// overwriting rather than dropping the handle.
+				if (merge_image >= 0 and merge_renderer)
+				{
+					merge_renderer->release();
+					merge_image = -1;
+				}
 				merge_this_frame = false;
 				merge_image = -1;
 				{
@@ -3141,6 +3149,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// deeper stalls. On the async path the frame-top poll
 						// already proved the fence, so this passes.)
 						bool merge_slot_safe = device.waitForFences(*mask_fence, VK_FALSE, 0) == vk::Result::eSuccess;
+					if (not merge_slot_safe)
+					{
+						// Coverage loss (the whole B union incl. hidden
+						// sits out): error, 1s-throttled — must stay
+						// visible in adb.
+						static XrTime last_merge_slot_log = 0;
+						XrTime merge_slot_now = instance.now();
+						if (merge_slot_now - last_merge_slot_log > 1'000'000'000LL)
+						{
+							last_merge_slot_log = merge_slot_now;
+							spdlog::error("Union merge slot-unsafe (prior mask command buffer in flight), B union sits out this frame");
+						}
+					}
 						if (merge_eyes_match and merge_slot_safe)
 						{
 							// False refuses the WHOLE merge below (the B union drops
@@ -3919,8 +3940,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if ((boundary_veil or full_passthrough_demo) and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
 				veil_hard_out = true;
 			bool submit_projected = have_projected and a_active > 0;
+			// The flat feed needs a B union behind it: when the merge
+			// drops (push failure, slot sit-out, timeout) with B
+			// contributors active, there is no alpha to consume, so
+			// flat must sit out too — otherwise it reads zero (or A's
+			// residue) while burning its compositor cost. Veil-hard-out
+			// opaque flat is by design and unaffected.
+			bool merge_covering = merge_this_frame and merge_image >= 0;
 			bool submit_flat = (need_flat or ((boundary_veil or full_passthrough_demo) and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
-			        (b_active > 0 or veil_hard_out);
+			        (veil_hard_out or (b_active > 0 and merge_covering));
+			if (b_active > 0 and not veil_hard_out and not merge_covering)
+			{
+				// Coverage loss (the B union dropped this frame): error,
+				// 1s-throttled — must stay visible in adb.
+				static XrTime last_merge_cover_log = 0;
+				XrTime merge_cover_now = instance.now();
+				if (merge_cover_now - last_merge_cover_log > 1'000'000'000LL)
+				{
+					last_merge_cover_log = merge_cover_now;
+					spdlog::error("Union-B merge dropped with {} B contributors active, flat sits out (no alpha to consume)", b_active);
+				}
+			}
 			// Forensic submit decisions (change-triggered): which camera layer
 			// submits and why. Permanent: coexistence bugs read as wrong output
 			// with no error, so the decision itself must be in the log.

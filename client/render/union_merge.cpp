@@ -74,11 +74,15 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	// init_pipelines below recreates the pool, which implicitly frees
 	// (destroys the use of) any sets still held.
 	descriptor_sets.clear();
-	format_ = format;
-	extent_ = {(uint32_t)w, (uint32_t)h};
-	swapchain_ = xr::swapchain(inst, sess, *device, format, w, h, 1, 2);
+	// format_/extent_ commit AFTER the fallible rebuild below: if the
+	// swapchain or pipeline construction throws, the old values stay
+	// and the next active frame retries instead of the early-out
+	// above suppressing recovery forever against stale targets.
+	vk::Format new_format = format;
+	vk::Extent2D new_extent{(uint32_t)w, (uint32_t)h};
+	swapchain_ = xr::swapchain(inst, sess, *device, new_format, w, h, 1, 2);
 	spdlog::info("Union merge swapchain: {}x{} ({} images)", w, h, swapchain_.image_count());
-	init_pipelines(format);
+	init_pipelines(new_format);
 	// One multiview target per swapchain image: array color view +
 	// layers=2 framebuffer; one draw broadcasts to both eyes.
 	targets.clear();
@@ -103,12 +107,15 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        .renderPass = *renderpass,
 		        .attachmentCount = 1,
 		        .pAttachments = &color_view,
-		        .width = extent_.width,
-		        .height = extent_.height,
+		        .width = new_extent.width,
+		        .height = new_extent.height,
 		        .layers = 2,
 		};
 		targets.back().framebuffer = vk::raii::Framebuffer(*device, fb_info);
 	}
+	// Commit only after the whole rebuild succeeded (see above).
+	format_ = new_format;
+	extent_ = new_extent;
 	return true;
 }
 
