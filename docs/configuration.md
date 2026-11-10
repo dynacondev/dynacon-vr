@@ -449,7 +449,7 @@ Each `passthrough` entry has:
   triangles budget). Both eyes fade together from a single per-frame
   headset distance. `"3d-passthrough-hidden"` reveals the flat feed
   where the model sits inside the proximity radius around the head
-  (hard-edged near-field cutout on its own mask layer, plus a
+  (hard-edged near-field cutout merged into the single union-B submit layer, plus a
   dot overlay in `dot-color` over the revealed feed (front faces
   only, so hidden meshes read best as **closed volumes** like boundary
   meshes): reversed cuts never apply to it (safety: hidden always wins),
@@ -478,7 +478,7 @@ Each `passthrough` entry has:
   negatives cut every
   layer and inherit each layer's feathering, while zones fade by
   distance instead (see `transition-distance`) and hidden cutouts are
-  hard-edged on their own layer.
+  hard-edged (composited through the shared union-B layer).
 - `transition-distance`: boundary fade width in meters
   (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
   scene cross-fades over ± this distance around the zone surface
@@ -493,11 +493,11 @@ Each `passthrough` entry has:
   `3d-depth-passthrough` or `3d-passthrough-hidden` (warned + ignored):
   zones never map camera
   onto geometry, depth volumes always reveal the flat feed, and hidden
-  objects always reveal the flat feed on their own layer.
+  objects always reveal the flat feed (through the shared union-B layer).
 - `dot-pitch`: hidden dot pitch in meters
   (`3d-passthrough-hidden` only, default `0.05`, clamped to
   `[0.01, 1]`, applied live). Fixed world-size dots wrapping the mesh
-  faces; all hidden objects share one layer, so the pitch is per-object
+  faces; all hidden objects share one merge input, so the pitch is per-object
   at draw time.
 - `dot-color`: hidden dot color as a `"#RRGGBB"` hex string
   (`3d-passthrough-hidden` only, default red `#FF291A`, applied

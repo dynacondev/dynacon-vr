@@ -29,9 +29,9 @@
 #include "render/depth_overlay.h"
 #include "render/feather_mask.h"
 #include "render/hidden_dots.h"
-#include "render/union_merge.h"
 #include "render/imgui_impl.h"
 #include "render/passthrough_mesh.h"
+#include "render/union_merge.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
 #include "stream_defoveator.h"
@@ -126,7 +126,8 @@ private:
 	// compositor joins via swapchain release, so no semaphore is
 	// needed). Single slot: reused when its fence reads signaled,
 	// otherwise the frame falls back to inline recording. Results
-	// feed the mask spans (q0 start, q1 after first group, q2 end).
+	// feed the mask spans (q0 start, q1 after first group, q2 end,
+	// q3/q4 union-B merge bracket).
 	vk::raii::Fence mask_fence = nullptr;
 	vk::raii::CommandBuffer mask_command_buffer = nullptr;
 	vk::raii::QueryPool mask_query_pool = nullptr;
@@ -586,6 +587,8 @@ private:
 		// the poll range is valid on group-less frames). Spans:
 		// frame = q1-q0, defoveate = q2-q0, gizmos = q3-q2,
 		// mask = q1-q3, mask first-group = q4-q3, mask rest = q1-q4.
+		// q5/q6 union-B merge bracket (inline mask frames only;
+		// async frames stamp the same span in mask-pool q3/q4).
 		// TopOfPipe stamps don't drain prior fragment work, so a late
 		// producer inflates the *following* span — read spikes by
 		// span, not as exact per-pass costs.
@@ -598,11 +601,11 @@ private:
 		// (preemption/contention inflates both halves together).
 		float mask_first_gpu_time = 0;
 		float mask_rest_gpu_time = 0;
-		// Union-B merge span: async = mask-pool q4-q3, inline =
-		// main-pool q6-q5 (spare slots past the q0..q4 plan above).
-		// One fullscreen full-res pass. Stamped unconditionally (zero
-		// span when the merge sits out) so the poll range never covers
-		// an unwritten query. Read spikes by span (TopOfPipe caveat).
+		// Union-B merge span: async = mask-pool q3/q4, inline =
+		// main-pool q5/q6. One fullscreen full-res pass. Stamped
+		// unconditionally (zero span when the merge sits out) so the
+		// poll range never covers an unwritten query. Read spikes by
+		// span (TopOfPipe caveat).
 		float merge_gpu_time = 0;
 	};
 

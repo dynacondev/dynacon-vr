@@ -383,7 +383,7 @@ void scenes::stream::gui_performance_metrics()
 	                             {_("Mask"),      &global_metric::mask_gpu_ms},
 	                             {_("Mask 1st"),  &global_metric::mask_first_gpu_ms},
 	                             {_("Mask rest"), &global_metric::mask_rest_gpu_ms},
-	                             {_("Merge"),     &global_metric::merge_gpu_ms},
+	                             {_("Mask merge"), &global_metric::merge_gpu_ms},
 	                             {_("Vol R"),     &global_metric::volume_raster_gpu_ms},
 	                             {_("Vol V"),     &global_metric::volume_virt_gpu_ms},
 	                             {_("Vol C"),     &global_metric::volume_compare_gpu_ms},

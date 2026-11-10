@@ -3254,7 +3254,15 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	    (has_reversed and not it->second.has_depth))
 	{
 		if (it != targets.end())
+		{
+			// The union-B merge samples these array views cross-frame
+			// (a prior async merge CB may still fly on inline-fallback
+			// frames): never destroy a live entry out from under it.
+			// Rare path (submit resize, first reversed frame) — the
+			// idle is affordable here, unlike on the frame path.
+			device.waitIdle();
 			targets.erase(it);
+		}
 		// NOTE: views below are named locals, not &* temporaries: the
 		// framebuffer create-info stores the pointer, so the VkImageView
 		// must outlive the vk::raii::Framebuffer constructor call.

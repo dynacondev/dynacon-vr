@@ -22,8 +22,7 @@
 #include "vk/shader.h"
 
 #include <algorithm>
-#include <cassert>
-#include <stdexcept>
+#include <vector>
 
 #include <spdlog/spdlog.h>
 
@@ -137,7 +136,7 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	// Linear + ClampToEdge (feather sampler precedent): the bilinear
 	// tap IS the upscale for half/quarter-res inputs. maxLod 0, no
 	// mipmap chain on swapchain images. NEVER nearest here: it would
-	// alias the feather band (see the header).
+	// alias the feather band.
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eLinear,
 	        .minFilter = vk::Filter::eLinear,
@@ -159,11 +158,13 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	        .type = vk::DescriptorType::eCombinedImageSampler,
 	        .descriptorCount = 2 * max_inputs,
 	};
-	descriptor_pool = vk::raii::DescriptorPool(*device, vk::DescriptorPoolCreateInfo{
-	                                                           .maxSets = 2,
-	                                                           .poolSizeCount = 1,
-	                                                           .pPoolSizes = &pool_size,
-	                                                   });
+	vk::DescriptorPoolCreateInfo pool_info{
+	        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+	        .maxSets = 2,
+	        .poolSizeCount = 1,
+	        .pPoolSizes = &pool_size,
+	};
+	descriptor_pool = vk::raii::DescriptorPool(*device, pool_info);
 	for (int i = 0; i < 2; ++i)
 	{
 		vk::DescriptorSetAllocateInfo set_alloc{
@@ -321,6 +322,8 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
 		        .oldLayout = in.general_layout ? vk::ImageLayout::eGeneral : vk::ImageLayout::eColorAttachmentOptimal,
 		        .newLayout = in.general_layout ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		        .image = in.image,
 		        .subresourceRange = {
 		                .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -377,6 +380,12 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	                        .minDepth = 0,
 	                        .maxDepth = 1,
 	                });
+	// Full-extent scissor, set explicitly: the pipeline enables the
+	// scissor dynamic state and prior passes in this command buffer
+	// leave narrowed boxes behind (per-draw unions, content boxes).
+	// Inheriting one would clip the merge (under-reveal) with no
+	// validation complaint.
+	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extent});
 	vk::ClearValue clear{};
 	clear.color.float32 = std::array<float, 4>{0, 0, 0, 0};
 	vk::RenderPassBeginInfo begin{
@@ -400,6 +409,8 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	        .dstAccessMask = vk::AccessFlagBits::eMemoryRead,
 	        .oldLayout = vk::ImageLayout::eGeneral,
 	        .newLayout = vk::ImageLayout::eGeneral,
+	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	        .image = swapchain_.image(image_index),
 	        .subresourceRange = {
 	                .aspectMask = vk::ImageAspectFlagBits::eColor,

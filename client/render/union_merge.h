@@ -63,7 +63,11 @@ class union_merge_renderer
 public:
 	// Hard input cap (see above): more contributors than this are
 	// dropped by the caller with an error, never merged, never
-	// submitted on a fallback path.
+	// submitted on a fallback path. Typical configs carry 1-3.
+	// 8 is the static sampler-binding count in
+	// union_merge_mv.frag.glsl (src0..src7, no descriptor indexing
+	// per the Adreno rule): raising max_inputs requires adding
+	// matching srcN shader bindings + layout slots in lockstep.
 	static constexpr uint32_t max_inputs = 8;
 
 	// One merge input: a just-recorded contributor image plus its
