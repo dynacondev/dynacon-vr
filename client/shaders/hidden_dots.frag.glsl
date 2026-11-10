@@ -61,10 +61,10 @@ void main()
 	vec3 c1 = vec3(pair_center(vQ.xz).x, vQ.y, pair_center(vQ.xz).y) * pitch;
 	vec3 c2 = vec3(vQ.x, pair_center(vQ.yz)) * pitch;
 	float d = min(pair_dist(c0), min(pair_dist(c1), pair_dist(c2)));
-	// World radius 0.045 cells, converted with the view-depth scale; 1px
+	// World radius 0.0045 cells, converted with the view-depth scale; 1px
 	// AA band (fades tiny distant dots gracefully instead of shimmering).
 	float px_per_m = (pc.view_params.y * 0.5) * abs(pc.view_params.z) / max(vViewZ, 1e-3);
-	float r_px = 0.045 * pitch * px_per_m;
+	float r_px = 0.0045 * pitch * px_per_m;
 	float dot_ = 1.0 - smoothstep(max(r_px - 1.0, 0.0), r_px, d);
 	if (dot_ <= 0.001)
 		discard;
