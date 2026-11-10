@@ -1,0 +1,66 @@
+/*
+ * WiVRn VR streaming
+ * Copyright (C) 2026  Guillaume Meunier <guillaume.meunier@centraliens.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+#version 450
+
+#extension GL_EXT_multiview : require
+
+layout(location = 0) in vec2 uv;
+layout(location = 0) out vec4 out_color;
+
+// Union-B mask merge: per-pixel MAX of up to 8 submitted mask images
+// (feather groups + debug cutout group + hidden group). Every input
+// covers the same FOV, so one shared UV addresses all of them; the
+// linear sampler's bilinear tap IS the upscale for half/quarter-res
+// inputs (same as the compositor stretch it replaces).
+//
+// MAX (any-mask-reveals-wins) preserves the two safety theorems:
+// hidden-wins-reversed (hidden only adds coverage) and over-reveal
+// (max >= every input, so no window can shrink). It differs from the
+// old saturating-ADD union only in overlap bands (0.6+0.6 saturated
+// to 1.0, MAX gives 0.6) — the double-count was a bug, not a feature.
+//
+// 8 STATIC bindings (not a sampler array): no descriptor-indexing
+// extension, no dynamic indexing for Adreno to miscompile, no
+// per-fragment early-out (loop-free, derivatives stay uniform).
+// Unused slots bind an already-active input's view again (same view
+// in several slots is legal); max() over duplicates is neutral.
+// RGB is zero: downstream the REPLACE blend preserves dst color and
+// the veil bias touches alpha only, so mask RGB is ignored.
+layout(set = 0, binding = 0) uniform sampler2DArray src0;
+layout(set = 0, binding = 1) uniform sampler2DArray src1;
+layout(set = 0, binding = 2) uniform sampler2DArray src2;
+layout(set = 0, binding = 3) uniform sampler2DArray src3;
+layout(set = 0, binding = 4) uniform sampler2DArray src4;
+layout(set = 0, binding = 5) uniform sampler2DArray src5;
+layout(set = 0, binding = 6) uniform sampler2DArray src6;
+layout(set = 0, binding = 7) uniform sampler2DArray src7;
+
+void main()
+{
+	vec3 buv = vec3(uv, float(gl_ViewIndex));
+	float a = texture(src0, buv).a;
+	a = max(a, texture(src1, buv).a);
+	a = max(a, texture(src2, buv).a);
+	a = max(a, texture(src3, buv).a);
+	a = max(a, texture(src4, buv).a);
+	a = max(a, texture(src5, buv).a);
+	a = max(a, texture(src6, buv).a);
+	a = max(a, texture(src7, buv).a);
+	out_color = vec4(0.0, 0.0, 0.0, a);
+}

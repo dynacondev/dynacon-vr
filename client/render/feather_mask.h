@@ -117,6 +117,16 @@ public:
 	};
 	std::optional<borrowed_dots> borrowed_dot_buffers(const std::string & key) const;
 
+	// Borrowed submitted-image array view (both layers) for the
+	// union-B merge pass: the just-recorded image's multiview color
+	// view, sampled (not rendered) by the merge. Built for every
+	// recorded image alongside the framebuffers, so any image a group
+	// recorded this frame has one. Null when unknown (retired image
+	// or never recorded): the caller must skip the input loudly,
+	// never silently. Same borrowed lifetime as the mesh buffers
+	// above (dies with reset_targets(), waitIdle'd upstream).
+	vk::ImageView submitted_view_array(vk::Image image) const;
+
 	// One silhouette draw: which uploaded mesh, per-eye transforms, and
 	// the first-acquisition fade opacity (presence 0..1 for both
 	// polarities; the renderer pushes 1 - fade as the cut strength for

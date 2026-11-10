@@ -1793,6 +1793,18 @@ void feather_mask_renderer::remove_mesh(const std::string & key)
 	meshes.erase(it);
 }
 
+vk::ImageView feather_mask_renderer::submitted_view_array(vk::Image image) const
+{
+	// The array view is built unconditionally with every targets
+	// entry (and every hidden entry), so map presence alone proves
+	// the view is live.
+	if (auto it = targets.find(image); it != targets.end())
+		return *it->second.view_array;
+	if (auto ht = hidden_targets.find(image); ht != hidden_targets.end())
+		return *ht->second.view_array;
+	return vk::ImageView{};
+}
+
 feather_mask_renderer::depth_entry feather_mask_renderer::make_depth_entry(vk::Extent2D e)
 {
 	depth_entry entry;
