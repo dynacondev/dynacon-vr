@@ -30,9 +30,9 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
 
 ## Quest: colorScaleBias alpha scale is ignored, RGB + alpha bias are honored
 
-- Symptom: hidden-object warning wash (own layer above flat, white silhouette, `colorScale = {tint, breathing alpha}`) showed as a *steady* tint. CPU-side heartbeat proven oscillating in-device via throttled log (`s` 0.00→0.99, alpha 0.15→0.37) while the display never varied — the runtime dropped the alpha channel of `colorScale` on this path.
-- Consistent side-evidence: the boundary veil works because it lifts through alpha *bias* (adds regardless of scale); RGB scale visibly tints (the steady blue). So on Quest: drive fades through **bias**, RGB scale, or layer submit on/off (blink) — never alpha scale, and never mask-image alpha for warnings (it ghosts game content over real objects).
+- Symptom: hidden-object color pulse showed as a *steady* tint (then, reframed as a blink, a harsh strobe). CPU-side heartbeat proven oscillating in-device via throttled log while the display never varied — the runtime drops the alpha channel of `colorScale` on this path, so any alpha-graded overlay is impossible; mask-image alpha does pulse but ghosts game content over real objects.
+- Design that threads it (`stream.cpp` hidden record/submit): opaque color matte twin below flat + dipping reveal above. One extra tier-0 matte raster (own swapchain, steady opacity 1, white silhouette × RGB scale = config color) sits above video below flat; the B-mask image alpha breathes `1−0.5·strength·s²` at ~1.2Hz, so the region mixes camera↔color with game structurally unable to show. `pulse-strength: 0` skips the matte (steady cutout).
 - Rules:
-  1. Animate warning visibility by submitting/skipping an opaque overlay layer on the heartbeat (blink). Full-opacity color covers camera and game alike: no ghost possible.
+  1. Never route warning visibility through `colorScale.a` (ignored) or mask-image alpha alone (game bleed). Opaque matte + dipping reveal composes only honored channels.
   2. Mask-layer RGB is invisible by design (`mask.frag.glsl`: ZERO color blend factors, flat covers via DST_ALPHA) — any color warning must live above flat or manifest as alpha.
-  3. When display disagrees with proven-oscillating logs, suspect the compositor channel, not the math: gate one variable per device round-trip with a throttled forensic log (`Hidden wash` pattern in `stream.cpp`).
+  3. When display disagrees with proven-oscillating logs, suspect the compositor channel, not the math: gate one variable per device round-trip with a throttled forensic log.

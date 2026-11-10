@@ -753,6 +753,11 @@ private:
 	// (hidden always wins). Union B (flat) semantics at submit.
 	// Render thread only.
 	mask_group hidden_group;
+	// Opaque color matte twin: steady full-opacity raster of the same
+	// meshes, purely as coverage for the color layer below flat (where
+	// the pulsing B alpha dips, matte — not game video — shows through).
+	// Recorded only while pulse-strength > 0.
+	mask_group hidden_color_group;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;

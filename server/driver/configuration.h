@@ -140,7 +140,7 @@ struct configuration
 		// Reserved for future use (3d-passthrough-hidden only): parsed and
 		// forwarded, but currently unused. Ignored for other types (warned).
 		float grid_scale_m = 0.1f;
-		// Hidden-object warning blink color as RGB 0..1, parsed from a
+		// Hidden-object warning matte color as RGB 0..1, parsed from a
 		// "#RRGGBB" hex string as-authored (no colorspace conversion;
 		// default #80D4FF light blue). Applied live. Ignored for other
 		// types (warned).
@@ -149,8 +149,8 @@ struct configuration
 		// only). Unused for now (always-on stage 1); reserved for the
 		// near-field reveal. Default 0.5, clamped to >= 0.
 		float trigger_distance_m = 0.5f;
-		// Warning blink on-duty 0..1 (3d-passthrough-hidden only): the opaque
-		// color flash strobes at ~1.2Hz with on-duty growing with this
+		// Warning mix depth 0..1 (3d-passthrough-hidden only): the cutout
+		// alpha breathes over the opaque matte at ~1.2Hz scaled by this
 		// (0 = steady cutout). Default 0.5, clamped to [0, 1].
 		float pulse_strength = 0.5f;
 	};

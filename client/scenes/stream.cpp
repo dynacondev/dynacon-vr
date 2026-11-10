@@ -2451,195 +2451,237 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// swapchain from the feather groups (tier 0 direct raster, no
 				// blur chain, no cutouts); reversed draws are never appended,
 				// so hidden always wins for safety.
+				// Hidden reveal + opaque color matte share one record path:
+				// the mask (union B, flat) breathes its image alpha with the
+				// heartbeat while the matte twin holds steady full opacity
+				// purely as coverage for the color layer below flat. Same
+				// tier-0 raster, same mesh list; only opacity differs.
+				float hidden_strength = 0;
+				for (auto & [oid, ost]: passthrough_objects)
 				{
-					bool known_hidden = false; // map-known (placed or not)
-					bool have_hidden = false; // placed + mesh ready
-					for (auto & [oid, ost]: passthrough_objects)
+					(void)oid;
+					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					hidden_strength = ost.def.pulse_strength;
+					break;
+				}
+				float hidden_beat = 0;
+				if (hidden_strength > 0)
+				{
+					double t = (double)frame_state.predictedDisplayTime * 1e-9;
+					// Reduce in double before narrowing: float phase would
+					// wobble after days of uptime.
+					double phase = std::fmod(t * 6.283185307179586 * 1.2, 6.283185307179586);
+					float s = 0.5f + 0.5f * std::sin((float)phase); // 2π·1.2Hz
+					hidden_beat = hidden_strength * s * s;
+				}
+				auto record_hidden_matte = [&](mask_group & g, const char * label, float opacity, bool needed) {
 					{
-						(void)oid;
-						if (ost.def.type != "3d-passthrough-hidden")
-							continue;
-						known_hidden = true;
-						if (ost.soup_ready and ost.fused.placed)
-						{
-							have_hidden = true;
-							break;
-						}
-					}
-					auto & g = hidden_group;
-					g.feather_px = 0;
-					g.projected = false;
-					if (known_hidden)
-					{
-						// Pre-warm (map-known, not necessarily placed):
-						// renderer + swapchain + intermediates ready before
-						// first placement so visible frames only rasterize,
-						// mirroring the feather groups. Meshes upload as
-						// soon as the soup is ready, even unplaced.
-						if (not g.renderer)
-							g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
-						if (not g.swapchain or g.swapchain.width() != mw or g.swapchain.height() != mh)
-						{
-							// Rare path (first frame, video resize): nothing
-							// outstanding (previous images released last
-							// frame), mirroring the feather groups.
-							device.waitIdle();
-							g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, view_count);
-							g.renderer->reset_targets();
-							g.extent = {(int32_t)mw, (int32_t)mh};
-							spdlog::info("Hidden mask swapchain: {}x{} ({} images)", mw, mh, g.swapchain.image_count());
-						}
-						g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+						bool known_hidden = false; // map-known (placed or not)
+						bool have_hidden = false; // placed + mesh ready
 						for (auto & [oid, ost]: passthrough_objects)
 						{
+							(void)oid;
 							if (ost.def.type != "3d-passthrough-hidden")
 								continue;
-							bool member = ost.soup_ready;
-							auto mhit = g.mesh_hashes.find(oid);
-							if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash))
+							known_hidden = true;
+							if (ost.soup_ready and ost.fused.placed)
 							{
-								g.renderer->set_mesh(oid, ost.soup);
-								g.mesh_hashes[oid] = ost.soup_hash;
-							}
-							else if (not member and mhit != g.mesh_hashes.end())
-							{
-								g.renderer->remove_mesh(oid);
-								g.mesh_hashes.erase(mhit);
+								have_hidden = true;
+								break;
 							}
 						}
-						// Hash-side eviction (mirrors the feather groups): oids
-						// deleted or retyped away from hidden are never
-						// visited above, so sweep them here.
-						for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
-						{
-							auto oit = passthrough_objects.find(hit->first);
-							bool member = oit != passthrough_objects.end() and
-							        oit->second.def.type == "3d-passthrough-hidden" and
-							        oit->second.soup_ready and oit->second.soup_hash == hit->second;
-							if (not member)
-							{
-								g.renderer->remove_mesh(hit->first);
-								hit = g.mesh_hashes.erase(hit);
-							}
-							else
-								++hit;
-						}
-					}
-					if (not have_hidden)
-					{
-						g.active = false;
-						if (not known_hidden and g.renderer)
-						{
-							for (auto & [key, _]: g.mesh_hashes)
-								g.renderer->remove_mesh(key);
-							g.mesh_hashes.clear();
-						}
-					}
-					else
-					{
-						std::vector<feather_mask_renderer::instance_draw> draws;
-						for (auto & [oid, ost]: passthrough_objects)
-						{
-							if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
-								continue;
-							const auto & fu = ost.fused;
-							glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
-							            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
-							glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
-							glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-							                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
-							std::array<glm::mat4, 2> mvp;
-							for (uint32_t view = 0; view < view_count; ++view)
-								mvp[view] = server_mvp[view] * model;
-							// Frustum skip (1px margin, hard edge: no feather
-							// bleed to preserve).
-							bool visible = true;
-							if (auto bounds = g.renderer->mesh_bounds(oid))
-							{
-								visible = false;
-								for (uint32_t view = 0; view < 2 and not visible; ++view)
-								{
-									bool any_front = false, any_behind = false, any_inside = false;
-									for (int corner = 0; corner < 8; ++corner)
-									{
-										glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
-										               (corner & 2) ? bounds->second.y : bounds->first.y,
-										               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
-										glm::vec4 c = mvp[view] * q4;
-										if (c.w < 0)
-										{
-											any_behind = true;
-											continue;
-										}
-										any_front = true;
-										if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)mw * 0.5f)) and
-										    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)mh * 0.5f)) and c.z >= 0 and c.z <= c.w)
-											any_inside = true;
-									}
-									visible = any_front and (any_behind or any_inside);
-								}
-							}
-							if (not visible)
-								continue;
-							draws.push_back({oid, mvp, 1.f, false});
-						}
-						if (draws.empty())
+						// Twin not needed (matte with pulse-strength 0): park
+						// it and drop uploaded meshes, keep the rest.
+						if (not needed)
 						{
 							g.active = false;
-							if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+							if (g.renderer)
 							{
-								g.last_draws_log = instance.now();
-								spdlog::info("Hidden mask draws lost");
+								for (auto & [key, _]: g.mesh_hashes)
+									g.renderer->remove_mesh(key);
+								g.mesh_hashes.clear();
 							}
-							g.had_draws = false;
+							return;
+						}
+						g.feather_px = 0;
+						g.projected = false;
+						if (known_hidden)
+						{
+							// Pre-warm (map-known, not necessarily placed):
+							// renderer + swapchain + intermediates ready before
+							// first placement so visible frames only rasterize,
+							// mirroring the feather groups. Meshes upload as
+							// soon as the soup is ready, even unplaced.
+							if (not g.renderer)
+								g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+							if (not g.swapchain or g.swapchain.width() != mw or g.swapchain.height() != mh)
+							{
+								// Rare path (first frame, video resize): nothing
+								// outstanding (previous images released last
+								// frame), mirroring the feather groups.
+								device.waitIdle();
+								g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, view_count);
+								g.renderer->reset_targets();
+								g.extent = {(int32_t)mw, (int32_t)mh};
+								spdlog::info("{} swapchain: {}x{} ({} images)", label, mw, mh, g.swapchain.image_count());
+							}
+							g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+							for (auto & [oid, ost]: passthrough_objects)
+							{
+								if (ost.def.type != "3d-passthrough-hidden")
+									continue;
+								bool member = ost.soup_ready;
+								auto mhit = g.mesh_hashes.find(oid);
+								if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash))
+								{
+									g.renderer->set_mesh(oid, ost.soup);
+									g.mesh_hashes[oid] = ost.soup_hash;
+								}
+								else if (not member and mhit != g.mesh_hashes.end())
+								{
+									g.renderer->remove_mesh(oid);
+									g.mesh_hashes.erase(mhit);
+								}
+							}
+							// Hash-side eviction (mirrors the feather groups): oids
+							// deleted or retyped away from hidden are never
+							// visited above, so sweep them here.
+							for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
+							{
+								auto oit = passthrough_objects.find(hit->first);
+								bool member = oit != passthrough_objects.end() and
+								        oit->second.def.type == "3d-passthrough-hidden" and
+								        oit->second.soup_ready and oit->second.soup_hash == hit->second;
+								if (not member)
+								{
+									g.renderer->remove_mesh(hit->first);
+									hit = g.mesh_hashes.erase(hit);
+								}
+								else
+									++hit;
+							}
+						}
+						if (not have_hidden)
+						{
+							g.active = false;
+							if (not known_hidden and g.renderer)
+							{
+								for (auto & [key, _]: g.mesh_hashes)
+									g.renderer->remove_mesh(key);
+								g.mesh_hashes.clear();
+							}
 						}
 						else
 						{
-							g.had_draws = true;
-							int mask_index = g.swapchain.acquire();
-							// Paired from acquisition (mirrors the feather
-							// groups): the release list owns it from here.
-							acquired_groups.push_back(&g);
-							if (not g.swapchain.wait(100'000'000))
+							std::vector<feather_mask_renderer::instance_draw> draws;
+							for (auto & [oid, ost]: passthrough_objects)
 							{
-								g.swapchain.release();
-								acquired_groups.pop_back();
-								g.active = false;
-								if (not g.wait_warned)
+								if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+									continue;
+								const auto & fu = ost.fused;
+								glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+								            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+								glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+								glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+								                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+								std::array<glm::mat4, 2> mvp;
+								for (uint32_t view = 0; view < view_count; ++view)
+									mvp[view] = server_mvp[view] * model;
+								// Frustum skip (1px margin, hard edge: no feather
+								// bleed to preserve).
+								bool visible = true;
+								if (auto bounds = g.renderer->mesh_bounds(oid))
 								{
-									g.wait_warned = true;
-									spdlog::warn("Hidden mask image wait timed out, skipping frame");
+									visible = false;
+									for (uint32_t view = 0; view < 2 and not visible; ++view)
+									{
+										bool any_front = false, any_behind = false, any_inside = false;
+										for (int corner = 0; corner < 8; ++corner)
+										{
+											glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+											               (corner & 2) ? bounds->second.y : bounds->first.y,
+											               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+											glm::vec4 c = mvp[view] * q4;
+											if (c.w < 0)
+											{
+												any_behind = true;
+												continue;
+											}
+											any_front = true;
+											if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)mw * 0.5f)) and
+											    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)mh * 0.5f)) and c.z >= 0 and c.z <= c.w)
+												any_inside = true;
+										}
+										visible = any_front and (any_behind or any_inside);
+									}
 								}
+								if (not visible)
+									continue;
+								draws.push_back({oid, mvp, opacity, false});
+							}
+							if (draws.empty())
+							{
+								g.active = false;
+								if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+								{
+									g.last_draws_log = instance.now();
+									spdlog::info("{} draws lost", label);
+								}
+								g.had_draws = false;
 							}
 							else
 							{
-								g.wait_warned = false;
-								g.acquired = true;
-								g.active = true;
-								g.extent = {(int32_t)mw, (int32_t)mh};
-								feather_mask_renderer::mask_stage_cpu mstats{};
-								try
+								g.had_draws = true;
+								int mask_index = g.swapchain.acquire();
+								// Paired from acquisition (mirrors the feather
+								// groups): the release list owns it from here.
+								acquired_groups.push_back(&g);
+								if (not g.swapchain.wait(100'000'000))
 								{
-									// Full-res submit (feather 0 = tier 0):
-									// hard edge, no blur intermediates.
-									vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
-									g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, draws,
-									                   true, 0, no_cutouts, server_mvp, &mstats, mex);
-								}
-								catch (std::exception & e)
-								{
-									spdlog::warn("Hidden mask record failed: {}", e.what());
 									g.swapchain.release();
 									acquired_groups.pop_back();
-									g.acquired = false;
 									g.active = false;
+									if (not g.wait_warned)
+									{
+										g.wait_warned = true;
+										spdlog::warn("{} image wait timed out, skipping frame", label);
+									}
 								}
-								mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
-								mask_draws += (int)mstats.draws;
+								else
+								{
+									g.wait_warned = false;
+									g.acquired = true;
+									g.active = true;
+									g.extent = {(int32_t)mw, (int32_t)mh};
+									feather_mask_renderer::mask_stage_cpu mstats{};
+									try
+									{
+										// Full-res submit (feather 0 = tier 0):
+										// hard edge, no blur intermediates.
+										vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
+										g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, draws,
+										                   true, 0, no_cutouts, server_mvp, &mstats, mex);
+									}
+									catch (std::exception & e)
+									{
+										spdlog::warn("{} record failed: {}", label, e.what());
+										g.swapchain.release();
+										acquired_groups.pop_back();
+										g.acquired = false;
+										g.active = false;
+									}
+									mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
+									mask_draws += (int)mstats.draws;
+								}
 							}
 						}
 					}
-				}
+				};
+				record_hidden_matte(hidden_group, "Hidden mask", 1.f - 0.5f * hidden_beat, true);
+				// Matte only backs the color layer: skip entirely when
+				// pulse-strength is 0 (steady cutout needs no mix).
+				record_hidden_matte(hidden_color_group, "Hidden matte", 1.f, hidden_strength > 0);
 			}
 		};
 
@@ -3428,6 +3470,50 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
 					}
 					first_group = false;
+				}
+				// Hidden opaque color matte: steady-alpha twin of the mask image,
+				// recolored by the config color. Sits above video, below flat:
+				// where the pulsing B alpha dips, this (not game video) shows
+				// through. Standard source-alpha blend (like the gizmo layer);
+				// white silhouette × color = opaque config color. Skipped
+				// without the colorScaleBias extension (RGB scale carries the
+				// color — an unscaled white flash would be wrong).
+				if (not proj_union and hidden_color_group.active and composition_layer_color_scale_bias_supported)
+				{
+					auto & g = hidden_color_group;
+					const float * tint = nullptr;
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						(void)oid;
+						if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+							continue;
+						tint = ost.def.grid_color.data();
+						break;
+					}
+					if (tint)
+					{
+						std::array<XrCompositionLayerProjectionView, view_count> matte_views;
+						for (uint32_t view = 0; view < view_count; ++view)
+						{
+							matte_views[view] = {
+							        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+							        .pose = sync_pose[view],
+							        .fov = sync_fov[view],
+							        .subImage = {
+							                .swapchain = g.swapchain,
+							                .imageRect = {
+							                        .offset = {0, 0},
+							                        .extent = {g.extent.width, g.extent.height},
+							                },
+							                .imageArrayIndex = view,
+							        },
+							};
+						}
+						add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+						                     application::space(xr::spaces::world),
+						                     matte_views);
+						set_color_scale_bias({tint[0], tint[1], tint[2], 1}, {0, 0, 0, 0});
+					}
 				}
 				// Each union's camera layer consumes its own alpha: A feeds
 				// projected, then B REPLACEs the alpha and feeds flat, so
