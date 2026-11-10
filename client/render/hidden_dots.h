@@ -21,8 +21,9 @@
 // Hidden-object dot overlay (3d-passthrough-hidden): a fixed world-size dot
 // grid wrapping the mesh, drawn over the revealed camera feed in the config
 // color. Deliberately the cheapest shape-conforming texture: one pipeline,
-// MVP + one object-space varying, ~12 ALU per dot pixel, zero derivatives,
-// no depth image. Front faces only (cull BACK, depth test OFF): closed
+// MVP + one object-space varying, screen-space derivatives to pick the
+// facing axis pair (so only round dots rasterize, never hairlines), no
+// depth image. Front faces only (cull BACK, depth test OFF): closed
 // meshes show near-side dots only, always on top (nothing to clip against,
 // so the curve-dropout class can't occur); open meshes read from the front
 // and vanish from behind. Concave folds fall back to draw order.
