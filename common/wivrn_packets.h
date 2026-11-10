@@ -1043,7 +1043,10 @@ struct passthrough_object
 	// "3d-boundary-reversed" inverts it. Boundary meshes must be closed
 	// volumes. "3d-depth-passthrough" reveals the flat feed where the
 	// runtime depth map resolves inside the model volume (depth-tested
-	// volume, feathered like a normal window). Unknown types are skipped
+	// volume, feathered like a normal window). "3d-passthrough-hidden"
+	// renders the model as a hard-edged always-on passthrough cutout on
+	// its own mask layer (reversed cuts never apply) plus a world-space
+	// warning grid overlay. Unknown types are skipped
 	// client-side (forward-compat).
 	std::string type = "3d-passthrough";
 	std::string id;
@@ -1077,6 +1080,16 @@ struct passthrough_object
 	// symmetric smoothstep over +/- this distance around the mesh
 	// surface (0.5 at the surface); 0 = hard step. Default 0.3.
 	float transition_distance_m = 0.3f;
+	// Hidden-object warning grid (3d-passthrough-hidden only): world-space
+	// triplanar line spacing in meters. Default 0.1.
+	float grid_scale_m = 0.1f;
+	// Hidden-object warning grid color as linear RGB 0..1 (parsed
+	// server-side from a "#RRGGBB" hex string). Default light blue.
+	std::array<float, 3> grid_color = {0.5f, 0.83f, 1.0f};
+	// Proximity trigger distance in meters (3d-passthrough-hidden only).
+	// Unused for now (always-on stage 1); reserved for the near-field
+	// reveal. Default 0.5.
+	float trigger_distance_m = 0.5f;
 };
 
 // Origin alignment (headset-side): re-base outgoing tracking so the

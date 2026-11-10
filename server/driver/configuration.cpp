@@ -500,7 +500,8 @@ configuration::configuration()
 					o.type = item["type"];
 				bool is_boundary = o.type == "3d-boundary" or o.type == "3d-boundary-reversed";
 				bool is_depth = o.type == "3d-depth-passthrough";
-				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed" and not is_boundary and not is_depth)
+				bool is_hidden = o.type == "3d-passthrough-hidden";
+				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed" and not is_boundary and not is_depth and not is_hidden)
 				{
 					U_LOG_W("passthrough object \"%s\": unknown type \"%s\", skipping (not implemented yet)",
 					        item.value("id", o.type).c_str(), o.type.c_str());
@@ -540,7 +541,7 @@ configuration::configuration()
 				}
 				if (item.contains("model-path"))
 					o.model_path = item["model-path"];
-				if (o.model_path.empty() and is_boundary)
+				if (o.model_path.empty() and (is_boundary or is_hidden))
 				{
 					U_LOG_W("passthrough object \"%s\": %s needs model-path (a zone without geometry), skipping", o.id.c_str(), o.type.c_str());
 					continue;
@@ -558,14 +559,14 @@ configuration::configuration()
 				}
 				if (item.contains("feather-px"))
 				{
-					if (o.type == "3d-passthrough-reversed" or is_boundary)
+					if (o.type == "3d-passthrough-reversed" or is_boundary or is_hidden)
 						U_LOG_W("passthrough object \"%s\": feather-px is not accepted for %s, ignoring", o.id.c_str(), o.type.c_str());
 					else
 						o.feather_px = item["feather-px"];
 				}
 				if (item.contains("surface-projected"))
 				{
-					if (o.type == "3d-passthrough-reversed" or is_boundary or is_depth)
+					if (o.type == "3d-passthrough-reversed" or is_boundary or is_depth or is_hidden)
 						U_LOG_W("passthrough object \"%s\": surface-projected is not applicable to %s, ignoring", o.id.c_str(), o.type.c_str());
 					else
 						o.surface_projected = item["surface-projected"];
@@ -581,6 +582,79 @@ configuration::configuration()
 						{
 							U_LOG_W("passthrough object \"%s\": negative transition-distance, clamping to 0", o.id.c_str());
 							o.transition_distance_m = 0;
+						}
+					}
+				}
+				if (item.contains("grid-scale"))
+				{
+					if (not is_hidden)
+						U_LOG_W("passthrough object \"%s\": grid-scale is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["grid-scale"].is_number())
+						U_LOG_W("passthrough object \"%s\": grid-scale must be a number of meters, ignoring", o.id.c_str());
+					else
+					{
+						o.grid_scale_m = item["grid-scale"];
+						if (o.grid_scale_m < 0.01f)
+						{
+							U_LOG_W("passthrough object \"%s\": grid-scale too small, clamping to 0.01", o.id.c_str());
+							o.grid_scale_m = 0.01f;
+						}
+						else if (o.grid_scale_m > 1.0f)
+						{
+							U_LOG_W("passthrough object \"%s\": grid-scale too large, clamping to 1", o.id.c_str());
+							o.grid_scale_m = 1.0f;
+						}
+					}
+				}
+				if (item.contains("grid-color"))
+				{
+					if (not is_hidden)
+						U_LOG_W("passthrough object \"%s\": grid-color is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["grid-color"].is_string())
+						U_LOG_W("passthrough object \"%s\": grid-color must be a \"#RRGGBB\" hex string, ignoring", o.id.c_str());
+					else
+					{
+						const std::string hex = item["grid-color"];
+						auto nibble = [](char c) -> int {
+							if (c >= '0' and c <= '9')
+								return c - '0';
+							if (c >= 'a' and c <= 'f')
+								return c - 'a' + 10;
+							if (c >= 'A' and c <= 'F')
+								return c - 'A' + 10;
+							return -1;
+						};
+						std::string digits = hex;
+						if (not digits.empty() and digits[0] == '#')
+							digits.erase(digits.begin());
+						bool ok = digits.size() == 6;
+						int rgb[3] = {0, 0, 0};
+						for (int i = 0; ok and i < 3; ++i)
+						{
+							int hi = nibble(digits[2 * i]);
+							int lo = nibble(digits[2 * i + 1]);
+							ok = hi >= 0 and lo >= 0;
+							rgb[i] = hi * 16 + lo;
+						}
+						if (not ok)
+							U_LOG_W("passthrough object \"%s\": invalid grid-color \"%s\", expected \"#RRGGBB\", ignoring", o.id.c_str(), hex.c_str());
+						else
+							o.grid_color = {rgb[0] / 255.f, rgb[1] / 255.f, rgb[2] / 255.f};
+					}
+				}
+				if (item.contains("trigger-distance"))
+				{
+					if (not is_hidden)
+						U_LOG_W("passthrough object \"%s\": trigger-distance is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["trigger-distance"].is_number())
+						U_LOG_W("passthrough object \"%s\": trigger-distance must be a number of meters, ignoring", o.id.c_str());
+					else
+					{
+						o.trigger_distance_m = item["trigger-distance"];
+						if (o.trigger_distance_m < 0)
+						{
+							U_LOG_W("passthrough object \"%s\": negative trigger-distance, clamping to 0", o.id.c_str());
+							o.trigger_distance_m = 0;
 						}
 					}
 				}

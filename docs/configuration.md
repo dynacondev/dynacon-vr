@@ -447,7 +447,11 @@ Each `passthrough` entry has:
   **closed volumes** (inside/outside comes from ray parity, undefined
   for open meshes); keep them simple (room-size boxes are ideal, ~5k
   triangles budget). Both eyes fade together from a single per-frame
-  headset distance.
+  headset distance. `"3d-passthrough-hidden"` renders the model as a
+  hard-edged always-on passthrough cutout on its own mask layer plus a
+  world-space warning grid overlay (grid lines + fresnel rim, no fill):
+  reversed cuts never apply to it (safety: hidden always wins), and it
+  needs `model-path` like boundary zones.
 - `id`: stable identifier (required, must be unique); `tag`:
   display-only label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required;
@@ -467,10 +471,12 @@ Each `passthrough` entry has:
   (default `24`; `0` disables feathering). Mask stacks group by this
   value so each object feathers independently; applied live. Depth
   volumes reuse their feather value and feather through the same
-  erode/blur chain. Not accepted for `3d-passthrough-reversed` or
-  `3d-boundary(-reversed)` (warned + ignored): negatives cut every
+  erode/blur chain. Not accepted for `3d-passthrough-reversed`,
+  `3d-boundary(-reversed)` or `3d-passthrough-hidden` (warned + ignored):
+  negatives cut every
   layer and inherit each layer's feathering, while zones fade by
-  distance instead (see `transition-distance`).
+  distance instead (see `transition-distance`) and hidden cutouts are
+  hard-edged on their own layer.
 - `transition-distance`: boundary fade width in meters
   (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
   scene cross-fades over ± this distance around the zone surface
@@ -481,9 +487,22 @@ Each `passthrough` entry has:
   object's mesh instead of the flat reconstruction feed (default
   `false`; opt in per object with `true`, plus a live in-headset
   override in the Passthrough tab). Ignored for
-  `3d-passthrough-reversed`, `3d-boundary(-reversed)` or
-  `3d-depth-passthrough` (warned + ignored): zones never map camera
-  onto geometry, and depth volumes always reveal the flat feed.
+  `3d-passthrough-reversed`, `3d-boundary(-reversed)`,
+  `3d-depth-passthrough` or `3d-passthrough-hidden` (warned + ignored):
+  zones never map camera
+  onto geometry, depth volumes always reveal the flat feed, and hidden
+  objects always reveal the flat feed on their own layer.
+- `grid-scale`: hidden warning grid spacing in meters
+  (`3d-passthrough-hidden` only, default `0.1`, clamped to
+  `[0.01, 1]`, applied live). World-space triplanar lines wrapping the
+  mesh faces.
+- `grid-color`: hidden warning grid color as a `"#RRGGBB"` hex string
+  (`3d-passthrough-hidden` only, default light blue `#80D4FF`, applied
+  live). The fresnel rim stays hardcoded red for now.
+- `trigger-distance`: proximity trigger distance in meters
+  (`3d-passthrough-hidden` only, default `0.5`). Unused for now
+  (hidden objects are always-on in stage 1); reserved for the
+  near-field reveal.
 
 Poses compose as
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).

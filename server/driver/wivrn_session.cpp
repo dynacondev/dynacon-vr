@@ -574,6 +574,9 @@ void wivrn_session::send_fiducial_map()
 		        .feather_px = entry.feather_px,
 		        .surface_projected = entry.surface_projected,
 		        .transition_distance_m = entry.transition_distance_m,
+		        .grid_scale_m = entry.grid_scale_m,
+		        .grid_color = entry.grid_color,
+		        .trigger_distance_m = entry.trigger_distance_m,
 		};
 
 		// Display label: the tag, or the id when untagged.
