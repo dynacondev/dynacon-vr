@@ -335,12 +335,12 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	pipeline = vk::raii::Pipeline(*device, *pipe_cache, pipeline_info);
 }
 
-void hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
+bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
                                   const std::array<vk::Extent2D, 2> & extents,
                                   const std::vector<instance_draw> & draws)
 {
 	if (draws.empty() or image_index >= targets.size())
-		return;
+		return false;
 
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
@@ -381,4 +381,5 @@ void hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		}
 		cmd.endRenderPass();
 	}
+	return true;
 }

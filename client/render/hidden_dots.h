@@ -97,8 +97,9 @@ public:
 
 	// Record draws into both eye layers of the acquired image.
 	// No-op when draws is empty. extents size the per-eye viewports
-	// (the submitted layer rects).
-	void record(vk::raii::CommandBuffer & cmd, size_t image_index,
+	// (the submitted layer rects). Returns false without recording
+	// (caller must release the acquisition to keep pairing).
+	bool record(vk::raii::CommandBuffer & cmd, size_t image_index,
 	            const std::array<vk::Extent2D, 2> & extents,
 	            const std::vector<instance_draw> & draws);
 

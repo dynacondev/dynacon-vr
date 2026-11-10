@@ -3172,9 +3172,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							dots_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
 						try
 						{
-							hidden_dots->record(command_buffer, (size_t)idx, dots_ext, dots_draws);
-							hidden_dots_image = idx;
-							hidden_dots_active = true;
+							if (hidden_dots->record(command_buffer, (size_t)idx, dots_ext, dots_draws))
+							{
+								hidden_dots_image = idx;
+								hidden_dots_active = true;
+							}
+							else
+								hidden_dots->release();
 						}
 						catch (std::exception & e)
 						{

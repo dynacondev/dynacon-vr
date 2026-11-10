@@ -500,8 +500,9 @@ Each `passthrough` entry has:
   at draw time.
 - `grid-color`: hidden warning color as a `"#RRGGBB"` hex string
   (`3d-passthrough-hidden` only, default light blue `#80D4FF`, applied
-  live). Tints the heartbeat matte and the dot overlay; all hidden
-  objects share one layer each, so the lowest-id placed object wins.
+  live). Tints the heartbeat matte and the dot overlay (per-object color
+  at draw time). All hidden objects share one matte layer, so the
+  lowest-id placed object wins the matte tint.
 - `trigger-distance`: proximity trigger distance in meters
   (`3d-passthrough-hidden` only, default `0.5`). Unused for now
   (hidden objects are always-on in stage 1); reserved for the
