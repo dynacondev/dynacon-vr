@@ -39,4 +39,10 @@ struct triangle_soup
 // indexed triangle list. Skinned meshes use their rest pose, morph targets,
 // points/lines are skipped. Throws std::exception on parse errors.
 triangle_soup flatten_gltf(const std::filesystem::path & path);
+
+// Unit-sphere positions for the proximity depth fields (non-indexed
+// triangles, outward-CCW winding so cull-front keeps the inside/exit
+// wall from any viewpoint). One shared generator: the dots renderer and
+// the hidden mask path both expand it with per-frame MVPs.
+std::vector<XrVector3f> unit_sphere_positions();
 } // namespace passthrough_mesh

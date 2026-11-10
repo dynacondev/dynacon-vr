@@ -31,6 +31,9 @@ layout(location = 3) in float vCenterDepth;
 layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D depthTex;
+// Proximity sphere field (furthest exit, same mapping): whole-circle
+// near-field gate alongside the occlusion test below.
+layout(set = 0, binding = 1) uniform sampler2D sphereTex;
 
 layout(push_constant) uniform PushConstants
 {
@@ -48,6 +51,11 @@ void main()
 	// makes this tolerance worth ~2cm at 2m but much looser far out —
 	// distant dots barely occlude, inherent to the mapping, not the eps.
 	if (vCenterDepth + 1e-4 < texture(depthTex, vCenterUV).r)
+		discard;
+	// Proximity gate (same keep-nearer form): the dot center must sit
+	// ahead of the furthest sphere exit, i.e. inside ANY tracked sphere.
+	// Outside-sphere eyes are an accepted over-reveal (range test later).
+	if (vCenterDepth + 1e-4 < texture(sphereTex, vCenterUV).r)
 		discard;
 	float d = length(vUv);
 	float pitch = max(pc.color_pitch.w, 1e-4);

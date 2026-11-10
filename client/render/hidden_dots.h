@@ -112,11 +112,17 @@ public:
 	// Record draws into both eye layers of the acquired image (union of
 	// the draws' scissor rects per eye; render-area CLEAR stays full).
 	// No-op (false) when draws is empty. extents size the per-eye
-	// viewports (the submitted layer rects). Returns false without
-	// recording (caller must release the acquisition to keep pairing).
+	// viewports (the submitted layer rects). spheres are proximity
+	// boundary MVPs (one per sphere, both eyes; model = translate(center)
+	// * scale(radius), stream-built so the renderer stays timebase-free):
+	// drawn first into the prepass with a min-accumulating LESS test, so
+	// the stored field is the furthest exit = inside ANY sphere. Returns
+	// false without recording (caller must release the acquisition to
+	// keep pairing).
 	bool record(vk::raii::CommandBuffer & cmd, size_t image_index,
 	            const std::array<vk::Extent2D, 2> & extents,
-	            const std::vector<instance_draw> & draws);
+	            const std::vector<instance_draw> & draws,
+	            const std::vector<std::array<glm::mat4, 2>> & spheres);
 
 	// Release the acquired image (after submit, before endFrame — the
 	// compositor takes the last released image).
@@ -140,17 +146,30 @@ private:
 	// prepass. Two passes, not one: the dots sample the stored depth at
 	// their CENTERS (whole circles live or die, never half-chopped).
 	vk::raii::RenderPass color_renderpass{nullptr};
+	// Shared by the mesh prepass (GREATER over a far-clear) and the
+	// proximity sphere prepass (LESS over a near-clear): same D16
+	// CLEAR/STORE/shader-readable shape, only the clear values and the
+	// framebuffers differ. Separate IMAGES (the fields must not mix).
 	vk::raii::RenderPass depth_renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
 	// Depth-fill pipeline (mesh triangles into the depth attachment,
 	// color writes off): the dots sample its output, they don't
 	// depth-test against it. Shared layout (subset of push).
 	vk::raii::Pipeline fill_pipeline{nullptr};
+	// Proximity sphere pipeline (unit-sphere verts into the sphere depth
+	// image): cull-front keeps the inside/exit wall from any viewpoint;
+	// LESS min-accumulates the furthest exit across spheres. Same stages
+	// (dotfill), layout and renderpass as the mesh fill above.
+	vk::raii::Pipeline sphere_pipeline{nullptr};
 	// Depth target (D16, half-res, 2 layers + one single-layer view per
 	// eye), recreated with the swapchain in ensure(). Sampled by the
 	// dots pass (nearest: exact texel, no cross-edge blending).
 	image_allocation depth_;
 	std::array<vk::raii::ImageView, 2> depth_views{nullptr, nullptr};
+	// Proximity sphere depth (D16, half-res, same shape): min-accumulated
+	// furthest-exit field, sampled alongside the mesh depth (binding 1).
+	image_allocation sphere_depth_;
+	std::array<vk::raii::ImageView, 2> sphere_views{nullptr, nullptr};
 	// One descriptor set per eye over the single-layer depth view above
 	// (rewritten on rebuild, not per frame). Nearest sampler.
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
@@ -161,6 +180,10 @@ private:
 	// once with the pipeline. Per-dot data arrives per draw as
 	// instanced attributes from the borrowed feather buffer.
 	buffer_allocation quad_;
+	// Unit-sphere verts (non-indexed, outward-CCW) for the proximity
+	// prepass, uploaded once. Expanded per frame by the sphere MVPs.
+	buffer_allocation sphere_verts_;
+	uint32_t sphere_vert_count = 0;
 
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;
@@ -170,7 +193,8 @@ private:
 	{
 		vk::raii::ImageView view{nullptr};
 		vk::raii::Framebuffer framebuffer{nullptr}; // color pass
-		vk::raii::Framebuffer depth_framebuffer{nullptr}; // prepass
+		vk::raii::Framebuffer depth_framebuffer{nullptr}; // mesh prepass
+		vk::raii::Framebuffer sphere_framebuffer{nullptr}; // sphere prepass
 	};
 	// [image][eye], parallel to the swapchain image list.
 	std::vector<std::array<target, 2>> targets;

@@ -2568,30 +2568,35 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// the revealed feed.
 				auto record_hidden_mask = [&]() {
 					auto & g = hidden_group;
+					// Half-res working + submit (alert-grade, like the dots
+					// layer): tier-0 stays a hard-edged direct raster (no
+					// blur chain ever — tier comes from feather_px = 0, not
+					// resolution), the compositor upscales the half-rect.
+					int hmw = std::max(64, mw / 2);
+					int hmh = std::max(64, mh / 2);
 					{
 						// State hoisted per frame above (shared with the
 						// nomask gate, dots record and submit).
 						if (hidden_known)
 						{
 							// Pre-warm (map-known, not necessarily placed):
-							// renderer + swapchain + intermediates ready before
-							// first placement so visible frames only rasterize,
+							// renderer + swapchain ready before first
+							// placement so visible frames only rasterize,
 							// mirroring the feather groups. Meshes upload as
 							// soon as the soup is ready, even unplaced.
 							if (not g.renderer)
 								g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
-							if (not g.swapchain or g.swapchain.width() != mw or g.swapchain.height() != mh)
+							if (not g.swapchain or g.swapchain.width() != hmw or g.swapchain.height() != hmh)
 							{
 								// Rare path (first frame, video resize): nothing
 								// outstanding (previous images released last
 								// frame), mirroring the feather groups.
 								device.waitIdle();
-								g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, view_count);
+								g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), hmw, hmh, 1, view_count);
 								g.renderer->reset_targets();
-								g.extent = {(int32_t)mw, (int32_t)mh};
-								spdlog::info("Hidden mask swapchain: {}x{} ({} images)", mw, mh, g.swapchain.image_count());
+								g.extent = {(int32_t)hmw, (int32_t)hmh};
+								spdlog::info("Hidden mask swapchain: {}x{} ({} images)", hmw, hmh, g.swapchain.image_count());
 							}
-							g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
 							for (auto & [oid, ost]: passthrough_objects)
 							{
 								if (ost.def.type != "3d-passthrough-hidden")
@@ -2681,8 +2686,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						else
 						{
 							// Silhouettes built once above (shared with the
-							// dots below): map straight to mask draws.
-							build_hidden_silhouettes(mw, mh);
+							// dots below): map straight to mask draws. The
+							// shared margin floors off the half-res mask
+							// working size (conservative superset either way;
+							// the dots scissor reads the px bounds exactly).
+							build_hidden_silhouettes(hmw, hmh);
+							// Proximity spheres (v1: head only — hands slot in
+							// as further entries later): head center = midpoint
+							// of the sync eye positions, same timebase as
+							// server_mvp by construction (NOT the fiducial
+							// head_pos, which runs on predicted timebase).
+							proximity_spheres.clear();
+							{
+								const auto & p0 = sync_pose[0].position;
+								const auto & p1 = sync_pose[1].position;
+								glm::vec3 center((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f,
+								                 (p0.z + p1.z) * 0.5f);
+								// Hardwired v1 radius (trigger_distance_m is
+								// its future config home, already parsed).
+								constexpr float proximity_radius_m = 0.4f;
+								glm::mat4 sphere_model =
+								        glm::translate(glm::mat4(1), center) *
+								        glm::scale(glm::mat4(1), glm::vec3(proximity_radius_m));
+								std::array<glm::mat4, 2> sm;
+								for (uint32_t view = 0; view < view_count; ++view)
+									sm[view] = server_mvp[view] * sphere_model;
+								proximity_spheres.push_back(sm);
+							}
 							hidden_mask_draws.reserve(hidden_silhouettes.size());
 							for (auto & s: hidden_silhouettes)
 								hidden_mask_draws.push_back({s.mesh, s.mvp, 1.f, false});
@@ -2719,15 +2749,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									g.wait_warned = false;
 									g.acquired = true;
 									g.active = true;
-									g.extent = {(int32_t)mw, (int32_t)mh};
-									feather_mask_renderer::mask_stage_cpu mstats{};
+									g.extent = {(int32_t)hmw, (int32_t)hmh};
+									feather_mask_renderer::hidden_cpu hstats{};
 									try
 									{
-										// Full-res submit (feather 0 = tier 0):
-										// hard edge, no blur intermediates.
-										vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
-										g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, hidden_mask_draws,
-										                   true, 0, no_cutouts, server_mvp, &mstats, mex);
+										// Half-res proximity reveal (dedicated
+										// hidden path beside feather record):
+										// sphere field first, silhouettes kept
+										// only where nearer (hard near-field
+										// edge — v1 flips the overlay from
+										// always-on to proximity-gated).
+										vk::Extent2D hex{(uint32_t)hmw, (uint32_t)hmh};
+										g.renderer->record_hidden(rec_cmd, g.swapchain.image(mask_index), hex,
+										                          hidden_mask_draws, proximity_spheres, &hstats);
 									}
 									catch (std::exception & e)
 									{
@@ -2741,8 +2775,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										// pass) — never submit it.
 										throw;
 									}
-									mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
-									mask_draws += (int)mstats.draws;
+									mask_raster_ms += hstats.raster_ms;
+									mask_draws += (int)hstats.draws;
 								}
 							}
 						}
@@ -2857,7 +2891,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								std::array<vk::Extent2D, 2> dots_ext{dext, dext};
 								try
 								{
-									if (hidden_dots->record(rec_cmd, (size_t)idx, dots_ext, hidden_dots_draws))
+									if (hidden_dots->record(rec_cmd, (size_t)idx, dots_ext, hidden_dots_draws,
+									                          proximity_spheres))
 									{
 										hidden_dots_image = idx;
 										hidden_dots_active = true;

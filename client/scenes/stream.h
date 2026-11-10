@@ -782,6 +782,10 @@ private:
 	// hash, no per-frame string formatting. Kept in step with
 	// hidden_group.mesh_hashes at the three sites below.
 	std::map<std::string, float> hidden_dot_pitch;
+	// Per-frame proximity spheres (model already placed): rebuilt when
+	// the mask phase builds draws below; the dots record reuses them.
+	// Capacity survives clear(). Render thread only.
+	std::vector<std::array<glm::mat4, 2>> proximity_spheres;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;

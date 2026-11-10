@@ -1834,6 +1834,398 @@ vk::ImageView feather_mask_renderer::output_depth_view(vk::Extent2D extent, int 
 	return *it->second.views[eye];
 }
 
+vk::ImageView feather_mask_renderer::hidden_sphere_view(vk::Extent2D extent, int eye)
+{
+	auto key = std::make_pair(extent.width, extent.height);
+	auto it = hidden_sphere_images.find(key);
+	if (it == hidden_sphere_images.end())
+	{
+		spdlog::info("Hidden proximity depth target: {}x{}", extent.width, extent.height);
+		it = hidden_sphere_images.emplace(key, make_depth_entry(extent)).first;
+	}
+	return *it->second.views[eye];
+}
+
+void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
+{
+	if (not hidden_ready)
+	{
+		hidden_ready = true;
+		// Unit-sphere verts (shared generator with the dots renderer).
+		auto sphere = passthrough_mesh::unit_sphere_positions();
+		hidden_sphere_vert_count = (uint32_t)sphere.size();
+		hidden_sphere_verts_ = buffer_allocation{
+		        device,
+		        vk::BufferCreateInfo{
+		                .size = sphere.size() * sizeof(XrVector3f),
+		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "hidden proximity sphere",
+		};
+		std::memcpy(hidden_sphere_verts_.map(), sphere.data(), sphere.size() * sizeof(XrVector3f));
+		hidden_sphere_verts_.unmap();
+
+		// Sphere depth-only RP: CLEAR near (1.0) / STORE, ends in the
+		// attachment layout for the silhouette pass below.
+		vk::AttachmentDescription sphere_att{
+		        .format = depth_format,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eClear,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+		        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		        .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		};
+		vk::AttachmentReference sphere_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		};
+		vk::SubpassDescription sphere_sub{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .pDepthStencilAttachment = &sphere_ref,
+		};
+		hidden_sphere_rp = vk::raii::RenderPass(device, vk::RenderPassCreateInfo{
+		                                                          .attachmentCount = 1,
+		                                                          .pAttachments = &sphere_att,
+		                                                          .subpassCount = 1,
+		                                                          .pSubpasses = &sphere_sub,
+		                                                  });
+		// Silhouette RP: color CLEAR/STORE/GENERAL + sphere depth
+		// LOAD (written by the pass above), DONT_CARE store.
+		vk::AttachmentDescription hidden_atts[2] = {
+		        vk::AttachmentDescription{
+		                .format = format,
+		                .samples = vk::SampleCountFlagBits::e1,
+		                .loadOp = vk::AttachmentLoadOp::eClear,
+		                .storeOp = vk::AttachmentStoreOp::eStore,
+		                .initialLayout = vk::ImageLayout::eUndefined,
+		                .finalLayout = vk::ImageLayout::eGeneral,
+		        },
+		        vk::AttachmentDescription{
+		                .format = depth_format,
+		                .samples = vk::SampleCountFlagBits::e1,
+		                .loadOp = vk::AttachmentLoadOp::eLoad,
+		                .storeOp = vk::AttachmentStoreOp::eDontCare,
+		                .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+		                .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+		                .initialLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		                .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		        },
+		};
+		vk::AttachmentReference hidden_color_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentReference hidden_depth_ref{
+		        .attachment = 1,
+		        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		};
+		vk::SubpassDescription hidden_sub{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .colorAttachmentCount = 1,
+		        .pColorAttachments = &hidden_color_ref,
+		        .pDepthStencilAttachment = &hidden_depth_ref,
+		};
+		hidden_color_rp = vk::raii::RenderPass(device, vk::RenderPassCreateInfo{
+		                                                         .attachmentCount = 2,
+		                                                         .pAttachments = hidden_atts,
+		                                                         .subpassCount = 1,
+		                                                         .pSubpasses = &hidden_sub,
+		                                                 });
+
+		// Same mask.vert/mask.frag modules as the tier-0 raster (shared
+		// raster_push layout), new pipeline objects: the shared ones
+		// don't match (no depth test on the plain pipe, MIN-blend on the
+		// reversed pipe which would zero the fill against clear).
+		auto hvert = load_shader(device, "mask.vert");
+		auto hfrag = load_shader(device, "mask.frag");
+		auto hempty = load_shader(device, "hidden_dotfill.frag");
+		vk::PipelineShaderStageCreateInfo hstages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **hvert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **hfrag,
+		                .pName = "main",
+		        },
+		};
+		vk::PipelineShaderStageCreateInfo hfill_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **hvert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **hempty,
+		                .pName = "main",
+		        },
+		};
+		// vec3 positions, shared by mesh verts and sphere verts.
+		vk::VertexInputBindingDescription hbinding{
+		        .binding = 0,
+		        .stride = sizeof(float) * 3,
+		        .inputRate = vk::VertexInputRate::eVertex,
+		};
+		vk::VertexInputAttributeDescription hattribute{
+		        .location = 0,
+		        .binding = 0,
+		        .format = vk::Format::eR32G32B32Sfloat,
+		        .offset = 0,
+		};
+		vk::PipelineVertexInputStateCreateInfo hvertex_input{
+		        .vertexBindingDescriptionCount = 1,
+		        .pVertexBindingDescriptions = &hbinding,
+		        .vertexAttributeDescriptionCount = 1,
+		        .pVertexAttributeDescriptions = &hattribute,
+		};
+		vk::PipelineInputAssemblyStateCreateInfo hinput_assembly{
+		        .topology = vk::PrimitiveTopology::eTriangleList,
+		};
+		vk::PipelineViewportStateCreateInfo hviewport_state{
+		        .viewportCount = 1,
+		        .scissorCount = 1,
+		};
+		vk::PipelineMultisampleStateCreateInfo hmultisample{
+		        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+		};
+		vk::DynamicState hdynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+		vk::PipelineDynamicStateCreateInfo hdynamic{
+		        .dynamicStateCount = 2,
+		        .pDynamicStates = hdynamics,
+		};
+		// Sphere fill: cull-front keeps the inside/exit wall from any
+		// viewpoint; LESS min-accumulates the furthest exit across
+		// spheres (sound over-approximation — see record_hidden).
+		vk::PipelineRasterizationStateCreateInfo hsphere_raster{
+		        .polygonMode = vk::PolygonMode::eFill,
+		        .cullMode = vk::CullModeFlagBits::eFront,
+		        .frontFace = vk::FrontFace::eCounterClockwise,
+		        .lineWidth = 1,
+		};
+		vk::PipelineDepthStencilStateCreateInfo hsphere_depth{
+		        .depthTestEnable = VK_TRUE,
+		        .depthWriteEnable = VK_TRUE,
+		        .depthCompareOp = vk::CompareOp::eLess,
+		};
+		hidden_sphere_pipe = vk::raii::Pipeline(device, *pipe_cache,
+		                                        vk::GraphicsPipelineCreateInfo{
+		                                                .stageCount = 2,
+		                                                .pStages = hfill_stages,
+		                                                .pVertexInputState = &hvertex_input,
+		                                                .pInputAssemblyState = &hinput_assembly,
+		                                                .pViewportState = &hviewport_state,
+		                                                .pRasterizationState = &hsphere_raster,
+		                                                .pMultisampleState = &hmultisample,
+		                                                .pDepthStencilState = &hsphere_depth,
+		                                                .pColorBlendState = nullptr,
+		                                                .pDynamicState = &hdynamic,
+		                                                .layout = *pipeline_layout,
+		                                                .renderPass = *hidden_sphere_rp,
+		                                        });
+		// Silhouette: tier-0 raster state verbatim (cull-none, blend-off
+		// overwrite) plus the proximity test (GREATER, no depth write).
+		vk::PipelineRasterizationStateCreateInfo hsil_raster{
+		        .polygonMode = vk::PolygonMode::eFill,
+		        .cullMode = vk::CullModeFlagBits::eNone,
+		        .frontFace = vk::FrontFace::eCounterClockwise,
+		        .lineWidth = 1,
+		};
+		vk::PipelineDepthStencilStateCreateInfo hsil_depth{
+		        .depthTestEnable = VK_TRUE,
+		        .depthWriteEnable = VK_FALSE,
+		        .depthCompareOp = vk::CompareOp::eGreater,
+		};
+		vk::PipelineColorBlendAttachmentState hsil_blend_att{
+		        .blendEnable = VK_FALSE,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		};
+		vk::PipelineColorBlendStateCreateInfo hsil_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &hsil_blend_att,
+		};
+		hidden_silhouette_pipe = vk::raii::Pipeline(device, *pipe_cache,
+		                                            vk::GraphicsPipelineCreateInfo{
+		                                                    .stageCount = 2,
+		                                                    .pStages = hstages,
+		                                                    .pVertexInputState = &hvertex_input,
+		                                                    .pInputAssemblyState = &hinput_assembly,
+		                                                    .pViewportState = &hviewport_state,
+		                                                    .pRasterizationState = &hsil_raster,
+		                                                    .pMultisampleState = &hmultisample,
+		                                                    .pDepthStencilState = &hsil_depth,
+		                                                    .pColorBlendState = &hsil_blend,
+		                                                    .pDynamicState = &hdynamic,
+		                                                    .layout = *pipeline_layout,
+		                                                    .renderPass = *hidden_color_rp,
+		                                            });
+	}
+
+	auto tit = hidden_targets.find(image);
+	if (tit == hidden_targets.end() or tit->second.extent.width != (int32_t)extent.width or
+	    tit->second.extent.height != (int32_t)extent.height)
+	{
+		hidden_frame_targets tgt;
+		tgt.extent = extent;
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			vk::ImageViewCreateInfo iv_info{
+			        .image = image,
+			        .viewType = vk::ImageViewType::e2DArray,
+			        .format = format,
+			        .subresourceRange = {
+			                .aspectMask = vk::ImageAspectFlagBits::eColor,
+			                .baseMipLevel = 0,
+			                .levelCount = 1,
+			                .baseArrayLayer = (uint32_t)eye,
+			                .layerCount = 1,
+			        },
+			};
+			tgt.views[eye] = vk::raii::ImageView(device, iv_info);
+			vk::ImageView color_view = *tgt.views[eye];
+			vk::ImageView sphere_view = hidden_sphere_view(extent, eye);
+			vk::ImageView color_atts[2] = {color_view, sphere_view};
+			vk::FramebufferCreateInfo color_fb{
+			        .renderPass = *hidden_color_rp,
+			        .attachmentCount = 2,
+			        .pAttachments = color_atts,
+			        .width = extent.width,
+			        .height = extent.height,
+			        .layers = 1,
+			};
+			tgt.framebuffers[eye] = vk::raii::Framebuffer(device, color_fb);
+			vk::FramebufferCreateInfo sphere_fb{
+			        .renderPass = *hidden_sphere_rp,
+			        .attachmentCount = 1,
+			        .pAttachments = &sphere_view,
+			        .width = extent.width,
+			        .height = extent.height,
+			        .layers = 1,
+			};
+			tgt.sphere_framebuffers[eye] = vk::raii::Framebuffer(device, sphere_fb);
+		}
+		hidden_targets[image] = std::move(tgt);
+	}
+}
+
+void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
+                                          vk::Image image,
+                                          vk::Extent2D extent,
+                                          const std::vector<instance_draw> & draws,
+                                          const std::vector<std::array<glm::mat4, 2>> & spheres,
+                                          hidden_cpu * cpu_stats)
+{
+	hidden_cpu local{};
+	section_clock raster_clk(&local.raster_ms);
+
+	for (auto & [key, mesh]: meshes)
+		flush_upload(cmd, mesh);
+	ensure_hidden(image, extent);
+	auto & tgt = hidden_targets[image];
+	auto sit = hidden_sphere_images.find({extent.width, extent.height});
+	VkImage sphere_image = *sit->second.image;
+
+	for (int eye = 0; eye < 2; ++eye)
+	{
+		vk::Viewport full_vp{
+		        .x = 0,
+		        .y = 0,
+		        .width = (float)extent.width,
+		        .height = (float)extent.height,
+		        .minDepth = 0,
+		        .maxDepth = 1,
+		};
+		vk::Rect2D full_sc{.offset = {0, 0}, .extent = extent};
+		// RP1: proximity field (sphere exits, LESS over a near-clear).
+		vk::ClearValue sphere_clear{};
+		sphere_clear.depthStencil = vk::ClearDepthStencilValue{1.f, 0};
+		vk::RenderPassBeginInfo sphere_begin{
+		        .renderPass = *hidden_sphere_rp,
+		        .framebuffer = *tgt.sphere_framebuffers[eye],
+		        .renderArea = {.offset = {0, 0}, .extent = extent},
+		        .clearValueCount = 1,
+		        .pClearValues = &sphere_clear,
+		};
+		cmd.beginRenderPass(sphere_begin, vk::SubpassContents::eInline);
+		cmd.setViewport(0, full_vp);
+		cmd.setScissor(0, full_sc);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hidden_sphere_pipe);
+		cmd.bindVertexBuffers(0, (vk::Buffer)hidden_sphere_verts_, (vk::DeviceSize)0);
+		for (const auto & s: spheres)
+		{
+			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+			                               raster_push{.mvp = s[eye], .opacity = 1});
+			cmd.draw(hidden_sphere_vert_count, 1, 0, 0);
+		}
+		cmd.endRenderPass();
+
+		// Sphere depth → silhouette test hazard (same attachment layout
+		// throughout, write then read).
+		vk::ImageMemoryBarrier sph_bar{
+		        .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead,
+		        .oldLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		        .newLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .image = sphere_image,
+		        .subresourceRange = {
+		                .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		                .baseMipLevel = 0,
+		                .levelCount = 1,
+		                .baseArrayLayer = 0,
+		                .layerCount = 2,
+		        },
+		};
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
+		                    vk::PipelineStageFlagBits::eEarlyFragmentTests, {}, {}, {}, sph_bar);
+
+		// RP2: silhouettes, kept only where nearer than the sphere exit
+		// (GREATER, no depth write). Hard near-field edge by design.
+		vk::ClearValue hidden_clears[2]{};
+		hidden_clears[0].color.float32.fill(0);
+		hidden_clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
+		vk::RenderPassBeginInfo color_begin{
+		        .renderPass = *hidden_color_rp,
+		        .framebuffer = *tgt.framebuffers[eye],
+		        .renderArea = {.offset = {0, 0}, .extent = extent},
+		        .clearValueCount = 2,
+		        .pClearValues = hidden_clears,
+		};
+		cmd.beginRenderPass(color_begin, vk::SubpassContents::eInline);
+		cmd.setViewport(0, full_vp);
+		cmd.setScissor(0, full_sc);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hidden_silhouette_pipe);
+		for (const auto & d: draws)
+		{
+			if (d.reverse)
+				continue;
+			auto mit = meshes.find(d.mesh);
+			if (mit == meshes.end() or mit->second.index_count == 0)
+				continue;
+			cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+			cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+			                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
+			cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+			++local.draws;
+		}
+		cmd.endRenderPass();
+	}
+
+	if (cpu_stats)
+		*cpu_stats = local;
+}
+
 void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
 {
 	if (targets_extent.width == extent.width and targets_extent.height == extent.height and

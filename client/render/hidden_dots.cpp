@@ -19,6 +19,7 @@
 #include "render/hidden_dots.h"
 
 #include "render/feather_mask.h"
+#include "render/passthrough_mesh.h"
 #include "vk/shader.h"
 
 #include <algorithm>
@@ -118,9 +119,47 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		                                                       },
 		                                               });
 	}
-	// One set per eye over the single-layer depth view (depth image is
+	// Proximity sphere field: same D16 half-res shape, separate image
+	// (the mesh field clears far/0 for GREATER; this one clears near/1.0
+	// for LESS — the fields must not mix).
+	sphere_depth_ = image_allocation{
+	        *device,
+	        vk::ImageCreateInfo{
+	                .imageType = vk::ImageType::e2D,
+	                .format = vk::Format::eD16Unorm,
+	                .extent = {hw, hh, 1},
+	                .mipLevels = 1,
+	                .arrayLayers = 2,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .tiling = vk::ImageTiling::eOptimal,
+	                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	        },
+	        VmaAllocationCreateInfo{
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	        },
+	        "hidden_dots sphere depth",
+	};
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		sphere_views[eye] = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
+		                                                        .image = (VkImage)sphere_depth_,
+		                                                        .viewType = vk::ImageViewType::e2D,
+		                                                        .format = vk::Format::eD16Unorm,
+		                                                        .subresourceRange = {
+		                                                                .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		                                                                .baseMipLevel = 0,
+		                                                                .levelCount = 1,
+		                                                                .baseArrayLayer = eye,
+		                                                                .layerCount = 1,
+		                                                        },
+		                                                });
+	}
+	// One set per eye over the single-layer depth views (both images are
 	// renderer-owned, so this runs on rebuild only, never per frame;
-	// the old sets were freed above, ahead of the pool recreation).
+	// the old sets were freed after waitIdle, ahead of the pool
+	// recreation in init_pipelines above).
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
 		vk::DescriptorSetAllocateInfo set_alloc{
@@ -129,19 +168,35 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        .pSetLayouts = &*descriptor_layout,
 		};
 		descriptor_sets.emplace_back(std::move(device->allocateDescriptorSets(set_alloc)[0]));
-		vk::DescriptorImageInfo depth_info{
-		        .sampler = *depth_sampler,
-		        .imageView = *depth_views[eye],
-		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		vk::DescriptorImageInfo depth_infos[2] = {
+		        vk::DescriptorImageInfo{
+		                .sampler = *depth_sampler,
+		                .imageView = *depth_views[eye],
+		                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		        },
+		        vk::DescriptorImageInfo{
+		                .sampler = *depth_sampler,
+		                .imageView = *sphere_views[eye],
+		                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		        },
 		};
-		vk::WriteDescriptorSet depth_write{
-		        .dstSet = *descriptor_sets[eye],
-		        .dstBinding = 0,
-		        .descriptorCount = 1,
-		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-		        .pImageInfo = &depth_info,
+		vk::WriteDescriptorSet depth_writes[2] = {
+		        vk::WriteDescriptorSet{
+		                .dstSet = *descriptor_sets[eye],
+		                .dstBinding = 0,
+		                .descriptorCount = 1,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .pImageInfo = &depth_infos[0],
+		        },
+		        vk::WriteDescriptorSet{
+		                .dstSet = *descriptor_sets[eye],
+		                .dstBinding = 1,
+		                .descriptorCount = 1,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .pImageInfo = &depth_infos[1],
+		        },
 		};
-		device->updateDescriptorSets(depth_write, {});
+		device->updateDescriptorSets(depth_writes, {});
 	}
 	targets.clear();
 	for (vk::Image image: swapchain_.images())
@@ -182,6 +237,16 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 			        .layers = 1,
 			};
 			targets.back()[eye].depth_framebuffer = vk::raii::Framebuffer(*device, depth_fb_info);
+			vk::ImageView sphere_view = *sphere_views[eye];
+			vk::FramebufferCreateInfo sphere_fb_info{
+			        .renderPass = *depth_renderpass,
+			        .attachmentCount = 1,
+			        .pAttachments = &sphere_view,
+			        .width = extent_.width,
+			        .height = extent_.height,
+			        .layers = 1,
+			};
+			targets.back()[eye].sphere_framebuffer = vk::raii::Framebuffer(*device, sphere_fb_info);
 		}
 	}
 }
@@ -227,20 +292,51 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 		std::memcpy(quad_.map(), corners, sizeof(corners));
 		quad_.unmap();
 	}
-	// Sampled-depth plumbing (dots pass reads the prepass output at the
-	// dot centers): one set layout + pool for the two per-eye sets
-	// written in ensure(), plus a nearest sampler (exact texel: linear
-	// would blend occluder/background depths across edges). Recreated
-	// with everything else on rebuild (move-assign drops the old).
-	vk::DescriptorSetLayoutBinding depth_binding{
-	        .binding = 0,
-	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = 1,
-	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	// Unit-sphere verts for the proximity prepass (non-indexed, outward
+	// CCW): expanded per frame by the stream-built sphere MVPs. One
+	// shared generator (passthrough_mesh): the hidden mask path uploads
+	// the same verts into its own buffer.
+	if (not sphere_verts_)
+	{
+		auto sphere = passthrough_mesh::unit_sphere_positions();
+		sphere_vert_count = (uint32_t)sphere.size();
+		sphere_verts_ = buffer_allocation{
+		        *device,
+		        vk::BufferCreateInfo{
+		                .size = sphere.size() * sizeof(XrVector3f),
+		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "hidden_dots sphere",
+		};
+		std::memcpy(sphere_verts_.map(), sphere.data(), sphere.size() * sizeof(XrVector3f));
+		sphere_verts_.unmap();
+	}
+	// Sampled-depth plumbing: binding 0 = mesh prepass output, binding 1
+	// = proximity sphere field (both single-layer per-eye views over one
+	// nearest sampler: exact texel, no cross-edge blending). One set
+	// layout + pool for the two per-eye sets written in ensure().
+	// Recreated with everything else on rebuild (move-assign drops old).
+	vk::DescriptorSetLayoutBinding depth_bindings[2] = {
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 0,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	        },
 	};
 	descriptor_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
-	                                                                 .bindingCount = 1,
-	                                                                 .pBindings = &depth_binding,
+	                                                                 .bindingCount = 2,
+	                                                                 .pBindings = depth_bindings,
 	                                                         });
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eNearest,
@@ -254,7 +350,7 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	depth_sampler = vk::raii::Sampler(*device, sampler_info);
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = 2,
+	        .descriptorCount = 4,
 	};
 	descriptor_pool = vk::raii::DescriptorPool(*device, vk::DescriptorPoolCreateInfo{
 	                                                           .maxSets = 2,
@@ -528,11 +624,44 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .renderPass = *depth_renderpass,
 	};
 	fill_pipeline = vk::raii::Pipeline(*device, *pipe_cache, fill_pipeline_info);
+
+	// Proximity sphere twin: same stages/vertex input/RP/layout, but
+	// cull-front (inside/exit wall only, from any viewpoint) and LESS
+	// (min-accumulates the furthest exit across spheres into a 1.0-clear).
+	vk::PipelineRasterizationStateCreateInfo sphere_rasterization{
+	        .polygonMode = vk::PolygonMode::eFill,
+	        .cullMode = vk::CullModeFlagBits::eFront,
+	        .frontFace = vk::FrontFace::eCounterClockwise,
+	        .lineWidth = 1,
+	};
+	vk::PipelineDepthStencilStateCreateInfo sphere_depth_stencil{
+	        .depthTestEnable = VK_TRUE,
+	        .depthWriteEnable = VK_TRUE,
+	        .depthCompareOp = vk::CompareOp::eLess,
+	};
+	vk::GraphicsPipelineCreateInfo sphere_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = fill_stages,
+	        .pVertexInputState = &fill_vertex_input,
+	        .pInputAssemblyState = &input_assembly,
+	        .pViewportState = &viewport_state,
+	        .pRasterizationState = &sphere_rasterization,
+	        .pMultisampleState = &multisample,
+	        .pDepthStencilState = &sphere_depth_stencil,
+	        // Depth-only subpass: no color blend state (null, not a
+	        // zero-mask attachment).
+	        .pColorBlendState = nullptr,
+	        .pDynamicState = &dynamic,
+	        .layout = *pipeline_layout,
+	        .renderPass = *depth_renderpass,
+	};
+	sphere_pipeline = vk::raii::Pipeline(*device, *pipe_cache, sphere_pipeline_info);
 }
 
 bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
                                   const std::array<vk::Extent2D, 2> & extents,
-                                  const std::vector<instance_draw> & draws)
+                                  const std::vector<instance_draw> & draws,
+                                  const std::vector<std::array<glm::mat4, 2>> & spheres)
 {
 	if (draws.empty() or image_index >= targets.size())
 		return false;
@@ -614,6 +743,38 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 			}
 		}
 		cmd.endRenderPass();
+		// Pass 1b: proximity sphere field (furthest exit wins). own
+		// renderpass over the sphere image (near-clear 1.0 for LESS;
+		// reuses the depth RP object — same shape, different clear
+		// values/framebuffer). Full scissor: sphere coverage is unrelated
+		// to the object rects. Subpass dependency carries the hazard.
+		vk::ClearValue sphere_clear{};
+		sphere_clear.depthStencil = {.depth = 1.f, .stencil = 0};
+		vk::RenderPassBeginInfo sphere_begin{
+		        .renderPass = *depth_renderpass,
+		        .framebuffer = *tgt.sphere_framebuffer,
+		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
+		        .clearValueCount = 1,
+		        .pClearValues = &sphere_clear,
+		};
+		cmd.beginRenderPass(sphere_begin, vk::SubpassContents::eInline);
+		if (any and sphere_vert_count > 0)
+		{
+			cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *sphere_pipeline);
+			cmd.bindVertexBuffers(0, (vk::Buffer)sphere_verts_, (vk::DeviceSize)0);
+			for (const auto & sphere_mvp: spheres)
+			{
+				push pc{
+				        .mvp = sphere_mvp[eye],
+				        .color_pitch = glm::vec4(0, 0, 0, 1),
+				        .view_params = glm::vec4(0, 0, 0, 0),
+				};
+				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
+				cmd.draw(sphere_vert_count, 1, 0, 0);
+			}
+		}
+		cmd.endRenderPass();
 		// Pass 2: dots sample the stored depth at their CENTERS (whole
 		// circles live or die — no per-pixel chop). The depth renderpass's
 		// subpass dependency carries the write→read hazard, no manual
@@ -635,9 +796,7 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 			cmd.bindVertexBuffers(0, (vk::Buffer)quad_, (vk::DeviceSize)0);
 			for (const auto & d: draws)
 			{
-				// Same unified skip as the fill loop above (push persists
-				// across the pipeline bind + renderpass boundary: same
-				// layout, same command buffer — no second push needed).
+				// Same unified skip as the fill loop above.
 				vk::Rect2D scissor;
 				if (d.index_count == 0 or d.dot_count == 0 or
 				    not clamp_scissor(d.scissor[eye], extents[eye], scissor))
@@ -645,7 +804,16 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 				cmd.setScissor(0, scissor);
 				// Baked dot instances borrowed from the feather hidden
 				// renderer (owns upload + eviction); bound fresh per draw.
+				// Per-draw push (not relying on fill-loop persistence:
+				// sphere draws push their own MVPs in the prepass, and
+				// multi-draw frames must not share the last push).
 				cmd.bindVertexBuffers(1, d.dot_buffer, (vk::DeviceSize)0);
+				push pc{
+				        .mvp = d.mvp[eye],
+				        .color_pitch = glm::vec4(d.color, d.pitch),
+				        .view_params = glm::vec4(d.view_params[eye], dot_radius_cells),
+				};
+				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
 				cmd.draw(6, d.dot_count, 0, 0);
 			}
 		}

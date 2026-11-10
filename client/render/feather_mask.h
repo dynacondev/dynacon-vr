@@ -286,6 +286,31 @@ public:
 	            vk::Extent2D out_extent,
 	            const volume_input * volume = nullptr);
 
+	// Hidden proximity record (3d-passthrough-hidden): hard-edged
+	// near-field reveal on its own layer. Dedicated path beside record()
+	// (shared logic untouched): RP1 rasters the proximity spheres into a
+	// depth field, RP2 rasters the silhouettes with a depth test against
+	// it, so only in-radius fragments write mask. Half-res working +
+	// submit (alert-grade, like the dots layer); tier-0 direct raster
+	// (no blur/erode/volume/VR ever — bubbles never engage here).
+	// spheres: one MVP pair per proximity volume (model =
+	// translate(center) * scale(radius)), stream-built so this stays
+	// timebase-free. Safety theorem baked in: LESS accumulates the
+	// furthest sphere exit (max distance), so coverage can only
+	// OVER-reveal (front-of-sphere imprecision, accepted); GREATER here
+	// would under-reveal (unsafe miss) and is forbidden.
+	struct hidden_cpu
+	{
+		double raster_ms = 0;
+		int draws = 0;
+	};
+	void record_hidden(vk::raii::CommandBuffer & cmd,
+	                   vk::Image image,
+	                   vk::Extent2D extent,
+	                   const std::vector<instance_draw> & draws,
+	                   const std::vector<std::array<glm::mat4, 2>> & spheres,
+	                   hidden_cpu * cpu_stats);
+
 	bool has_mesh() const
 	{
 		return not meshes.empty();
@@ -297,6 +322,7 @@ public:
 	void reset_targets()
 	{
 		targets.clear();
+		hidden_targets.clear();
 	}
 
 	// Ensure intermediates for an extent (idempotent, change-gated). Public
@@ -625,6 +651,33 @@ private:
 	// Grown on demand; created lazily on first cutout use.
 	buffer_allocation cutout_verts;
 
+	// Hidden proximity path (record_hidden): own renderpasses (sphere
+	// depth-only + color-with-depth-LOAD), own pipelines (sphere fill +
+	// silhouette-with-proximity-test, same mask.vert/mask.frag modules),
+	// own unit-sphere verts. Created lazily on first record_hidden.
+	vk::raii::RenderPass hidden_sphere_rp{nullptr};
+	vk::raii::RenderPass hidden_color_rp{nullptr};
+	vk::raii::Pipeline hidden_sphere_pipe{nullptr};
+	vk::raii::Pipeline hidden_silhouette_pipe{nullptr};
+	buffer_allocation hidden_sphere_verts_;
+	uint32_t hidden_sphere_vert_count = 0;
+	// (Sphere depth images live beside output_depth below: the map needs
+	// depth_entry complete.)
+	vk::ImageView hidden_sphere_view(vk::Extent2D extent, int eye);
+	// Per-swapchain-image framebuffers for the two hidden passes (color
+	// + sphere-depth FBs per eye); dropped by reset_targets() with the
+	// rest (swapchain recreate = waitIdle'd upstream).
+	struct hidden_frame_targets
+	{
+		vk::Extent2D extent{0, 0};
+		std::array<vk::raii::ImageView, 2> views{nullptr, nullptr};
+		std::array<vk::raii::Framebuffer, 2> framebuffers{nullptr, nullptr};
+		std::array<vk::raii::Framebuffer, 2> sphere_framebuffers{nullptr, nullptr};
+	};
+	std::unordered_map<VkImage, hidden_frame_targets> hidden_targets;
+	void ensure_hidden(vk::Image image, vk::Extent2D extent);
+	bool hidden_ready = false; // lazy RPs/pipes/sphere verts (first record_hidden)
+
 	// Framebuffers + views per swapchain image (images cycle; entries for
 	// retired swapchains are dropped via reset_targets()).
 	struct frame_targets
@@ -673,6 +726,12 @@ private:
 	};
 	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
 	vk::ImageView output_depth_view(vk::Extent2D extent, int eye);
+	// Extent-keyed sphere depth images for the hidden proximity path
+	// (mask side: attachment-only, never sampled; survives
+	// reset_targets() like output_depth — only a handful of quantized
+	// sizes ever exist). Same-queue CLEAR-every-frame makes cross-frame
+	// reuse safe in practice (output_depth precedent).
+	std::map<std::pair<uint32_t, uint32_t>, depth_entry> hidden_sphere_images;
 	// D16 depth image + per-eye views at an extent (depth-test-only
 	// raster: never sampled, device-local). Backs output_depth above and
 	// the intermediate raster companions in ensure_targets.

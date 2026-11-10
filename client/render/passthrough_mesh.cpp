@@ -19,6 +19,7 @@
 #include "passthrough_mesh.h"
 
 #include "utils/mapped_file.h"
+#include <cmath>
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
@@ -262,3 +263,38 @@ passthrough_mesh::triangle_soup passthrough_mesh::flatten_gltf(const std::filesy
 	spdlog::info("passthrough_mesh: {} -> {} vertices, {} triangles", path.string(), out.vertices.size(), out.indices.size() / 3);
 	return out;
 }
+
+namespace passthrough_mesh
+{
+// Latitude-longitude grid, 16x8 (512 tris incl. degenerate pole rows:
+// harmless, rasterizer culls zero-area). Quad (i,j): a=(i,j), b=(i,j+1),
+// d=(i+1,j), e=(i+1,j+1) with latitude increasing upward; tris (a,e,b) +
+// (a,d,e) wind outward-CCW (verified: equator quad gives +X normals).
+std::vector<XrVector3f> unit_sphere_positions()
+{
+	constexpr int rows = 8, cols = 16;
+	constexpr float pi = 3.14159265358979323846f;
+	std::vector<XrVector3f> out;
+	out.reserve((size_t)rows * cols * 6);
+	auto at = [&](int i, int j) {
+		float lat = -pi / 2.f + pi * (float)i / (float)rows;
+		float lon = 2.f * pi * (float)(j % cols) / (float)cols;
+		float cl = std::cos(lat);
+		return XrVector3f{cl * std::cos(lon), std::sin(lat), cl * std::sin(lon)};
+	};
+	for (int i = 0; i < rows; ++i)
+	{
+		for (int j = 0; j < cols; ++j)
+		{
+			XrVector3f a = at(i, j), b = at(i, j + 1), d = at(i + 1, j), e = at(i + 1, j + 1);
+			out.push_back(a);
+			out.push_back(e);
+			out.push_back(b);
+			out.push_back(a);
+			out.push_back(d);
+			out.push_back(e);
+		}
+	}
+	return out;
+}
+} // namespace passthrough_mesh
