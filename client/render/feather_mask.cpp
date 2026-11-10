@@ -2811,20 +2811,28 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				}
 			}
 		};
-		for (const auto & d: draws)
-			accumulate_box(d);
-		// Depth volumes feed the same erode/blur chain, so the scissor
-		// box must cover them too (viewer-inside volumes usually trip
-		// the behind-camera fallback to fullscreen, which is correct).
-		if (use_volume)
-			for (const auto & d: volume->draws)
+		// Content box only feeds pass_scissor, which the tier-0 direct
+		// raster never calls: skip the 16N projections + N finds when
+		// tier==0 with no volume/VR draws. A future tier-0 consumer of
+		// pass_scissor must lift this gate (unconsumed, eye_box stays
+		// empty and pass_scissor falls back to fullscreen — fail-safe).
+		if (tier != 0 or use_volume or use_vr)
+		{
+			for (const auto & d: draws)
 				accumulate_box(d);
-		// VR occluders are a subset of the silhouette positives above, so
-		// the box already covers them; accumulate anyway for safety (a
-		// future caller could pass a differing set).
-		if (use_vr)
-			for (const auto & d: volume->vr_draws)
-				accumulate_box(d);
+			// Depth volumes feed the same erode/blur chain, so the scissor
+			// box must cover them too (viewer-inside volumes usually trip
+			// the behind-camera fallback to fullscreen, which is correct).
+			if (use_volume)
+				for (const auto & d: volume->draws)
+					accumulate_box(d);
+			// VR occluders are a subset of the silhouette positives above, so
+			// the box already covers them; accumulate anyway for safety (a
+			// future caller could pass a differing set).
+			if (use_vr)
+				for (const auto & d: volume->vr_draws)
+					accumulate_box(d);
+		}
 		// Support margin (full working pixels, conservative): the feather
 		// bleed itself plus blur/erode/downsample support at any tier plus
 		// rounding. Over-wide just costs area; under-wide would clip.
