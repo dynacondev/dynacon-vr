@@ -2059,7 +2059,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						pg.renderer->reset_targets();
 						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", pgw, pgh, pf, pproj ? "A" : "B", pg.swapchain.image_count());
 					}
-					pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+					pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh}, ptier != 0);
 				}
 				for (auto & [oid, ost]: passthrough_objects)
 				{
@@ -2222,7 +2222,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.renderer->reset_targets();
 						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", gw, gh, f, proj ? "A" : "B", g.swapchain.image_count());
 					}
-					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh}, tier != 0);
 					std::vector<feather_mask_renderer::instance_draw> draws;
 					// Frustum skip: drop draws fully outside both eyes (the
 					// empty-draws path below then skips acquire/record for

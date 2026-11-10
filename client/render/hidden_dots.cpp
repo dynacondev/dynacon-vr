@@ -630,28 +630,53 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		// size instead of the fullscreen, per draw rather than one union
 		// (a single behind-camera object must not force fullscreen for
 		// the rest). Degenerate draws are skipped outright (nothing
-		// visible: saves the draw call too). The render-area CLEAR stays
-		// full (correctness); an all-degenerate eye still begins/ends
-		// both passes (clear-only): the images start UNDEFINED and
-		// the compositor samples the full rect.
+		// visible: saves the draw call too). The color render-area CLEAR
+		// stays full (correctness); an all-degenerate eye still
+		// begins/ends both passes (clear-only): the images start
+		// UNDEFINED and the compositor samples the full rect.
+		// Content union for the depth prepass renderArea below: the
+		// prepass output is sampled only at dot centers, which lie inside
+		// the per-draw scissors by construction — texels outside the union
+		// are never read, so clearing/storing them is pure waste. The
+		// COLOR pass keeps its full renderArea (submitted full-rect: the
+		// compositor samples everywhere, UNDEFINED holes would show).
 		bool any = false;
+		vk::Rect2D prepass_area{.offset = {0, 0}, .extent = extents[eye]};
+		bool prepass_box = false;
 		for (const auto & d: draws)
 		{
-			vk::Rect2D ignored;
-			if (d.index_count > 0 and d.dot_count > 0 and clamp_scissor(d.scissor[eye], extents[eye], ignored))
+			vk::Rect2D clamped;
+			if (d.index_count > 0 and d.dot_count > 0 and clamp_scissor(d.scissor[eye], extents[eye], clamped))
 			{
 				any = true;
-				break;
+				if (not prepass_box)
+				{
+					prepass_area = clamped;
+					prepass_box = true;
+				}
+				else
+				{
+					int32_t x0 = std::min(prepass_area.offset.x, clamped.offset.x);
+					int32_t y0 = std::min(prepass_area.offset.y, clamped.offset.y);
+					int32_t x1 = std::max(prepass_area.offset.x + (int32_t)prepass_area.extent.width,
+					                      clamped.offset.x + (int32_t)clamped.extent.width);
+					int32_t y1 = std::max(prepass_area.offset.y + (int32_t)prepass_area.extent.height,
+					                      clamped.offset.y + (int32_t)clamped.extent.height);
+					prepass_area = vk::Rect2D{.offset = {x0, y0},
+					                          .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+				}
 			}
 		}
 		// Pass 1: depth prepass (mesh triangles resolve nearest-surface
-		// per pixel; reversed-Z: clear far 0, GREATER wins).
+		// per pixel; reversed-Z: clear far 0, GREATER wins). renderArea is
+		// the content union above (all-degenerate keeps full: clear-only
+		// images still cycle defined content).
 		vk::ClearValue depth_clear{};
 		depth_clear.depthStencil = {.depth = 0.f, .stencil = 0};
 		vk::RenderPassBeginInfo depth_begin{
 		        .renderPass = *depth_renderpass,
 		        .framebuffer = *tgt.depth_framebuffer,
-		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
+		        .renderArea = {.offset = prepass_area.offset, .extent = prepass_area.extent},
 		        .clearValueCount = 1,
 		        .pClearValues = &depth_clear,
 		};

@@ -2319,16 +2319,44 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		*cpu_stats = local;
 }
 
-void feather_mask_renderer::ensure_targets(vk::Extent2D extent)
+void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_intermediates)
 {
 	if (targets_extent.width == extent.width and targets_extent.height == extent.height and
-	    targets_extent.width != 0)
+	    targets_extent.width != 0 and targets_has_intermediates == with_intermediates)
 		return;
 
-	// Rare path (extent change): in-flight frames may still read the old
-	// images, mirroring setup_reprojection_swapchain.
+	// Rare path (extent/tier change): in-flight frames may still read
+	// the old images, mirroring setup_reprojection_swapchain.
 	device.waitIdle();
 	targets_extent = extent;
+	targets_has_intermediates = with_intermediates;
+	if (not with_intermediates)
+	{
+		// Tier-0 direct raster never touches the blur/downsample
+		// workspaces: it rasters straight into the submitted images
+		// (per-image targets map), reversed depth uses output_depth,
+		// volume/VR use their own fixed targets. Drop any present
+		// (tier downgrade) and skip the ~17 MB alloc. Views die before
+		// the images they reference (existing order below).
+		for (auto * target: {&target_a, &target_b, &down_targets[0], &down_targets[1],
+		                     &down_targets[2], &eblur_targets[0], &eblur_targets[1],
+		                     &eblur_targets[2]})
+		{
+			target->views.clear();
+			target->raster_fbs.clear();
+			target->blur_fbs.clear();
+			target->view_array.clear();
+			target->blur_fb_mv.clear();
+			target->raster_depth_fbs.clear();
+			target->depth_views.clear();
+			target->image.clear();
+			target->memory.clear();
+			target->depth_image.clear();
+			target->depth_memory.clear();
+		}
+		spdlog::info("Fiducial mask blur targets: skipped (tier-0 direct raster) {}x{}", extent.width, extent.height);
+		return;
+	}
 	// A/B intermediates at half mask resolution (the mask extent is
 	// 64-quantized upstream, hence evenly divisible); tier-1 raster and
 	// H run small, V writes the half-res submitted image (the compositor
@@ -3351,7 +3379,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 		for (auto & [key, mesh]: meshes)
 			flush_upload(cmd, mesh);
-		ensure_targets(extent);
+		ensure_targets(extent, tier_for_feather(feather_px) != 0);
 
 		// Tier from feather-px (see header): 0 hard edge, 1 half-res
 		// blur, 2/4/8 downsampled. Every feathered group submits a

@@ -357,7 +357,13 @@ public:
 	// Ensure intermediates for an extent (idempotent, change-gated). Public
 	// so the scene can warm targets at map arrival, before first draws;
 	// record() calls it too (same gate, no double work).
-	void ensure_targets(vk::Extent2D extent);
+	// with_intermediates=false skips (and drops) the blur/downsample
+	// workspaces: tier-0 direct raster never touches them (it rasters
+	// straight into the submitted images; reversed depth uses
+	// output_depth, volume/VR use their own fixed targets). Saves ~17 MB
+	// per tier-0 group at 2k masks. The gate keys on (extent, flag) so a
+	// tier change rebuilds correctly.
+	void ensure_targets(vk::Extent2D extent, bool with_intermediates = true);
 
 private:
 	vk::raii::Device & device;
@@ -506,6 +512,9 @@ private:
 	blur_target down_targets[3];
 	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
+	// Whether the intermediates above currently exist (tier-0 groups
+	// skip them — see ensure_targets; part of the rebuild gate).
+	bool targets_has_intermediates = false;
 
 	// Depth-volume chain (3d-depth-passthrough, fixed 320px working
 	// size regardless of mask extent). Raster outputs R16 sensor-D,
