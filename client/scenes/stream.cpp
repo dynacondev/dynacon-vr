@@ -2597,11 +2597,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								if (ost.def.type != "3d-passthrough-hidden")
 									continue;
 								bool member = ost.soup_ready;
+								// The baked dot lattice rides the upload, so a
+								// pitch edit must re-upload (grid_scale_m is
+								// otherwise live-applied, excluded from the
+								// map fingerprint).
+								float dot_pitch = std::max(0.01f, ost.def.grid_scale_m);
+								std::string want = ost.soup_hash + '\x1f' + std::to_string(dot_pitch);
 								auto mhit = g.mesh_hashes.find(oid);
-								if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash))
+								if (member and (mhit == g.mesh_hashes.end() or mhit->second != want))
 								{
-									g.renderer->set_mesh(oid, ost.soup);
-									g.mesh_hashes[oid] = ost.soup_hash;
+									g.renderer->set_mesh(oid, ost.soup, dot_pitch);
+									g.mesh_hashes[oid] = want;
 								}
 								else if (not member and mhit != g.mesh_hashes.end())
 								{
@@ -2617,7 +2623,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								auto oit = passthrough_objects.find(hit->first);
 								bool member = oit != passthrough_objects.end() and
 								        oit->second.def.type == "3d-passthrough-hidden" and
-								        oit->second.soup_ready and oit->second.soup_hash == hit->second;
+								        oit->second.soup_ready;
+								if (member)
+								{
+									float dot_pitch = std::max(0.01f, oit->second.def.grid_scale_m);
+									member = hit->second == oit->second.soup_hash + '\x1f' + std::to_string(dot_pitch);
+								}
 								if (not member)
 								{
 									g.renderer->remove_mesh(hit->first);
@@ -2736,16 +2747,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						hidden_dots_draws.reserve(hidden_silhouettes.size());
 						for (auto & s: hidden_silhouettes)
 						{
-							auto bb = hidden_group.renderer->borrowed_mesh_buffers(s.mesh);
-							if (not bb or bb->index_count == 0)
+							auto bb = hidden_group.renderer->borrowed_dot_buffers(s.mesh);
+							if (not bb or bb->count == 0)
 								continue;
 							hidden_dots_renderer::instance_draw d;
 							d.mvp = s.mvp;
 							d.color = s.color;
 							d.pitch = s.pitch;
-							d.vertex_buffer = bb->vertex_buffer;
-							d.index_buffer = bb->index_buffer;
-							d.index_count = bb->index_count;
+							d.dot_buffer = bb->buffer;
+							d.dot_count = bb->count;
 							for (uint32_t view = 0; view < 2; ++view)
 								d.view_params[view] = glm::vec3((float)dext.width, (float)dext.height,
 								                                scene::projection_matrix(sync_fov[view])[1][1]);

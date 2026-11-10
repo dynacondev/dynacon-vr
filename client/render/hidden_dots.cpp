@@ -22,6 +22,7 @@
 #include "vk/shader.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include <spdlog/spdlog.h>
 
@@ -130,6 +131,26 @@ void hidden_dots_renderer::release()
 void hidden_dots_renderer::init_pipelines(vk::Format format)
 {
 	pipe_cache = pipeline_cache(*device);
+	// Static billboard quad (two triangles, corners -1..1), uploaded once:
+	// every dot instance expands into these 6 verts in the vertex shader.
+	if (not quad_)
+	{
+		quad_ = buffer_allocation{
+		        *device,
+		        vk::BufferCreateInfo{
+		                .size = sizeof(float) * 2 * 6,
+		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "hidden_dots quad",
+		};
+		static const float corners[12] = {-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
+		std::memcpy(quad_.map(), corners, sizeof(corners));
+		quad_.unmap();
+	}
 	auto vert = load_shader(*device, "hidden_dots.vert");
 	auto frag = load_shader(*device, "hidden_dots.frag");
 
@@ -146,22 +167,45 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        },
 	};
 
-	vk::VertexInputBindingDescription binding{
-	        .binding = 0,
-	        .stride = sizeof(XrVector3f),
-	        .inputRate = vk::VertexInputRate::eVertex,
+	vk::VertexInputBindingDescription bindings[2] = {
+	        {
+	                .binding = 0, // static quad corners, per-vertex
+	                .stride = sizeof(float) * 2,
+	                .inputRate = vk::VertexInputRate::eVertex,
+	        },
+	        {
+	                // baked dot center + face normal, per-instance
+	                // (borrowed feather buffer, 2x vec3).
+	                .binding = 1,
+	                .stride = sizeof(float) * 6,
+	                .inputRate = vk::VertexInputRate::eInstance,
+	        },
 	};
-	vk::VertexInputAttributeDescription attribute{
-	        .location = 0,
-	        .binding = 0,
-	        .format = vk::Format::eR32G32B32Sfloat,
-	        .offset = 0,
+	vk::VertexInputAttributeDescription attributes[3] = {
+	        {
+	                .location = 0,
+	                .binding = 0,
+	                .format = vk::Format::eR32G32Sfloat,
+	                .offset = 0,
+	        },
+	        {
+	                .location = 1,
+	                .binding = 1,
+	                .format = vk::Format::eR32G32B32Sfloat,
+	                .offset = 0,
+	        },
+	        {
+	                .location = 2,
+	                .binding = 1,
+	                .format = vk::Format::eR32G32B32Sfloat,
+	                .offset = sizeof(float) * 3,
+	        },
 	};
 	vk::PipelineVertexInputStateCreateInfo vertex_input{
-	        .vertexBindingDescriptionCount = 1,
-	        .pVertexBindingDescriptions = &binding,
-	        .vertexAttributeDescriptionCount = 1,
-	        .pVertexAttributeDescriptions = &attribute,
+	        .vertexBindingDescriptionCount = 2,
+	        .pVertexBindingDescriptions = bindings,
+	        .vertexAttributeDescriptionCount = 3,
+	        .pVertexAttributeDescriptions = attributes,
 	};
 
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly{
@@ -175,9 +219,10 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 
 	vk::PipelineRasterizationStateCreateInfo rasterization{
 	        .polygonMode = vk::PolygonMode::eFill,
-	        // Front faces only, no depth test: closed meshes show near-side
-	        // dots only, always on top. Open meshes read from the front.
-	        .cullMode = vk::CullModeFlagBits::eBack,
+	        // No culling: billboards face the camera by construction;
+	        // backfaces collapse in the vertex shader via the baked
+	        // per-dot normal (no depth test, always on top).
+	        .cullMode = vk::CullModeFlagBits::eNone,
 	        .frontFace = vk::FrontFace::eCounterClockwise,
 	        .lineWidth = 1,
 	};
@@ -344,21 +389,21 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		if (any)
 		{
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+			cmd.bindVertexBuffers(0, (vk::Buffer)quad_, (vk::DeviceSize)0);
 			for (const auto & d: draws)
 			{
-				if (d.index_count == 0)
+				if (d.dot_count == 0)
 					continue;
-				// Buffers borrowed from the feather hidden renderer (owns
-				// upload + eviction); bound fresh per draw, no map lookups.
-				cmd.bindVertexBuffers(0, d.vertex_buffer, (vk::DeviceSize)0);
-				cmd.bindIndexBuffer(d.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
+				// Baked dot instances borrowed from the feather hidden
+				// renderer (owns upload + eviction); bound fresh per draw.
+				cmd.bindVertexBuffers(1, d.dot_buffer, (vk::DeviceSize)0);
 				push pc{
 				        .mvp = d.mvp[eye],
 				        .color_pitch = glm::vec4(d.color, d.pitch),
 				        .view_params = glm::vec4(d.view_params[eye], 0.f),
 				};
 				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
-				cmd.drawIndexed(d.index_count, 1, 0, 0, 0);
+				cmd.draw(6, d.dot_count, 0, 0);
 			}
 		}
 		cmd.endRenderPass();

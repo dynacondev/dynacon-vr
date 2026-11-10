@@ -27,6 +27,7 @@
 #include <map>
 #include <spdlog/spdlog.h>
 #include <stdexcept>
+#include <vector>
 
 namespace
 {
@@ -1584,7 +1585,7 @@ std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_
 	return {std::move(buffer), std::move(memory)};
 }
 
-void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
+void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup, float dot_pitch_m)
 {
 	if (soup.indices.empty() or soup.vertices.empty())
 	{
@@ -1596,10 +1597,74 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	// old buffers before replacing them.
 	device.waitIdle();
 
+	// Billboard dot lattice for the hidden overlay: per-triangle
+	// dominant-axis lattice points snapped exactly onto the face plane
+	// (pitch in object-space units). Static per (mesh, pitch): placement
+	// rides the draw MVP, so no per-frame CPU work. Dots on shared edges
+	// may emit from both faces (identical overlapping dots, harmless).
+	struct dot_point
+	{
+		glm::vec3 center;
+		glm::vec3 normal;
+	};
+	std::vector<dot_point> dots;
+	if (dot_pitch_m > 0)
+	{
+		float pitch = dot_pitch_m;
+		size_t tris = soup.indices.size() / 3;
+		dots.reserve(tris);
+		for (size_t t = 0; t < tris; ++t)
+		{
+			glm::vec3 v[3];
+			for (int k = 0; k < 3; ++k)
+			{
+				const auto & sv = soup.vertices[soup.indices[3 * t + k]];
+				v[k] = glm::vec3(sv.x, sv.y, sv.z);
+			}
+			glm::vec3 n = glm::cross(v[1] - v[0], v[2] - v[0]);
+			float a2 = glm::length(n);
+			if (a2 <= 1e-12f)
+				continue;
+			n /= a2;
+			glm::vec3 an = glm::abs(n);
+			int d = an.x > an.y ? (an.x > an.z ? 0 : 2) : (an.y > an.z ? 1 : 2);
+			int u = (d + 1) % 3, w = (d + 2) % 3;
+			float minu = std::min({v[0][u], v[1][u], v[2][u]}) / pitch;
+			float maxu = std::max({v[0][u], v[1][u], v[2][u]}) / pitch;
+			float minv = std::min({v[0][w], v[1][w], v[2][w]}) / pitch;
+			float maxv = std::max({v[0][w], v[1][w], v[2][w]}) / pitch;
+			float au = v[0][u], av = v[0][w];
+			float bu = v[1][u], bv = v[1][w];
+			float cu = v[2][u], cv = v[2][w];
+			for (long iu = (long)std::floor(minu); iu <= (long)std::ceil(maxu); ++iu)
+			{
+				for (long iv = (long)std::floor(minv); iv <= (long)std::ceil(maxv); ++iv)
+				{
+					float xu = (float)iu * pitch, xv = (float)iv * pitch;
+					// Half-edge inclusion (edges inclusive on both sides:
+					// shared-edge duplicates overlap identically).
+					float e0 = (bu - au) * (xv - av) - (bv - av) * (xu - au);
+					float e1 = (cu - bu) * (xv - bv) - (cv - bv) * (xu - bu);
+					float e2 = (au - cu) * (xv - cv) - (av - cv) * (xu - cu);
+					if (not ((e0 >= 0 and e1 >= 0 and e2 >= 0) or (e0 <= 0 and e1 <= 0 and e2 <= 0)))
+						continue;
+					// Snap onto the face plane via the dominant axis.
+					float xd = (glm::dot(n, v[0]) - n[u] * xu - n[w] * xv) / n[d];
+					glm::vec3 center{0};
+					center[d] = xd;
+					center[u] = xu;
+					center[w] = xv;
+					dots.push_back({center, n});
+				}
+			}
+		}
+	}
+
 	mesh_buffers & mesh = meshes[key];
 	vk::DeviceSize vertex_bytes = soup.vertices.size() * sizeof(XrVector3f);
 	vk::DeviceSize index_bytes = soup.indices.size() * sizeof(uint32_t);
-	vk::DeviceSize total = vertex_bytes + index_bytes;
+	vk::DeviceSize dot_bytes = dots.size() * sizeof(dot_point);
+	vk::DeviceSize total = vertex_bytes + index_bytes + dot_bytes;
 
 	if (mesh.staging_size < total)
 	{
@@ -1612,6 +1677,8 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	void * mapped = mesh.staging_memory.mapMemory(0, total);
 	std::memcpy(mapped, soup.vertices.data(), vertex_bytes);
 	std::memcpy((char *)mapped + vertex_bytes, soup.indices.data(), index_bytes);
+	if (dot_bytes > 0)
+		std::memcpy((char *)mapped + vertex_bytes + index_bytes, dots.data(), dot_bytes);
 	mesh.staging_memory.unmapMemory();
 
 	std::tie(mesh.vertex_buffer, mesh.vertex_memory) = make_buffer(
@@ -1622,9 +1689,22 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        index_bytes,
 	        vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst,
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
+	if (dot_bytes > 0)
+	{
+		std::tie(mesh.dot_buffer, mesh.dot_memory) = make_buffer(
+		        dot_bytes,
+		        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+		        vk::MemoryPropertyFlagBits::eDeviceLocal);
+	}
+	else
+	{
+		mesh.dot_buffer = nullptr;
+		mesh.dot_memory = nullptr;
+	}
 
-	mesh.pending_upload = {vertex_bytes, index_bytes};
+	mesh.pending_upload = {vertex_bytes, index_bytes, dot_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
+	mesh.dot_count = (uint32_t)dots.size();
 	// Model-space bounds for the stream-side frustum skip (upload-time
 	// only; per-frame tests transform the 8 corners by the draw MVP).
 	glm::vec3 lo{soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z};
@@ -1655,6 +1735,19 @@ std::optional<feather_mask_renderer::borrowed_mesh> feather_mask_renderer::borro
 	        (vk::Buffer)*it->second.vertex_buffer,
 	        (vk::Buffer)*it->second.index_buffer,
 	        it->second.index_count,
+	};
+}
+
+std::optional<feather_mask_renderer::borrowed_dots> feather_mask_renderer::borrowed_dot_buffers(const std::string & key) const
+{
+	auto it = meshes.find(key);
+	if (it == meshes.end() or it->second.pending_upload)
+		return std::nullopt;
+	if (it->second.dot_count == 0)
+		return borrowed_dots{vk::Buffer{}, 0};
+	return borrowed_dots{
+	        (vk::Buffer)*it->second.dot_buffer,
+	        it->second.dot_count,
 	};
 }
 
@@ -2284,7 +2377,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 {
 	if (not mesh.pending_upload)
 		return;
-	auto [vertex_bytes, index_bytes] = *mesh.pending_upload;
+	auto [vertex_bytes, index_bytes, dot_bytes] = *mesh.pending_upload;
 	mesh.pending_upload.reset();
 
 	vk::BufferCopy vertex_copy{
@@ -2299,8 +2392,17 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	        .size = index_bytes,
 	};
 	cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
+	if (dot_bytes > 0)
+	{
+		vk::BufferCopy dot_copy{
+		        .srcOffset = vertex_bytes + index_bytes,
+		        .dstOffset = 0,
+		        .size = dot_bytes,
+		};
+		cmd.copyBuffer(*mesh.staging_buffer, *mesh.dot_buffer, dot_copy);
+	}
 
-	std::array<vk::BufferMemoryBarrier, 2> barriers = {
+	std::vector<vk::BufferMemoryBarrier> barriers = {
 	        vk::BufferMemoryBarrier{
 	                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
 	                .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
@@ -2320,6 +2422,20 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	                .size = index_bytes,
 	        },
 	};
+	// Only when a dot copy ran above (same CB order as the borrower
+	// below): a null dot buffer means count 0, never bound.
+	if (dot_bytes > 0)
+	{
+		barriers.push_back(vk::BufferMemoryBarrier{
+		        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
+		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .buffer = *mesh.dot_buffer,
+		        .offset = 0,
+		        .size = dot_bytes,
+		});
+	}
 	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                    vk::PipelineStageFlagBits::eVertexInput,
 	                    {},

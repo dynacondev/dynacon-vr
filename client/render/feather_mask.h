@@ -78,8 +78,11 @@ public:
 
 	// (Re)upload one object's mesh buffers under its key. Synchronous
 	// (device idle on replace); call when idle, e.g. on map change, not
-	// per frame. Empty soup erases the entry.
-	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
+	// per frame. Empty soup erases the entry. dot_pitch_m > 0 also bakes
+	// the hidden billboard dot lattice (object-space centers + face
+	// normals for this pitch) into an extra buffer, uploaded and gated
+	// with the mesh; 0 skips it (non-hidden meshes).
+	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup, float dot_pitch_m = 0);
 	void remove_mesh(const std::string & key);
 	// Model-space AABB for frustum skip (nullopt = unknown key: keep the
 	// draw). Computed once at upload; the draws filter in stream.cpp
@@ -99,6 +102,18 @@ public:
 		uint32_t index_count;
 	};
 	std::optional<borrowed_mesh> borrowed_mesh_buffers(const std::string & key) const;
+
+	// Borrowed billboard dot instances for the dots overlay (per-dot
+	// object-space center + face normal, baked at upload for the pitch
+	// passed to set_mesh). Same pending-upload gate as the mesh buffers
+	// above: nullopt when unknown, pending, or baked with dot_pitch 0.
+	// Count 0 (degenerate lattice) also means skip the draw.
+	struct borrowed_dots
+	{
+		vk::Buffer buffer;
+		uint32_t count;
+	};
+	std::optional<borrowed_dots> borrowed_dot_buffers(const std::string & key) const;
 
 	// One silhouette draw: which uploaded mesh, per-eye transforms, and
 	// the first-acquisition fade opacity (presence 0..1 for both
@@ -583,10 +598,21 @@ private:
 		vk::raii::Buffer index_buffer{nullptr};
 		vk::raii::DeviceMemory index_memory{nullptr};
 		uint32_t index_count = 0;
+		// Baked billboard dots (hidden overlay): per-dot center + face
+		// normal, uploaded with the mesh above when set_mesh got a pitch.
+		vk::raii::Buffer dot_buffer{nullptr};
+		vk::raii::DeviceMemory dot_memory{nullptr};
+		uint32_t dot_count = 0;
 		vk::raii::Buffer staging_buffer{nullptr};
 		vk::raii::DeviceMemory staging_memory{nullptr};
 		vk::DeviceSize staging_size = 0;
-		std::optional<std::pair<vk::DeviceSize, vk::DeviceSize>> pending_upload;
+		struct upload_sizes
+		{
+			vk::DeviceSize vertex_bytes = 0;
+			vk::DeviceSize index_bytes = 0;
+			vk::DeviceSize dot_bytes = 0;
+		};
+		std::optional<upload_sizes> pending_upload;
 		glm::vec3 aabb_min{0}, aabb_max{0};
 	};
 	std::map<std::string, mesh_buffers> meshes;

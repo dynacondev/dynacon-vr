@@ -20,13 +20,14 @@
 
 // Hidden-object dot overlay (3d-passthrough-hidden): a fixed world-size dot
 // grid wrapping the mesh, drawn over the revealed camera feed in the config
-// color. Deliberately the cheapest shape-conforming texture: one pipeline,
-// MVP + one object-space varying, screen-space derivatives to pick the
-// facing axis pair (so only round dots rasterize, never hairlines), no
-// depth image. Front faces only (cull BACK, depth test OFF): closed
-// meshes show near-side dots only, always on top (nothing to clip against,
-// so the curve-dropout class can't occur); open meshes read from the front
-// and vanish from behind. Concave folds fall back to draw order.
+// color. Real camera-facing billboard quads, instanced from per-dot
+// center+normal lists baked once per (mesh, pitch) by the feather hidden
+// renderer (which keeps owning upload + eviction; dots just borrow).
+// Screen-aligned by construction, so every dot is round from any angle
+// and the quad extends a full radius past the center, so triangle edges
+// never slice dots. Backfaces collapse in the vertex shader (facing test
+// on the baked normal; no depth test, always on top). One pipeline, one
+// pass, trivial circle fragment.
 //
 // Composited as ONE transparent projection layer (standard alpha blend,
 // above the flat passthrough, below gizmos/GUI) so the maxLayerCount
@@ -42,6 +43,7 @@
 #include <glm/vec3.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
+#include "vk/allocation.h"
 #include "xr/swapchain.h"
 
 namespace xr
@@ -57,8 +59,8 @@ public:
 	// baked in), dot color + pitch, per-eye scissor rects (dots pixel
 	// space, computed stream-side from the same cull corners), per-eye
 	// view params (viewport W/H px + proj[1][1] for the world→px radius),
-	// and the mesh GPU buffers borrowed from the feather hidden renderer
-	// (which keeps owning upload + eviction).
+	// and the baked dot instance buffer borrowed from the feather hidden
+	// renderer (per-dot center + face normal; count 0 = skip).
 	struct instance_draw
 	{
 		std::array<glm::mat4, 2> mvp;
@@ -66,9 +68,8 @@ public:
 		float pitch = 0.05f;
 		std::array<vk::Rect2D, 2> scissor;
 		std::array<glm::vec3, 2> view_params; // x: view W px, y: view H px, z: proj[1][1]
-		vk::Buffer vertex_buffer;
-		vk::Buffer index_buffer;
-		uint32_t index_count = 0;
+		vk::Buffer dot_buffer;
+		uint32_t dot_count = 0;
 	};
 
 	explicit hidden_dots_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
@@ -123,6 +124,10 @@ private:
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
+	// Static billboard quad (6 corners, -1..1, non-indexed), uploaded
+	// once with the pipeline. Per-dot data arrives per draw as
+	// instanced attributes from the borrowed feather buffer.
+	buffer_allocation quad_;
 
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;

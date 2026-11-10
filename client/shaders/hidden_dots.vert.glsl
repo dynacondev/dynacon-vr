@@ -18,12 +18,18 @@
 
 #version 450
 
-// Plain MVP plus pitch-normalized position and view depth for the
-// fragment-stage round dots. No placement rebuild, no normals.
-layout(location = 0) in vec3 pos;
+// Camera-facing billboard expansion for the baked dot instances (one
+// instance = object-space center + face normal, one static quad). The
+// quad is square in screen pixels by construction, so dots are round
+// from any angle and extend a full radius past the center, so triangle
+// edges never slice them. Backfaces collapse here (facing test on the
+// baked normal; the layer has no depth test).
+layout(location = 0) in vec2 corner; // static quad, -1..1
+layout(location = 1) in vec3 center; // per-instance, object space
+layout(location = 2) in vec3 normal; // per-instance, object-space face normal
 
-layout(location = 0) out vec3 vQ;
-layout(location = 1) out float vViewZ;
+layout(location = 0) out vec2 vUv; // quad space: 1.0 == dot radius
+layout(location = 1) out float vW; // clip w (view distance) for the radius/AA
 
 layout(push_constant) uniform PushConstants
 {
@@ -35,11 +41,27 @@ pc;
 
 void main()
 {
-	vQ = pos / max(pc.color_pitch.w, 1e-4);
-	vec4 clip = pc.mvp * vec4(pos, 1.0);
-	// Perspective clip w is -z_eye (w row is (0,0,-1,0) in every
-	// perspective variant including reversed-Z): positive view distance
-	// in meters straight from w, no matrix needed.
-	vViewZ = clip.w;
-	gl_Position = clip;
+	vec4 clip = pc.mvp * vec4(center, 1.0);
+	float w = clip.w;
+	// Front-facing test: the normal as a direction (w=0) through the
+	// MVP has clip w = -z_view(normal), so w < 0 means the normal has
+	// +z_view, i.e. points at the camera. Approximate only for faces
+	// nearly edge-on far off-axis (there the lateral terms outweigh
+	// n_z); those dots are merged streaks either way, so a slightly
+	// early/late pop there is accepted.
+	float facing = (pc.mvp * vec4(normal, 0.0)).w;
+	float pitch = max(pc.color_pitch.w, 1e-4);
+	float px_per_m = (pc.view_params.y * 0.5) * abs(pc.view_params.z) / max(w, 1e-3);
+	float r_px = 0.15 * pitch * px_per_m;
+	vUv = corner;
+	vW = w;
+	if (w <= 1e-6 || facing >= 0.0)
+	{
+		// Behind the camera or backfacing: collapse outside clip space.
+		gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+		return;
+	}
+	// corner ±1 maps to ±r_px screen pixels (aspect-correct per axis).
+	vec2 px = corner * r_px / (pc.view_params.xy * 0.5);
+	gl_Position = vec4(clip.xy + px * w, clip.z, w);
 }
