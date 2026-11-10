@@ -177,7 +177,7 @@ void xr::session::end_frame(XrTime display_time, const std::vector<XrComposition
 	// the passthrough handle being active: the runtime refuses suppression
 	// (SUPPRESSION_NOT_ALLOWED) and forces visible when the app fully
 	// obscures reality (opaque video-only), so video-only must expect
-	// visible. Projected counts too: camera imagery is showing.
+	// visible.
 	bool passthrough_visible = (blend_mode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND);
 	for (auto * l: layers)
 	{

@@ -25,9 +25,9 @@
 
 namespace passthrough_mesh
 {
-// Baked, hierarchy-space (model-space) triangle list ready for
-// XrTriangleMeshFB. World placement arrives later via the geometry
-// instance transform, never baked here.
+// Baked, hierarchy-space (model-space) triangle list for the mask
+// raster. World placement arrives later via per-eye MVPs, never
+// baked here.
 // Only positions matter to the runtime: no normals, UVs or materials.
 struct triangle_soup
 {

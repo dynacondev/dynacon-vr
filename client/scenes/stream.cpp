@@ -1517,7 +1517,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Marker tracking runs every frame: solved frames feed the
 		// record phase below (cutouts, gizmos) and the status UI.
 		// Sync timebase: the mask alpha composites with server video, so
-		// projected-geometry transforms ride the server display time
+		// mask-raster transforms ride the server display time
 		// (one common warp). Tracking/filtering itself stays live.
 		// Eye-0 time: both eyes share frame_index on the common path;
 		// fallback scans for the first paired eye below.

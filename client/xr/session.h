@@ -146,7 +146,7 @@ public:
 	void on_boundary_visibility_changed(XrBoundaryVisibilityMETA);
 
 	// Demo passthrough effects (Passthrough tab subsection).
-	// Stored desired state, applied to the live fb layer(s) on creation
+	// Stored desired state, applied to the live fb layer on creation
 	// and re-applied after enable_passthrough() recreates them.
 	const passthrough_effects & get_passthrough_effects() const
 	{

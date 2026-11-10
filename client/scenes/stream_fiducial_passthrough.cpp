@@ -336,7 +336,7 @@ void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, Xr
 	float s_zone = any_valid ? mix.result() : 1;
 	float s = s_zone;
 	// Until-lock overrides everything while waiting: full passthrough via
-	// the same B floor lift, no geometry involved. After lock the veil
+	// the same floor lift, no geometry involved. After lock the veil
 	// fades out over passthrough-fade-time (smoothstep 0->1). Combines
 	// as OR (min): either source can demand passthrough, so zones still
 	// hold fullscreen even mid-fade.

@@ -450,7 +450,7 @@ Each `passthrough` entry has:
   triangles budget). Both eyes fade together from a single per-frame
   headset distance. `"3d-passthrough-hidden"` reveals the flat feed
   where the model sits inside the proximity radius around the head
-  (hard-edged near-field cutout merged into the single union-B submit layer, plus a
+  (hard-edged near-field cutout merged into the single merged submit layer, plus a
   dot overlay in `dot-color` over the revealed feed (front faces
   only, so hidden meshes read best as **closed volumes** like boundary
   meshes): reversed cuts never apply to it (safety: hidden always wins),

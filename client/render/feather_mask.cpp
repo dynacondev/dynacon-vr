@@ -3255,7 +3255,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	{
 		if (it != targets.end())
 		{
-			// The union-B merge samples these array views cross-frame
+			// The merge samples these array views cross-frame
 			// (a prior async merge CB may still fly on inline-fallback
 			// frames): never destroy a live entry out from under it.
 			// Rare path (submit resize, first reversed frame) — the

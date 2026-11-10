@@ -593,7 +593,7 @@ private:
 		// (preemption/contention inflates both halves together).
 		float mask_first_gpu_time = 0;
 		float mask_rest_gpu_time = 0;
-		// Union-B merge span: async = mask-pool q3/q4, inline =
+		// Merge span: async = mask-pool q3/q4, inline =
 		// main-pool q5/q6. One fullscreen full-res pass. Stamped
 		// unconditionally (zero span when the merge sits out) so the
 		// poll range never covers an unwritten query. Read spikes by
@@ -730,8 +730,8 @@ private:
 	std::map<float, mask_group> mask_groups;
 	// Local debug cutout group: QR windows punched at full
 	// alpha. Standalone member, not in the map: debug never keys off
-	// server feather values. Claimed while cutouts exist and no B group
-	// does (real B groups punch cutouts themselves), and promoted to the
+	// server feather values. Claimed while cutouts exist and no group
+	// does (real groups punch cutouts themselves), and promoted to the
 	// boundary-veil carrier while the veil is active with no group to
 	// carry its floor (boundary-only / all-culled configs). Empty
 	// draws (clear-only record), tier 0; the submit-time bias lifts the
@@ -825,7 +825,7 @@ private:
 	// solve latches, never reset on loss; cleared on map change). Empty
 	// target disables. Armed only when the target matches a fiducial id
 	// in the map. While waiting (armed && !locked) the veil is forced to
-	// fullscreen via the same B floor lift, no geometry involved. On lock
+	// fullscreen via the same floor lift, no geometry involved. On lock
 	// the veil fades to normal over passthrough-fade-time seconds
 	// (smoothstep, min-combined with boundary zones so zones still hold
 	// passthrough independently). Render thread only.
@@ -887,7 +887,7 @@ private:
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough while depth debugging: the mask floor
 	// lifts to full alpha under the viz (same lift as the boundary
-	// veil). True from the toggle frame (pre-probe optimistic) so the B
+	// veil). True from the toggle frame (pre-probe optimistic) so the
 	// canvas exists when the probe lands; runtimes without depth support
 	// drop out once probing reports unsupported.
 	bool depth_fullscreen_passthrough() const

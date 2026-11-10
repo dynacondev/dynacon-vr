@@ -118,7 +118,7 @@ public:
 	std::optional<borrowed_dots> borrowed_dot_buffers(const std::string & key) const;
 
 	// Borrowed submitted-image array view (both layers) for the
-	// union-B merge pass: the just-recorded image's multiview color
+	// merge pass: the just-recorded image's multiview color
 	// view, sampled (not rendered) by the merge. Built for every
 	// recorded image alongside the framebuffers, so any image a group
 	// recorded this frame has one. Null when unknown (retired image
@@ -296,7 +296,7 @@ public:
 	            const volume_input * volume = nullptr);
 
 	// Hidden proximity record (3d-passthrough-hidden): hard-edged
-	// near-field reveal, submit-merged into the single union-B layer.
+	// near-field reveal, submit-merged into the single merged layer.
 	// Dedicated path beside record()
 	// (shared logic untouched): RP1 rasters the proximity spheres into a
 	// depth field, RP2 rasters the silhouettes with a depth test against

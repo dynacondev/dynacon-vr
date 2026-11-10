@@ -23,8 +23,6 @@
 #include "utils/handle.h"
 #include <cstdint>
 #include <map>
-#include <optional>
-#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -117,7 +115,7 @@ class passthrough_fb : public utils::handle<XrPassthroughFB>
 	bool lut_warn_once = false;
 
 	XrPassthroughColorLutMETA get_or_create_lut(passthrough_lut_preset preset, uint32_t resolution);
-	// Build + apply XrPassthroughStyleFB chain for both layers.
+	// Build + apply XrPassthroughStyleFB chain for the flat layer.
 	// LUT handles are cached per preset; missing LUT ext falls back to
 	// unstyled with a one-shot warn.
 	void apply_style(const passthrough_effects & fx);
