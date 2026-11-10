@@ -34,21 +34,14 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <memory>
-#include <optional>
-#include <string>
-#include <utility>
 #include <vector>
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
-#include <glm/vec4.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
-#include "vk/allocation.h"
 #include "xr/swapchain.h"
-#include "render/passthrough_mesh.h"
 
 namespace xr
 {
@@ -59,16 +52,20 @@ class session;
 class hidden_dots_renderer
 {
 public:
-	// One silhouette draw: which uploaded mesh, per-eye clip transforms
-	// (placement already baked in), flat dot color, and dot pitch in
-	// model-space meters (uniform placement scale is ~1, so this is the
-	// world pitch up to the user's object scale).
+	// One silhouette draw: per-eye clip transforms (placement already
+	// baked in), dot color + pitch, per-eye scissor rects (dots pixel
+	// space, computed stream-side from the same cull corners), and the
+	// mesh GPU buffers borrowed from the feather hidden renderer (which
+	// keeps owning upload + eviction).
 	struct instance_draw
 	{
-		std::string mesh;
 		std::array<glm::mat4, 2> mvp;
 		glm::vec3 color{1.0f, 0.16f, 0.10f};
 		float pitch = 0.05f;
+		std::array<vk::Rect2D, 2> scissor;
+		vk::Buffer vertex_buffer;
+		vk::Buffer index_buffer;
+		uint32_t index_count = 0;
 	};
 
 	explicit hidden_dots_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
@@ -95,10 +92,11 @@ public:
 	// acquisition is released inside, skip the frame).
 	int acquire();
 
-	// Record draws into both eye layers of the acquired image.
-	// No-op when draws is empty. extents size the per-eye viewports
-	// (the submitted layer rects). Returns false without recording
-	// (caller must release the acquisition to keep pairing).
+	// Record draws into both eye layers of the acquired image (union of
+	// the draws' scissor rects per eye; render-area CLEAR stays full).
+	// No-op (false) when draws is empty. extents size the per-eye
+	// viewports (the submitted layer rects). Returns false without
+	// recording (caller must release the acquisition to keep pairing).
 	bool record(vk::raii::CommandBuffer & cmd, size_t image_index,
 	            const std::array<vk::Extent2D, 2> & extents,
 	            const std::vector<instance_draw> & draws);
@@ -111,15 +109,6 @@ public:
 	{
 		return swapchain_;
 	}
-
-	// (Re)upload one object's mesh buffers under its key. Synchronous;
-	// call when idle, e.g. on map change, not per frame. Empty soup
-	// erases the entry.
-	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
-	void remove_mesh(const std::string & key);
-	// Model-space AABB for the frustum skip (nullopt = unknown key: skip
-	// the draw). Computed once at upload.
-	std::optional<std::pair<glm::vec3, glm::vec3>> mesh_bounds(const std::string & key) const;
 
 private:
 	void init_pipelines(vk::Format format);
@@ -135,15 +124,6 @@ private:
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;
 	vk::Extent2D extent_{0, 0};
-
-	struct mesh_buffers
-	{
-		buffer_allocation vertex_buffer;
-		buffer_allocation index_buffer;
-		uint32_t index_count = 0;
-		glm::vec3 aabb_min{0}, aabb_max{0};
-	};
-	std::map<std::string, mesh_buffers> meshes;
 
 	struct target
 	{

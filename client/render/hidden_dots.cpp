@@ -22,8 +22,6 @@
 #include "vk/shader.h"
 
 #include <algorithm>
-#include <cstring>
-#include <stdexcept>
 
 #include <spdlog/spdlog.h>
 
@@ -126,72 +124,6 @@ int hidden_dots_renderer::acquire()
 void hidden_dots_renderer::release()
 {
 	swapchain_.release();
-}
-
-void hidden_dots_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
-{
-	if (soup.vertices.empty() or soup.indices.empty())
-	{
-		remove_mesh(key);
-		return;
-	}
-	auto & mesh = meshes[key];
-	vk::DeviceSize vsize = soup.vertices.size() * sizeof(XrVector3f);
-	vk::DeviceSize isize = soup.indices.size() * sizeof(uint32_t);
-	mesh.vertex_buffer = buffer_allocation(
-	        *device,
-	        vk::BufferCreateInfo{
-	                .size = vsize,
-	                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
-	        },
-	        VmaAllocationCreateInfo{
-	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-	                .usage = VMA_MEMORY_USAGE_AUTO,
-	        },
-	        "hidden dots verts");
-	mesh.index_buffer = buffer_allocation(
-	        *device,
-	        vk::BufferCreateInfo{
-	                .size = isize,
-	                .usage = vk::BufferUsageFlagBits::eIndexBuffer,
-	        },
-	        VmaAllocationCreateInfo{
-	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-	                .usage = VMA_MEMORY_USAGE_AUTO,
-	        },
-	        "hidden dots indices");
-	std::memcpy(mesh.vertex_buffer.map(), soup.vertices.data(), vsize);
-	mesh.vertex_buffer.unmap();
-	std::memcpy(mesh.index_buffer.map(), soup.indices.data(), isize);
-	mesh.index_buffer.unmap();
-	// Non-coherent host-visible memory: flush once, meshes are static.
-	vmaFlushAllocation(vk_allocator::instance(), mesh.vertex_buffer, 0, vsize);
-	vmaFlushAllocation(vk_allocator::instance(), mesh.index_buffer, 0, isize);
-	mesh.index_count = (uint32_t)soup.indices.size();
-	// Model-space bounds for the stream-side frustum skip (upload-time
-	// only; per-frame tests transform the 8 corners by the draw MVP).
-	// Seeded from the first vertex: infinity is UB under -ffast-math.
-	glm::vec3 mn(soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z);
-	glm::vec3 mx = mn;
-	for (const auto & v: soup.vertices)
-	{
-		mn = glm::min(mn, glm::vec3(v.x, v.y, v.z));
-		mx = glm::max(mx, glm::vec3(v.x, v.y, v.z));
-	}
-	mesh.aabb_min = mn;
-	mesh.aabb_max = mx;
-}
-
-void hidden_dots_renderer::remove_mesh(const std::string & key)
-{
-	meshes.erase(key);
-}
-
-std::optional<std::pair<glm::vec3, glm::vec3>> hidden_dots_renderer::mesh_bounds(const std::string & key) const
-{
-	if (auto it = meshes.find(key); it != meshes.end())
-		return std::make_pair(it->second.aabb_min, it->second.aabb_max);
-	return std::nullopt;
 }
 
 void hidden_dots_renderer::init_pipelines(vk::Format format)
@@ -359,60 +291,42 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		                        .minDepth = 0,
 		                        .maxDepth = 1,
 		                });
-		// Tight scissor from the draws' projected bounds: shading tracks
-		// object size instead of the fullscreen. The render-area CLEAR
-		// stays full (correctness); only draw fragments are culled. Y-flip
-		// safe: min/max over corners is symmetric under the flip.
+		// Union of the draws' stream-side scissor rects (computed once per
+		// object in the shared silhouette build): shading tracks object
+		// size instead of the fullscreen. The render-area CLEAR stays full
+		// (correctness); only draw fragments are culled.
 		vk::Rect2D scissor{.offset = {0, 0}, .extent = extents[eye]};
 		{
-			float x0 = 0, y0 = 0, x1 = (float)extents[eye].width, y1 = (float)extents[eye].height;
-			bool full = false, any = false;
+			bool any = false;
+			int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
 			for (const auto & d: draws)
 			{
-				auto mit = meshes.find(d.mesh);
-				if (mit == meshes.end())
+				const auto & r = d.scissor[eye];
+				int32_t rx0 = std::max(r.offset.x, 0);
+				int32_t ry0 = std::max(r.offset.y, 0);
+				int32_t rx1 = std::min(r.offset.x + (int32_t)r.extent.width, (int32_t)extents[eye].width);
+				int32_t ry1 = std::min(r.offset.y + (int32_t)r.extent.height, (int32_t)extents[eye].height);
+				if (rx1 <= rx0 or ry1 <= ry0)
+					continue;
+				if (not any)
 				{
-					full = true;
-					break;
+					x0 = rx0;
+					y0 = ry0;
+					x1 = rx1;
+					y1 = ry1;
+					any = true;
 				}
-				for (int corner = 0; corner < 8 and not full; ++corner)
+				else
 				{
-					glm::vec4 q4((corner & 1) ? mit->second.aabb_max.x : mit->second.aabb_min.x,
-					             (corner & 2) ? mit->second.aabb_max.y : mit->second.aabb_min.y,
-					             (corner & 4) ? mit->second.aabb_max.z : mit->second.aabb_min.z, 1);
-					glm::vec4 c = d.mvp[eye] * q4;
-					if (c.w <= 0)
-					{
-						full = true;
-						break;
-					}
-					float px = (c.x / c.w * 0.5f + 0.5f) * (float)extents[eye].width;
-					float py = (c.y / c.w * 0.5f + 0.5f) * (float)extents[eye].height;
-					if (not any)
-					{
-						x0 = x1 = px;
-						y0 = y1 = py;
-						any = true;
-					}
-					else
-					{
-						x0 = std::min(x0, px);
-						x1 = std::max(x1, px);
-						y0 = std::min(y0, py);
-						y1 = std::max(y1, py);
-					}
+					x0 = std::min(x0, rx0);
+					y0 = std::min(y0, ry0);
+					x1 = std::max(x1, rx1);
+					y1 = std::max(y1, ry1);
 				}
 			}
-			if (not full and any)
-			{
-				int32_t ix0 = (int32_t)std::max(0.f, x0 - 1.f);
-				int32_t iy0 = (int32_t)std::max(0.f, y0 - 1.f);
-				int32_t ix1 = (int32_t)std::min((float)extents[eye].width, x1 + 1.f);
-				int32_t iy1 = (int32_t)std::min((float)extents[eye].height, y1 + 1.f);
-				if (ix1 > ix0 and iy1 > iy0)
-					scissor = vk::Rect2D{.offset = {ix0, iy0},
-					                     .extent = {(uint32_t)(ix1 - ix0), (uint32_t)(iy1 - iy0)}};
-			}
+			if (any)
+				scissor = vk::Rect2D{.offset = {x0, y0},
+				                     .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
 		}
 		cmd.setScissor(0, scissor);
 		vk::ClearValue clear{};
@@ -427,17 +341,18 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
 		for (const auto & d: draws)
 		{
-			auto mit = meshes.find(d.mesh);
-			if (mit == meshes.end() or mit->second.index_count == 0)
+			if (d.index_count == 0)
 				continue;
-			cmd.bindVertexBuffers(0, vk::Buffer(mit->second.vertex_buffer), (vk::DeviceSize)0);
-			cmd.bindIndexBuffer(vk::Buffer(mit->second.index_buffer), (vk::DeviceSize)0, vk::IndexType::eUint32);
+			// Buffers borrowed from the feather hidden renderer (owns
+			// upload + eviction); bound fresh per draw, no map lookups.
+			cmd.bindVertexBuffers(0, d.vertex_buffer, (vk::DeviceSize)0);
+			cmd.bindIndexBuffer(d.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
 			push pc{
 			        .mvp = d.mvp[eye],
 			        .color_pitch = glm::vec4(d.color, d.pitch),
 			};
 			cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
-			cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+			cmd.drawIndexed(d.index_count, 1, 0, 0, 0);
 		}
 		cmd.endRenderPass();
 	}

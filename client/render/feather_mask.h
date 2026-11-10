@@ -86,6 +86,19 @@ public:
 	// consults it before acquire, so fully-culled groups cost nothing.
 	std::optional<std::pair<glm::vec3, glm::vec3>> mesh_bounds(const std::string & key) const;
 
+	// Borrowed GPU mesh buffers for the dots overlay (binds these for its
+	// own silhouette raster; feather keeps owning upload + eviction).
+	// Nullopt when unknown OR an upload is still pending (the GPU copy
+	// lands in this mask record — the borrower skips one frame rather
+	// than binding stale data).
+	struct borrowed_mesh_buffers
+	{
+		vk::Buffer vertex_buffer;
+		vk::Buffer index_buffer;
+		uint32_t index_count;
+	};
+	std::optional<borrowed_mesh_buffers> borrowed_mesh_buffers(const std::string & key) const;
+
 	// One silhouette draw: which uploaded mesh, per-eye transforms, and
 	// the first-acquisition fade opacity (presence 0..1 for both
 	// polarities; the renderer pushes 1 - fade as the cut strength for

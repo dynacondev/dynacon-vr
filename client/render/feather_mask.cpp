@@ -1646,6 +1646,18 @@ std::optional<std::pair<glm::vec3, glm::vec3>> feather_mask_renderer::mesh_bound
 	return std::make_pair(it->second.aabb_min, it->second.aabb_max);
 }
 
+std::optional<feather_mask_renderer::borrowed_mesh_buffers> feather_mask_renderer::borrowed_mesh_buffers(const std::string & key) const
+{
+	auto it = meshes.find(key);
+	if (it == meshes.end() or it->second.pending_upload)
+		return std::nullopt;
+	return borrowed_mesh_buffers{
+	        (vk::Buffer)*it->second.vertex_buffer,
+	        (vk::Buffer)*it->second.index_buffer,
+	        it->second.index_count,
+	};
+}
+
 void feather_mask_renderer::remove_mesh(const std::string & key)
 {
 	auto it = meshes.find(key);
