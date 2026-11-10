@@ -297,7 +297,8 @@ public:
 	            const volume_input * volume = nullptr);
 
 	// Hidden proximity record (3d-passthrough-hidden): hard-edged
-	// near-field reveal on its own layer. Dedicated path beside record()
+	// near-field reveal, submit-merged into the single union-B layer.
+	// Dedicated path beside record()
 	// (shared logic untouched): RP1 rasters the proximity spheres into a
 	// depth field, RP2 rasters the silhouettes with a depth test against
 	// it, so only in-radius fragments write mask. Quarter-res working +
