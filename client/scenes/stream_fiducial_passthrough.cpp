@@ -667,9 +667,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		// dot_color/dot_pitch_m excluded: live-applied (dot color +
 		// pitch), edits must not reset tracking. transition_distance_m
 		// excluded too (live-applied by the boundary fade).
-		// proximity_radius_m excluded as well (live-applied by the
-		// near-field reveal: sphere MVPs rebuild every frame).
-		// pulse_strength excluded as reserved, unused.
+		// proximity_radius_m/hand_proximity_radius_m excluded as well
+		// (live-applied by the near-field reveal: sphere MVPs rebuild
+		// every frame).
 	}
 	map_key += 'L';
 	map_key += map->passthrough_until_lock;

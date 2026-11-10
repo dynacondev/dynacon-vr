@@ -639,6 +639,8 @@ void scenes::stream::on_unfocused()
 	input.reset();
 	left_hand.reset();
 	right_hand.reset();
+	prox_left_hand.reset();
+	prox_right_hand.reset();
 	apps.reset();
 
 	imgui_ctx.reset();
@@ -2681,6 +2683,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								// under hidden_known below; nothing is
 								// submitted while inactive.
 								hidden_dots.reset();
+								prox_left_hand.reset();
+								prox_right_hand.reset();
 							}
 						}
 						else
@@ -2691,17 +2695,63 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// working size (conservative superset either way;
 							// the dots scissor reads the px bounds exactly).
 							build_hidden_silhouettes(hmw, hmh);
-							// Proximity spheres (v1: head only — hands slot in
-							// as further entries later): head center = midpoint
-							// of the sync eye positions, same timebase as
-							// server_mvp by construction (NOT the fiducial
-							// head_pos, which runs on predicted timebase).
-							// One entry per placed hidden object, each with
-							// its own live proximity-radius: the
-							// min-accumulating field unions them (inside ANY
-							// = over-reveal, the safe direction).
+							// Proximity spheres (v1: head + hands — further
+							// trackers slot in as more entries later): head
+							// center = midpoint of the sync eye positions,
+							// same timebase as server_mvp by construction
+							// (NOT the fiducial head_pos, which runs on
+							// predicted timebase).
+							// One head entry per placed hidden object, each
+							// with its own live proximity-radius, plus one
+							// entry per tracked palm/grip with the same
+							// object's hand-proximity-radius (default 0.3):
+							// the min-accumulating field unions them (inside
+							// ANY = over-reveal, the safe direction).
 							proximity_spheres.clear();
-							proximity_spheres.reserve(hidden_silhouettes.size());
+							proximity_spheres.reserve(hidden_silhouettes.size() * 3);
+							if (system.hand_tracking_supported())
+							{
+								if (not prox_left_hand)
+									prox_left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
+								if (not prox_right_hand)
+									prox_right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+							}
+							XrSpace prox_space = application::space(xr::spaces::world);
+							// Palm preferred, controller grip fallback, per
+							// side. Fail-closed: an untracked side contributes
+							// no sphere (the head sphere always remains).
+							auto hand_pos = [&](std::optional<xr::hand_tracker> & tracker,
+							                    xr::spaces grip) -> std::optional<glm::vec3> {
+								if (tracker)
+								{
+									if (auto located = tracker->locate(prox_space, sync_display_time))
+									{
+										const auto & palm = located->joints[XR_HAND_JOINT_PALM_EXT].first;
+										if (palm.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+										{
+											return glm::vec3(palm.pose.position.x, palm.pose.position.y,
+											                 palm.pose.position.z);
+										}
+									}
+								}
+								if (auto grip_pos = application::locate_controller(application::space(grip),
+								                                                   prox_space, sync_display_time))
+									return grip_pos->first;
+								return std::nullopt;
+							};
+							std::optional<glm::vec3> palm_l = hand_pos(prox_left_hand, xr::spaces::grip_left);
+							std::optional<glm::vec3> palm_r = hand_pos(prox_right_hand, xr::spaces::grip_right);
+							auto push_sphere = [&](glm::vec3 c, float r) {
+								if (r <= 0)
+									return; // degenerate: field stays cleared, fail-closed
+								glm::mat4 sphere_model =
+								        glm::translate(glm::mat4(1), c) *
+								        glm::scale(glm::mat4(1), glm::vec3(r));
+								std::array<glm::mat4, 2> sm;
+								for (uint32_t view = 0; view < view_count; ++view)
+									sm[view] = server_mvp[view] * sphere_model;
+								proximity_spheres.push_back(sm);
+							};
 							{
 								const auto & p0 = sync_pose[0].position;
 								const auto & p1 = sync_pose[1].position;
@@ -2709,17 +2759,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								                 (p0.z + p1.z) * 0.5f);
 								for (auto & s: hidden_silhouettes)
 								{
-									float radius = 0.5f;
+									float head_r = 0.5f, hand_r = 0.3f;
 									auto soit = passthrough_objects.find(s.mesh);
 									if (soit != passthrough_objects.end())
-										radius = std::max(0.f, soit->second.def.proximity_radius_m);
-									glm::mat4 sphere_model =
-									        glm::translate(glm::mat4(1), center) *
-									        glm::scale(glm::mat4(1), glm::vec3(radius));
-									std::array<glm::mat4, 2> sm;
-									for (uint32_t view = 0; view < view_count; ++view)
-										sm[view] = server_mvp[view] * sphere_model;
-									proximity_spheres.push_back(sm);
+									{
+										head_r = std::max(0.f, soit->second.def.proximity_radius_m);
+										hand_r = std::max(0.f, soit->second.def.hand_proximity_radius_m);
+									}
+									push_sphere(center, head_r);
+									if (palm_l)
+										push_sphere(*palm_l, hand_r);
+									if (palm_r)
+										push_sphere(*palm_r, hand_r);
 								}
 							}
 							hidden_mask_draws.reserve(hidden_silhouettes.size());

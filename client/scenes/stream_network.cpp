@@ -212,10 +212,11 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 			if (obj.model_hash.empty())
 				spdlog::info("Passthrough object \"{}\" ({}): no model", label, obj.type);
 			else
-				spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes) dots pitch {:.2f}m reveal {:.2f}m #{:02X}{:02X}{:02X}",
+				spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes) dots pitch {:.2f}m reveal {:.2f}m hands {:.2f}m #{:02X}{:02X}{:02X}",
 				             label, obj.type, obj.model_hash.substr(0, 8), obj.model_size,
 				             (double)obj.dot_pitch_m,
 				             (double)std::max(0.f, obj.proximity_radius_m),
+				             (double)std::max(0.f, obj.hand_proximity_radius_m),
 				             (unsigned)lroundf(std::clamp(obj.dot_color[0], 0.f, 1.f) * 255.f),
 				             (unsigned)lroundf(std::clamp(obj.dot_color[1], 0.f, 1.f) * 255.f),
 				             (unsigned)lroundf(std::clamp(obj.dot_color[2], 0.f, 1.f) * 255.f));

@@ -577,7 +577,7 @@ void wivrn_session::send_fiducial_map()
 		        .dot_pitch_m = entry.dot_pitch_m,
 		        .dot_color = entry.dot_color,
 		        .proximity_radius_m = entry.proximity_radius_m,
-		        .pulse_strength = entry.pulse_strength,
+		        .hand_proximity_radius_m = entry.hand_proximity_radius_m,
 		};
 
 		// Display label: the tag, or the id when untagged.

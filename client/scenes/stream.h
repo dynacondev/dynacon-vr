@@ -786,6 +786,11 @@ private:
 	// the mask phase builds draws below; the dots record reuses them.
 	// Capacity survives clear(). Render thread only.
 	std::vector<std::array<glm::mat4, 2>> proximity_spheres;
+	// Dedicated hand trackers for the proximity palms (not the GUI
+	// pair: their lifecycle follows GUI interactability and would churn
+	// here). Created on demand under hidden_known, dropped with the map.
+	std::optional<xr::hand_tracker> prox_left_hand;
+	std::optional<xr::hand_tracker> prox_right_hand;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;
