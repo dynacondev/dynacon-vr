@@ -88,9 +88,10 @@ public:
 
 	// Borrowed GPU mesh buffers for the dots overlay (binds these for its
 	// own silhouette raster; feather keeps owning upload + eviction).
-	// Nullopt when unknown OR an upload is still pending (the GPU copy
-	// lands in this mask record — the borrower skips one frame rather
-	// than binding stale data).
+	// Nullopt when unknown OR an upload is still pending (no flush ran
+	// ahead of this borrow — e.g. empty mask draws or a skipped mask
+	// record). On flush frames the copy + barrier precede the borrower in
+	// the same command buffer, so it binds fresh data immediately.
 	struct borrowed_mesh
 	{
 		vk::Buffer vertex_buffer;

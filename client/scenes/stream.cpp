@@ -1794,9 +1794,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// draw list and the dots draw list + scissor: model/MVP/visibility
 		// computed once instead of per consumer (plus the old third copy,
 		// the scissor re-projection in the dots renderer, which rides the
-		// corners below). Unified 1px extents margin: a superset of the old
-		// mask mw/mh margin, so the mask may keep a ≤1px sliver it
-		// previously skipped — visually identical, exact for dots.
+		// corners below). 1px margin per eye floored by the mask working
+		// size: a superset of the old mask margin for every eye, so the
+		// mask may keep a ≤1px sliver it previously skipped — visually
+		// identical, exact for dots.
 		// Full-res pixel bounds per eye ride along for the dots scissor
 		// (any behind-camera corner → fullscreen that eye).
 		struct hidden_silhouette_draw
@@ -1808,7 +1809,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			float pitch = 0.1f;
 		};
 		std::vector<hidden_silhouette_draw> hidden_silhouettes;
-		auto build_hidden_silhouettes = [&]() {
+		auto build_hidden_silhouettes = [&](int mask_w, int mask_h) {
 			hidden_silhouettes.clear();
 			auto * fr = hidden_group.renderer.get();
 			if (not fr)
@@ -1833,8 +1834,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					s.px[view] = {0, 0, (float)extents[view].width, (float)extents[view].height};
 				// Frustum skip (draw on unknown bounds: mesh sync above
 				// uploads before draws, so unexpected — keep the draw).
+				// 1px margin per eye, floored by the mask working size so
+				// the shared test stays a superset of the old mask margin
+				// even under asymmetric eyes.
 				bool visible = true;
 				if (auto bounds = fr->mesh_bounds(oid))
+				{
+					visible = false;
+					for (uint32_t view = 0; view < 2 and not visible; ++view)
+					{
+						float denom_w = std::min((float)mask_w, (float)extents[view].width);
+						float denom_h = std::min((float)mask_h, (float)extents[view].height);
+						bool any_front = false, any_behind = false, any_inside = false;
 				{
 					visible = false;
 					for (uint32_t view = 0; view < 2 and not visible; ++view)
@@ -1854,8 +1865,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								continue;
 							}
 							any_front = true;
-							if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)extents[view].width * 0.5f)) and
-							    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)extents[view].height * 0.5f)) and c.z >= 0 and c.z <= c.w)
+							if (glm::abs(c.x) <= c.w * (1.f + 1.f / (denom_w * 0.5f)) and
+							    glm::abs(c.y) <= c.w * (1.f + 1.f / (denom_h * 0.5f)) and c.z >= 0 and c.z <= c.w)
 								any_inside = true;
 							float px = (c.x / c.w * 0.5f + 0.5f) * (float)extents[view].width;
 							float py = (c.y / c.w * 0.5f + 0.5f) * (float)extents[view].height;
@@ -2656,7 +2667,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						{
 							// Silhouettes built once above (shared with the
 							// dots below): map straight to mask draws.
-							build_hidden_silhouettes();
+							build_hidden_silhouettes(mw, mh);
 							std::vector<feather_mask_renderer::instance_draw> draws;
 							for (auto & s: hidden_silhouettes)
 								draws.push_back({s.mesh, s.mvp, opacity, false});
