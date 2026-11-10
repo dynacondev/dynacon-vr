@@ -23,11 +23,12 @@
 //
 // Composited as ONE transparent projection layer (standard alpha blend,
 // above the flat passthrough, below gizmos/GUI) so the maxLayerCount
-// discipline holds. Own swapchain + own depth (self-occluding, backface
-// culled), CLEAR every frame. Face normals come from screen-space
+// discipline holds. Own swapchain + own depth (self-occluding via depth,
+// no culling: open single-sided furniture reads from either side), CLEAR
+// every frame. Face normals come from screen-space
 // derivatives of the world position (no normal attributes: the triangle
 // soup carries positions only). No translucent fill by design (stage 1):
-// grid lines + rim only. Render thread only.
+// grid lines only. Render thread only.
 
 #include <array>
 #include <cstddef>
@@ -61,7 +62,9 @@ public:
 	// One silhouette draw: which uploaded mesh, per-eye clip transforms,
 	// rigid uniform-scale placement (rebuilt in-shader from pos/quat/scale
 	// so the push block stays within the 128-byte minimum guarantee),
-	// per-object grid style, and per-eye camera positions for the rim.
+	// per-object grid style, and per-eye line width. cam_pos carries the
+	// eye world position per eye: reserved ballast keeping the 128B push
+	// layout (only .w is read).
 	struct instance_draw
 	{
 		std::string mesh;
