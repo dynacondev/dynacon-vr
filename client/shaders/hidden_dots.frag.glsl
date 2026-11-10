@@ -20,11 +20,17 @@
 
 // Trivial circle falloff inside the billboard quad (quad space: the dot
 // edge is at 1.0 by construction). 1px AA band; subpixel dots fade by
-// coverage instead of popping (no shimmer at distance).
+// coverage instead of popping (no shimmer at distance). Occlusion is a
+// single center-depth compare against the prepass (whole circles live or
+// die — never half-chopped by geometry edges).
 layout(location = 0) in vec2 vUv;
 layout(location = 1) in float vW;
+layout(location = 2) in vec2 vCenterUV;
+layout(location = 3) in float vCenterDepth;
 
 layout(location = 0) out vec4 out_color;
+
+layout(set = 0, binding = 0) uniform sampler2D depthTex;
 
 layout(push_constant) uniform PushConstants
 {
@@ -36,6 +42,11 @@ pc;
 
 void main()
 {
+	// Reversed-Z (nearer = larger): visible iff the center sits ahead of
+	// the prepass surface. Own face passes strictly via the 2mm nudge;
+	// eps guards D16 quantization only.
+	if (vCenterDepth + 1e-4 < texture(depthTex, vCenterUV).r)
+		discard;
 	float d = length(vUv);
 	float pitch = max(pc.color_pitch.w, 1e-4);
 	float px_per_m = (pc.view_params.y * 0.5) * abs(pc.view_params.z) / max(vW, 1e-3);

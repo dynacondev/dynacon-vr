@@ -30,6 +30,8 @@ layout(location = 2) in vec3 normal; // per-instance, object-space face normal
 
 layout(location = 0) out vec2 vUv; // quad space: 1.0 == dot radius
 layout(location = 1) out float vW; // clip w (view distance) for the radius/AA
+layout(location = 2) out vec2 vCenterUV; // dot-center sample point in the depth image
+layout(location = 3) out float vCenterDepth; // dot-center depth (same mapping the prepass stores)
 
 layout(push_constant) uniform PushConstants
 {
@@ -59,6 +61,11 @@ void main()
 	float r_px = pc.view_params.w * pitch * px_per_m;
 	vUv = corner;
 	vW = w;
+	// Center sample point for the occlusion compare below (same NDC→UV
+	// mapping the viewport uses, so it lands on the prepass texel under
+	// the dot center; depth in the mapping the prepass stores).
+	vCenterUV = clip.xy / max(w, 1e-6) * 0.5 + 0.5;
+	vCenterDepth = clip.z / max(w, 1e-6);
 	if (w <= 1e-6 || facing >= 0.0)
 	{
 		// Behind the camera or backfacing: collapse outside clip space.

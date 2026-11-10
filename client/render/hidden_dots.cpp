@@ -88,7 +88,8 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	                .arrayLayers = 2,
 	                .samples = vk::SampleCountFlagBits::e1,
 	                .tiling = vk::ImageTiling::eOptimal,
-	                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment,
+	                // Written by the prepass, sampled by the dots pass.
+	                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled,
 	                .sharingMode = vk::SharingMode::eExclusive,
 	                .initialLayout = vk::ImageLayout::eUndefined,
 	        },
@@ -112,6 +113,31 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		                                                       },
 		                                               });
 	}
+	// One set per eye over the single-layer depth view (depth image is
+	// renderer-owned, so this runs on rebuild only, never per frame).
+	descriptor_sets.clear();
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		vk::DescriptorSetAllocateInfo set_alloc{
+		        .descriptorPool = *descriptor_pool,
+		        .descriptorSetCount = 1,
+		        .pSetLayouts = &*descriptor_layout,
+		};
+		descriptor_sets.emplace_back(std::move(device->allocateDescriptorSets(set_alloc)[0]));
+		vk::DescriptorImageInfo depth_info{
+		        .sampler = *depth_sampler,
+		        .imageView = *depth_views[eye],
+		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		};
+		vk::WriteDescriptorSet depth_write{
+		        .dstSet = *descriptor_sets[eye],
+		        .dstBinding = 0,
+		        .descriptorCount = 1,
+		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		        .pImageInfo = &depth_info,
+		};
+		device->updateDescriptorSets(depth_write, {});
+	}
 	targets.clear();
 	for (vk::Image image: swapchain_.images())
 	{
@@ -131,16 +157,26 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 			        },
 			};
 			targets.back()[eye].view = vk::raii::ImageView(*device, iv_info);
-			vk::ImageView attachments[2] = {*targets.back()[eye].view, *depth_views[eye]};
+			vk::ImageView color_view = *targets.back()[eye].view;
 			vk::FramebufferCreateInfo fb_info{
-			        .renderPass = *renderpass,
-			        .attachmentCount = 2,
-			        .pAttachments = attachments,
+			        .renderPass = *color_renderpass,
+			        .attachmentCount = 1,
+			        .pAttachments = &color_view,
 			        .width = extent_.width,
 			        .height = extent_.height,
 			        .layers = 1,
 			};
 			targets.back()[eye].framebuffer = vk::raii::Framebuffer(*device, fb_info);
+			vk::ImageView depth_view = *depth_views[eye];
+			vk::FramebufferCreateInfo depth_fb_info{
+			        .renderPass = *depth_renderpass,
+			        .attachmentCount = 1,
+			        .pAttachments = &depth_view,
+			        .width = extent_.width,
+			        .height = extent_.height,
+			        .layers = 1,
+			};
+			targets.back()[eye].depth_framebuffer = vk::raii::Framebuffer(*device, depth_fb_info);
 		}
 	}
 }
@@ -186,6 +222,40 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 		std::memcpy(quad_.map(), corners, sizeof(corners));
 		quad_.unmap();
 	}
+	// Sampled-depth plumbing (dots pass reads the prepass output at the
+	// dot centers): one set layout + pool for the two per-eye sets
+	// written in ensure(), plus a nearest sampler (exact texel: linear
+	// would blend occluder/background depths across edges). Recreated
+	// with everything else on rebuild (move-assign drops the old).
+	vk::DescriptorSetLayoutBinding depth_binding{
+	        .binding = 0,
+	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	        .descriptorCount = 1,
+	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	};
+	descriptor_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
+	                                                                 .bindingCount = 1,
+	                                                                 .pBindings = &depth_binding,
+	                                                         });
+	vk::SamplerCreateInfo sampler_info{
+	        .magFilter = vk::Filter::eNearest,
+	        .minFilter = vk::Filter::eNearest,
+	        .mipmapMode = vk::SamplerMipmapMode::eNearest,
+	        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+	        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+	        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+	        .maxLod = 0,
+	};
+	depth_sampler = vk::raii::Sampler(*device, sampler_info);
+	vk::DescriptorPoolSize pool_size{
+	        .type = vk::DescriptorType::eCombinedImageSampler,
+	        .descriptorCount = 2,
+	};
+	descriptor_pool = vk::raii::DescriptorPool(*device, vk::DescriptorPoolCreateInfo{
+	                                                           .maxSets = 2,
+	                                                           .poolSizeCount = 1,
+	                                                           .pPoolSizes = &pool_size,
+	                                                   });
 	auto vert = load_shader(*device, "hidden_dots.vert");
 	auto frag = load_shader(*device, "hidden_dots.frag");
 
@@ -266,17 +336,12 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
 	};
 
-	// No depth attachment, no test, no writes: dots draw over whatever the
-	// layers below composed.
+	// No depth attachment in the dots pass: occlusion is a sampled
+	// center-depth compare in the fragment shader (whole circles live or
+	// die), not a per-pixel test (which would chop circles at edges).
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil{
-	        // Reversed-Z MVPs (near = 1, far = 0, mask precedent): nearer
-	        // wins with GREATER. The fill pass below clears 0 (far) and
-	        // writes the mesh; dots test against it. Dots ride 2mm toward
-	        // the camera off their face plane (vertex shader), so own-face
-	        // tests pass strictly while occluded faces fail.
-	        .depthTestEnable = VK_TRUE,
+	        .depthTestEnable = VK_FALSE,
 	        .depthWriteEnable = VK_FALSE,
-	        .depthCompareOp = vk::CompareOp::eGreater,
 	};
 
 	// Depth-fill twin: mesh triangles only, color writes off, depth write
@@ -286,14 +351,6 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .depthTestEnable = VK_TRUE,
 	        .depthWriteEnable = VK_TRUE,
 	        .depthCompareOp = vk::CompareOp::eGreater,
-	};
-	vk::PipelineColorBlendAttachmentState fill_blend_attachment{
-	        .blendEnable = VK_FALSE,
-	        .colorWriteMask = vk::ColorComponentFlags{},
-	};
-	vk::PipelineColorBlendStateCreateInfo fill_blend{
-	        .attachmentCount = 1,
-	        .pAttachments = &fill_blend_attachment,
 	};
 	vk::VertexInputBindingDescription fill_binding{
 	        .binding = 0,
@@ -343,6 +400,8 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .size = sizeof(push),
 	};
 	vk::PipelineLayoutCreateInfo layout_info{
+	        .setLayoutCount = 1,
+	        .pSetLayouts = &*descriptor_layout,
 	        .pushConstantRangeCount = 1,
 	        .pPushConstantRanges = &push_range,
 	};
@@ -350,49 +409,72 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 
 	// Color CLEAR on UNDEFINED every frame (no layout history ever assumed,
 	// gizmo precedent). Final GENERAL for the color (universally samplable
-	// at submit, mask precedent). Depth is CLEAR-once per pass, never
-	// sampled: D16, same extent as the color target.
-	vk::AttachmentDescription attachments[2] = {
-	        vk::AttachmentDescription{
-	                .format = format,
-	                .samples = vk::SampleCountFlagBits::e1,
-	                .loadOp = vk::AttachmentLoadOp::eClear,
-	                .storeOp = vk::AttachmentStoreOp::eStore,
-	                .initialLayout = vk::ImageLayout::eUndefined,
-	                .finalLayout = vk::ImageLayout::eGeneral,
-	        },
-	        vk::AttachmentDescription{
-	                .format = vk::Format::eD16Unorm,
-	                .samples = vk::SampleCountFlagBits::e1,
-	                .loadOp = vk::AttachmentLoadOp::eClear,
-	                .storeOp = vk::AttachmentStoreOp::eDontCare,
-	                .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
-	                .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
-	                .initialLayout = vk::ImageLayout::eUndefined,
-	                .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
-	        },
+	// at submit, mask precedent).
+	vk::AttachmentDescription color_attachment{
+	        .format = format,
+	        .samples = vk::SampleCountFlagBits::e1,
+	        .loadOp = vk::AttachmentLoadOp::eClear,
+	        .storeOp = vk::AttachmentStoreOp::eStore,
+	        .initialLayout = vk::ImageLayout::eUndefined,
+	        .finalLayout = vk::ImageLayout::eGeneral,
 	};
 	vk::AttachmentReference color_ref{
 	        .attachment = 0,
 	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
-	vk::AttachmentReference depth_ref{
-	        .attachment = 1,
-	        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
-	};
-	vk::SubpassDescription subpass{
+	vk::SubpassDescription color_subpass{
 	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
 	        .colorAttachmentCount = 1,
 	        .pColorAttachments = &color_ref,
+	};
+	vk::RenderPassCreateInfo color_renderpass_info{
+	        .attachmentCount = 1,
+	        .pAttachments = &color_attachment,
+	        .subpassCount = 1,
+	        .pSubpasses = &color_subpass,
+	};
+	color_renderpass = vk::raii::RenderPass(*device, color_renderpass_info);
+
+	// Depth-only prepass: CLEAR every frame (initial UNDEFINED is the
+	// transient-target idiom — contents discarded, cleared anyway),
+	// STORE + shader-readable final so the dots pass samples it. The
+	// subpass dependency carries the write→read hazard (no manual
+	// barrier between the passes).
+	vk::AttachmentDescription depth_attachment{
+	        .format = vk::Format::eD16Unorm,
+	        .samples = vk::SampleCountFlagBits::e1,
+	        .loadOp = vk::AttachmentLoadOp::eClear,
+	        .storeOp = vk::AttachmentStoreOp::eStore,
+	        .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+	        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+	        .initialLayout = vk::ImageLayout::eUndefined,
+	        .finalLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	};
+	vk::AttachmentReference depth_ref{
+	        .attachment = 0,
+	        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	};
+	vk::SubpassDescription depth_subpass{
+	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
 	        .pDepthStencilAttachment = &depth_ref,
 	};
-	vk::RenderPassCreateInfo renderpass_info{
-	        .attachmentCount = 2,
-	        .pAttachments = attachments,
-	        .subpassCount = 1,
-	        .pSubpasses = &subpass,
+	vk::SubpassDependency depth_dep{
+	        .srcSubpass = 0,
+	        .dstSubpass = VK_SUBPASS_EXTERNAL,
+	        .srcStageMask = vk::PipelineStageFlagBits::eLateFragmentTests,
+	        .dstStageMask = vk::PipelineStageFlagBits::eFragmentShader,
+	        .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+	        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
 	};
-	renderpass = vk::raii::RenderPass(*device, renderpass_info);
+	vk::RenderPassCreateInfo depth_renderpass_info{
+	        .attachmentCount = 1,
+	        .pAttachments = &depth_attachment,
+	        .subpassCount = 1,
+	        .pSubpasses = &depth_subpass,
+	        .dependencyCount = 1,
+	        .pDependencies = &depth_dep,
+	};
+	depth_renderpass = vk::raii::RenderPass(*device, depth_renderpass_info);
 
 	vk::GraphicsPipelineCreateInfo pipeline_info{
 	        .stageCount = 2,
@@ -406,7 +488,7 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .pColorBlendState = &blend,
 	        .pDynamicState = &dynamic,
 	        .layout = *pipeline_layout,
-	        .renderPass = *renderpass,
+	        .renderPass = *color_renderpass,
 	};
 	pipeline = vk::raii::Pipeline(*device, *pipe_cache, pipeline_info);
 
@@ -433,10 +515,12 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .pRasterizationState = &rasterization,
 	        .pMultisampleState = &multisample,
 	        .pDepthStencilState = &fill_depth_stencil,
-	        .pColorBlendState = &fill_blend,
+	        // Depth-only subpass: no color blend state (null, not a
+	        // zero-mask attachment).
+	        .pColorBlendState = nullptr,
 	        .pDynamicState = &dynamic,
 	        .layout = *pipeline_layout,
-	        .renderPass = *renderpass,
+	        .renderPass = *depth_renderpass,
 	};
 	fill_pipeline = vk::raii::Pipeline(*device, *pipe_cache, fill_pipeline_info);
 }
@@ -499,23 +583,23 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 				                     .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
 		}
 		cmd.setScissor(0, scissor);
-		vk::ClearValue clears[2]{};
-		clears[0].color.float32.fill(0);
-		// Reversed-Z (near = 1, far = 0): clear far, GREATER wins.
-		clears[1].depthStencil = {.depth = 0.f, .stencil = 0};
-		vk::RenderPassBeginInfo begin_info{
-		        .renderPass = *renderpass,
-		        .framebuffer = *tgt.framebuffer,
+		// Pass 1: depth prepass (mesh triangles resolve nearest-surface
+		// per pixel; reversed-Z: clear far 0, GREATER wins). A zero union
+		// for this eye still begins/ends both passes (clear-only): the
+		// images start UNDEFINED and the compositor samples the full
+		// color rect.
+		vk::ClearValue depth_clear{};
+		depth_clear.depthStencil = {.depth = 0.f, .stencil = 0};
+		vk::RenderPassBeginInfo depth_begin{
+		        .renderPass = *depth_renderpass,
+		        .framebuffer = *tgt.depth_framebuffer,
 		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
-		        .clearValueCount = 2,
-		        .pClearValues = clears,
+		        .clearValueCount = 1,
+		        .pClearValues = &depth_clear,
 		};
-		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+		cmd.beginRenderPass(depth_begin, vk::SubpassContents::eInline);
 		if (any)
 		{
-			// Depth prepass: mesh triangles resolve nearest-surface per
-			// pixel, so dots on occluded faces fail the test below and
-			// never show through. Color writes off.
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *fill_pipeline);
 			for (const auto & d: draws)
 			{
@@ -531,7 +615,26 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
 				cmd.drawIndexed(d.index_count, 1, 0, 0, 0);
 			}
+		}
+		cmd.endRenderPass();
+		// Pass 2: dots sample the stored depth at their CENTERS (whole
+		// circles live or die — no per-pixel chop). The depth renderpass's
+		// subpass dependency carries the write→read hazard, no manual
+		// barrier.
+		vk::ClearValue color_clear{};
+		color_clear.color.float32.fill(0);
+		vk::RenderPassBeginInfo color_begin{
+		        .renderPass = *color_renderpass,
+		        .framebuffer = *tgt.framebuffer,
+		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
+		        .clearValueCount = 1,
+		        .pClearValues = &color_clear,
+		};
+		cmd.beginRenderPass(color_begin, vk::SubpassContents::eInline);
+		if (any)
+		{
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, *descriptor_sets[eye], {});
 			cmd.bindVertexBuffers(0, (vk::Buffer)quad_, (vk::DeviceSize)0);
 			for (const auto & d: draws)
 			{

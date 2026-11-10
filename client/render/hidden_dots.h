@@ -133,16 +133,28 @@ private:
 	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
-	vk::raii::RenderPass renderpass{nullptr};
+	// Color-only renderpass (CLEAR/STORE/GENERAL) for the dots pass;
+	// depth-only renderpass (CLEAR/STORE, ends shader-readable) for the
+	// prepass. Two passes, not one: the dots sample the stored depth at
+	// their CENTERS (whole circles live or die, never half-chopped).
+	vk::raii::RenderPass color_renderpass{nullptr};
+	vk::raii::RenderPass depth_renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
 	// Depth-fill pipeline (mesh triangles into the depth attachment,
-	// color writes off): the dots pipeline depth-tests against it so
-	// occluded faces never show through. Shared layout (subset of push).
+	// color writes off): the dots sample its output, they don't
+	// depth-test against it. Shared layout (subset of push).
 	vk::raii::Pipeline fill_pipeline{nullptr};
 	// Depth target (D16, half-res, 2 layers + one single-layer view per
-	// eye), recreated with the swapchain in ensure().
+	// eye), recreated with the swapchain in ensure(). Sampled by the
+	// dots pass (nearest: exact texel, no cross-edge blending).
 	image_allocation depth_;
 	std::array<vk::raii::ImageView, 2> depth_views{nullptr, nullptr};
+	// One descriptor set per eye over the single-layer depth view above
+	// (rewritten on rebuild, not per frame). Nearest sampler.
+	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
+	vk::raii::DescriptorPool descriptor_pool{nullptr};
+	std::vector<vk::raii::DescriptorSet> descriptor_sets;
+	vk::raii::Sampler depth_sampler{nullptr};
 	// Static billboard quad (6 corners, -1..1, non-indexed), uploaded
 	// once with the pipeline. Per-dot data arrives per draw as
 	// instanced attributes from the borrowed feather buffer.
@@ -155,7 +167,8 @@ private:
 	struct target
 	{
 		vk::raii::ImageView view{nullptr};
-		vk::raii::Framebuffer framebuffer{nullptr};
+		vk::raii::Framebuffer framebuffer{nullptr}; // color pass
+		vk::raii::Framebuffer depth_framebuffer{nullptr}; // prepass
 	};
 	// [image][eye], parallel to the swapchain image list.
 	std::vector<std::array<target, 2>> targets;
