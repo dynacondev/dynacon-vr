@@ -91,13 +91,13 @@ public:
 	// Nullopt when unknown OR an upload is still pending (the GPU copy
 	// lands in this mask record — the borrower skips one frame rather
 	// than binding stale data).
-	struct borrowed_mesh_buffers
+	struct borrowed_mesh
 	{
 		vk::Buffer vertex_buffer;
 		vk::Buffer index_buffer;
 		uint32_t index_count;
 	};
-	std::optional<borrowed_mesh_buffers> borrowed_mesh_buffers(const std::string & key) const;
+	std::optional<borrowed_mesh> borrowed_mesh_buffers(const std::string & key) const;
 
 	// One silhouette draw: which uploaded mesh, per-eye transforms, and
 	// the first-acquisition fade opacity (presence 0..1 for both
