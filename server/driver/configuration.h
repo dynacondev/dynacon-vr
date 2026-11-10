@@ -106,8 +106,8 @@ struct configuration
 		// runtime depth map resolves inside the model volume (depth-tested
 		// volume, feathered like a normal window). "3d-passthrough-hidden"
 		// renders the model as a hard-edged always-on passthrough cutout
-		// on its own mask layer (reversed cuts never apply) plus a
-		// world-space warning grid overlay. Unknown types are skipped
+		// on its own mask layer (reversed cuts never apply) plus a flat
+		// warning outline around the silhouette. Unknown types are skipped
 		// with a warning (forward-compat).
 		std::string type = "3d-passthrough";
 		std::string id;
@@ -137,11 +137,11 @@ struct configuration
 		// surface (symmetric smoothstep, 0.5 at the surface). 0 = hard
 		// step at the surface. Ignored for other types (warned).
 		float transition_distance_m = 0.3f;
-		// Hidden-object warning grid (3d-passthrough-hidden only):
-		// world-space triplanar line spacing in meters (default 0.1,
-		// clamped to [0.01, 1]). Ignored for other types (warned).
+		// Reserved for future use (3d-passthrough-hidden only): parsed and
+		// forwarded, but the warning outline currently has a fixed world
+		// width. Ignored for other types (warned).
 		float grid_scale_m = 0.1f;
-		// Hidden-object warning grid color as RGB 0..1, parsed from a
+		// Hidden-object warning outline color as RGB 0..1, parsed from a
 		// "#RRGGBB" hex string as-authored (no colorspace conversion;
 		// default #80D4FF light blue). Ignored for other types (warned).
 		std::array<float, 3> grid_color = {128.f / 255.f, 212.f / 255.f, 1.0f};
