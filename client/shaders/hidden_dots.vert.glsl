@@ -18,12 +18,14 @@
 
 #version 450
 
-// Plain MVP plus the object-space position for the fragment-stage dot
-// pattern. No placement rebuild, no center math: the dots live in model
+// Plain MVP plus the pitch-normalized object-space position for the
+// fragment-stage dot pattern. The pitch division lives here (linear
+// interpolation keeps it visually identical) so no per-pixel divide
+// runs. No placement rebuild, no center math: the dots live in model
 // space, which is world space up to the (uniform, ~1) placement scale.
 layout(location = 0) in vec3 pos;
 
-layout(location = 0) out vec3 vObj;
+layout(location = 0) out vec3 vQ;
 
 layout(push_constant) uniform PushConstants
 {
@@ -34,6 +36,6 @@ pc;
 
 void main()
 {
-	vObj = pos;
+	vQ = pos / max(pc.color_pitch.w, 1e-4);
 	gl_Position = pc.mvp * vec4(pos, 1.0);
 }

@@ -20,30 +20,29 @@
 
 // Fixed world-size dot grid: the dot function runs on all three axis
 // pairs and takes the minimum, so every face is covered with no normals,
-// no axis selection, no derivatives. Radius is cell-relative (0.18), so
-// dots scale with the pitch and stay perspective-correct for free.
+// no axis selection, no derivatives. Radius is cell-relative (0.045),
+// so dots scale with the pitch and stay perspective-correct for free.
 // Non-dot pixels discard (no depth to punch holes in — pure bandwidth
-// win, ~90% of the silhouette skips blending).
-layout(location = 0) in vec3 vObj;
+// win, ~99% of the silhouette skips blending).
+layout(location = 0) in vec3 vQ;
 
 layout(location = 0) out vec4 out_color;
 
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp;
-	vec4 color_pitch; // rgb: dot color, w: dot pitch (m)
+	vec4 color_pitch; // rgb: dot color, w: dot pitch (m, read in vertex)
 }
 pc;
 
 void main()
 {
-	vec3 q = vObj / max(pc.color_pitch.w, 1e-4);
 	vec3 d2 = vec3(
-	        length(fract(q.xy - 0.5) - 0.5),
-	        length(fract(q.xz - 0.5) - 0.5),
-	        length(fract(q.yz - 0.5) - 0.5));
+	        length(fract(vQ.xy - 0.5) - 0.5),
+	        length(fract(vQ.xz - 0.5) - 0.5),
+	        length(fract(vQ.yz - 0.5) - 0.5));
 	float m = min(d2.x, min(d2.y, d2.z));
-	float dot_ = 1.0 - smoothstep(0.16, 0.20, m);
+	float dot_ = 1.0 - smoothstep(0.03, 0.06, m);
 	if (dot_ <= 0.001)
 		discard;
 	out_color = vec4(pc.color_pitch.rgb, dot_);
