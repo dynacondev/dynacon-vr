@@ -414,7 +414,8 @@ frame, live or held.
 Each `passthrough` entry has:
 
 - `type`: behavior type (required). `"3d-passthrough"` renders the
-  model as a surface-projected passthrough cutout; unknown types are
+  model as a flat-feed passthrough cutout through the single merged
+  alpha layer; unknown types are
   skipped with a warning. Where a warped virtual-depth frame is paired,
   VR content also occludes the cutout eye-space (`virt < object` at
   half stream resolution, feathered like a silhouette edge). `"3d-passthrough-reversed"` reverse-cuts
@@ -478,22 +479,13 @@ Each `passthrough` entry has:
   negatives cut every
   layer and inherit each layer's feathering, while zones fade by
   distance instead (see `transition-distance`) and hidden cutouts are
-  hard-edged (composited through the shared union-B layer).
+  hard-edged (composited through the shared merged layer).
 - `transition-distance`: boundary fade width in meters
   (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
   scene cross-fades over ± this distance around the zone surface
   (symmetric smoothstep, 0.5 at the surface); `0` is a hard step.
   Composited by lifting the flat union's mask floor, so no extra layers
   or swapchains: exiting saturates the existing flat feed to fullscreen.
-- `surface-projected`: the headset projects camera imagery onto this
-  object's mesh instead of the flat reconstruction feed (default
-  `false`; opt in per object with `true`, plus a live in-headset
-  override in the Passthrough tab). Ignored for
-  `3d-passthrough-reversed`, `3d-boundary(-reversed)`,
-  `3d-depth-passthrough` or `3d-passthrough-hidden` (warned + ignored):
-  zones never map camera
-  onto geometry, depth volumes always reveal the flat feed, and hidden
-  objects always reveal the flat feed (through the shared union-B layer).
 - `dot-pitch`: hidden dot pitch in meters
   (`3d-passthrough-hidden` only, default `0.05`, clamped to
   `[0.01, 1]`, applied live). Fixed world-size dots wrapping the mesh
