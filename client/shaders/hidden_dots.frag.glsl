@@ -44,7 +44,9 @@ void main()
 {
 	// Reversed-Z (nearer = larger): visible iff the center sits ahead of
 	// the prepass surface. Own face passes strictly via the 2mm nudge;
-	// eps guards D16 quantization only.
+	// eps guards D16 quantization only. Range note: the 1/w depth mapping
+	// makes this tolerance worth ~2cm at 2m but much looser far out —
+	// distant dots barely occlude, inherent to the mapping, not the eps.
 	if (vCenterDepth + 1e-4 < texture(depthTex, vCenterUV).r)
 		discard;
 	float d = length(vUv);

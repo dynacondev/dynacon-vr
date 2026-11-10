@@ -62,7 +62,7 @@ public:
 	// by both shaders (quad size + circle edge), so they can't disagree.
 	// Floor note: radii far below ~0.08 cells go subpixel at room range
 	// (2m, 5cm pitch) and fade by coverage — invisible, not broken.
-	static constexpr float dot_radius_cells = 0.005f;
+	static constexpr float dot_radius_cells = 0.05f;
 	// One silhouette draw: per-eye clip transforms (placement already
 	// baked in), dot color + pitch, per-eye scissor rects (dots pixel
 	// space, computed stream-side from the same cull corners), per-eye

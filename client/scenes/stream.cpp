@@ -2670,6 +2670,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									g.renderer->remove_mesh(key);
 								g.mesh_hashes.clear();
 								hidden_dot_pitch.clear();
+								// Map no longer carries hidden objects: drop
+								// the dots renderer too (swapchain + depth),
+								// not just the meshes. Recreated on demand
+								// under hidden_known below; nothing is
+								// submitted while inactive.
+								hidden_dots.reset();
 							}
 						}
 						else
