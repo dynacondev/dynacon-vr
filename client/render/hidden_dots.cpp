@@ -684,10 +684,9 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		// the rest). Degenerate draws are skipped outright (nothing
 		// visible: saves the draw call too). The render-area CLEAR stays
 		// full (correctness); an all-degenerate eye still begins/ends
-		// both passes (clear-only): the images start UNDEFINED and the
-		// compositor samples the full rect.
-		auto clamp_scissor = [&](const vk::Rect2D & r, const vk::Extent2D & ext, vk::Rect2D & out) {
-			int32_t x0 = std::max(r.offset.x, 0);
+		// all three passes (clear-only): the images start UNDEFINED and
+		// the compositor samples the full rect.
+		auto clamp_scissor = [&](const vk::Rect2D & r, const vk::Extent2D & ext, vk::Rect2D & out) {			int32_t x0 = std::max(r.offset.x, 0);
 			int32_t y0 = std::max(r.offset.y, 0);
 			int32_t x1 = std::min(r.offset.x + (int32_t)r.extent.width, (int32_t)ext.width);
 			int32_t y1 = std::min(r.offset.y + (int32_t)r.extent.height, (int32_t)ext.height);
@@ -724,8 +723,8 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 			for (const auto & d: draws)
 			{
 				// Unified skip with the dots loop below (index/dot/
-				// scissor): every dots-drawn draw was pushed here, so the
-				// single push below persists correctly into pass 2.
+				// scissor). Each loop pushes its own constants per draw;
+				// nothing persists across passes.
 				vk::Rect2D scissor;
 				if (d.index_count == 0 or d.dot_count == 0 or
 				    not clamp_scissor(d.scissor[eye], extents[eye], scissor))

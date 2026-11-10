@@ -26,10 +26,11 @@
 // Screen-aligned by construction, so every dot is round from any angle
 // and the quad extends a full radius past the center, so triangle edges
 // never slice dots. Backfaces collapse in the vertex shader (facing test
-// on the baked normal). Two pipelines, two passes: a D16 depth prepass
-// of the mesh, then the dots sample that depth at their CENTERS — whole
-// circles live or die, never half-chopped by geometry. Trivial circle
-// fragment with a 1px AA band and coverage fade at distance.
+// on the baked normal). Three pipelines, three passes: a D16 mesh-depth
+// prepass plus a D16 sphere-field prepass, then the dots sample both
+// stored depths at their CENTERS — whole circles live or die, never
+// half-chopped by geometry. Trivial circle fragment with a 1px AA band
+// and coverage fade at distance.
 //
 // Composited as ONE transparent projection layer (standard alpha blend,
 // above the flat passthrough, below gizmos/GUI) so the maxLayerCount
@@ -143,8 +144,9 @@ private:
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	// Color-only renderpass (CLEAR/STORE/GENERAL) for the dots pass;
 	// depth-only renderpass (CLEAR/STORE, ends shader-readable) for the
-	// prepass. Two passes, not one: the dots sample the stored depth at
-	// their CENTERS (whole circles live or die, never half-chopped).
+	// prepasses. The sphere prepass reuses the same depth RP object over
+	// its own image (near-clear for LESS); only clear values and
+	// framebuffers differ.
 	vk::raii::RenderPass color_renderpass{nullptr};
 	// Shared by the mesh prepass (GREATER over a far-clear) and the
 	// proximity sphere prepass (LESS over a near-clear): same D16

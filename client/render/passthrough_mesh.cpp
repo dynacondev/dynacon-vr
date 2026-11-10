@@ -266,7 +266,7 @@ passthrough_mesh::triangle_soup passthrough_mesh::flatten_gltf(const std::filesy
 
 namespace passthrough_mesh
 {
-// Latitude-longitude grid, 16x8 (512 tris incl. degenerate pole rows:
+// Latitude-longitude grid, 16x8 (256 tris incl. degenerate pole rows:
 // harmless, rasterizer culls zero-area). Quad (i,j): a=(i,j), b=(i,j+1),
 // d=(i+1,j), e=(i+1,j+1) with latitude increasing upward; tris (a,e,b) +
 // (a,d,e) wind outward-CCW (verified: equator quad gives +X normals).
