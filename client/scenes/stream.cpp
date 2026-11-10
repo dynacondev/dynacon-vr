@@ -2603,7 +2603,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								// map fingerprint). Two-field compare (hash +
 								// pitch float, exact: same clamped source) —
 								// no per-frame string formatting.
-								float dot_pitch = std::max(0.01f, ost.def.grid_scale_m);
+								// Scale-corrected: the lattice bakes in
+								// object units but grid_scale_m is world
+								// meters, so divide by the model scale (max
+								// axis: never denser than configured under
+								// non-uniform scale). Without this a 0.1x
+								// model bakes a 10x over-dense lattice and
+								// the radius knob reads 10x off.
+								float dot_pitch_world = std::max(0.01f, ost.def.grid_scale_m);
+								float model_scale = std::max({std::abs(ost.fused.world_scale.x),
+								                              std::abs(ost.fused.world_scale.y),
+								                              std::abs(ost.fused.world_scale.z), 1e-6f});
+								float dot_pitch = dot_pitch_world / model_scale;
 								auto mhit = g.mesh_hashes.find(oid);
 								auto phit = hidden_dot_pitch.find(oid);
 								if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash or
@@ -2631,7 +2642,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								        oit->second.soup_ready;
 								if (member)
 								{
-									float dot_pitch = std::max(0.01f, oit->second.def.grid_scale_m);
+									float want_world = std::max(0.01f, oit->second.def.grid_scale_m);
+									float want_scale = std::max({std::abs(oit->second.fused.world_scale.x),
+									                             std::abs(oit->second.fused.world_scale.y),
+									                             std::abs(oit->second.fused.world_scale.z), 1e-6f});
+									float dot_pitch = want_world / want_scale;
 									auto phit = hidden_dot_pitch.find(hit->first);
 									member = hit->second == oit->second.soup_hash and
 									        phit != hidden_dot_pitch.end() and phit->second == dot_pitch;

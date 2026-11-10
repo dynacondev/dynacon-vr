@@ -81,7 +81,9 @@ public:
 	// per frame. Empty soup erases the entry. dot_pitch_m > 0 also bakes
 	// the hidden billboard dot lattice (object-space centers + face
 	// normals for this pitch) into an extra buffer, uploaded and gated
-	// with the mesh; 0 skips it (non-hidden meshes).
+	// with the mesh; 0 skips it (non-hidden meshes). dot_pitch_m is in
+	// OBJECT units: callers pass world_pitch / model_scale so the world
+	// spacing matches the configured pitch at any model scale.
 	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup, float dot_pitch_m = 0);
 	void remove_mesh(const std::string & key);
 	// Model-space AABB for frustum skip (nullopt = unknown key: keep the
