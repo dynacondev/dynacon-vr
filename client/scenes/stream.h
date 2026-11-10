@@ -28,6 +28,7 @@
 #include "render/debug_lines.h"
 #include "render/depth_overlay.h"
 #include "render/feather_mask.h"
+#include "render/hidden_dots.h"
 #include "render/imgui_impl.h"
 #include "render/passthrough_mesh.h"
 #include "scene.h"
@@ -758,6 +759,15 @@ private:
 	// the pulsing B alpha dips, matte — not game video — shows through).
 	// Recorded only while pulse-strength > 0.
 	mask_group hidden_color_group;
+	// Dot overlay over the revealed camera feed: fixed world-size dots in
+	// the config color, front faces only, no depth. Own swapchain,
+	// submitted after the flat layer, before gizmos. -1 = inactive.
+	std::unique_ptr<hidden_dots_renderer> hidden_dots;
+	int hidden_dots_image = -1;
+	bool hidden_dots_active = false;
+	// Uploaded dot meshes by object id (hash compare avoids re-upload;
+	// mirrors hidden_group.mesh_hashes for the mask side).
+	std::map<std::string, std::string> hidden_dots_hashes;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;

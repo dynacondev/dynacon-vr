@@ -3051,6 +3051,154 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
 		}
 
+		// Hidden dot overlay: fixed world-size dots in the config color over
+		// the revealed camera feed. Records on the main command buffer
+		// (after the video wait, so a video stall never leaks the
+		// acquisition). Server eye timebase (server_mvp): the dots must
+		// register with the mask silhouette they annotate.
+		hidden_dots_image = -1;
+		hidden_dots_active = false;
+		if (mask_frame)
+		{
+			bool known_hidden_dots = false; // map-known (placed or not)
+			bool have_hidden_dots = false; // placed + mesh ready
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				(void)oid;
+				if (ost.def.type != "3d-passthrough-hidden")
+					continue;
+				known_hidden_dots = true;
+				if (ost.soup_ready and ost.fused.placed)
+				{
+					have_hidden_dots = true;
+					break;
+				}
+			}
+			if (known_hidden_dots)
+			{
+				auto dots_t0 = std::chrono::steady_clock::now();
+				if (not hidden_dots)
+					hidden_dots = std::make_unique<hidden_dots_renderer>(device, physical_device);
+				hidden_dots->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+				// Mesh sync rides soup readiness, not placement (mirrors the
+				// hidden mask): first-visible frames only rasterize.
+				for (auto hit = hidden_dots_hashes.begin(); hit != hidden_dots_hashes.end();)
+				{
+					auto oit = passthrough_objects.find(hit->first);
+					bool member = oit != passthrough_objects.end() and
+					        oit->second.def.type == "3d-passthrough-hidden" and oit->second.soup_ready and
+					        oit->second.soup_hash == hit->second;
+					if (not member)
+					{
+						hidden_dots->remove_mesh(hit->first);
+						hit = hidden_dots_hashes.erase(hit);
+					}
+					else
+						++hit;
+				}
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready)
+						continue;
+					auto ghit = hidden_dots_hashes.find(oid);
+					if (ghit == hidden_dots_hashes.end() or ghit->second != ost.soup_hash)
+					{
+						hidden_dots->set_mesh(oid, ost.soup);
+						hidden_dots_hashes[oid] = ost.soup_hash;
+					}
+				}
+				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
+			}
+			if (have_hidden_dots)
+			{
+				auto dots_t0 = std::chrono::steady_clock::now();
+				std::vector<hidden_dots_renderer::instance_draw> dots_draws;
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					// Meshes synced in the map-known block above (skip when
+					// unknown — syncs above, so unexpected).
+					auto bounds = hidden_dots->mesh_bounds(oid);
+					if (not bounds)
+						continue;
+					const auto & fu = ost.fused;
+					glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+					            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+					glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+					glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+					                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+					hidden_dots_renderer::instance_draw d;
+					d.mesh = oid;
+					for (uint32_t view = 0; view < view_count; ++view)
+						d.mvp[view] = server_mvp[view] * model;
+					d.color = glm::vec3(ost.def.grid_color[0], ost.def.grid_color[1], ost.def.grid_color[2]);
+					d.pitch = std::max(0.01f, ost.def.grid_scale_m);
+					// Frustum skip (1px margin, like the hidden mask; dots
+					// sit exactly on-surface, so the margin is exact).
+					bool visible = false;
+					for (uint32_t view = 0; view < 2 and not visible; ++view)
+					{
+						bool any_front = false, any_behind = false, any_inside = false;
+						for (int corner = 0; corner < 8; ++corner)
+						{
+							glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+							               (corner & 2) ? bounds->second.y : bounds->first.y,
+							               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+							glm::vec4 c = d.mvp[view] * q4;
+							if (c.w < 0)
+							{
+								any_behind = true;
+								continue;
+							}
+							any_front = true;
+							if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)extents[view].width * 0.5f)) and
+							    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)extents[view].height * 0.5f)) and c.z >= 0 and c.z <= c.w)
+								any_inside = true;
+						}
+						visible = any_front and (any_behind or any_inside);
+					}
+					if (not visible)
+						continue;
+					dots_draws.push_back(std::move(d));
+				}
+				if (not dots_draws.empty())
+				{
+					int idx = hidden_dots->acquire();
+					if (idx >= 0)
+					{
+						std::array<vk::Extent2D, 2> dots_ext;
+						for (uint32_t view = 0; view < view_count; ++view)
+							dots_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+						try
+						{
+							hidden_dots->record(command_buffer, (size_t)idx, dots_ext, dots_draws);
+							hidden_dots_image = idx;
+							hidden_dots_active = true;
+						}
+						catch (std::exception & e)
+						{
+							spdlog::warn("Hidden dots record failed: {}", e.what());
+							hidden_dots->release();
+						}
+					}
+				}
+				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
+			}
+			if (not known_hidden_dots and not hidden_dots_hashes.empty())
+			{
+				// Map wipe: drop stale GPU meshes (mirrors the hidden mask
+				// cleanup above — meshes stay uploaded while map-known so
+				// track-loss/replace cycles only rasterize).
+				if (hidden_dots)
+				{
+					for (auto & [key, _]: hidden_dots_hashes)
+						hidden_dots->remove_mesh(key);
+				}
+				hidden_dots_hashes.clear();
+			}
+		}
+
 		// Environment-depth debug overlay: records the fullscreen
 		// false-color viz from the shared frame (acquired once above) into
 		// its own transparent swapchain. Provider cost is bound to the
@@ -3322,7 +3470,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				static bool last_submit_flat = true;
 				static bool last_submit_projected = false;
 				static bool last_hidden = false;
-				bool hidden_on = hidden_group.active;
+				bool hidden_on = hidden_group.active or hidden_dots_active;
 				if (submit_flat != last_submit_flat or submit_projected != last_submit_projected or hidden_on != last_hidden)
 				{
 					last_submit_flat = submit_flat;
@@ -3547,6 +3695,39 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 		}
 
+		// Hidden dot overlay: ONE transparent projection layer over the
+		// revealed camera feed (server eye timebase, like the masks),
+		// below gizmos and GUI quads. Same discipline as the debug lines:
+		// standard alpha blend, no FB extensions.
+		if (hidden_dots_active and hidden_dots_image >= 0 and hidden_dots)
+		{
+			std::array<XrCompositionLayerProjectionView, view_count> dots_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				dots_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = sync_pose[view],
+				        .fov = sync_fov[view],
+				        .subImage = {
+				                .swapchain = hidden_dots->swapchain(),
+				                .imageRect = {
+				                        .offset = {0, 0},
+				                        .extent = extents[view],
+				                },
+				                .imageArrayIndex = view,
+				        },
+				};
+			}
+			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     dots_views);
+			// Paired with the acquire in the record phase above: the
+			// compositor takes the last released image; release after submit.
+			hidden_dots->release();
+			hidden_dots_active = false;
+			hidden_dots_image = -1;
+		}
+
 		// Debug gizmo layer: ONE transparent projection layer for all debug
 		// geometry (standard alpha blend: no FB extensions, works wherever
 		// the old quads did). Always exactly one layer: maxLayerCount can
@@ -3767,6 +3948,9 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	// anyway).
 	mask_pipe_cache = feather_mask_renderer::pipeline_cache(device);
 	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
+	// Same for the hidden dots (one trivial pipeline): first-visible
+	// hidden frames must only rasterize.
+	hidden_dots_renderer::warm_pipelines(device, physical_device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()
