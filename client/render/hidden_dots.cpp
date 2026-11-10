@@ -62,15 +62,20 @@ void hidden_dots_renderer::warm_pipelines(vk::raii::Device & device, vk::raii::P
 
 void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h)
 {
-	if (ready() and format_ == format and (int)extent_.width == w and (int)extent_.height == h)
+	// Half resolution: dots stay crisp (world-size pattern, still several
+	// px per dot at room range) while clear/store/shading quarter. The
+	// compositor upscales the submitted rect to the full FOV.
+	uint32_t hw = ((uint32_t)w + 1) / 2;
+	uint32_t hh = ((uint32_t)h + 1) / 2;
+	if (ready() and format_ == format and extent_.width == hw and extent_.height == hh)
 		return;
 	// Rare path (first frame, video resize): nothing outstanding (we
 	// acquire + release within one frame, always paired below).
 	device->waitIdle();
 	format_ = format;
-	extent_ = {(uint32_t)w, (uint32_t)h};
-	swapchain_ = xr::swapchain(inst, sess, *device, format, w, h, 1, 2);
-	spdlog::info("Hidden dots swapchain: {}x{} ({} images)", w, h, swapchain_.image_count());
+	extent_ = {hw, hh};
+	swapchain_ = xr::swapchain(inst, sess, *device, format, (int)hw, (int)hh, 1, 2);
+	spdlog::info("Hidden dots swapchain: {}x{} ({} images)", hw, hh, swapchain_.image_count());
 	init_pipelines(format);
 	targets.clear();
 	for (vk::Image image: swapchain_.images())
@@ -354,7 +359,62 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		                        .minDepth = 0,
 		                        .maxDepth = 1,
 		                });
-		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
+		// Tight scissor from the draws' projected bounds: shading tracks
+		// object size instead of the fullscreen. The render-area CLEAR
+		// stays full (correctness); only draw fragments are culled. Y-flip
+		// safe: min/max over corners is symmetric under the flip.
+		vk::Rect2D scissor{.offset = {0, 0}, .extent = extents[eye]};
+		{
+			float x0 = 0, y0 = 0, x1 = (float)extents[eye].width, y1 = (float)extents[eye].height;
+			bool full = false, any = false;
+			for (const auto & d: draws)
+			{
+				auto mit = meshes.find(d.mesh);
+				if (mit == meshes.end())
+				{
+					full = true;
+					break;
+				}
+				for (int corner = 0; corner < 8 and not full; ++corner)
+				{
+					glm::vec4 q4((corner & 1) ? mit->second.aabb_max.x : mit->second.aabb_min.x,
+					             (corner & 2) ? mit->second.aabb_max.y : mit->second.aabb_min.y,
+					             (corner & 4) ? mit->second.aabb_max.z : mit->second.aabb_min.z, 1);
+					glm::vec4 c = d.mvp[eye] * q4;
+					if (c.w <= 0)
+					{
+						full = true;
+						break;
+					}
+					float px = (c.x / c.w * 0.5f + 0.5f) * (float)extents[eye].width;
+					float py = (c.y / c.w * 0.5f + 0.5f) * (float)extents[eye].height;
+					if (not any)
+					{
+						x0 = x1 = px;
+						y0 = y1 = py;
+						any = true;
+					}
+					else
+					{
+						x0 = std::min(x0, px);
+						x1 = std::max(x1, px);
+						y0 = std::min(y0, py);
+						y1 = std::max(y1, py);
+					}
+				}
+			}
+			if (not full and any)
+			{
+				int32_t ix0 = (int32_t)std::max(0.f, x0 - 1.f);
+				int32_t iy0 = (int32_t)std::max(0.f, y0 - 1.f);
+				int32_t ix1 = (int32_t)std::min((float)extents[eye].width, x1 + 1.f);
+				int32_t iy1 = (int32_t)std::min((float)extents[eye].height, y1 + 1.f);
+				if (ix1 > ix0 and iy1 > iy0)
+					scissor = vk::Rect2D{.offset = {ix0, iy0},
+					                     .extent = {(uint32_t)(ix1 - ix0), (uint32_t)(iy1 - iy0)}};
+			}
+		}
+		cmd.setScissor(0, scissor);
 		vk::ClearValue clear{};
 		clear.color.float32.fill(0);
 		vk::RenderPassBeginInfo begin_info{

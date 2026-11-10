@@ -3138,9 +3138,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					int idx = hidden_dots->acquire();
 					if (idx >= 0)
 					{
+						// Half-res overlay: viewports/rects track the dots
+						// swapchain, the compositor upscales to the FOV.
 						std::array<vk::Extent2D, 2> dots_ext;
 						for (uint32_t view = 0; view < view_count; ++view)
-							dots_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+							dots_ext[view] = {(uint32_t)hidden_dots->swapchain().width(),
+							                  (uint32_t)hidden_dots->swapchain().height()};
 						try
 						{
 							if (hidden_dots->record(command_buffer, (size_t)idx, dots_ext, dots_draws))
@@ -3627,6 +3630,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// standard alpha blend, no FB extensions.
 		if (hidden_dots_active and hidden_dots_image >= 0 and hidden_dots)
 		{
+			// Half-res image rect: the runtime stretches it over the FOV.
+			XrExtent2Di dots_rect{(int32_t)hidden_dots->swapchain().width(),
+			                       (int32_t)hidden_dots->swapchain().height()};
 			std::array<XrCompositionLayerProjectionView, view_count> dots_views;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
@@ -3638,7 +3644,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				                .swapchain = hidden_dots->swapchain(),
 				                .imageRect = {
 				                        .offset = {0, 0},
-				                        .extent = extents[view],
+				                        .extent = dots_rect,
 				                },
 				                .imageArrayIndex = view,
 				        },

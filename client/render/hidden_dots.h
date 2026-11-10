@@ -67,8 +67,8 @@ public:
 	{
 		std::string mesh;
 		std::array<glm::mat4, 2> mvp;
-		glm::vec3 color{128.f / 255.f, 212.f / 255.f, 1.0f};
-		float pitch = 0.1f;
+		glm::vec3 color{1.0f, 0.16f, 0.10f};
+		float pitch = 0.05f;
 	};
 
 	explicit hidden_dots_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
