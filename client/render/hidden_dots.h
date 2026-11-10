@@ -145,9 +145,11 @@ public:
 	{
 		return sphere_depth_;
 	}
-	vk::ImageView sphere_view(int eye) const
+	// Array view over both sphere layers for the mask's multiview
+	// sphere framebuffer (same borrowed lifetime as the image).
+	vk::ImageView sphere_view_array() const
 	{
-		return *sphere_views[eye];
+		return *sphere_view_array_;
 	}
 
 private:
@@ -158,39 +160,40 @@ private:
 	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
-	// Color-only renderpass (CLEAR/STORE/GENERAL) for the dots pass;
-	// depth-only renderpass (CLEAR/STORE, ends shader-readable) for the
-	// prepasses. The sphere prepass reuses the same depth RP object over
-	// its own image (near-clear for LESS); only clear values and
-	// framebuffers differ.
+	// Color-only renderpass (CLEAR/STORE/OPTIMAL — submitted image,
+	// nothing app-side re-reads it) for the dots pass; depth-only
+	// renderpass (CLEAR/STORE, ends shader-readable) for the mesh
+	// prepass. Both multiview (viewMask=both).
 	vk::raii::RenderPass color_renderpass{nullptr};
-	// Shared by the mesh prepass (GREATER over a far-clear) and the
-	// proximity sphere prepass (LESS over a near-clear): same D16
-	// CLEAR/STORE/shader-readable shape, only the clear values and the
-	// framebuffers differ. Separate IMAGES (the fields must not mix).
+	// Shared by the mesh prepass (GREATER over a far-clear): D16
+	// CLEAR/STORE/shader-readable depth for the dots pass to sample.
 	vk::raii::RenderPass depth_renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
 	// Depth-fill pipeline (mesh triangles into the depth attachment,
 	// color writes off): the dots sample its output, they don't
 	// depth-test against it. Shared layout (subset of push).
 	vk::raii::Pipeline fill_pipeline{nullptr};
-	// Depth target (D16, quarter-res, 2 layers + one single-layer view per
-	// eye), recreated with the swapchain in ensure(). Sampled by the
-	// dots pass (nearest: exact texel, no cross-edge blending).
+	// Depth target (D16, quarter-res, 2 layers, one array view): written
+	// by the mesh prepass, sampled by the dots pass (nearest: exact
+	// texel, no cross-edge blending).
 	image_allocation depth_;
-	std::array<vk::raii::ImageView, 2> depth_views{nullptr, nullptr};
-	// Proximity sphere depth (D16, quarter-res, same shape): min-accumulated
-	// furthest-exit field, sampled alongside the mesh depth (binding 1).
+	vk::raii::ImageView depth_view_array{nullptr};
+	// Proximity sphere depth (D16, quarter-res, 2 layers, one array
+	// view): min-accumulated furthest-exit field, sampled alongside the
+	// mesh depth (binding 1).
 	// SHARED with the feather mask hidden record: the mask renders the
 	// spheres into this image (same command buffer, earlier pass) and
 	// transitions it to shader-readable; this renderer never writes it.
-	// Borrowed-framebuffer discipline (mask builds FBs against
-	// sphere_views): ensure() reports rebuilds so the mask can drop its
-	// FBs first — views die with this renderer.
+	// Borrowed-framebuffer discipline (mask builds its sphere FB against
+	// the array view): ensure() reports rebuilds so the mask can drop
+	// its FBs first — views die with this renderer.
 	image_allocation sphere_depth_;
-	std::array<vk::raii::ImageView, 2> sphere_views{nullptr, nullptr};
-	// One descriptor set per eye over the single-layer depth view above
-	// (rewritten on rebuild, not per frame). Nearest sampler.
+	// Array view over both sphere layers: sampled by the dots pass
+	// (binding 1, indexed by gl_ViewIndex) and lent to the mask's
+	// multiview sphere framebuffer (see sphere_view_array()).
+	vk::raii::ImageView sphere_view_array_{nullptr};
+	// One descriptor set over the two array views above (rewritten on
+	// rebuild, not per frame). Nearest sampler.
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	std::vector<vk::raii::DescriptorSet> descriptor_sets;
@@ -206,10 +209,11 @@ private:
 
 	struct target
 	{
-		vk::raii::ImageView view{nullptr};
-		vk::raii::Framebuffer framebuffer{nullptr}; // color pass
-		vk::raii::Framebuffer depth_framebuffer{nullptr}; // mesh prepass
+		vk::raii::ImageView view{nullptr}; // color array view (both eyes)
+		vk::raii::Framebuffer framebuffer{nullptr}; // color MV pass
+		vk::raii::Framebuffer depth_framebuffer{nullptr}; // mesh prepass MV
 	};
-	// [image][eye], parallel to the swapchain image list.
-	std::vector<std::array<target, 2>> targets;
+	// [image], parallel to the swapchain image list (one multiview
+	// target per image — both eyes broadcast in one pass).
+	std::vector<target> targets;
 };

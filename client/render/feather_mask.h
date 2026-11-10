@@ -300,7 +300,7 @@ public:
 	// OVER-reveal (front-of-sphere imprecision, accepted); GREATER here
 	// would under-reveal (unsafe miss) and is forbidden.
 	// The sphere field is the dots-owned shared image (P4: one raster
-	// per frame, not two): RP1 renders into field.views at
+	// per frame, not two): RP1 renders into field.view_array at
 	// field.extent, RP2 tests against it, then the record transitions
 	// the image to shader-readable for the dots color pass later in
 	// the same command buffer. Extent MUST equal the quarter-res
@@ -314,7 +314,7 @@ public:
 	{
 		VkImage image = VK_NULL_HANDLE; // shared D16 2-layer field
 		vk::Extent2D extent{0, 0}; // must equal the mask extent below
-		std::array<vk::ImageView, 2> views{}; // per-eye single-layer
+		vk::ImageView view_array{}; // both layers (mask builds its MV FB against this)
 	};
 	// One draw per silhouette: which uploaded mesh, per-eye transforms,
 	// opacity, and the full-res pixel bounds per eye (scaled to the mask
@@ -697,19 +697,24 @@ private:
 	vk::raii::RenderPass hidden_color_rp{nullptr};
 	vk::raii::Pipeline hidden_sphere_pipe{nullptr};
 	vk::raii::Pipeline hidden_silhouette_pipe{nullptr};
+	// Dedicated layout for the hidden multiview pipes (132B MVP-pair
+	// push range; the shared raster_push layout stays 68B for the
+	// per-eye feather paths).
+	vk::raii::PipelineLayout hidden_mv_layout{nullptr};
 	buffer_allocation hidden_sphere_verts_;
 	uint32_t hidden_sphere_vert_count = 0;
 	// (The sphere depth images moved to the dots renderer — P4 shared
 	// field. output_depth_view is declared with output_depth below.)
-	// Per-swapchain-image framebuffers for the two hidden passes (color
-	// + sphere-depth FBs per eye); dropped by reset_targets() with the
-	// rest (swapchain recreate = waitIdle'd upstream).
+	// Per-swapchain-image multiview framebuffers for the two hidden
+	// passes (color + sphere-depth, layers=2 each); dropped by
+	// reset_targets() with the rest (swapchain recreate = waitIdle'd
+	// upstream).
 	struct hidden_frame_targets
 	{
 		vk::Extent2D extent{0, 0};
-		std::array<vk::raii::ImageView, 2> views{nullptr, nullptr};
-		std::array<vk::raii::Framebuffer, 2> framebuffers{nullptr, nullptr};
-		std::array<vk::raii::Framebuffer, 2> sphere_framebuffers{nullptr, nullptr};
+		vk::raii::ImageView view_array{nullptr}; // color, both layers
+		vk::raii::Framebuffer framebuffer{nullptr}; // color MV, layers=2
+		vk::raii::Framebuffer sphere_framebuffer{nullptr}; // sphere MV, layers=2
 	};
 	std::unordered_map<VkImage, hidden_frame_targets> hidden_targets;
 	void ensure_hidden(vk::Image image, vk::Extent2D extent, const hidden_sphere_field & field);

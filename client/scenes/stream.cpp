@@ -2918,7 +2918,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										feather_mask_renderer::hidden_sphere_field sphere_field{
 											.image = hidden_dots->sphere_image(),
 											.extent = hex,
-											.views = {hidden_dots->sphere_view(0), hidden_dots->sphere_view(1)},
+											.view_array = hidden_dots->sphere_view_array(),
 										};
 										g.renderer->record_hidden(rec_cmd, g.swapchain.image(mask_index), hex,
 										                          hidden_mask_draws, proximity_spheres, &hstats, full_ext,

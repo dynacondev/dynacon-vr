@@ -22,21 +22,30 @@
 #include "vk/shader.h"
 
 #include <algorithm>
+#include <array>
+#include <cassert>
+#include <stdexcept>
 #include <cstring>
 
 #include <spdlog/spdlog.h>
 
 namespace
 {
-// Mirrors hidden_dots.vert/frag.glsl PushConstants: mvp (64) + color and
-// pitch (16) + view params (16) = 96B, within the 128-byte minimum.
+// Mirrors hidden_dots_mv.vert/frag.glsl PushConstants: per-eye mvp
+// (2x64) + color and pitch (16) + per-eye view params (2x16) = 176B.
+// EXCEEDS the 128-byte Vulkan minimum: the multiview path needs both
+// eyes. Adreno 740 (Quest 3) provides 256B; init_pipelines throws
+// loudly below if some future device reports less (do NOT silently
+// fall back — a 128B encoding does not exist for stereo MVPs; the
+// alternative is a dynamic-UBO MVP delivery, i.e. a redesign).
 struct push
 {
-	glm::mat4 mvp;
+	std::array<glm::mat4, 2> mvp;
 	glm::vec4 color_pitch; // rgb: dot color, w: dot pitch (m)
-	glm::vec4 view_params; // x: view W px, y: view H px, z: proj[1][1], w: dot radius (cells)
+	std::array<glm::vec4, 2> view_params; // per eye: x: view W px, y: view H px, z: proj[1][1], w: dot radius (cells)
 };
-static_assert(sizeof(push) == 96);
+static_assert(sizeof(push) == 176);
+static_assert(sizeof(push) <= 256);
 } // namespace
 
 hidden_dots_renderer::hidden_dots_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device) :
@@ -104,21 +113,20 @@ bool hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	        },
 	        "hidden_dots depth",
 	};
-	for (uint32_t eye = 0; eye < 2; ++eye)
-	{
-		depth_views[eye] = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
-		                                                       .image = (VkImage)depth_,
-		                                                       .viewType = vk::ImageViewType::e2D,
-		                                                       .format = vk::Format::eD16Unorm,
-		                                                       .subresourceRange = {
-		                                                               .aspectMask = vk::ImageAspectFlagBits::eDepth,
-		                                                               .baseMipLevel = 0,
-		                                                               .levelCount = 1,
-		                                                               .baseArrayLayer = eye,
-		                                                               .layerCount = 1,
-		                                                       },
-		                                               });
-	}
+	// Array views (both layers): the multiview passes render into and
+	// sample them with the view selected by gl_ViewIndex.
+	depth_view_array = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
+	                                                       .image = (VkImage)depth_,
+	                                                       .viewType = vk::ImageViewType::e2DArray,
+	                                                       .format = vk::Format::eD16Unorm,
+	                                                       .subresourceRange = {
+	                                                               .aspectMask = vk::ImageAspectFlagBits::eDepth,
+	                                                               .baseMipLevel = 0,
+	                                                               .levelCount = 1,
+	                                                               .baseArrayLayer = 0,
+	                                                               .layerCount = 2,
+	                                                       },
+	                                               });
 	// Proximity sphere field: same D16 quarter-res shape, separate image
 	// (the mesh field clears far/0 for GREATER; this one clears near/1.0
 	// for LESS — the fields must not mix).
@@ -141,26 +149,22 @@ bool hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	        },
 	        "hidden_dots sphere depth",
 	};
-	for (uint32_t eye = 0; eye < 2; ++eye)
-	{
-		sphere_views[eye] = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
-		                                                        .image = (VkImage)sphere_depth_,
-		                                                        .viewType = vk::ImageViewType::e2D,
-		                                                        .format = vk::Format::eD16Unorm,
-		                                                        .subresourceRange = {
-		                                                                .aspectMask = vk::ImageAspectFlagBits::eDepth,
-		                                                                .baseMipLevel = 0,
-		                                                                .levelCount = 1,
-		                                                                .baseArrayLayer = eye,
-		                                                                .layerCount = 1,
-		                                                        },
-		                                                });
-	}
-	// One set per eye over the single-layer depth views (both images are
-	// renderer-owned, so this runs on rebuild only, never per frame;
-	// the old sets were freed after waitIdle, ahead of the pool
-	// recreation in init_pipelines above).
-	for (uint32_t eye = 0; eye < 2; ++eye)
+	sphere_view_array_ = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
+	                                                        .image = (VkImage)sphere_depth_,
+	                                                        .viewType = vk::ImageViewType::e2DArray,
+	                                                        .format = vk::Format::eD16Unorm,
+	                                                        .subresourceRange = {
+	                                                                .aspectMask = vk::ImageAspectFlagBits::eDepth,
+	                                                                .baseMipLevel = 0,
+	                                                                .levelCount = 1,
+	                                                                .baseArrayLayer = 0,
+	                                                                .layerCount = 2,
+	                                                        },
+	                                                });
+	// One set over the array views (multiview frag selects the layer by
+	// gl_ViewIndex). Both images are renderer-owned, so this runs on
+	// rebuild only, never per frame; the old set was freed after
+	// waitIdle, ahead of the pool recreation in init_pipelines above.
 	{
 		vk::DescriptorSetAllocateInfo set_alloc{
 		        .descriptorPool = *descriptor_pool,
@@ -171,25 +175,25 @@ bool hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		vk::DescriptorImageInfo depth_infos[2] = {
 		        vk::DescriptorImageInfo{
 		                .sampler = *depth_sampler,
-		                .imageView = *depth_views[eye],
+		                .imageView = *depth_view_array,
 		                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		        },
 		        vk::DescriptorImageInfo{
 		                .sampler = *depth_sampler,
-		                .imageView = *sphere_views[eye],
+		                .imageView = *sphere_view_array_,
 		                .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		        },
 		};
 		vk::WriteDescriptorSet depth_writes[2] = {
 		        vk::WriteDescriptorSet{
-		                .dstSet = *descriptor_sets[eye],
+		                .dstSet = *descriptor_sets[0],
 		                .dstBinding = 0,
 		                .descriptorCount = 1,
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 		                .pImageInfo = &depth_infos[0],
 		        },
 		        vk::WriteDescriptorSet{
-		                .dstSet = *descriptor_sets[eye],
+		                .dstSet = *descriptor_sets[0],
 		                .dstBinding = 1,
 		                .descriptorCount = 1,
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -198,46 +202,45 @@ bool hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		};
 		device->updateDescriptorSets(depth_writes, {});
 	}
+	// One multiview target per swapchain image: array color view +
+	// layers=2 framebuffers; one draw broadcasts to both eyes.
 	targets.clear();
 	for (vk::Image image: swapchain_.images())
 	{
 		targets.emplace_back();
-		for (uint32_t eye = 0; eye < 2; ++eye)
-		{
-			vk::ImageViewCreateInfo iv_info{
-			        .image = image,
-			        .viewType = vk::ImageViewType::e2DArray,
-			        .format = format,
-			        .subresourceRange = {
-			                .aspectMask = vk::ImageAspectFlagBits::eColor,
-			                .baseMipLevel = 0,
-			                .levelCount = 1,
-			                .baseArrayLayer = eye,
-			                .layerCount = 1,
-			        },
-			};
-			targets.back()[eye].view = vk::raii::ImageView(*device, iv_info);
-			vk::ImageView color_view = *targets.back()[eye].view;
-			vk::FramebufferCreateInfo fb_info{
-			        .renderPass = *color_renderpass,
-			        .attachmentCount = 1,
-			        .pAttachments = &color_view,
-			        .width = extent_.width,
-			        .height = extent_.height,
-			        .layers = 1,
-			};
-			targets.back()[eye].framebuffer = vk::raii::Framebuffer(*device, fb_info);
-			vk::ImageView depth_view = *depth_views[eye];
-			vk::FramebufferCreateInfo depth_fb_info{
-			        .renderPass = *depth_renderpass,
-			        .attachmentCount = 1,
-			        .pAttachments = &depth_view,
-			        .width = extent_.width,
-			        .height = extent_.height,
-			        .layers = 1,
-			};
-			targets.back()[eye].depth_framebuffer = vk::raii::Framebuffer(*device, depth_fb_info);
-		}
+		vk::ImageViewCreateInfo iv_info{
+		        .image = image,
+		        .viewType = vk::ImageViewType::e2DArray,
+		        .format = format,
+		        .subresourceRange = {
+		                .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                .baseMipLevel = 0,
+		                .levelCount = 1,
+		                .baseArrayLayer = 0,
+		                .layerCount = 2,
+		        },
+		};
+		targets.back().view = vk::raii::ImageView(*device, iv_info);
+		vk::ImageView color_view = *targets.back().view;
+		vk::FramebufferCreateInfo fb_info{
+		        .renderPass = *color_renderpass,
+		        .attachmentCount = 1,
+		        .pAttachments = &color_view,
+		        .width = extent_.width,
+		        .height = extent_.height,
+		        .layers = 2,
+		};
+		targets.back().framebuffer = vk::raii::Framebuffer(*device, fb_info);
+		vk::ImageView depth_view = *depth_view_array;
+		vk::FramebufferCreateInfo depth_fb_info{
+		        .renderPass = *depth_renderpass,
+		        .attachmentCount = 1,
+		        .pAttachments = &depth_view,
+		        .width = extent_.width,
+		        .height = extent_.height,
+		        .layers = 2,
+		};
+		targets.back().depth_framebuffer = vk::raii::Framebuffer(*device, depth_fb_info);
 	}
 	return true;
 }
@@ -284,9 +287,9 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 		quad_.unmap();
 	}
 	// Sampled-depth plumbing: binding 0 = mesh prepass output, binding 1
-	// = proximity sphere field (both single-layer per-eye views over one
-	// nearest sampler: exact texel, no cross-edge blending). One set
-	// layout + pool for the two per-eye sets written in ensure().
+	// = proximity sphere field (both array views over one nearest sampler:
+	// exact texel, no cross-edge blending, layer selected by gl_ViewIndex).
+	// One set layout + pool for the single set written in ensure().
 	// Recreated with everything else on rebuild (move-assign drops old).
 	vk::DescriptorSetLayoutBinding depth_bindings[2] = {
 	        vk::DescriptorSetLayoutBinding{
@@ -325,8 +328,12 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	                                                           .poolSizeCount = 1,
 	                                                           .pPoolSizes = &pool_size,
 	                                                   });
-	auto vert = load_shader(*device, "hidden_dots.vert");
-	auto frag = load_shader(*device, "hidden_dots.frag");
+	// Multiview pushes (176B) exceed the 128-byte Vulkan minimum:
+	// fail loudly here — not silently on device — when unsupported.
+	if (physical_device->getProperties().limits.maxPushConstantsSize < sizeof(push))
+		throw std::runtime_error("hidden dots multiview needs 176B push constants");
+	auto vert = load_shader(*device, "hidden_dots_mv.vert");
+	auto frag = load_shader(*device, "hidden_dots_mv.frag");
 
 	vk::PipelineShaderStageCreateInfo stages[2] = {
 	        {
@@ -477,15 +484,15 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	pipeline_layout = vk::raii::PipelineLayout(*device, layout_info);
 
 	// Color CLEAR on UNDEFINED every frame (no layout history ever assumed,
-	// gizmo precedent). Final GENERAL for the color (universally samplable
-	// at submit, mask precedent).
+	// gizmo precedent). Final COLOR_ATTACHMENT_OPTIMAL (spec-compatible at
+	// submit, keeps Adreno UBWC live; nothing app-side re-reads this image).
 	vk::AttachmentDescription color_attachment{
 	        .format = format,
 	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eGeneral,
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference color_ref{
 	        .attachment = 0,
@@ -496,7 +503,15 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .colorAttachmentCount = 1,
 	        .pColorAttachments = &color_ref,
 	};
+	uint32_t mv_view_mask = 0b11, mv_corr_mask = 0b11;
+	vk::RenderPassMultiviewCreateInfo mv_rp_info{
+	        .subpassCount = 1,
+	        .pViewMasks = &mv_view_mask,
+	        .correlationMaskCount = 1,
+	        .pCorrelationMasks = &mv_corr_mask,
+	};
 	vk::RenderPassCreateInfo color_renderpass_info{
+	        .pNext = &mv_rp_info,
 	        .attachmentCount = 1,
 	        .pAttachments = &color_attachment,
 	        .subpassCount = 1,
@@ -536,6 +551,7 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
 	};
 	vk::RenderPassCreateInfo depth_renderpass_info{
+	        .pNext = &mv_rp_info,
 	        .attachmentCount = 1,
 	        .pAttachments = &depth_attachment,
 	        .subpassCount = 1,
@@ -561,7 +577,7 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	};
 	pipeline = vk::raii::Pipeline(*device, *pipe_cache, pipeline_info);
 
-	auto fill_vert = load_shader(*device, "hidden_dotfill.vert");
+	auto fill_vert = load_shader(*device, "hidden_dotfill_mv.vert");
 	auto fill_frag = load_shader(*device, "hidden_dotfill.frag");
 	vk::PipelineShaderStageCreateInfo fill_stages[2] = {
 	        {
@@ -600,6 +616,10 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 {
 	if (draws.empty() or image_index >= targets.size())
 		return false;
+	// Multiview broadcasts one draw to both layers: both eyes must share
+	// the extent (caller passes {dext, dext}). A mismatch would silently
+	// misalign one eye — nausea-grade. Loud here instead.
+	assert(extents[0].width == extents[1].width and extents[0].height == extents[1].height);
 
 	// Clamp helper, hoisted (stateless: extent passed per call — one
 	// definition serves the prescan and both passes below).
@@ -614,143 +634,163 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		return true;
 	};
 
-	for (uint32_t eye = 0; eye < 2; ++eye)
+	// Multiview: one draw broadcasts to both layers (viewMask=both), so
+	// the two per-eye passes collapse into two begins total. The vertex
+	// shader executes once per view; per-draw data carries both eyes and
+	// each invocation selects its own (exact, no cross-eye leakage).
+	// Both eyes share the dots extent in practice (caller passes
+	// {dext, dext}); the framebuffer is that size.
+	auto & tgt = targets[image_index];
+	cmd.setViewport(0, vk::Viewport{
+	                        .x = 0,
+	                        .y = 0,
+	                        .width = (float)extents[0].width,
+	                        .height = (float)extents[0].height,
+	                        .minDepth = 0,
+	                        .maxDepth = 1,
+	                });
+	// Both-eyes union of a draw.s valid per-eye boxes (empty = skip the
+	// draw outright; a single behind-camera eye must not force
+	// fullscreen for the other). Shading tracks object size per draw.
+	auto draw_union = [&](const instance_draw & d, vk::Rect2D & out) {
+		bool got = false;
+		vk::Rect2D acc{};
+		for (uint32_t eye = 0; eye < 2; ++eye)
+		{
+			vk::Rect2D b;
+			if (d.index_count == 0 or d.dot_count == 0 or
+			    not clamp_scissor(d.scissor[eye], extents[eye], b))
+				continue;
+			if (not got)
+			{
+				acc = b;
+				got = true;
+			}
+			else
+			{
+				int32_t x0 = std::min(acc.offset.x, b.offset.x);
+				int32_t y0 = std::min(acc.offset.y, b.offset.y);
+				int32_t x1 = std::max(acc.offset.x + (int32_t)acc.extent.width,
+				                      b.offset.x + (int32_t)b.extent.width);
+				int32_t y1 = std::max(acc.offset.y + (int32_t)acc.extent.height,
+				                      b.offset.y + (int32_t)b.extent.height);
+				acc = vk::Rect2D{.offset = {x0, y0},
+				                  .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+			}
+		}
+		if (got)
+			out = acc;
+		return got;
+	};
+	// Content union for the depth prepass renderArea (same invariant as
+	// before: sampled only at dot centers inside the per-draw boxes).
+	// The COLOR pass keeps its full renderArea (submitted full-rect).
+	bool any = false;
+	vk::Rect2D prepass_area{.offset = {0, 0}, .extent = extents[0]};
+	bool prepass_box = false;
+	for (const auto & d: draws)
 	{
-		auto & tgt = targets[image_index][eye];
-		cmd.setViewport(0, vk::Viewport{
-		                        .x = 0,
-		                        .y = 0,
-		                        .width = (float)extents[eye].width,
-		                        .height = (float)extents[eye].height,
-		                        .minDepth = 0,
-		                        .maxDepth = 1,
-		                });
-		// Per-draw scissor from the stream-side rects (computed once per
-		// object in the shared silhouette build): shading tracks object
-		// size instead of the fullscreen, per draw rather than one union
-		// (a single behind-camera object must not force fullscreen for
-		// the rest). Degenerate draws are skipped outright (nothing
-		// visible: saves the draw call too). The color render-area CLEAR
-		// stays full (correctness); an all-degenerate eye still
-		// begins/ends both passes (clear-only): the images start
-		// UNDEFINED and the compositor samples the full rect.
-		// Content union for the depth prepass renderArea below: the
-		// prepass output is sampled only at dot centers, which lie inside
-		// the per-draw scissors by construction — texels outside the union
-		// are never read, so clearing/storing them is pure waste. The
-		// COLOR pass keeps its full renderArea (submitted full-rect: the
-		// compositor samples everywhere, UNDEFINED holes would show).
-		bool any = false;
-		vk::Rect2D prepass_area{.offset = {0, 0}, .extent = extents[eye]};
-		bool prepass_box = false;
+		vk::Rect2D u;
+		if (not draw_union(d, u))
+			continue;
+		any = true;
+		if (not prepass_box)
+		{
+			prepass_area = u;
+			prepass_box = true;
+		}
+		else
+		{
+			int32_t x0 = std::min(prepass_area.offset.x, u.offset.x);
+			int32_t y0 = std::min(prepass_area.offset.y, u.offset.y);
+			int32_t x1 = std::max(prepass_area.offset.x + (int32_t)prepass_area.extent.width,
+			                      u.offset.x + (int32_t)u.extent.width);
+			int32_t y1 = std::max(prepass_area.offset.y + (int32_t)prepass_area.extent.height,
+			                      u.offset.y + (int32_t)u.extent.height);
+			prepass_area = vk::Rect2D{.offset = {x0, y0},
+			                          .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+		}
+	}
+	// Pass 1: depth prepass (mesh triangles resolve nearest-surface per
+	// pixel; reversed-Z: clear far 0, GREATER wins). One multiview begin
+	// over the layers=2 framebuffer (all-degenerate keeps full renderArea:
+	// clear-only images still cycle defined content).
+	vk::ClearValue depth_clear{};
+	depth_clear.depthStencil = {.depth = 0.f, .stencil = 0};
+	vk::RenderPassBeginInfo depth_begin{
+	        .renderPass = *depth_renderpass,
+	        .framebuffer = *tgt.depth_framebuffer,
+	        .renderArea = {.offset = prepass_area.offset, .extent = prepass_area.extent},
+	        .clearValueCount = 1,
+	        .pClearValues = &depth_clear,
+	};
+	cmd.beginRenderPass(depth_begin, vk::SubpassContents::eInline);
+	if (any)
+	{
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *fill_pipeline);
 		for (const auto & d: draws)
 		{
-			vk::Rect2D clamped;
-			if (d.index_count > 0 and d.dot_count > 0 and clamp_scissor(d.scissor[eye], extents[eye], clamped))
-			{
-				any = true;
-				if (not prepass_box)
-				{
-					prepass_area = clamped;
-					prepass_box = true;
-				}
-				else
-				{
-					int32_t x0 = std::min(prepass_area.offset.x, clamped.offset.x);
-					int32_t y0 = std::min(prepass_area.offset.y, clamped.offset.y);
-					int32_t x1 = std::max(prepass_area.offset.x + (int32_t)prepass_area.extent.width,
-					                      clamped.offset.x + (int32_t)clamped.extent.width);
-					int32_t y1 = std::max(prepass_area.offset.y + (int32_t)prepass_area.extent.height,
-					                      clamped.offset.y + (int32_t)clamped.extent.height);
-					prepass_area = vk::Rect2D{.offset = {x0, y0},
-					                          .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
-				}
-			}
+			// Unified skip with the dots loop below. Each loop pushes its
+			// own constants per draw; nothing persists across passes.
+			vk::Rect2D scissor;
+			if (not draw_union(d, scissor))
+				continue;
+			cmd.setScissor(0, scissor);
+			cmd.bindVertexBuffers(0, d.vertex_buffer, (vk::DeviceSize)0);
+			cmd.bindIndexBuffer(d.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
+			push pc{
+			        .mvp = {{d.mvp[0], d.mvp[1]}},
+			        .color_pitch = glm::vec4(d.color, d.pitch),
+			        .view_params = {{glm::vec4(d.view_params[0], dot_radius_cells),
+			                          glm::vec4(d.view_params[1], dot_radius_cells)}},
+			};
+			cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
+			cmd.drawIndexed(d.index_count, 1, 0, 0, 0);
 		}
-		// Pass 1: depth prepass (mesh triangles resolve nearest-surface
-		// per pixel; reversed-Z: clear far 0, GREATER wins). renderArea is
-		// the content union above (all-degenerate keeps full: clear-only
-		// images still cycle defined content).
-		vk::ClearValue depth_clear{};
-		depth_clear.depthStencil = {.depth = 0.f, .stencil = 0};
-		vk::RenderPassBeginInfo depth_begin{
-		        .renderPass = *depth_renderpass,
-		        .framebuffer = *tgt.depth_framebuffer,
-		        .renderArea = {.offset = prepass_area.offset, .extent = prepass_area.extent},
-		        .clearValueCount = 1,
-		        .pClearValues = &depth_clear,
-		};
-		cmd.beginRenderPass(depth_begin, vk::SubpassContents::eInline);
-		if (any)
-		{
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *fill_pipeline);
-			for (const auto & d: draws)
-			{
-				// Unified skip with the dots loop below (index/dot/
-				// scissor). Each loop pushes its own constants per draw;
-				// nothing persists across passes.
-				vk::Rect2D scissor;
-				if (d.index_count == 0 or d.dot_count == 0 or
-				    not clamp_scissor(d.scissor[eye], extents[eye], scissor))
-					continue;
-				cmd.setScissor(0, scissor);
-				cmd.bindVertexBuffers(0, d.vertex_buffer, (vk::DeviceSize)0);
-				cmd.bindIndexBuffer(d.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
-				push pc{
-				        .mvp = d.mvp[eye],
-				        .color_pitch = glm::vec4(d.color, d.pitch),
-				        .view_params = glm::vec4(d.view_params[eye], dot_radius_cells),
-				};
-				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
-				cmd.drawIndexed(d.index_count, 1, 0, 0, 0);
-			}
-		}
-		cmd.endRenderPass();
-		// (Pass 1b retired: the proximity sphere field is rendered once
-		// by the feather mask hidden record into the shared sphere image
-		// sampled below — same command buffer, earlier. See record().)
-		// Pass 2: dots sample the stored depths at their CENTERS (whole
-		// circles live or die — no per-pixel chop). The depth renderpass's
-		// subpass dependency carries the write→read hazard, no manual
-		// barrier.
-		vk::ClearValue color_clear{};
-		color_clear.color.float32.fill(0);
-		vk::RenderPassBeginInfo color_begin{
-		        .renderPass = *color_renderpass,
-		        .framebuffer = *tgt.framebuffer,
-		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
-		        .clearValueCount = 1,
-		        .pClearValues = &color_clear,
-		};
-		cmd.beginRenderPass(color_begin, vk::SubpassContents::eInline);
-		if (any)
-		{
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, *descriptor_sets[eye], {});
-			cmd.bindVertexBuffers(0, (vk::Buffer)quad_, (vk::DeviceSize)0);
-			for (const auto & d: draws)
-			{
-				// Same unified skip as the fill loop above.
-				vk::Rect2D scissor;
-				if (d.index_count == 0 or d.dot_count == 0 or
-				    not clamp_scissor(d.scissor[eye], extents[eye], scissor))
-					continue;
-				cmd.setScissor(0, scissor);
-				// Baked dot instances borrowed from the feather hidden
-				// renderer (owns upload + eviction); bound fresh per draw.
-				// Per-draw push (not relying on fill-loop persistence:
-				// multi-draw frames must not share the last push).
-				cmd.bindVertexBuffers(1, d.dot_buffer, (vk::DeviceSize)0);
-				push pc{
-				        .mvp = d.mvp[eye],
-				        .color_pitch = glm::vec4(d.color, d.pitch),
-				        .view_params = glm::vec4(d.view_params[eye], dot_radius_cells),
-				};
-				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
-				cmd.draw(6, d.dot_count, 0, 0);
-			}
-		}
-		cmd.endRenderPass();
 	}
+	cmd.endRenderPass();
+	// (Pass 1b retired: the proximity sphere field is rendered once by the
+	// feather mask hidden record into the shared sphere image sampled below
+	// — same command buffer, earlier. See record().)
+	// Pass 2: dots sample the stored depths at their CENTERS (whole circles
+	// live or die — no per-pixel chop). The depth renderpass.s subpass
+	// dependency carries the write→read hazard, no manual barrier.
+	vk::ClearValue color_clear{};
+	color_clear.color.float32.fill(0);
+	vk::RenderPassBeginInfo color_begin{
+	        .renderPass = *color_renderpass,
+	        .framebuffer = *tgt.framebuffer,
+	        .renderArea = {.offset = {0, 0}, .extent = extents[0]},
+	        .clearValueCount = 1,
+	        .pClearValues = &color_clear,
+	};
+	cmd.beginRenderPass(color_begin, vk::SubpassContents::eInline);
+	if (any)
+	{
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, *descriptor_sets[0], {});
+		cmd.bindVertexBuffers(0, (vk::Buffer)quad_, (vk::DeviceSize)0);
+		for (const auto & d: draws)
+		{
+			// Same unified skip as the fill loop above.
+			vk::Rect2D scissor;
+			if (not draw_union(d, scissor))
+				continue;
+			cmd.setScissor(0, scissor);
+			// Baked dot instances borrowed from the feather hidden renderer
+			// (owns upload + eviction); bound fresh per draw. Per-draw push
+			// (multi-draw frames must not share the last push).
+			cmd.bindVertexBuffers(1, d.dot_buffer, (vk::DeviceSize)0);
+			push pc{
+			        .mvp = {{d.mvp[0], d.mvp[1]}},
+			        .color_pitch = glm::vec4(d.color, d.pitch),
+			        .view_params = {{glm::vec4(d.view_params[0], dot_radius_cells),
+			                          glm::vec4(d.view_params[1], dot_radius_cells)}},
+			};
+			cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
+			cmd.draw(6, d.dot_count, 0, 0);
+		}
+	}
+	cmd.endRenderPass();
 	return true;
 }

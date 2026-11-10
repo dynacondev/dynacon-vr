@@ -60,6 +60,18 @@ struct raster_push
 	float opacity = 1;
 };
 
+// Multiview hidden push block. Mirrors mask_mv.vert.glsl: per-eye mvp
+// selected by gl_ViewIndex. 132B — same >128B note as the dots push in
+// hidden_dots.cpp (Adreno 740 provides 256B; ensure_hidden throws loudly
+// below when the device reports less).
+struct hidden_mv_push
+{
+	std::array<glm::mat4, 2> mvp;
+	float opacity = 1;
+};
+static_assert(sizeof(hidden_mv_push) == 132);
+static_assert(sizeof(hidden_mv_push) <= 256);
+
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
 // layout).
@@ -1840,6 +1852,12 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 
 	if (not hidden_ready)
 	{
+		// Multiview hidden pushes (132B MVP pair) exceed the 128-byte
+		// Vulkan minimum: Adreno 740 (Quest 3) provides 256B. Throw loudly
+		// here — not silently on device — when unsupported (see the
+		// hidden_mv_push note by raster_push).
+		if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(hidden_mv_push))
+			throw std::runtime_error("hidden multiview needs 132B push constants");
 		hidden_ready = true;
 		// Unit-sphere verts (shared generator with the dots renderer).
 		auto sphere = passthrough_mesh::unit_sphere_positions();
@@ -1879,14 +1897,23 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
 		        .pDepthStencilAttachment = &sphere_ref,
 		};
+		uint32_t hmv_view_mask = 0b11, hmv_corr_mask = 0b11;
+		vk::RenderPassMultiviewCreateInfo hmv_rp_info{
+		        .subpassCount = 1,
+		        .pViewMasks = &hmv_view_mask,
+		        .correlationMaskCount = 1,
+		        .pCorrelationMasks = &hmv_corr_mask,
+		};
 		hidden_sphere_rp = vk::raii::RenderPass(device, vk::RenderPassCreateInfo{
+		                                                          .pNext = &hmv_rp_info,
 		                                                          .attachmentCount = 1,
 		                                                          .pAttachments = &sphere_att,
 		                                                          .subpassCount = 1,
 		                                                          .pSubpasses = &sphere_sub,
 		                                                  });
-		// Silhouette RP: color CLEAR/STORE/GENERAL + sphere depth
-		// LOAD (written by the pass above), DONT_CARE store.
+		// Silhouette RP: color CLEAR/STORE/OPTIMAL (submitted image, nothing
+		// app-side re-reads it — keeps UBWC live) + sphere depth LOAD
+		// (written by the pass above), DONT_CARE store.
 		vk::AttachmentDescription hidden_atts[2] = {
 		        vk::AttachmentDescription{
 		                .format = format,
@@ -1894,7 +1921,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		                .loadOp = vk::AttachmentLoadOp::eClear,
 		                .storeOp = vk::AttachmentStoreOp::eStore,
 		                .initialLayout = vk::ImageLayout::eUndefined,
-		                .finalLayout = vk::ImageLayout::eGeneral,
+		                .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 		        },
 		        vk::AttachmentDescription{
 		                .format = depth_format,
@@ -1922,18 +1949,19 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		        .pDepthStencilAttachment = &hidden_depth_ref,
 		};
 		hidden_color_rp = vk::raii::RenderPass(device, vk::RenderPassCreateInfo{
+		                                                         .pNext = &hmv_rp_info,
 		                                                         .attachmentCount = 2,
 		                                                         .pAttachments = hidden_atts,
 		                                                         .subpassCount = 1,
 		                                                         .pSubpasses = &hidden_sub,
 		                                                 });
 
-		// Same mask.vert/mask.frag modules as the tier-0 raster (shared
-		// raster_push layout), new pipeline objects: the shared ones
-		// don't match (no depth test on the plain pipe, MIN-blend on the
-		// reversed pipe which would zero the fill against clear).
-		auto hvert = load_shader(device, "mask.vert");
-		auto hfrag = load_shader(device, "mask.frag");
+		// Multiview twins of the mask modules (mask_mv.vert/frag, 132B
+		// hidden_mv_layout): same raster state as the tier-0 raster plus
+		// the proximity depth test. The shared 68B raster_push layout is
+		// untouched (per-eye feather paths keep it).
+		auto hvert = load_shader(device, "mask_mv.vert");
+		auto hfrag = load_shader(device, "mask_mv.frag");
 		auto hempty = load_shader(device, "hidden_dotfill.frag");
 		vk::PipelineShaderStageCreateInfo hstages[2] = {
 		        {
@@ -2006,6 +2034,17 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		        .depthWriteEnable = VK_TRUE,
 		        .depthCompareOp = vk::CompareOp::eLess,
 		};
+		vk::PushConstantRange hmv_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+		        .offset = 0,
+		        .size = sizeof(hidden_mv_push),
+		};
+		vk::PipelineLayoutCreateInfo hmv_layout_info{
+		        .setLayoutCount = 0,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &hmv_push_range,
+		};
+		hidden_mv_layout = vk::raii::PipelineLayout(device, hmv_layout_info);
 		hidden_sphere_pipe = vk::raii::Pipeline(device, *pipe_cache,
 		                                        vk::GraphicsPipelineCreateInfo{
 		                                                .stageCount = 2,
@@ -2018,7 +2057,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		                                                .pDepthStencilState = &hsphere_depth,
 		                                                .pColorBlendState = nullptr,
 		                                                .pDynamicState = &hdynamic,
-		                                                .layout = *pipeline_layout,
+		                                                .layout = *hidden_mv_layout,
 		                                                .renderPass = *hidden_sphere_rp,
 		                                        });
 		// Silhouette: tier-0 raster state verbatim (cull-none, blend-off
@@ -2055,7 +2094,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		                                                    .pDepthStencilState = &hsil_depth,
 		                                                    .pColorBlendState = &hsil_blend,
 		                                                    .pDynamicState = &hdynamic,
-		                                                    .layout = *pipeline_layout,
+		                                                    .layout = *hidden_mv_layout,
 		                                                    .renderPass = *hidden_color_rp,
 		                                            });
 	}
@@ -2066,48 +2105,46 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 	{
 		hidden_frame_targets tgt;
 		tgt.extent = extent;
-		for (int eye = 0; eye < 2; ++eye)
-		{
-			vk::ImageViewCreateInfo iv_info{
-			        .image = image,
-			        .viewType = vk::ImageViewType::e2DArray,
-			        .format = format,
-			        .subresourceRange = {
-			                .aspectMask = vk::ImageAspectFlagBits::eColor,
-			                .baseMipLevel = 0,
-			                .levelCount = 1,
-			                .baseArrayLayer = (uint32_t)eye,
-			                .layerCount = 1,
-			        },
-			};
-			tgt.views[eye] = vk::raii::ImageView(device, iv_info);
-			vk::ImageView color_view = *tgt.views[eye];
-			// Shared sphere field (dots-owned): the framebuffer bakes
-			// the borrowed view, so the scene must reset_targets()
-			// before the dots renderer dies or rebuilds (see
-			// hidden_sphere_field). Extent agreement is the scene's
-			// job — one quarter-res for mask, field and dots.
-			vk::ImageView sphere_view = field.views[eye];
-			vk::ImageView color_atts[2] = {color_view, sphere_view};
-			vk::FramebufferCreateInfo color_fb{
-			        .renderPass = *hidden_color_rp,
-			        .attachmentCount = 2,
-			        .pAttachments = color_atts,
-			        .width = extent.width,
-			        .height = extent.height,
-			        .layers = 1,
-			};
-			tgt.framebuffers[eye] = vk::raii::Framebuffer(device, color_fb);
-			vk::FramebufferCreateInfo sphere_fb{
-			        .renderPass = *hidden_sphere_rp,
-			        .attachmentCount = 1,
-			        .pAttachments = &sphere_view,
-			        .width = extent.width,
-			        .height = extent.height,
-			        .layers = 1,
-			};
-			tgt.sphere_framebuffers[eye] = vk::raii::Framebuffer(device, sphere_fb);
-		}
+		// One multiview target: array color view (both layers) + layers=2
+		// framebuffers; one draw broadcasts to both eyes. The sphere
+		// framebuffer bakes the dots-owned borrowed ARRAY view, so the
+		// scene must reset_targets() before the dots renderer dies or
+		// rebuilds (see hidden_sphere_field). Extent agreement is the
+		// scene's job — one quarter-res for mask, field and dots.
+		vk::ImageViewCreateInfo iv_info{
+		        .image = image,
+		        .viewType = vk::ImageViewType::e2DArray,
+		        .format = format,
+		        .subresourceRange = {
+		                .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                .baseMipLevel = 0,
+		                .levelCount = 1,
+		                .baseArrayLayer = 0,
+		                .layerCount = 2,
+		        },
+		};
+		tgt.view_array = vk::raii::ImageView(device, iv_info);
+		vk::ImageView color_view = *tgt.view_array;
+		vk::ImageView sphere_view = field.view_array;
+		vk::ImageView color_atts[2] = {color_view, sphere_view};
+		vk::FramebufferCreateInfo color_fb{
+		        .renderPass = *hidden_color_rp,
+		        .attachmentCount = 2,
+		        .pAttachments = color_atts,
+		        .width = extent.width,
+		        .height = extent.height,
+		        .layers = 2,
+		};
+		tgt.framebuffer = vk::raii::Framebuffer(device, color_fb);
+		vk::FramebufferCreateInfo sphere_fb{
+		        .renderPass = *hidden_sphere_rp,
+		        .attachmentCount = 1,
+		        .pAttachments = &sphere_view,
+		        .width = extent.width,
+		        .height = extent.height,
+		        .layers = 2,
+		};
+		tgt.sphere_framebuffer = vk::raii::Framebuffer(device, sphere_fb);
 		hidden_targets[image] = std::move(tgt);
 	}
 }
@@ -2130,65 +2167,51 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 	auto & tgt = hidden_targets[image];
 	VkImage sphere_image = field.image;
 
-	for (int eye = 0; eye < 2; ++eye)
-	{
-		vk::Viewport full_vp{
-		        .x = 0,
-		        .y = 0,
-		        .width = (float)extent.width,
-		        .height = (float)extent.height,
-		        .minDepth = 0,
-		        .maxDepth = 1,
-		};
-		vk::Rect2D full_sc{.offset = {0, 0}, .extent = extent};
-		// RP1: proximity field (sphere exits, LESS over a near-clear).
-		vk::ClearValue sphere_clear{};
-		sphere_clear.depthStencil = vk::ClearDepthStencilValue{1.f, 0};
-		vk::RenderPassBeginInfo sphere_begin{
-		        .renderPass = *hidden_sphere_rp,
-		        .framebuffer = *tgt.sphere_framebuffers[eye],
-		        .renderArea = {.offset = {0, 0}, .extent = extent},
-		        .clearValueCount = 1,
-		        .pClearValues = &sphere_clear,
-		};
-		cmd.beginRenderPass(sphere_begin, vk::SubpassContents::eInline);
-		cmd.setViewport(0, full_vp);
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hidden_sphere_pipe);
-		cmd.bindVertexBuffers(0, (vk::Buffer)hidden_sphere_verts_, (vk::DeviceSize)0);
-		for (const auto & s: spheres)
+	// Multiview: one draw broadcasts to both layers (viewMask=both) — the
+	// two per-eye passes collapse into two begins total. Push carries both
+	// MVPs; each invocation selects its own eye (exact, no cross-eye
+	// leakage). Scissors are the both-eyes union (one scissor covers both
+	// views): superset-safe, skip only when both eyes degenerate.
+	vk::Viewport full_vp{
+	        .x = 0,
+	        .y = 0,
+	        .width = (float)extent.width,
+	        .height = (float)extent.height,
+	        .minDepth = 0,
+	        .maxDepth = 1,
+	};
+	vk::Rect2D full_sc{.offset = {0, 0}, .extent = extent};
+	// Both-eyes union of the containing-cube boxes for a sphere MVP pair.
+	// Per eye: rigorous superset while every corner is in front (+2px pad,
+	// float-domain clamp — see the UB note below); any corner at/behind
+	// the camera forces fullscreen for that eye (the eye-inside case always
+	// has one; a clipped box there would under-reveal, fail-unsafe).
+	// Returns false only when both eyes degenerate (fully off-screen).
+	auto sphere_union = [&](const std::array<glm::mat4, 2> & s, vk::Rect2D & out) {
+		bool got = false;
+		int32_t ax0 = 0, ay0 = 0, ax1 = 0, ay1 = 0;
+		for (int eye = 0; eye < 2; ++eye)
 		{
-			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-			                               raster_push{.mvp = s[eye], .opacity = 1});
-			// Per-sphere scissor from the containing cube (unit-sphere
-			// space corners through the MVP): a rigorous superset of the
-			// sphere coverage while every corner is in front (planar faces
-			// map line-to-line under perspective), +2px pad, clamped.
-			// Any corner at/behind the camera falls back to fullscreen:
-			// the eye-inside case always has one (corners surround the
-			// center), and a clipped box there would under-reveal
-			// (fail-unsafe: field stays clear, RP2 + dots both cut).
-			// NDC->pixel convention copies RP2 below. An empty clamped
-			// box means fully off-screen (superset empty) and skips.
-			bool sph_full = false;
+			bool eye_full = false;
 			float sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;
-			bool sph_any = false;
-			for (int corner = 0; corner < 8 and not sph_full; ++corner)
+			bool eye_any = false;
+			for (int corner = 0; corner < 8 and not eye_full; ++corner)
 			{
 				glm::vec4 q4((corner & 1) ? 1.f : -1.f, (corner & 2) ? 1.f : -1.f,
 				               (corner & 4) ? 1.f : -1.f, 1);
 				glm::vec4 c = s[eye] * q4;
 				if (c.w <= 1e-6f)
 				{
-					sph_full = true;
+					eye_full = true;
 					break;
 				}
 				float px = (c.x / c.w * 0.5f + 0.5f) * (float)extent.width;
 				float py = (c.y / c.w * 0.5f + 0.5f) * (float)extent.height;
-				if (not sph_any)
+				if (not eye_any)
 				{
 					sx0 = sx1 = px;
 					sy0 = sy1 = py;
-					sph_any = true;
+					eye_any = true;
 				}
 				else
 				{
@@ -2198,80 +2221,57 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 					sy1 = std::max(sy1, py);
 				}
 			}
-			if (sph_full)
+			if (eye_full)
 			{
-				cmd.setScissor(0, full_sc);
+				out = full_sc;
+				return true;
+			}
+			if (not eye_any)
+				continue;
+			// Float-domain clamp first: radii are config-controlled with no
+			// upper bound, and an out-of-range float->int cast is UB that
+			// resolves (x86) to INT_MIN => wrongful skip => under-reveal
+			// (fail-unsafe). Clamped floats cast exactly.
+			float fx0 = std::min(std::max(sx0 - 2.f, 0.f), (float)extent.width);
+			float fy0 = std::min(std::max(sy0 - 2.f, 0.f), (float)extent.height);
+			float fx1 = std::min(std::max(sx1 + 2.f, 0.f), (float)extent.width);
+			float fy1 = std::min(std::max(sy1 + 2.f, 0.f), (float)extent.height);
+			int32_t ix0 = (int32_t)std::floor(fx0);
+			int32_t iy0 = (int32_t)std::floor(fy0);
+			int32_t ix1 = (int32_t)std::ceil(fx1);
+			int32_t iy1 = (int32_t)std::ceil(fy1);
+			if (ix1 <= ix0 or iy1 <= iy0)
+				continue;
+			if (not got)
+			{
+				ax0 = ix0;
+				ay0 = iy0;
+				ax1 = ix1;
+				ay1 = iy1;
+				got = true;
 			}
 			else
 			{
-				// Float-domain clamp first: radii are config-controlled with no
-				// upper bound, and an out-of-range float->int cast is UB that
-				// resolves (x86) to INT_MIN => wrongful skip => under-reveal
-				// (fail-unsafe). Clamped floats cast exactly.
-				float fx0 = std::min(std::max(sx0 - 2.f, 0.f), (float)extent.width);
-				float fy0 = std::min(std::max(sy0 - 2.f, 0.f), (float)extent.height);
-				float fx1 = std::min(std::max(sx1 + 2.f, 0.f), (float)extent.width);
-				float fy1 = std::min(std::max(sy1 + 2.f, 0.f), (float)extent.height);
-				int32_t ix0 = (int32_t)std::floor(fx0);
-				int32_t iy0 = (int32_t)std::floor(fy0);
-				int32_t ix1 = (int32_t)std::ceil(fx1);
-				int32_t iy1 = (int32_t)std::ceil(fy1);
-				if (ix1 <= ix0 or iy1 <= iy0)
-					continue;
-				cmd.setScissor(0, vk::Rect2D{.offset = {ix0, iy0},
-				                             .extent = {(uint32_t)(ix1 - ix0), (uint32_t)(iy1 - iy0)}});
+				ax0 = std::min(ax0, ix0);
+				ay0 = std::min(ay0, iy0);
+				ax1 = std::max(ax1, ix1);
+				ay1 = std::max(ay1, iy1);
 			}
-			cmd.draw(hidden_sphere_vert_count, 1, 0, 0);
 		}
-		cmd.endRenderPass();
-
-		// Sphere depth → silhouette test hazard (same attachment layout
-		// throughout, write then read).
-		vk::ImageMemoryBarrier sph_bar{
-		        .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
-		        .dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead,
-		        .oldLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
-		        .newLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
-		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .image = sphere_image,
-		        .subresourceRange = {
-		                .aspectMask = vk::ImageAspectFlagBits::eDepth,
-		                .baseMipLevel = 0,
-		                .levelCount = 1,
-		                .baseArrayLayer = 0,
-		                .layerCount = 2,
-		        },
-		};
-		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
-		                    vk::PipelineStageFlagBits::eEarlyFragmentTests, {}, {}, {}, sph_bar);
-
-		// RP2: silhouettes, kept only where nearer than the sphere exit
-		// (GREATER, no depth write). Hard near-field edge by design.
-		// Per-draw scissor from the shared full-res bounds (scaled into
-		// the mask extent +1px pad): the only tri-raster with one, so
-		// small objects shade small. RenderArea stays full (correctness).
-		vk::ClearValue hidden_clears[2]{};
-		hidden_clears[0].color.float32.fill(0);
-		hidden_clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0}; // dead by LOAD, ignored
-		vk::RenderPassBeginInfo color_begin{
-		        .renderPass = *hidden_color_rp,
-		        .framebuffer = *tgt.framebuffers[eye],
-		        .renderArea = {.offset = {0, 0}, .extent = extent},
-		        .clearValueCount = 2,
-		        .pClearValues = hidden_clears,
-		};
-		cmd.beginRenderPass(color_begin, vk::SubpassContents::eInline);
-		cmd.setViewport(0, full_vp);
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hidden_silhouette_pipe);
-		for (const auto & d: draws)
+		if (not got)
+			return false;
+		out = vk::Rect2D{.offset = {ax0, ay0}, .extent = {(uint32_t)(ax1 - ax0), (uint32_t)(ay1 - ay0)}};
+		return true;
+	};
+	// Both-eyes union of a silhouette draw.s per-eye pixel boxes (same
+	// full-res bounds scaled into the mask extent +1px pad, clamped).
+	// NDC->pixel convention unchanged from the per-eye path. Skip only
+	// when both eyes degenerate.
+	auto draw_union = [&](const hidden_draw & d, vk::Rect2D & out) {
+		bool got = false;
+		int32_t ax0 = 0, ay0 = 0, ax1 = 0, ay1 = 0;
+		for (int eye = 0; eye < 2; ++eye)
 		{
-			auto mit = meshes.find(d.mesh);
-			if (mit == meshes.end() or mit->second.index_count == 0)
-				continue;
-			// Per-draw scissor from the shared full-res bounds (scaled
-			// into the mask extent +1px pad, clamped; degenerate draws
-			// skipped). RenderArea stays full (correctness).
 			float msx = (float)extent.width / (float)full_extents[eye].width;
 			float msy = (float)extent.height / (float)full_extents[eye].height;
 			int32_t x0 = (int32_t)std::max(0.f, d.px[eye][0] * msx - 1.f);
@@ -2280,17 +2280,110 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 			int32_t y1 = (int32_t)std::min((float)extent.height, d.px[eye][3] * msy + 1.f);
 			if (x1 <= x0 or y1 <= y0)
 				continue;
-			cmd.setScissor(0, vk::Rect2D{.offset = {x0, y0},
-			                             .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}});
-			cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-			cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-			                               raster_push{.mvp = d.mvp[eye], .opacity = d.opacity});
-			cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-			++local.draws;
+			if (not got)
+			{
+				ax0 = x0;
+				ay0 = y0;
+				ax1 = x1;
+				ay1 = y1;
+				got = true;
+			}
+			else
+			{
+				ax0 = std::min(ax0, x0);
+				ay0 = std::min(ay0, y0);
+				ax1 = std::max(ax1, x1);
+				ay1 = std::max(ay1, y1);
+			}
 		}
-		cmd.endRenderPass();
+		if (not got)
+			return false;
+		out = vk::Rect2D{.offset = {ax0, ay0}, .extent = {(uint32_t)(ax1 - ax0), (uint32_t)(ay1 - ay0)}};
+		return true;
+	};
+	// RP1: proximity field (sphere exits, LESS over a near-clear). One
+	// multiview begin over the layers=2 framebuffer.
+	vk::ClearValue sphere_clear{};
+	sphere_clear.depthStencil = vk::ClearDepthStencilValue{1.f, 0};
+	vk::RenderPassBeginInfo sphere_begin{
+	        .renderPass = *hidden_sphere_rp,
+	        .framebuffer = *tgt.sphere_framebuffer,
+	        .renderArea = {.offset = {0, 0}, .extent = extent},
+	        .clearValueCount = 1,
+	        .pClearValues = &sphere_clear,
+	};
+	cmd.beginRenderPass(sphere_begin, vk::SubpassContents::eInline);
+	cmd.setViewport(0, full_vp);
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hidden_sphere_pipe);
+	cmd.bindVertexBuffers(0, (vk::Buffer)hidden_sphere_verts_, (vk::DeviceSize)0);
+	for (const auto & s: spheres)
+	{
+		vk::Rect2D scissor;
+		if (not sphere_union(s, scissor))
+			continue;
+		cmd.setScissor(0, scissor);
+		cmd.pushConstants<hidden_mv_push>(*hidden_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+		                                 hidden_mv_push{.mvp = {{s[0], s[1]}}, .opacity = 1});
+		cmd.draw(hidden_sphere_vert_count, 1, 0, 0);
 	}
+	cmd.endRenderPass();
+
+	// Sphere depth → silhouette test hazard (same attachment layout
+	// throughout, write then read).
+	vk::ImageMemoryBarrier sph_bar{
+	        .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+	        .dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead,
+	        .oldLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	        .newLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .image = sphere_image,
+	        .subresourceRange = {
+	                .aspectMask = vk::ImageAspectFlagBits::eDepth,
+	                .baseMipLevel = 0,
+	                .levelCount = 1,
+	                .baseArrayLayer = 0,
+	                .layerCount = 2,
+	        },
+	};
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
+	                    vk::PipelineStageFlagBits::eEarlyFragmentTests, {}, {}, {}, sph_bar);
+
+	// RP2: silhouettes, kept only where nearer than the sphere exit
+	// (GREATER, no depth write). Hard near-field edge by design. One
+	// multiview begin over the layers=2 framebuffer. Per-draw scissor is
+	// the both-eyes union (submitted full-rect image: renderArea stays
+	// full, correctness).
+	vk::ClearValue hidden_clears[2]{};
+	hidden_clears[0].color.float32.fill(0);
+	hidden_clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0}; // dead by LOAD, ignored
+	vk::RenderPassBeginInfo color_begin{
+	        .renderPass = *hidden_color_rp,
+	        .framebuffer = *tgt.framebuffer,
+	        .renderArea = {.offset = {0, 0}, .extent = extent},
+	        .clearValueCount = 2,
+	        .pClearValues = hidden_clears,
+	};
+	cmd.beginRenderPass(color_begin, vk::SubpassContents::eInline);
+	cmd.setViewport(0, full_vp);
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hidden_silhouette_pipe);
+	for (const auto & d: draws)
+	{
+		auto mit = meshes.find(d.mesh);
+		if (mit == meshes.end() or mit->second.index_count == 0)
+			continue;
+		vk::Rect2D scissor;
+		if (not draw_union(d, scissor))
+			continue;
+		cmd.setScissor(0, scissor);
+		cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+		cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+		cmd.pushConstants<hidden_mv_push>(*hidden_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+		                                 hidden_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity});
+		cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+		++local.draws;
+	}
+	cmd.endRenderPass();
 
 	// Shared-field handoff (P4): the dots color pass samples the sphere
 	// image later in this command buffer. Same-queue write→read needs an
