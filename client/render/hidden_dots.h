@@ -54,15 +54,17 @@ class hidden_dots_renderer
 public:
 	// One silhouette draw: per-eye clip transforms (placement already
 	// baked in), dot color + pitch, per-eye scissor rects (dots pixel
-	// space, computed stream-side from the same cull corners), and the
-	// mesh GPU buffers borrowed from the feather hidden renderer (which
-	// keeps owning upload + eviction).
+	// space, computed stream-side from the same cull corners), per-eye
+	// view params (viewport W/H px + proj[1][1] for the world→px radius),
+	// and the mesh GPU buffers borrowed from the feather hidden renderer
+	// (which keeps owning upload + eviction).
 	struct instance_draw
 	{
 		std::array<glm::mat4, 2> mvp;
 		glm::vec3 color{1.0f, 0.16f, 0.10f};
 		float pitch = 0.05f;
 		std::array<vk::Rect2D, 2> scissor;
+		std::array<glm::vec3, 2> view_params; // x: view W px, y: view H px, z: proj[1][1]
 		vk::Buffer vertex_buffer;
 		vk::Buffer index_buffer;
 		uint32_t index_count = 0;

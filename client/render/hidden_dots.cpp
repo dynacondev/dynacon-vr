@@ -28,13 +28,14 @@
 namespace
 {
 // Mirrors hidden_dots.vert/frag.glsl PushConstants: mvp (64) + color and
-// pitch (16) = 80B, within the 128-byte minimum.
+// pitch (16) + view params (16) = 96B, within the 128-byte minimum.
 struct push
 {
 	glm::mat4 mvp;
 	glm::vec4 color_pitch; // rgb: dot color, w: dot pitch (m)
+	glm::vec4 view_params; // x: view W px, y: view H px, z: proj[1][1], w: unused
 };
-static_assert(sizeof(push) == 80);
+static_assert(sizeof(push) == 96);
 } // namespace
 
 hidden_dots_renderer::hidden_dots_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device) :
@@ -282,7 +283,6 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
 		auto & tgt = targets[image_index][eye];
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 		cmd.setViewport(0, vk::Viewport{
 		                        .x = 0,
 		                        .y = 0,
@@ -294,10 +294,12 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		// Union of the draws' stream-side scissor rects (computed once per
 		// object in the shared silhouette build): shading tracks object
 		// size instead of the fullscreen. The render-area CLEAR stays full
-		// (correctness); only draw fragments are culled.
+		// (correctness); only draw fragments are culled. A zero union for
+		// this eye still begins/ends the pass (clear-only): the image
+		// starts UNDEFINED and the compositor samples the full rect.
 		vk::Rect2D scissor{.offset = {0, 0}, .extent = extents[eye]};
+		bool any = false;
 		{
-			bool any = false;
 			int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
 			for (const auto & d: draws)
 			{
@@ -339,20 +341,25 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		        .pClearValues = &clear,
 		};
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		for (const auto & d: draws)
+		if (any)
 		{
-			if (d.index_count == 0)
-				continue;
-			// Buffers borrowed from the feather hidden renderer (owns
-			// upload + eviction); bound fresh per draw, no map lookups.
-			cmd.bindVertexBuffers(0, d.vertex_buffer, (vk::DeviceSize)0);
-			cmd.bindIndexBuffer(d.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
-			push pc{
-			        .mvp = d.mvp[eye],
-			        .color_pitch = glm::vec4(d.color, d.pitch),
-			};
-			cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
-			cmd.drawIndexed(d.index_count, 1, 0, 0, 0);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+			for (const auto & d: draws)
+			{
+				if (d.index_count == 0)
+					continue;
+				// Buffers borrowed from the feather hidden renderer (owns
+				// upload + eviction); bound fresh per draw, no map lookups.
+				cmd.bindVertexBuffers(0, d.vertex_buffer, (vk::DeviceSize)0);
+				cmd.bindIndexBuffer(d.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
+				push pc{
+				        .mvp = d.mvp[eye],
+				        .color_pitch = glm::vec4(d.color, d.pitch),
+				        .view_params = glm::vec4(d.view_params[eye], 0.f),
+				};
+				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
+				cmd.drawIndexed(d.index_count, 1, 0, 0, 0);
+			}
 		}
 		cmd.endRenderPass();
 	}

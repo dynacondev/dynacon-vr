@@ -18,24 +18,28 @@
 
 #version 450
 
-// Plain MVP plus the pitch-normalized object-space position for the
-// fragment-stage dot pattern. The pitch division lives here (linear
-// interpolation keeps it visually identical) so no per-pixel divide
-// runs. No placement rebuild, no center math: the dots live in model
-// space, which is world space up to the (uniform, ~1) placement scale.
+// Plain MVP plus pitch-normalized position and view depth for the
+// fragment-stage round dots. No placement rebuild, no normals.
 layout(location = 0) in vec3 pos;
 
 layout(location = 0) out vec3 vQ;
+layout(location = 1) out float vViewZ;
 
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp;
 	vec4 color_pitch; // rgb: dot color, w: dot pitch (m)
+	vec4 view_params; // x: view W px, y: view H px, z: proj[1][1]
 }
 pc;
 
 void main()
 {
 	vQ = pos / max(pc.color_pitch.w, 1e-4);
-	gl_Position = pc.mvp * vec4(pos, 1.0);
+	vec4 clip = pc.mvp * vec4(pos, 1.0);
+	// Perspective clip w is -z_eye (w row is (0,0,-1,0) in every
+	// perspective variant including reversed-Z), so this is the view
+	// distance in meters, no matrix needed.
+	vViewZ = -clip.w;
+	gl_Position = clip;
 }
