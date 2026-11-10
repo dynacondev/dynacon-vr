@@ -450,8 +450,11 @@ Each `passthrough` entry has:
   headset distance. `"3d-passthrough-hidden"` renders the model as a
   hard-edged always-on passthrough cutout on its own mask layer plus a
   flat guardian-style warning outline around the silhouette (opaque,
-  fixed ~2cm world width): reversed cuts never apply to it (safety:
-  hidden always wins), and it needs `model-path` like boundary zones.
+  fixed ~2cm world width at scale 1): reversed cuts never apply to it
+  (safety: hidden always wins), and it needs `model-path` like boundary
+  zones. Hidden meshes must be **closed volumes** like boundary meshes
+  (the outline is an inverted hull: open meshes degrade — solid from
+  behind, invisible from the front).
 - `id`: stable identifier (required, must be unique); `tag`:
   display-only label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required;

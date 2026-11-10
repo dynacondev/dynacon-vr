@@ -39,12 +39,7 @@ struct push
 };
 static_assert(sizeof(push) == 96);
 
-// World-space shell expansion for the rim pass (2cm): the rim ring this
-// wide peeks out around the occluder silhouette. Fixed, not per-object:
-// keeps the push small and the thickness perspective-correct for free.
-constexpr float outline_expand_m = 0.02f;
-
-// Depth for the grid raster (D16 depth-test-only: never sampled,
+// Depth for the outline raster (D16 depth-test-only: never sampled,
 // device-local; D16 attachment support is mandatory per spec).
 constexpr vk::Format depth_format = vk::Format::eD16Unorm;
 
@@ -56,7 +51,7 @@ uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t t
 		if ((type_bits & (1u << i)) and (mem.memoryTypes[i].propertyFlags & properties) == properties)
 			return i;
 	}
-	throw std::runtime_error("hidden_grid: no suitable memory type");
+	throw std::runtime_error("hidden outline: no suitable memory type");
 }
 } // namespace
 
@@ -323,11 +318,13 @@ void hidden_outline_renderer::init_pipelines(vk::Format format)
 
 	// Reversed-Z (near = 1, far = 0, matching scene_renderer and the
 	// feather depth path); clear is 0.0 = far.
-	// Occluder: no test (first writer per pixel), depth write on, color
-	// masked off below.
+	// Occluder: nearer-or-equal wins so overlapping objects and concave
+	// folds resolve by depth regardless of draw order (clear 0 always
+	// passes first). Depth write on, color masked off below.
 	vk::PipelineDepthStencilStateCreateInfo depth_occluder{
-	        .depthTestEnable = VK_FALSE,
+	        .depthTestEnable = VK_TRUE,
 	        .depthWriteEnable = VK_TRUE,
+	        .depthCompareOp = vk::CompareOp::eGreaterOrEqual,
 	};
 	// Rim: nearer-wins against the prepass. OR_EQUAL (not strict) so the
 	// silhouette edge itself stays continuous; strictly-farther backfaces
@@ -489,7 +486,7 @@ void hidden_outline_renderer::record(vk::raii::CommandBuffer & cmd, size_t image
 		        .pClearValues = clears.data(),
 		};
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		auto draw_all = [&](vk::raii::Pipeline & pipe, float expand) {
+		auto draw_all = [&](vk::raii::Pipeline & pipe, bool per_draw_expand) {
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipe);
 			for (const auto & d: draws)
 			{
@@ -501,7 +498,9 @@ void hidden_outline_renderer::record(vk::raii::CommandBuffer & cmd, size_t image
 				push pc{
 				        .mvp = d.mvp[eye],
 				        .color = glm::vec4(d.color, 1.f),
-				        .center_thickness = glm::vec4(d.obj_center, expand),
+				        // Occluder runs exact (0); the rim expands per draw
+				        // (model-space meters, scale-compensated upstream).
+				        .center_thickness = glm::vec4(d.obj_center, per_draw_expand ? d.expand : 0.f),
 				};
 				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
 				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
@@ -509,8 +508,8 @@ void hidden_outline_renderer::record(vk::raii::CommandBuffer & cmd, size_t image
 		};
 		// Occluder prepass (exact silhouette into depth, no color),
 		// then the expanded shell: only the rim ring passes.
-		draw_all(pipeline_occluder, 0.f);
-		draw_all(pipeline_rim, outline_expand_m);
+		draw_all(pipeline_occluder, false);
+		draw_all(pipeline_rim, true);
 		cmd.endRenderPass();
 	}
 }

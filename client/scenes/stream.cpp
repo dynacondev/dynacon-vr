@@ -3092,15 +3092,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						d.mvp[view] = server_mvp[view] * model;
 					d.color = glm::vec3(ost.def.grid_color[0], ost.def.grid_color[1], ost.def.grid_color[2]);
 					d.obj_center = (bounds->first + bounds->second) * 0.5f;
+					// Scale-compensated shell expand (model-space meters):
+					// the vertex shader expands pre-MVP, so divide out the
+					// uniform placement scale to hold a fixed world width.
+					d.expand = hidden_outline_renderer::expand_m / std::max(fu.world_scale.x, 1e-6f);
+					// Frustum skip (1px margin, like the hidden mask): test
+					// the shell bounds, i.e. the AABB dilated by the model-
+					// space expand (exact: the shader expands pre-MVP, and
+					// the MVP carries the placement scale).
 					bool visible = false;
+					glm::vec3 bmin = bounds->first - hidden_outline_renderer::expand_m;
+					glm::vec3 bmax = bounds->second + hidden_outline_renderer::expand_m;
 					for (uint32_t view = 0; view < 2 and not visible; ++view)
 					{
 						bool any_front = false, any_behind = false, any_inside = false;
 						for (int corner = 0; corner < 8; ++corner)
 						{
-							glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
-							               (corner & 2) ? bounds->second.y : bounds->first.y,
-							               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+							glm::vec4 q4((corner & 1) ? bmax.x : bmin.x,
+							               (corner & 2) ? bmax.y : bmin.y,
+							               (corner & 4) ? bmax.z : bmin.z, 1);
 							glm::vec4 c = d.mvp[view] * q4;
 							if (c.w < 0)
 							{
@@ -3141,10 +3151,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - outline_t0).count();
 			}
-			if (not have_hidden_outline and not hidden_outline_hashes.empty())
+			if (not known_hidden_outline and not hidden_outline_hashes.empty())
 			{
-				// Map wipe / all hidden objects gone: drop stale GPU meshes
-				// (mirrors the hidden mask cleanup above).
+				// Map wipe: drop stale GPU meshes (mirrors the hidden mask
+				// cleanup above — meshes stay uploaded while map-known so
+				// track-loss/replace cycles only rasterize).
 				if (hidden_outline)
 				{
 					for (auto & [key, _]: hidden_outline_hashes)
@@ -3607,10 +3618,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// standard alpha blend, no FB extensions.
 		if (hidden_outline_active and hidden_outline_image >= 0 and hidden_outline)
 		{
-			std::array<XrCompositionLayerProjectionView, view_count> grid_views;
+			std::array<XrCompositionLayerProjectionView, view_count> outline_views;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
-				grid_views[view] = {
+				outline_views[view] = {
 				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
 				        .pose = sync_pose[view],
 				        .fov = sync_fov[view],
@@ -3626,7 +3637,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 			                     application::space(xr::spaces::world),
-			                     grid_views);
+			                     outline_views);
 			// Paired with the acquire in the record phase above: the
 			// compositor takes the last released image; release after submit.
 			hidden_outline->release();

@@ -34,11 +34,22 @@
 // Own swapchain + own D16 depth (never sampled, cleared every frame).
 // Render thread only.
 //
-// Notes: open single-sided meshes viewed from behind write no occluder
-// depth (back culled), so the rim draws as a solid blob there — acceptable
-// warning behavior, and closed volumes (the complaint: far-side lines
-// showing through) resolve correctly. Overlapping hidden objects resolve
-// nearest-wins via depth regardless of draw order.
+// Notes: hidden meshes must be closed volumes (like boundary zones —
+// the hole the rim rings comes from occluder depth). Open single-sided
+// meshes degrade: viewed from behind the rim draws solid (no occluder
+// depth), viewed from the front nothing draws at all (no backfaces for
+// the inverted hull). Overlapping hidden objects resolve nearest-wins
+// via depth regardless of draw order.
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <array>
 #include <cstddef>
@@ -67,15 +78,24 @@ class session;
 class hidden_outline_renderer
 {
 public:
+	// Shell expansion for the rim pass, in model-space meters at scale 1
+	// (the rim ring this wide peeks out around the occluder silhouette).
+	// The stream side divides by the placement's uniform scale so the
+	// world width stays fixed; it also dilates the frustum test by this.
+	static constexpr float expand_m = 0.02f;
+
 	// One silhouette draw: which uploaded mesh, per-eye clip transforms
 	// (placement already baked in), model-space shell center for the
-	// vertex-stage expansion, and the flat outline color.
+	// vertex-stage expansion, per-draw shell expand (model-space meters;
+	// expand_m divided by the uniform placement scale), and the flat
+	// outline color.
 	struct instance_draw
 	{
 		std::string mesh;
 		std::array<glm::mat4, 2> mvp;
 		glm::vec3 color{128.f / 255.f, 212.f / 255.f, 1.0f};
 		glm::vec3 obj_center{0};
+		float expand = expand_m;
 	};
 
 	explicit hidden_outline_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
