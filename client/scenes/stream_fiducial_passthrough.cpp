@@ -665,8 +665,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		map_key += std::to_string(o.feather_px);
 		map_key += ';';
 		// grid_color/grid_scale_m excluded: live-applied (dot color +
-		// pitch), edits must not reset tracking. pulse_strength and
-		// trigger_distance_m excluded as reserved, unused.
+		// pitch), edits must not reset tracking. transition_distance_m
+		// excluded too (live-applied by the boundary fade). pulse_strength
+		// and trigger_distance_m excluded as reserved, unused.
 	}
 	map_key += 'L';
 	map_key += map->passthrough_until_lock;
@@ -706,6 +707,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		board_poses.clear();
 		board_warm_start.clear();
 		passthrough_objects.clear();
+		// One-shot hidden-nomask warn re-arms with the map (remove-all then
+		// re-add warns again).
+		hidden_nomask_warned = false;
 		// Projected instances are rebuilt from placements below (the
 		// per-frame sync destroys stale ones, the map wipe clears the
 		// rest).

@@ -1520,21 +1520,48 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		update_fiducial_passthrough(frame_state.predictedDisplayTime, sync_display_time);
 
+		// Hidden state, computed once per frame and shared by the nomask
+		// gate, mask record, dots record and submit below (one scan, not
+		// five). Persistent draw buffers (capacity survives clear()).
+		bool hidden_known = false; // map-known (placed or not)
+		bool hidden_placed = false; // placed + mesh ready
+		// One hidden-silhouette build per frame (see the mask phase): model
+		// /MVP/visibility/full-res pixel bounds per eye, shared by the mask
+		// draw list and the dots draw list + scissor.
+		struct hidden_silhouette_draw
+		{
+			std::string mesh;
+			std::array<glm::mat4, 2> mvp;
+			std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
+			glm::vec3 color;
+			float pitch;
+		};
+		std::vector<hidden_silhouette_draw> hidden_silhouettes;
+		std::vector<feather_mask_renderer::instance_draw> hidden_mask_draws;
+		std::vector<hidden_dots_renderer::instance_draw> hidden_dots_draws;
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			(void)oid;
+			if (ost.def.type != "3d-passthrough-hidden")
+				continue;
+			hidden_known = true;
+			if (ost.soup_ready and ost.fused.placed)
+			{
+				hidden_placed = true;
+				break;
+			}
+		}
+		// Per-frame hidden working buffers (declared here, filled by the
+		// shared silhouette build in the mask phase; capacity survives).
+		hidden_silhouettes.clear();
+		hidden_mask_draws.clear();
+		hidden_dots_draws.clear();
+
 		// Hidden objects need the mask path (alpha blend): without it they
 		// stay unrevealed rather than flashing. One-shot log.
 		if (not mask_frame)
 		{
-			bool any_hidden = false;
-			for (auto & [oid, ost]: passthrough_objects)
-			{
-				(void)oid;
-				if (ost.def.type == "3d-passthrough-hidden" and ost.soup_ready and ost.fused.placed)
-				{
-					any_hidden = true;
-					break;
-				}
-			}
-			if (any_hidden and not hidden_nomask_warned)
+			if (hidden_placed and not hidden_nomask_warned)
 			{
 				hidden_nomask_warned = true;
 				spdlog::warn("Hidden passthrough objects placed but the mask path is unavailable on this runtime, staying unrevealed");
@@ -1792,23 +1819,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// fence below).
 		// One hidden-silhouette build per frame, shared by the hidden mask
 		// draw list and the dots draw list + scissor: model/MVP/visibility
-		// computed once instead of per consumer (plus the old third copy,
-		// the scissor re-projection in the dots renderer, which rides the
-		// corners below). 1px margin per eye floored by the mask working
-		// size: a superset of the old mask margin for every eye, so the
-		// mask may keep a ≤1px sliver it previously skipped — visually
-		// identical, exact for dots.
+		// computed once instead of per consumer. 1px margin per eye floored
+		// by the mask working size: a superset of the old mask margin for
+		// every eye, so the mask may keep a ≤1px sliver it previously
+		// skipped — visually identical, exact for dots.
 		// Full-res pixel bounds per eye ride along for the dots scissor
 		// (any behind-camera corner → fullscreen that eye).
-		struct hidden_silhouette_draw
-		{
-			std::string mesh;
-			std::array<glm::mat4, 2> mvp;
-			std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
-			glm::vec3 color{0};
-			float pitch = 0.1f;
-		};
-		std::vector<hidden_silhouette_draw> hidden_silhouettes;
 		auto build_hidden_silhouettes = [&](int mask_w, int mask_h) {
 			hidden_silhouettes.clear();
 			auto * fr = hidden_group.renderer.get();
@@ -1829,14 +1845,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				for (uint32_t view = 0; view < view_count; ++view)
 					s.mvp[view] = server_mvp[view] * model;
 				// Unknown bounds (sync above uploads before draws, so
-				// unexpected): keep the draw, fullscreen scissor.
+				// unexpected): keep the draw with a fullscreen scissor,
+				// then the frustum skip below (1px margin per eye, floored
+				// by the mask working size so the shared test stays a
+				// superset of the old mask margin even under asymmetric
+				// eyes).
 				for (uint32_t view = 0; view < 2; ++view)
 					s.px[view] = {0, 0, (float)extents[view].width, (float)extents[view].height};
-				// Frustum skip (draw on unknown bounds: mesh sync above
-				// uploads before draws, so unexpected — keep the draw).
-				// 1px margin per eye, floored by the mask working size so
-				// the shared test stays a superset of the old mask margin
-				// even under asymmetric eyes.
 				bool visible = true;
 				if (auto bounds = fr->mesh_bounds(oid))
 				{
@@ -2562,37 +2577,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// so hidden always wins for safety.
 				// Steady full-opacity cutout; the dot overlay below annotates
 				// the revealed feed.
-				auto record_hidden_mask = [&](mask_group & g, const char * label, float opacity, bool needed) {
+				auto record_hidden_mask = [&]() {
+					auto & g = hidden_group;
 					{
-						bool known_hidden = false; // map-known (placed or not)
-						bool have_hidden = false; // placed + mesh ready
-						for (auto & [oid, ost]: passthrough_objects)
-						{
-							(void)oid;
-							if (ost.def.type != "3d-passthrough-hidden")
-								continue;
-							known_hidden = true;
-							if (ost.soup_ready and ost.fused.placed)
-							{
-								have_hidden = true;
-								break;
-							}
-						}
-						// Not needed: park it and drop uploaded meshes, keep the rest.
-						if (not needed)
-						{
-							g.active = false;
-							if (g.renderer)
-							{
-								for (auto & [key, _]: g.mesh_hashes)
-									g.renderer->remove_mesh(key);
-								g.mesh_hashes.clear();
-							}
-							return;
-						}
-						g.feather_px = 0;
-						g.projected = false;
-						if (known_hidden)
+						// State hoisted per frame above (shared with the
+						// nomask gate, dots record and submit).
+						if (hidden_known)
 						{
 							// Pre-warm (map-known, not necessarily placed):
 							// renderer + swapchain + intermediates ready before
@@ -2610,7 +2600,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, view_count);
 								g.renderer->reset_targets();
 								g.extent = {(int32_t)mw, (int32_t)mh};
-								spdlog::info("{} swapchain: {}x{} ({} images)", label, mw, mh, g.swapchain.image_count());
+								spdlog::info("Hidden mask swapchain: {}x{} ({} images)", mw, mh, g.swapchain.image_count());
 							}
 							g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
 							for (auto & [oid, ost]: passthrough_objects)
@@ -2648,10 +2638,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									++hit;
 							}
 						}
-						if (not have_hidden)
+						if (not hidden_placed)
 						{
 							g.active = false;
-							if (not known_hidden and g.renderer)
+							if (not hidden_known and g.renderer)
 							{
 								for (auto & [key, _]: g.mesh_hashes)
 									g.renderer->remove_mesh(key);
@@ -2663,16 +2653,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// Silhouettes built once above (shared with the
 							// dots below): map straight to mask draws.
 							build_hidden_silhouettes(mw, mh);
-							std::vector<feather_mask_renderer::instance_draw> draws;
+							hidden_mask_draws.reserve(hidden_silhouettes.size());
 							for (auto & s: hidden_silhouettes)
-								draws.push_back({s.mesh, s.mvp, opacity, false});
-							if (draws.empty())
+								hidden_mask_draws.push_back({s.mesh, s.mvp, 1.f, false});
+							if (hidden_mask_draws.empty())
 							{
 								g.active = false;
 								if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
 								{
 									g.last_draws_log = instance.now();
-									spdlog::info("{} draws lost", label);
+									spdlog::info("Hidden mask draws lost");
 								}
 								g.had_draws = false;
 							}
@@ -2691,7 +2681,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									if (not g.wait_warned)
 									{
 										g.wait_warned = true;
-										spdlog::warn("{} image wait timed out, skipping frame", label);
+										spdlog::warn("Hidden mask image wait timed out, skipping frame");
 									}
 								}
 								else
@@ -2706,12 +2696,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										// Full-res submit (feather 0 = tier 0):
 										// hard edge, no blur intermediates.
 										vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
-										g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, draws,
+										g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, hidden_mask_draws,
 										                   true, 0, no_cutouts, server_mvp, &mstats, mex);
 									}
 									catch (std::exception & e)
 									{
-										spdlog::warn("{} record failed: {}", label, e.what());
+										spdlog::warn("Hidden mask record failed: {}", e.what());
 										g.swapchain.release();
 										acquired_groups.pop_back();
 										g.acquired = false;
@@ -2724,7 +2714,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 					}
 				};
-				record_hidden_mask(hidden_group, "Hidden mask", 1.f, true);
+				record_hidden_mask();
 				// Hidden dot overlay, recorded in the mask phase (async-safe:
 				// acquire happens here ahead of the video wait; every path
 				// below pairs it — record-throw, wait-timeout, submit, and
@@ -2738,16 +2728,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				hidden_dots_active = false;
 				if (mask_frame)
 				{
-					bool known_hidden_dots = false;
-					for (auto & [oid, ost]: passthrough_objects)
-					{
-						(void)oid;
-						if (ost.def.type != "3d-passthrough-hidden")
-							continue;
-						known_hidden_dots = true;
-						break;
-					}
-					if (known_hidden_dots)
+					// Map-known state hoisted per frame above (shared with
+					// the mask record): prewarm while known so visible
+					// frames only rasterize.
+					if (hidden_known)
 					{
 						auto dots_t0 = std::chrono::steady_clock::now();
 						if (not hidden_dots)
@@ -2760,8 +2744,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						auto dots_t0 = std::chrono::steady_clock::now();
 						vk::Extent2D dext{(uint32_t)hidden_dots->swapchain().width(),
 						                  (uint32_t)hidden_dots->swapchain().height()};
-						std::vector<hidden_dots_renderer::instance_draw> dots_draws;
-						dots_draws.reserve(hidden_silhouettes.size());
+						hidden_dots_draws.reserve(hidden_silhouettes.size());
 						for (auto & s: hidden_silhouettes)
 						{
 							auto bb = hidden_group.renderer->borrowed_mesh_buffers(s.mesh);
@@ -2774,6 +2757,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							d.vertex_buffer = bb->vertex_buffer;
 							d.index_buffer = bb->index_buffer;
 							d.index_count = bb->index_count;
+							for (uint32_t view = 0; view < 2; ++view)
+								d.view_params[view] = glm::vec3((float)dext.width, (float)dext.height,
+								                                scene::projection_matrix(sync_fov[view])[1][1]);
 							// Scissor: shared full-res pixel bounds scaled
 							// into the half-res dots extent (+1px pad).
 							for (uint32_t view = 0; view < 2; ++view)
@@ -2788,19 +2774,34 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								                             .extent = {(uint32_t)std::max(x1 - x0, 0),
 								                                        (uint32_t)std::max(y1 - y0, 0)}};
 							}
-							dots_draws.push_back(d);
+							hidden_dots_draws.push_back(d);
 						}
-						if (not dots_draws.empty())
+						// Zero-area union skip: all-degenerate rects mean no
+						// content (far/subpixel) — skip acquire/record/layer
+						// entirely rather than presenting an empty frame.
+						bool dots_empty = true;
+						for (auto & d: hidden_dots_draws)
+						{
+							for (uint32_t view = 0; view < 2; ++view)
+							{
+								if (d.scissor[view].extent.width > 0 and d.scissor[view].extent.height > 0)
+								{
+									dots_empty = false;
+									break;
+								}
+							}
+							if (not dots_empty)
+								break;
+						}
+						if (not hidden_dots_draws.empty() and not dots_empty)
 						{
 							int idx = hidden_dots->acquire();
 							if (idx >= 0)
 							{
-								std::array<vk::Extent2D, 2> dots_ext;
-								for (uint32_t view = 0; view < view_count; ++view)
-									dots_ext[view] = dext;
+								std::array<vk::Extent2D, 2> dots_ext{dext, dext};
 								try
 								{
-									if (hidden_dots->record(rec_cmd, (size_t)idx, dots_ext, dots_draws))
+									if (hidden_dots->record(rec_cmd, (size_t)idx, dots_ext, hidden_dots_draws))
 									{
 										hidden_dots_image = idx;
 										hidden_dots_active = true;
@@ -3402,15 +3403,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					break;
 				}
 			}
-			// Hidden objects reveal the flat feed on their own layer.
-			for (auto & [oid, ost]: passthrough_objects)
-			{
-				(void)oid;
-				if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
-					continue;
+			// Hidden objects reveal the flat feed on their own layer
+			// (state hoisted per frame above).
+			if (hidden_placed)
 				need_flat = true;
-				break;
-			}
 			if (cutouts_punched)
 				need_flat = true;
 			bool have_projected = session.has_projected_instances();
