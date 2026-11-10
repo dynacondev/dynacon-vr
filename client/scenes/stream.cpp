@@ -2680,8 +2680,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				};
 				record_hidden_matte(hidden_group, "Hidden mask", 1.f - 0.5f * hidden_beat, true);
 				// Matte only backs the color layer: skip entirely when
-				// pulse-strength is 0 (steady cutout needs no mix).
-				record_hidden_matte(hidden_color_group, "Hidden matte", 1.f, hidden_strength > 0);
+				// pulse-strength is 0 (steady cutout needs no mix), and
+				// without the colorScaleBias extension (submit would skip
+				// it anyway — don't pay the raster).
+				record_hidden_matte(hidden_color_group, "Hidden matte", 1.f,
+				                    hidden_strength > 0 and composition_layer_color_scale_bias_supported);
 			}
 		};
 
@@ -3512,6 +3515,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 						                     application::space(xr::spaces::world),
 						                     matte_views);
+						// Opaque config color in-silhouette (white × scale),
+						// destination alpha preserved: the flat layer below
+						// reads the B-accumulated alpha, and no FB default
+						// can be trusted to keep it.
+						set_alpha_blend(XR_BLEND_FACTOR_SRC_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA_FB, XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB);
 						set_color_scale_bias({tint[0], tint[1], tint[2], 1}, {0, 0, 0, 0});
 					}
 				}
@@ -3536,71 +3544,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 					}
 				}
-			}
-		}
-
-		// Hidden warning blink: the mask image above is a white silhouette,
-		// so resubmit the same image over the flat feed in the config color
-		// at full opacity, strobing with the heartbeat. Alpha scale is
-		// ignored on this runtime, so gradation is impossible — the layer
-		// submits on the beat's upper half and skips below it instead.
-		// Opaque color covers camera and game alike: VR never ghosts
-		// through. Zero new draws/rasters/swapchains: one extra compositor
-		// layer referencing the already-acquired image, released with the
-		// group drain above like the mask itself. One blink per shared
-		// layer: the lowest-id placed object wins color and strength.
-		// pulse-strength scales the on-duty (0 = steady cutout); skipped
-		// without the colorScaleBias extension (RGB scale carries color).
-		if (mask_frame and hidden_group.active and composition_layer_color_scale_bias_supported)
-		{
-			const float * tint = nullptr;
-			float strength = 0;
-			for (auto & [oid, ost]: passthrough_objects)
-			{
-				(void)oid;
-				if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
-					continue;
-				tint = ost.def.grid_color.data();
-				strength = ost.def.pulse_strength;
-				break;
-			}
-			bool blink_on = false;
-			if (tint and strength > 0)
-			{
-				double t = (double)frame_state.predictedDisplayTime * 1e-9;
-				// Reduce in double before narrowing: float phase would
-				// wobble after days of uptime.
-				double phase = std::fmod(t * 6.283185307179586 * 1.2, 6.283185307179586);
-				float s = 0.5f + 0.5f * std::sin((float)phase); // 2π·1.2Hz
-				// On-duty grows with strength (~10% at 0.1, ~50% at 1).
-				blink_on = s * s > 1.f - 0.5f * strength;
-			}
-			if (blink_on)
-			{
-				auto & g = hidden_group;
-				std::array<XrCompositionLayerProjectionView, view_count> blink_views;
-				for (uint32_t view = 0; view < view_count; ++view)
-				{
-					blink_views[view] = {
-					        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-					        .pose = sync_pose[view],
-					        .fov = sync_fov[view],
-					        .subImage = {
-					                .swapchain = g.swapchain,
-					                .imageRect = {
-					                        .offset = {0, 0},
-					                        .extent = {g.extent.width, g.extent.height},
-					                },
-					                .imageArrayIndex = view,
-					        },
-					};
-				}
-				add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-				                     application::space(xr::spaces::world),
-				                     blink_views);
-				// White silhouette × color = opaque config-color flash.
-				// Standard source-alpha blend, silhouette alpha is 0/1.
-				set_color_scale_bias({tint[0], tint[1], tint[2], 1}, {0, 0, 0, 0});
 			}
 		}
 
