@@ -1522,23 +1522,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		// Hidden state, computed once per frame and shared by the nomask
 		// gate, mask record, dots record and submit below (one scan, not
-		// five). Persistent draw buffers (capacity survives clear()).
+		// five). Working buffers live on the scene (members, capacity
+		// survives clear()); the silhouette build in the mask phase fills
+		// them (see below).
 		bool hidden_known = false; // map-known (placed or not)
 		bool hidden_placed = false; // placed + mesh ready
-		// One hidden-silhouette build per frame (see the mask phase): model
-		// /MVP/visibility/full-res pixel bounds per eye, shared by the mask
-		// draw list and the dots draw list + scissor.
-		struct hidden_silhouette_draw
-		{
-			std::string mesh;
-			std::array<glm::mat4, 2> mvp;
-			std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
-			glm::vec3 color;
-			float pitch;
-		};
-		std::vector<hidden_silhouette_draw> hidden_silhouettes;
-		std::vector<feather_mask_renderer::instance_draw> hidden_mask_draws;
-		std::vector<hidden_dots_renderer::instance_draw> hidden_dots_draws;
 		for (auto & [oid, ost]: passthrough_objects)
 		{
 			(void)oid;
@@ -1556,6 +1544,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		hidden_silhouettes.clear();
 		hidden_mask_draws.clear();
 		hidden_dots_draws.clear();
+		hidden_silhouettes.reserve(passthrough_objects.size());
 
 		// Hidden objects need the mask path (alpha blend): without it they
 		// stay unrevealed rather than flashing. One-shot log.

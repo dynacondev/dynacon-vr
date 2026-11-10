@@ -38,8 +38,8 @@ void main()
 	vQ = pos / max(pc.color_pitch.w, 1e-4);
 	vec4 clip = pc.mvp * vec4(pos, 1.0);
 	// Perspective clip w is -z_eye (w row is (0,0,-1,0) in every
-	// perspective variant including reversed-Z), so this is the view
-	// distance in meters, no matrix needed.
-	vViewZ = -clip.w;
+	// perspective variant including reversed-Z): positive view distance
+	// in meters straight from w, no matrix needed.
+	vViewZ = clip.w;
 	gl_Position = clip;
 }

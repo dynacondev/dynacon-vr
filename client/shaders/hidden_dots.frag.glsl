@@ -40,11 +40,11 @@ layout(push_constant) uniform PushConstants
 }
 pc;
 
-// Nearest lattice center of one axis pair (cells), in object space with
-// the fragment's own third coordinate (dot centers: fract(u-0.5)==0.5).
+// Nearest lattice center of one axis pair (cells): integer lattice
+// (the historic dot convention), symmetric basin [C-0.5, C+0.5).
 vec2 pair_center(vec2 q)
 {
-	return floor(q - 0.5) + 0.5;
+	return floor(q + 0.5);
 }
 
 float pair_dist(vec3 cobj)
@@ -63,7 +63,7 @@ void main()
 	float d = min(pair_dist(c0), min(pair_dist(c1), pair_dist(c2)));
 	// World radius 0.045 cells, converted with the view-depth scale; 1px
 	// AA band (fades tiny distant dots gracefully instead of shimmering).
-	float px_per_m = (pc.view_params.y * 0.5) * pc.view_params.z / max(vViewZ, 1e-3);
+	float px_per_m = (pc.view_params.y * 0.5) * abs(pc.view_params.z) / max(vViewZ, 1e-3);
 	float r_px = 0.045 * pitch * px_per_m;
 	float dot_ = 1.0 - smoothstep(max(r_px - 1.0, 0.0), r_px, d);
 	if (dot_ <= 0.001)

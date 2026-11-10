@@ -753,6 +753,8 @@ private:
 	// its own swapchain, never feathered, never cut by reversed draws
 	// (hidden always wins). Union B (flat) semantics at submit.
 	// Render thread only.
+	// NOTE: hidden_group.feather_px/projected intentionally untouched
+	// (stale defaults): the hidden record passes tier/behavior literals.
 	mask_group hidden_group;
 	// Dot overlay over the revealed camera feed: fixed world-size dots in
 	// the config color, front faces only, no depth. Own swapchain,
@@ -760,6 +762,20 @@ private:
 	std::unique_ptr<hidden_dots_renderer> hidden_dots;
 	int hidden_dots_image = -1;
 	bool hidden_dots_active = false;
+	// Per-frame hidden working buffers (filled by the shared silhouette
+	// build in the mask phase; capacity survives clear()). Render thread
+	// only.
+	struct hidden_silhouette_draw
+	{
+		std::string mesh;
+		std::array<glm::mat4, 2> mvp;
+		std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
+		glm::vec3 color{0};
+		float pitch = 0.1f;
+	};
+	std::vector<hidden_silhouette_draw> hidden_silhouettes;
+	std::vector<feather_mask_renderer::instance_draw> hidden_mask_draws;
+	std::vector<hidden_dots_renderer::instance_draw> hidden_dots_draws;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;
