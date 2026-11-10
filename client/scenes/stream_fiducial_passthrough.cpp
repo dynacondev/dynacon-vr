@@ -664,9 +664,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		map_key += ';';
 		map_key += std::to_string(o.feather_px);
 		map_key += ';';
-		// pulse_strength excluded: live-applied mix, edits must not
-		// reset tracking. grid_color/grid_scale_m live-applied too (tint
-		// + dot pitch); trigger_distance_m excluded as reserved, unused.
+		// grid_color/grid_scale_m excluded: live-applied (dot color +
+		// pitch), edits must not reset tracking. pulse_strength and
+		// trigger_distance_m excluded as reserved, unused.
 	}
 	map_key += 'L';
 	map_key += map->passthrough_until_lock;

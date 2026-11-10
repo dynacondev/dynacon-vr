@@ -498,20 +498,16 @@ Each `passthrough` entry has:
   `[0.01, 1]`, applied live). Fixed world-size dots wrapping the mesh
   faces; all hidden objects share one layer, so the pitch is per-object
   at draw time.
-- `grid-color`: hidden warning color as a `"#RRGGBB"` hex string
+- `grid-color`: hidden dot color as a `"#RRGGBB"` hex string
   (`3d-passthrough-hidden` only, default light blue `#80D4FF`, applied
-  live). Tints the heartbeat matte and the dot overlay (per-object color
-  at draw time). All hidden objects share one matte layer, so the
-  lowest-id placed object wins the matte tint.
+  live). Tints the dot overlay (per-object color at draw time).
 - `trigger-distance`: proximity trigger distance in meters
   (`3d-passthrough-hidden` only, default `0.5`). Unused for now
   (hidden objects are always-on in stage 1); reserved for the
   near-field reveal.
-- `pulse-strength`: warning mix depth `0..1`
-  (`3d-passthrough-hidden` only, default `0.5`, clamped, applied live).
-  The cutout alpha breathes `1-0.5·strength·s²` at ~1.2Hz over the opaque
-  matte, so the region mixes camera↔color with no game bleed (`0` =
-  steady cutout, matte skipped); edits do not reset tracking.
+- `pulse-strength`: reserved, currently unused
+  (`3d-passthrough-hidden` only, default `0.5`, clamped). Parsed and
+  forwarded for config compatibility; the client renders a steady cutout.
 
 Poses compose as
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).

@@ -1085,18 +1085,18 @@ struct passthrough_object
 	// Reserved for future use (3d-passthrough-hidden only): parsed and
 	// forwarded, but currently unused. Default 0.1.
 	float grid_scale_m = 0.1f;
-	// Hidden-object warning matte color as RGB 0..1, parsed server-side
+	// Hidden-object dot color as RGB 0..1, parsed server-side
 	// from a "#RRGGBB" hex string as-authored (no colorspace conversion).
-	// An opaque twin of the cutout renders in this color below the flat
-	// feed. Applied live. Default #80D4FF light blue.
+	// Tints the dot overlay (per-object color at draw time). Applied
+	// live. Default #80D4FF light blue.
 	std::array<float, 3> grid_color = {128.f / 255.f, 212.f / 255.f, 1.0f};
 	// Proximity trigger distance in meters (3d-passthrough-hidden only).
 	// Unused for now (always-on stage 1); reserved for the near-field
 	// reveal. Default 0.5.
 	float trigger_distance_m = 0.5f;
-	// Warning mix depth 0..1 (3d-passthrough-hidden only): config
-	// pulse-strength, applied live (0 = steady cutout, matte skipped).
-	// Default 0.5.
+	// Reserved, currently unused (3d-passthrough-hidden only): config
+	// pulse-strength, parsed and forwarded for compatibility; the client
+	// renders a steady cutout. Default 0.5.
 	float pulse_strength = 0.5f;
 };
 

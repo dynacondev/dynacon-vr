@@ -2451,31 +2451,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// swapchain from the feather groups (tier 0 direct raster, no
 				// blur chain, no cutouts); reversed draws are never appended,
 				// so hidden always wins for safety.
-				// Hidden reveal + opaque color matte share one record path:
-				// the mask (union B, flat) breathes its image alpha with the
-				// heartbeat while the matte twin holds steady full opacity
-				// purely as coverage for the color layer below flat. Same
-				// tier-0 raster, same mesh list; only opacity differs.
-				float hidden_strength = 0;
-				for (auto & [oid, ost]: passthrough_objects)
-				{
-					(void)oid;
-					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
-						continue;
-					hidden_strength = ost.def.pulse_strength;
-					break;
-				}
-				float hidden_beat = 0;
-				if (hidden_strength > 0)
-				{
-					double t = (double)frame_state.predictedDisplayTime * 1e-9;
-					// Reduce in double before narrowing: float phase would
-					// wobble after days of uptime.
-					double phase = std::fmod(t * 6.283185307179586 * 1.2, 6.283185307179586);
-					float s = 0.5f + 0.5f * std::sin((float)phase); // 2π·1.2Hz
-					hidden_beat = hidden_strength * s * s;
-				}
-				auto record_hidden_matte = [&](mask_group & g, const char * label, float opacity, bool needed) {
+				// Steady full-opacity cutout; the dot overlay below annotates
+				// the revealed feed.
+				auto record_hidden_mask = [&](mask_group & g, const char * label, float opacity, bool needed) {
 					{
 						bool known_hidden = false; // map-known (placed or not)
 						bool have_hidden = false; // placed + mesh ready
@@ -2491,8 +2469,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								break;
 							}
 						}
-						// Twin not needed (matte with pulse-strength 0): park
-						// it and drop uploaded meshes, keep the rest.
+						// Not needed: park it and drop uploaded meshes, keep the rest.
 						if (not needed)
 						{
 							g.active = false;
@@ -2678,13 +2655,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 					}
 				};
-				record_hidden_matte(hidden_group, "Hidden mask", 1.f - 0.5f * hidden_beat, true);
-				// Matte only backs the color layer: skip entirely when
-				// pulse-strength is 0 (steady cutout needs no mix), and
-				// without the colorScaleBias extension (submit would skip
-				// it anyway — don't pay the raster).
-				record_hidden_matte(hidden_color_group, "Hidden matte", 1.f,
-				                    hidden_strength > 0 and composition_layer_color_scale_bias_supported);
+				record_hidden_mask(hidden_group, "Hidden mask", 1.f, true);
 			}
 		};
 
@@ -3625,55 +3596,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
 					}
 					first_group = false;
-				}
-				// Hidden opaque color matte: steady-alpha twin of the mask image,
-				// recolored by the config color. Sits above video, below flat:
-				// where the pulsing B alpha dips, this (not game video) shows
-				// through. Standard source-alpha blend (like the gizmo layer);
-				// white silhouette × color = opaque config color. Skipped
-				// without the colorScaleBias extension (RGB scale carries the
-				// color — an unscaled white flash would be wrong).
-				if (not proj_union and hidden_color_group.active and composition_layer_color_scale_bias_supported)
-				{
-					auto & g = hidden_color_group;
-					const float * tint = nullptr;
-					for (auto & [oid, ost]: passthrough_objects)
-					{
-						(void)oid;
-						if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
-							continue;
-						tint = ost.def.grid_color.data();
-						break;
-					}
-					if (tint)
-					{
-						std::array<XrCompositionLayerProjectionView, view_count> matte_views;
-						for (uint32_t view = 0; view < view_count; ++view)
-						{
-							matte_views[view] = {
-							        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-							        .pose = sync_pose[view],
-							        .fov = sync_fov[view],
-							        .subImage = {
-							                .swapchain = g.swapchain,
-							                .imageRect = {
-							                        .offset = {0, 0},
-							                        .extent = {g.extent.width, g.extent.height},
-							                },
-							                .imageArrayIndex = view,
-							        },
-							};
-						}
-						add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-						                     application::space(xr::spaces::world),
-						                     matte_views);
-						// Opaque config color in-silhouette (white × scale),
-						// destination alpha preserved: the flat layer below
-						// reads the B-accumulated alpha, and no FB default
-						// can be trusted to keep it.
-						set_alpha_blend(XR_BLEND_FACTOR_SRC_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA_FB, XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB);
-						set_color_scale_bias({tint[0], tint[1], tint[2], 1}, {0, 0, 0, 0});
-					}
 				}
 				// Each union's camera layer consumes its own alpha: A feeds
 				// projected, then B REPLACEs the alpha and feeds flat, so
