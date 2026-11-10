@@ -221,8 +221,11 @@ void hidden_grid_renderer::set_mesh(const std::string & key, const passthrough_m
 	vmaFlushAllocation(vk_allocator::instance(), mesh.vertex_buffer, 0, vsize);
 	vmaFlushAllocation(vk_allocator::instance(), mesh.index_buffer, 0, isize);
 	mesh.index_count = (uint32_t)soup.indices.size();
-	glm::vec3 mn(std::numeric_limits<float>::infinity());
-	glm::vec3 mx(-std::numeric_limits<float>::infinity());
+	// Model-space bounds for the stream-side frustum skip (upload-time
+	// only; per-frame tests transform the 8 corners by the draw MVP).
+	// Seeded from the first vertex: infinity is UB under -ffast-math.
+	glm::vec3 mn(soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z);
+	glm::vec3 mx = mn;
 	for (const auto & v: soup.vertices)
 	{
 		mn = glm::min(mn, glm::vec3(v.x, v.y, v.z));
@@ -446,8 +449,8 @@ void hidden_grid_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 			auto mit = meshes.find(d.mesh);
 			if (mit == meshes.end() or mit->second.index_count == 0)
 				continue;
-			cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-			cmd.bindIndexBuffer(*mit->second.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
+			cmd.bindVertexBuffers(0, vk::Buffer(mit->second.vertex_buffer), (vk::DeviceSize)0);
+			cmd.bindIndexBuffer(vk::Buffer(mit->second.index_buffer), (vk::DeviceSize)0, vk::IndexType::eUint32);
 			push pc{
 			        .mvp = d.mvp[eye],
 			        .obj_pos_scale = glm::vec4(d.obj_pos, d.obj_scale),
