@@ -1846,11 +1846,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						float denom_w = std::min((float)mask_w, (float)extents[view].width);
 						float denom_h = std::min((float)mask_h, (float)extents[view].height);
 						bool any_front = false, any_behind = false, any_inside = false;
-				{
-					visible = false;
-					for (uint32_t view = 0; view < 2 and not visible; ++view)
-					{
-						bool any_front = false, any_behind = false, any_inside = false;
 						float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
 						bool any_px = false;
 						for (int corner = 0; corner < 8; ++corner)
