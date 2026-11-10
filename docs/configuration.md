@@ -497,7 +497,7 @@ Each `passthrough` entry has:
 - `grid-color`: hidden heartbeat tint color as a `"#RRGGBB"` hex string
   (`3d-passthrough-hidden` only, default light blue `#80D4FF`, applied
   live). The cutout breathes this color; all hidden objects share one
-  mask layer, so the first placed object wins the tint.
+  mask layer, so the lowest-id placed object wins the tint.
 - `trigger-distance`: proximity trigger distance in meters
   (`3d-passthrough-hidden` only, default `0.5`). Unused for now
   (hidden objects are always-on in stage 1); reserved for the

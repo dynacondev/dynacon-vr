@@ -3420,10 +3420,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 					else
 						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
-					// Heartbeat tint in the config color: squared sine at 0.6Hz
-					// so energy peaks land ~1.2/s, scaled by pulse-strength
-					// (0 = steady untinted cutout). One tint per shared
-					// layer: the first placed + ready hidden object wins.
+					// Heartbeat tint in the config color: squared sine at 1.2Hz
+					// (~1.2 pulses/s), scaled by pulse-strength (0 = steady
+					// untinted cutout). One tint per shared layer: the
+					// lowest-id placed object wins.
 					// Composed with the veil floor lift below; skipped where
 					// the colorScaleBias extension is missing (untinted).
 					float pulse_rgb[3] = {1, 1, 1};
@@ -3443,7 +3443,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (tint and strength > 0)
 						{
 							double t = (double)frame_state.predictedDisplayTime * 1e-9;
-							float s = 0.5f + 0.5f * std::sin(3.7699113f * (float)t); // 2π·0.6Hz
+							// Reduce in double before narrowing: float phase
+							// would wobble after days of uptime.
+							double phase = std::fmod(t * 6.283185307179586 * 1.2, 6.283185307179586);
+							float s = 0.5f + 0.5f * std::sin((float)phase); // 2π·1.2Hz
 							float beat = strength * s * s;
 							for (int c = 0; c < 3; ++c)
 								pulse_rgb[c] = 1.f + (tint[c] - 1.f) * beat;
