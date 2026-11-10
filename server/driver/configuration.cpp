@@ -658,6 +658,27 @@ configuration::configuration()
 						}
 					}
 				}
+				if (item.contains("pulse-strength"))
+				{
+					if (not is_hidden)
+						U_LOG_W("passthrough object \"%s\": pulse-strength is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["pulse-strength"].is_number())
+						U_LOG_W("passthrough object \"%s\": pulse-strength must be a number 0..1, ignoring", o.id.c_str());
+					else
+					{
+						o.pulse_strength = item["pulse-strength"];
+						if (o.pulse_strength < 0)
+						{
+							U_LOG_W("passthrough object \"%s\": negative pulse-strength, clamping to 0", o.id.c_str());
+							o.pulse_strength = 0;
+						}
+						else if (o.pulse_strength > 1.0f)
+						{
+							U_LOG_W("passthrough object \"%s\": pulse-strength above 1, clamping to 1", o.id.c_str());
+							o.pulse_strength = 1.0f;
+						}
+					}
+				}
 				if (std::ranges::any_of(passthrough_objects, [&](const passthrough_object & p) { return p.id == o.id; }))
 				{
 					U_LOG_W("duplicate passthrough object id \"%s\", skipping", o.id.c_str());

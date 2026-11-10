@@ -140,15 +140,19 @@ struct configuration
 		// Reserved for future use (3d-passthrough-hidden only): parsed and
 		// forwarded, but currently unused. Ignored for other types (warned).
 		float grid_scale_m = 0.1f;
-		// Hidden-object warning color as RGB 0..1, parsed from a "#RRGGBB"
-		// hex string as-authored (no colorspace conversion; default #80D4FF
-		// light blue). Reserved for a future visibility method (currently
-		// unused). Ignored for other types (warned).
+		// Hidden-object heartbeat tint color as RGB 0..1, parsed from a
+		// "#RRGGBB" hex string as-authored (no colorspace conversion;
+		// default #80D4FF light blue). Applied live. Ignored for other
+		// types (warned).
 		std::array<float, 3> grid_color = {128.f / 255.f, 212.f / 255.f, 1.0f};
 		// Proximity trigger distance in meters (3d-passthrough-hidden
 		// only). Unused for now (always-on stage 1); reserved for the
 		// near-field reveal. Default 0.5, clamped to >= 0.
 		float trigger_distance_m = 0.5f;
+		// Heartbeat tint strength 0..1 (3d-passthrough-hidden only): depth
+		// of the config-color pulse at peak (0 = steady untinted cutout).
+		// Default 0.5, clamped to [0, 1].
+		float pulse_strength = 0.5f;
 	};
 	std::vector<passthrough_object> passthrough_objects;
 
