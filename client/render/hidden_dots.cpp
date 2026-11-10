@@ -77,6 +77,41 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	swapchain_ = xr::swapchain(inst, sess, *device, format, (int)hw, (int)hh, 1, 2);
 	spdlog::info("Hidden dots swapchain: {}x{} ({} images)", hw, hh, swapchain_.image_count());
 	init_pipelines(format);
+	// Depth target for the prepass (never sampled, device-local).
+	depth_ = image_allocation{
+	        *device,
+	        vk::ImageCreateInfo{
+	                .imageType = vk::ImageType::e2D,
+	                .format = vk::Format::eD16Unorm,
+	                .extent = {hw, hh, 1},
+	                .mipLevels = 1,
+	                .arrayLayers = 2,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .tiling = vk::ImageTiling::eOptimal,
+	                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	        },
+	        VmaAllocationCreateInfo{
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	        },
+	        "hidden_dots depth",
+	};
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		depth_views[eye] = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
+		                                                       .image = (VkImage)depth_,
+		                                                       .viewType = vk::ImageViewType::e2D,
+		                                                       .format = vk::Format::eD16Unorm,
+		                                                       .subresourceRange = {
+		                                                               .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		                                                               .baseMipLevel = 0,
+		                                                               .levelCount = 1,
+		                                                               .baseArrayLayer = eye,
+		                                                               .layerCount = 1,
+		                                                       },
+		                                               });
+	}
 	targets.clear();
 	for (vk::Image image: swapchain_.images())
 	{
@@ -96,11 +131,11 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 			        },
 			};
 			targets.back()[eye].view = vk::raii::ImageView(*device, iv_info);
-			vk::ImageView raw_view = *targets.back()[eye].view;
+			vk::ImageView attachments[2] = {*targets.back()[eye].view, *depth_views[eye]};
 			vk::FramebufferCreateInfo fb_info{
 			        .renderPass = *renderpass,
-			        .attachmentCount = 1,
-			        .pAttachments = &raw_view,
+			        .attachmentCount = 2,
+			        .pAttachments = attachments,
 			        .width = extent_.width,
 			        .height = extent_.height,
 			        .layers = 1,
@@ -234,8 +269,48 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	// No depth attachment, no test, no writes: dots draw over whatever the
 	// layers below composed.
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil{
-	        .depthTestEnable = VK_FALSE,
+	        // Reversed-Z MVPs (near = 1, far = 0, mask precedent): nearer
+	        // wins with GREATER. The fill pass below clears 0 (far) and
+	        // writes the mesh; dots test against it. Dots ride 2mm toward
+	        // the camera off their face plane (vertex shader), so own-face
+	        // tests pass strictly while occluded faces fail.
+	        .depthTestEnable = VK_TRUE,
 	        .depthWriteEnable = VK_FALSE,
+	        .depthCompareOp = vk::CompareOp::eGreater,
+	};
+
+	// Depth-fill twin: mesh triangles only, color writes off, depth write
+	// on. Same vertex layout as the feather silhouette raster (plain
+	// vec3 positions).
+	vk::PipelineDepthStencilStateCreateInfo fill_depth_stencil{
+	        .depthTestEnable = VK_TRUE,
+	        .depthWriteEnable = VK_TRUE,
+	        .depthCompareOp = vk::CompareOp::eGreater,
+	};
+	vk::PipelineColorBlendAttachmentState fill_blend_attachment{
+	        .blendEnable = VK_FALSE,
+	        .colorWriteMask = vk::ColorComponentFlags{},
+	};
+	vk::PipelineColorBlendStateCreateInfo fill_blend{
+	        .attachmentCount = 1,
+	        .pAttachments = &fill_blend_attachment,
+	};
+	vk::VertexInputBindingDescription fill_binding{
+	        .binding = 0,
+	        .stride = sizeof(float) * 3,
+	        .inputRate = vk::VertexInputRate::eVertex,
+	};
+	vk::VertexInputAttributeDescription fill_attribute{
+	        .location = 0,
+	        .binding = 0,
+	        .format = vk::Format::eR32G32B32Sfloat,
+	        .offset = 0,
+	};
+	vk::PipelineVertexInputStateCreateInfo fill_vertex_input{
+	        .vertexBindingDescriptionCount = 1,
+	        .pVertexBindingDescriptions = &fill_binding,
+	        .vertexAttributeDescriptionCount = 1,
+	        .pVertexAttributeDescriptions = &fill_attribute,
 	};
 
 	// Straight alpha blend over transparent; dots are opaque, non-dot
@@ -275,27 +350,45 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 
 	// Color CLEAR on UNDEFINED every frame (no layout history ever assumed,
 	// gizmo precedent). Final GENERAL for the color (universally samplable
-	// at submit, mask precedent).
-	vk::AttachmentDescription attachment{
-	        .format = format,
-	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eClear,
-	        .storeOp = vk::AttachmentStoreOp::eStore,
-	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eGeneral,
+	// at submit, mask precedent). Depth is CLEAR-once per pass, never
+	// sampled: D16, same extent as the color target.
+	vk::AttachmentDescription attachments[2] = {
+	        vk::AttachmentDescription{
+	                .format = format,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .loadOp = vk::AttachmentLoadOp::eClear,
+	                .storeOp = vk::AttachmentStoreOp::eStore,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	                .finalLayout = vk::ImageLayout::eGeneral,
+	        },
+	        vk::AttachmentDescription{
+	                .format = vk::Format::eD16Unorm,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .loadOp = vk::AttachmentLoadOp::eClear,
+	                .storeOp = vk::AttachmentStoreOp::eDontCare,
+	                .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+	                .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	                .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	        },
 	};
 	vk::AttachmentReference color_ref{
 	        .attachment = 0,
 	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
+	vk::AttachmentReference depth_ref{
+	        .attachment = 1,
+	        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	};
 	vk::SubpassDescription subpass{
 	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
 	        .colorAttachmentCount = 1,
 	        .pColorAttachments = &color_ref,
+	        .pDepthStencilAttachment = &depth_ref,
 	};
 	vk::RenderPassCreateInfo renderpass_info{
-	        .attachmentCount = 1,
-	        .pAttachments = &attachment,
+	        .attachmentCount = 2,
+	        .pAttachments = attachments,
 	        .subpassCount = 1,
 	        .pSubpasses = &subpass,
 	};
@@ -316,6 +409,36 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .renderPass = *renderpass,
 	};
 	pipeline = vk::raii::Pipeline(*device, *pipe_cache, pipeline_info);
+
+	auto fill_vert = load_shader(*device, "hidden_dotfill.vert");
+	auto fill_frag = load_shader(*device, "hidden_dotfill.frag");
+	vk::PipelineShaderStageCreateInfo fill_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **fill_vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **fill_frag,
+	                .pName = "main",
+	        },
+	};
+	vk::GraphicsPipelineCreateInfo fill_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = fill_stages,
+	        .pVertexInputState = &fill_vertex_input,
+	        .pInputAssemblyState = &input_assembly,
+	        .pViewportState = &viewport_state,
+	        .pRasterizationState = &rasterization,
+	        .pMultisampleState = &multisample,
+	        .pDepthStencilState = &fill_depth_stencil,
+	        .pColorBlendState = &fill_blend,
+	        .pDynamicState = &dynamic,
+	        .layout = *pipeline_layout,
+	        .renderPass = *renderpass,
+	};
+	fill_pipeline = vk::raii::Pipeline(*device, *pipe_cache, fill_pipeline_info);
 }
 
 bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
@@ -376,18 +499,38 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 				                     .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
 		}
 		cmd.setScissor(0, scissor);
-		vk::ClearValue clear{};
-		clear.color.float32.fill(0);
+		vk::ClearValue clears[2]{};
+		clears[0].color.float32.fill(0);
+		// Reversed-Z (near = 1, far = 0): clear far, GREATER wins.
+		clears[1].depthStencil = {.depth = 0.f, .stencil = 0};
 		vk::RenderPassBeginInfo begin_info{
 		        .renderPass = *renderpass,
 		        .framebuffer = *tgt.framebuffer,
 		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
-		        .clearValueCount = 1,
-		        .pClearValues = &clear,
+		        .clearValueCount = 2,
+		        .pClearValues = clears,
 		};
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
 		if (any)
 		{
+			// Depth prepass: mesh triangles resolve nearest-surface per
+			// pixel, so dots on occluded faces fail the test below and
+			// never show through. Color writes off.
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *fill_pipeline);
+			for (const auto & d: draws)
+			{
+				if (d.index_count == 0)
+					continue;
+				cmd.bindVertexBuffers(0, d.vertex_buffer, (vk::DeviceSize)0);
+				cmd.bindIndexBuffer(d.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
+				push pc{
+				        .mvp = d.mvp[eye],
+				        .color_pitch = glm::vec4(d.color, d.pitch),
+				        .view_params = glm::vec4(d.view_params[eye], dot_radius_cells),
+				};
+				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
+				cmd.drawIndexed(d.index_count, 1, 0, 0, 0);
+			}
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 			cmd.bindVertexBuffers(0, (vk::Buffer)quad_, (vk::DeviceSize)0);
 			for (const auto & d: draws)

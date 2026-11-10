@@ -2750,12 +2750,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							auto bb = hidden_group.renderer->borrowed_dot_buffers(s.mesh);
 							if (not bb or bb->count == 0)
 								continue;
+							// Mesh triangles for the depth prepass (same
+							// pending-upload gate: prepass copies precede in
+							// the same command buffer).
+							auto mb = hidden_group.renderer->borrowed_mesh_buffers(s.mesh);
+							if (not mb or mb->index_count == 0)
+								continue;
 							hidden_dots_renderer::instance_draw d;
 							d.mvp = s.mvp;
 							d.color = s.color;
 							d.pitch = s.pitch;
 							d.dot_buffer = bb->buffer;
 							d.dot_count = bb->count;
+							d.vertex_buffer = mb->vertex_buffer;
+							d.index_buffer = mb->index_buffer;
+							d.index_count = mb->index_count;
 							for (uint32_t view = 0; view < 2; ++view)
 								d.view_params[view] = glm::vec3((float)dext.width, (float)dext.height,
 								                                scene::projection_matrix(sync_fov[view])[1][1]);

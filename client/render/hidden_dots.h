@@ -64,9 +64,11 @@ public:
 	// One silhouette draw: per-eye clip transforms (placement already
 	// baked in), dot color + pitch, per-eye scissor rects (dots pixel
 	// space, computed stream-side from the same cull corners), per-eye
-	// view params (viewport W/H px + proj[1][1] for the world→px radius),
-	// and the baked dot instance buffer borrowed from the feather hidden
-	// renderer (per-dot center + face normal; count 0 = skip).
+	// view params (viewport W/H px + proj[1][1] for the world→px radius
+	// + dot radius cells in w), the baked dot instance buffer borrowed
+	// from the feather hidden renderer (per-dot center + face normal;
+	// count 0 = skip), and the mesh triangle buffers for the depth
+	// prepass (occluded dots must not show through).
 	struct instance_draw
 	{
 		std::array<glm::mat4, 2> mvp;
@@ -76,6 +78,9 @@ public:
 		std::array<glm::vec3, 2> view_params; // x: view W px, y: view H px, z: proj[1][1]
 		vk::Buffer dot_buffer;
 		uint32_t dot_count = 0;
+		vk::Buffer vertex_buffer;
+		vk::Buffer index_buffer;
+		uint32_t index_count = 0;
 	};
 
 	explicit hidden_dots_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
@@ -130,6 +135,14 @@ private:
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
+	// Depth-fill pipeline (mesh triangles into the depth attachment,
+	// color writes off): the dots pipeline depth-tests against it so
+	// occluded faces never show through. Shared layout (subset of push).
+	vk::raii::Pipeline fill_pipeline{nullptr};
+	// Depth target (D16, half-res, 2 layers + one single-layer view per
+	// eye), recreated with the swapchain in ensure().
+	image_allocation depth_;
+	std::array<vk::raii::ImageView, 2> depth_views{nullptr, nullptr};
 	// Static billboard quad (6 corners, -1..1, non-indexed), uploaded
 	// once with the pipeline. Per-dot data arrives per draw as
 	// instanced attributes from the borrowed feather buffer.

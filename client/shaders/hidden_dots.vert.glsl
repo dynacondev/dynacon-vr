@@ -41,7 +41,11 @@ pc;
 
 void main()
 {
-	vec4 clip = pc.mvp * vec4(center, 1.0);
+	// 2mm toward the camera off the face plane (front faces: the baked
+	// normal points at the viewer): own-face depth tests then pass
+	// strictly against the prepass raster, while occluded faces still
+	// fail. Invisible, dwarfs 1-ulp rasterization differences.
+	vec4 clip = pc.mvp * vec4(center + normal * 0.002, 1.0);
 	float w = clip.w;
 	// Front-facing test: the normal as a direction (w=0) through the
 	// MVP has clip w = -z_view(normal), so w < 0 means the normal has
