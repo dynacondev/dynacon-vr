@@ -18,17 +18,27 @@
 
 #pragma once
 
-// Hidden-object warning grid overlay (3d-passthrough-hidden): world-space
-// triplanar grid lines rendered over the revealed camera feed.
+// Hidden-object warning outline (3d-passthrough-hidden): a flat guardian-
+// style rim around the revealed camera feed, following the mesh silhouette.
 //
-// Composited as ONE transparent projection layer (standard alpha blend,
-// above the flat passthrough, below gizmos/GUI) so the maxLayerCount
-// discipline holds. Own swapchain + own depth (self-occluding via depth,
-// no culling: open single-sided furniture reads from either side), CLEAR
-// every frame. Face normals come from screen-space
-// derivatives of the world position (no normal attributes: the triangle
-// soup carries positions only). No translucent fill by design (stage 1):
-// grid lines only. Render thread only.
+// Inverted-hull in one renderpass: an occluder prepass draws the original
+// mesh with color writes masked off (depth only), then the rim pass draws
+// the shell expanded ~2cm about the model-space AABB center with front
+// faces culled, depth-tested against the prepass. Interior fails, the rim
+// ring passes. Both shaders are trivial (MVP + flat color, no varyings,
+// no derivatives): the triplanar grid this replaces cost ~80 ALU per pixel
+// over the full silhouette, this costs ~nothing per pixel.
+//
+// Composited as ONE transparent projection layer (above the flat
+// passthrough, below gizmos/GUI) so the maxLayerCount discipline holds.
+// Own swapchain + own D16 depth (never sampled, cleared every frame).
+// Render thread only.
+//
+// Notes: open single-sided meshes viewed from behind write no occluder
+// depth (back culled), so the rim draws as a solid blob there — acceptable
+// warning behavior, and closed volumes (the complaint: far-side lines
+// showing through) resolve correctly. Overlapping hidden objects resolve
+// nearest-wins via depth regardless of draw order.
 
 #include <array>
 #include <cstddef>
@@ -42,8 +52,6 @@
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
-#include <glm/vec4.hpp>
-#include <glm/gtc/quaternion.hpp>
 #include <vulkan/vulkan_raii.hpp>
 
 #include "vk/allocation.h"
@@ -56,32 +64,21 @@ class instance;
 class session;
 } // namespace xr
 
-class hidden_grid_renderer
+class hidden_outline_renderer
 {
 public:
-	// One silhouette draw: which uploaded mesh, per-eye clip transforms,
-	// rigid uniform-scale placement (rebuilt in-shader from pos/quat/scale
-	// so the push block stays within the 128-byte minimum guarantee),
-	// per-object grid style, and per-eye line width. cam_pos carries the
-	// eye world position per eye: reserved ballast keeping the 128B push
-	// layout (only .w is read).
+	// One silhouette draw: which uploaded mesh, per-eye clip transforms
+	// (placement already baked in), model-space shell center for the
+	// vertex-stage expansion, and the flat outline color.
 	struct instance_draw
 	{
 		std::string mesh;
 		std::array<glm::mat4, 2> mvp;
-		glm::vec3 obj_pos{0};
-		glm::quat obj_quat{1, 0, 0, 0};
-		// Uniform object scale (fused placements are always uniform; the
-		// clip MVP stays correct regardless, but the world-space grid
-		// would shear under a non-uniform scale).
-		float obj_scale = 1;
-		glm::vec3 grid_color{128.f / 255.f, 212.f / 255.f, 1.0f};
-		float grid_scale = 0.1f; // world-space line spacing, meters
-		std::array<glm::vec3, 2> cam_pos{};
-		float line_width_px = 1.5f;
+		glm::vec3 color{128.f / 255.f, 212.f / 255.f, 1.0f};
+		glm::vec3 obj_center{0};
 	};
 
-	explicit hidden_grid_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
+	explicit hidden_outline_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
 
 	// Shared driver pipeline cache (one per device, same object the
 	// feather mask renderer uses): every renderer compiles distinct
@@ -109,7 +106,8 @@ public:
 
 	// Record draws into both eye layers of the acquired image.
 	// No-op when draws is empty. extents size the per-eye viewports
-	// (the submitted layer rects).
+	// (the submitted layer rects). Both passes record inside one
+	// renderpass per eye (occluder prepass, then rim).
 	void record(vk::raii::CommandBuffer & cmd, size_t image_index,
 	            const std::array<vk::Extent2D, 2> & extents,
 	            const std::vector<instance_draw> & draws);
@@ -128,8 +126,8 @@ public:
 	// erases the entry.
 	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
 	void remove_mesh(const std::string & key);
-	// Model-space AABB for frustum skip (nullopt = unknown key: keep the
-	// draw). Computed once at upload.
+	// Model-space AABB for the frustum skip and the shell center
+	// (nullopt = unknown key: skip the draw). Computed once at upload.
 	std::optional<std::pair<glm::vec3, glm::vec3>> mesh_bounds(const std::string & key) const;
 
 private:
@@ -141,7 +139,8 @@ private:
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::RenderPass renderpass{nullptr};
-	vk::raii::Pipeline pipeline{nullptr};
+	vk::raii::Pipeline pipeline_occluder{nullptr};
+	vk::raii::Pipeline pipeline_rim{nullptr};
 
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;

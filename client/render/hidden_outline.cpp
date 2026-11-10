@@ -16,31 +16,33 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "render/hidden_grid.h"
+#include "render/hidden_outline.h"
 
 #include "render/feather_mask.h"
 #include "vk/shader.h"
 
 #include <algorithm>
 #include <cstring>
-#include <limits>
 #include <stdexcept>
 
 #include <spdlog/spdlog.h>
 
 namespace
 {
-// Mirrors hidden_grid.vert/frag.glsl PushConstants. Stays within the
-// 128-byte minimum push guarantee: mvp (64) + placement (32) + style (32).
+// Mirrors hidden_outline.vert/frag.glsl PushConstants: mvp (64) + color
+// (16) + shell center/expand (16) = 96B, within the 128-byte minimum.
 struct push
 {
 	glm::mat4 mvp;
-	glm::vec4 obj_pos_scale; // xyz: world pos (m), w: uniform scale
-	glm::vec4 obj_quat; // xyzw
-	glm::vec4 grid_col_scale; // rgb: grid color, w: spacing (m)
-	glm::vec4 cam_pos_width; // xyz: eye world pos (m), w: line width (px)
+	glm::vec4 color; // rgb: outline color
+	glm::vec4 center_thickness; // xyz: model-space shell center (m), w: expand (m)
 };
-static_assert(sizeof(push) == 128);
+static_assert(sizeof(push) == 96);
+
+// World-space shell expansion for the rim pass (2cm): the rim ring this
+// wide peeks out around the occluder silhouette. Fixed, not per-object:
+// keeps the push small and the thickness perspective-correct for free.
+constexpr float outline_expand_m = 0.02f;
 
 // Depth for the grid raster (D16 depth-test-only: never sampled,
 // device-local; D16 attachment support is mandatory per spec).
@@ -58,29 +60,29 @@ uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t t
 }
 } // namespace
 
-hidden_grid_renderer::hidden_grid_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device) :
+hidden_outline_renderer::hidden_outline_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device) :
         device(&device),
         physical_device(&physical_device)
 {
 }
 
-std::shared_ptr<vk::raii::PipelineCache> hidden_grid_renderer::pipeline_cache(vk::raii::Device & device)
+std::shared_ptr<vk::raii::PipelineCache> hidden_outline_renderer::pipeline_cache(vk::raii::Device & device)
 {
 	// Same process-wide object the feather mask renderer shares (one entry
 	// per VkDevice): keeps a single cache alive across both renderers.
 	return feather_mask_renderer::pipeline_cache(device);
 }
 
-void hidden_grid_renderer::warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format)
+void hidden_outline_renderer::warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format)
 {
 	// Throwaway renderer: its pipeline compiles populate the shared
-	// cache above, so the first real grid pays ~nothing. Only two
-	// pipelines (vs the feather stack), so this is milliseconds.
-	hidden_grid_renderer warm(device, physical_device);
+	// cache above, so the first real outline pays ~nothing. Two trivial
+	// pipelines, so this is milliseconds.
+	hidden_outline_renderer warm(device, physical_device);
 	warm.init_pipelines(format);
 }
 
-void hidden_grid_renderer::ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h)
+void hidden_outline_renderer::ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h)
 {
 	if (ready() and format_ == format and (int)extent_.width == w and (int)extent_.height == h)
 		return;
@@ -90,7 +92,7 @@ void hidden_grid_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	format_ = format;
 	extent_ = {(uint32_t)w, (uint32_t)h};
 	swapchain_ = xr::swapchain(inst, sess, *device, format, w, h, 1, 2);
-	spdlog::info("Hidden grid swapchain: {}x{} ({} images)", w, h, swapchain_.image_count());
+	spdlog::info("Hidden outline swapchain: {}x{} ({} images)", w, h, swapchain_.image_count());
 	init_pipelines(format);
 	targets.clear();
 	// Shared depth pair (single frame records at a time).
@@ -163,7 +165,7 @@ void hidden_grid_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	}
 }
 
-int hidden_grid_renderer::acquire()
+int hidden_outline_renderer::acquire()
 {
 	int idx = swapchain_.acquire();
 	if (not swapchain_.wait(100'000'000))
@@ -176,12 +178,12 @@ int hidden_grid_renderer::acquire()
 	return idx;
 }
 
-void hidden_grid_renderer::release()
+void hidden_outline_renderer::release()
 {
 	swapchain_.release();
 }
 
-void hidden_grid_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
+void hidden_outline_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
 {
 	if (soup.vertices.empty() or soup.indices.empty())
 	{
@@ -201,7 +203,7 @@ void hidden_grid_renderer::set_mesh(const std::string & key, const passthrough_m
 	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
 	                .usage = VMA_MEMORY_USAGE_AUTO,
 	        },
-	        "hidden grid verts");
+	        "hidden outline verts");
 	mesh.index_buffer = buffer_allocation(
 	        *device,
 	        vk::BufferCreateInfo{
@@ -212,7 +214,7 @@ void hidden_grid_renderer::set_mesh(const std::string & key, const passthrough_m
 	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
 	                .usage = VMA_MEMORY_USAGE_AUTO,
 	        },
-	        "hidden grid indices");
+	        "hidden outline indices");
 	std::memcpy(mesh.vertex_buffer.map(), soup.vertices.data(), vsize);
 	mesh.vertex_buffer.unmap();
 	std::memcpy(mesh.index_buffer.map(), soup.indices.data(), isize);
@@ -221,9 +223,10 @@ void hidden_grid_renderer::set_mesh(const std::string & key, const passthrough_m
 	vmaFlushAllocation(vk_allocator::instance(), mesh.vertex_buffer, 0, vsize);
 	vmaFlushAllocation(vk_allocator::instance(), mesh.index_buffer, 0, isize);
 	mesh.index_count = (uint32_t)soup.indices.size();
-	// Model-space bounds for the stream-side frustum skip (upload-time
-	// only; per-frame tests transform the 8 corners by the draw MVP).
-	// Seeded from the first vertex: infinity is UB under -ffast-math.
+	// Model-space bounds for the stream-side frustum skip and the shell
+	// center (upload-time only; per-frame tests transform the 8 corners
+	// by the draw MVP). Seeded from the first vertex: infinity is UB
+	// under -ffast-math.
 	glm::vec3 mn(soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z);
 	glm::vec3 mx = mn;
 	for (const auto & v: soup.vertices)
@@ -235,23 +238,23 @@ void hidden_grid_renderer::set_mesh(const std::string & key, const passthrough_m
 	mesh.aabb_max = mx;
 }
 
-void hidden_grid_renderer::remove_mesh(const std::string & key)
+void hidden_outline_renderer::remove_mesh(const std::string & key)
 {
 	meshes.erase(key);
 }
 
-std::optional<std::pair<glm::vec3, glm::vec3>> hidden_grid_renderer::mesh_bounds(const std::string & key) const
+std::optional<std::pair<glm::vec3, glm::vec3>> hidden_outline_renderer::mesh_bounds(const std::string & key) const
 {
 	if (auto it = meshes.find(key); it != meshes.end())
 		return std::make_pair(it->second.aabb_min, it->second.aabb_max);
 	return std::nullopt;
 }
 
-void hidden_grid_renderer::init_pipelines(vk::Format format)
+void hidden_outline_renderer::init_pipelines(vk::Format format)
 {
 	pipe_cache = pipeline_cache(*device);
-	auto vert = load_shader(*device, "hidden_grid.vert");
-	auto frag = load_shader(*device, "hidden_grid.frag");
+	auto vert = load_shader(*device, "hidden_outline.vert");
+	auto frag = load_shader(*device, "hidden_outline.frag");
 
 	vk::PipelineShaderStageCreateInfo stages[2] = {
 	        {
@@ -293,13 +296,23 @@ void hidden_grid_renderer::init_pipelines(vk::Format format)
 	        .scissorCount = 1,
 	};
 
-	vk::PipelineRasterizationStateCreateInfo rasterization{
+	vk::PipelineRasterizationStateCreateInfo raster_occluder{
 	        .polygonMode = vk::PolygonMode::eFill,
-	        // No culling: hidden meshes are often open single-sided
-	        // furniture (desk planes), which must read from either side.
-	        // Depth (GREATER_OR_EQUAL + write) still resolves self-occlusion
-	        // for closed volumes; open backfaces simply draw over.
-	        .cullMode = vk::CullModeFlagBits::eNone,
+	        // Front faces only: the prepass needs the near-side silhouette
+	        // in depth. (Open single-sided meshes viewed from behind write
+	        // nothing here; the rim then draws solid — accepted, see the
+	        // header.)
+	        .cullMode = vk::CullModeFlagBits::eBack,
+	        .frontFace = vk::FrontFace::eCounterClockwise,
+	        .lineWidth = 1,
+	};
+
+	vk::PipelineRasterizationStateCreateInfo raster_rim{
+	        .polygonMode = vk::PolygonMode::eFill,
+	        // Inverted hull: backfaces of the expanded shell. Interior
+	        // fragments sit behind the occluder depth and fail; the ~2cm
+	        // ring outside it passes.
+	        .cullMode = vk::CullModeFlagBits::eFront,
 	        .frontFace = vk::FrontFace::eCounterClockwise,
 	        .lineWidth = 1,
 	};
@@ -308,21 +321,31 @@ void hidden_grid_renderer::init_pipelines(vk::Format format)
 	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
 	};
 
-	// Self-occluding silhouette: GREATER_OR_EQUAL, not GREATER.
-	// scene::projection_matrix is reversed-Z (near = 1, far = 0, matching
-	// scene_renderer and the feather depth path); LESS here would invert
-	// the occlusion. OR_EQUAL (not strict) so same-surface ties pass:
-	// every covered fragment writes depth (no discard in the fragment
-	// shader), so adjacent triangles at near-identical depth must not
-	// drop pixels. Backfaces are strictly farther and still fail.
-	vk::PipelineDepthStencilStateCreateInfo depth_stencil{
-	        .depthTestEnable = VK_TRUE,
+	// Reversed-Z (near = 1, far = 0, matching scene_renderer and the
+	// feather depth path); clear is 0.0 = far.
+	// Occluder: no test (first writer per pixel), depth write on, color
+	// masked off below.
+	vk::PipelineDepthStencilStateCreateInfo depth_occluder{
+	        .depthTestEnable = VK_FALSE,
 	        .depthWriteEnable = VK_TRUE,
+	};
+	// Rim: nearer-wins against the prepass. OR_EQUAL (not strict) so the
+	// silhouette edge itself stays continuous; strictly-farther backfaces
+	// still fail, which is what killed the far-side leak.
+	vk::PipelineDepthStencilStateCreateInfo depth_rim{
+	        .depthTestEnable = VK_TRUE,
+	        .depthWriteEnable = VK_FALSE,
 	        .depthCompareOp = vk::CompareOp::eGreaterOrEqual,
 	};
 
-	// Straight alpha blend over transparent.
-	vk::PipelineColorBlendAttachmentState blend_attachment{
+	// Occluder writes nothing visible (depth prepass only).
+	vk::PipelineColorBlendAttachmentState blend_occluder{
+	        .blendEnable = VK_FALSE,
+	        .colorWriteMask = vk::ColorComponentFlags{},
+	};
+	// Straight alpha blend over transparent; the rim is opaque so this
+	// overwrites.
+	vk::PipelineColorBlendAttachmentState blend_rim{
 	        .blendEnable = VK_TRUE,
 	        .srcColorBlendFactor = vk::BlendFactor::eSrcAlpha,
 	        .dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha,
@@ -333,9 +356,13 @@ void hidden_grid_renderer::init_pipelines(vk::Format format)
 	        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
 	                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
 	};
-	vk::PipelineColorBlendStateCreateInfo blend{
+	vk::PipelineColorBlendStateCreateInfo blend_occluder_state{
 	        .attachmentCount = 1,
-	        .pAttachments = &blend_attachment,
+	        .pAttachments = &blend_occluder,
+	};
+	vk::PipelineColorBlendStateCreateInfo blend_rim_state{
+	        .attachmentCount = 1,
+	        .pAttachments = &blend_rim,
 	};
 
 	vk::DynamicState dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
@@ -400,26 +427,41 @@ void hidden_grid_renderer::init_pipelines(vk::Format format)
 	};
 	renderpass = vk::raii::RenderPass(*device, renderpass_info);
 
-	vk::GraphicsPipelineCreateInfo pipeline_info{
+	vk::GraphicsPipelineCreateInfo occluder_info{
 	        .stageCount = 2,
 	        .pStages = stages,
 	        .pVertexInputState = &vertex_input,
 	        .pInputAssemblyState = &input_assembly,
 	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &rasterization,
+	        .pRasterizationState = &raster_occluder,
 	        .pMultisampleState = &multisample,
-	        .pDepthStencilState = &depth_stencil,
-	        .pColorBlendState = &blend,
+	        .pDepthStencilState = &depth_occluder,
+	        .pColorBlendState = &blend_occluder_state,
 	        .pDynamicState = &dynamic,
 	        .layout = *pipeline_layout,
 	        .renderPass = *renderpass,
 	};
-	pipeline = vk::raii::Pipeline(*device, *pipe_cache, pipeline_info);
+	pipeline_occluder = vk::raii::Pipeline(*device, *pipe_cache, occluder_info);
+	vk::GraphicsPipelineCreateInfo rim_info{
+	        .stageCount = 2,
+	        .pStages = stages,
+	        .pVertexInputState = &vertex_input,
+	        .pInputAssemblyState = &input_assembly,
+	        .pViewportState = &viewport_state,
+	        .pRasterizationState = &raster_rim,
+	        .pMultisampleState = &multisample,
+	        .pDepthStencilState = &depth_rim,
+	        .pColorBlendState = &blend_rim_state,
+	        .pDynamicState = &dynamic,
+	        .layout = *pipeline_layout,
+	        .renderPass = *renderpass,
+	};
+	pipeline_rim = vk::raii::Pipeline(*device, *pipe_cache, rim_info);
 }
 
-void hidden_grid_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
-                                   const std::array<vk::Extent2D, 2> & extents,
-                                   const std::vector<instance_draw> & draws)
+void hidden_outline_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
+                                     const std::array<vk::Extent2D, 2> & extents,
+                                     const std::vector<instance_draw> & draws)
 {
 	if (draws.empty() or image_index >= targets.size())
 		return;
@@ -427,7 +469,6 @@ void hidden_grid_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
 		auto & tgt = targets[image_index][eye];
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 		cmd.setViewport(0, vk::Viewport{
 		                        .x = 0,
 		                        .y = 0,
@@ -448,23 +489,28 @@ void hidden_grid_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		        .pClearValues = clears.data(),
 		};
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		for (const auto & d: draws)
-		{
-			auto mit = meshes.find(d.mesh);
-			if (mit == meshes.end() or mit->second.index_count == 0)
-				continue;
-			cmd.bindVertexBuffers(0, vk::Buffer(mit->second.vertex_buffer), (vk::DeviceSize)0);
-			cmd.bindIndexBuffer(vk::Buffer(mit->second.index_buffer), (vk::DeviceSize)0, vk::IndexType::eUint32);
-			push pc{
-			        .mvp = d.mvp[eye],
-			        .obj_pos_scale = glm::vec4(d.obj_pos, d.obj_scale),
-			        .obj_quat = glm::vec4(d.obj_quat.x, d.obj_quat.y, d.obj_quat.z, d.obj_quat.w),
-			        .grid_col_scale = glm::vec4(d.grid_color, d.grid_scale),
-			        .cam_pos_width = glm::vec4(d.cam_pos[eye], d.line_width_px),
-			};
-			cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
-			cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-		}
+		auto draw_all = [&](vk::raii::Pipeline & pipe, float expand) {
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipe);
+			for (const auto & d: draws)
+			{
+				auto mit = meshes.find(d.mesh);
+				if (mit == meshes.end() or mit->second.index_count == 0)
+					continue;
+				cmd.bindVertexBuffers(0, vk::Buffer(mit->second.vertex_buffer), (vk::DeviceSize)0);
+				cmd.bindIndexBuffer(vk::Buffer(mit->second.index_buffer), (vk::DeviceSize)0, vk::IndexType::eUint32);
+				push pc{
+				        .mvp = d.mvp[eye],
+				        .color = glm::vec4(d.color, 1.f),
+				        .center_thickness = glm::vec4(d.obj_center, expand),
+				};
+				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
+				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+			}
+		};
+		// Occluder prepass (exact silhouette into depth, no color),
+		// then the expanded shell: only the rim ring passes.
+		draw_all(pipeline_occluder, 0.f);
+		draw_all(pipeline_rim, outline_expand_m);
 		cmd.endRenderPass();
 	}
 }

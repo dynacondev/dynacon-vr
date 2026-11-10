@@ -18,28 +18,21 @@
 
 #version 450
 
-layout(location = 0) in vec3 pos;
-
-layout(location = 0) out vec3 vWorld;
+// Flat guardian outline color, opaque. Deliberately no lighting, no
+// derivatives, no varyings: every covered pixel costs ~nothing, which is
+// the point (the triplanar grid this replaces burned ~80 ALU + fwidths
+// per pixel over the full silhouette).
+layout(location = 0) out vec4 out_color;
 
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp;
-	vec4 obj_pos_scale; // xyz: world position (m), w: uniform scale
-	vec4 obj_quat; // xyzw orientation
-	vec4 grid_col_scale; // rgb: grid color, w: grid spacing (m)
-	vec4 cam_pos_width; // xyz: eye world position (m), w: line width (px)
+	vec4 color; // rgb: outline color
+	vec4 center_thickness;
 }
 pc;
 
-vec3 qrot(vec4 q, vec3 v)
-{
-	return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
-}
-
 void main()
 {
-	vec3 wp = pc.obj_pos_scale.xyz + qrot(pc.obj_quat, pos * pc.obj_pos_scale.w);
-	vWorld = wp;
-	gl_Position = pc.mvp * vec4(pos, 1.0);
+	out_color = vec4(pc.color.rgb, 1.0);
 }
