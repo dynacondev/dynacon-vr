@@ -3458,7 +3458,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// the flat feed recolored by the config color with a breathing
 		// alpha. Zero new draws/rasters/swapchains: one extra compositor
 		// layer referencing the already-acquired image, released with the
-		// group drain below like the mask itself. One wash per shared
+		// group drain above like the mask itself. One wash per shared
 		// layer: the lowest-id placed object wins color and strength.
 		// Skipped when pulse-strength is 0 or the colorScaleBias extension
 		// is missing (steady cutout). Inside the mask-frame branch's

@@ -505,8 +505,9 @@ Each `passthrough` entry has:
   near-field reveal.
 - `pulse-strength`: warning wash breath depth `0..1`
   (`3d-passthrough-hidden` only, default `0.5`, clamped, applied live).
-  The wash alpha breathes ~0.15–0.6 at ~1.2Hz scaled by this (`0` skips
-  the wash layer: steady untinted cutout); edits do not reset tracking.
+  The wash alpha breathes `0.15+0.45·strength·s²` (≈0.15–0.6 at
+  strength 1, ~1.2Hz); `0` skips the wash layer (steady untinted
+  cutout). Edits do not reset tracking.
 
 Poses compose as
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).
