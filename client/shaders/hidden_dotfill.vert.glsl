@@ -19,9 +19,10 @@
 #version 450
 
 // Depth-fill pass for the hidden dot overlay: plain MVP raster of the
-// mesh triangles into the depth attachment (color writes off). The dot
-// billboards then depth-test against it, so occluded faces never show
-// through. Same push layout as the dots pair (subset use).
+// mesh triangles into the depth attachment (color writes off). The dots
+// pass samples that depth at the dot centers (whole circles live or die),
+// so occluded faces never show through. Same push layout as the dots pair
+// (subset use).
 layout(location = 0) in vec3 pos;
 
 layout(push_constant) uniform PushConstants

@@ -2600,19 +2600,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								// The baked dot lattice rides the upload, so a
 								// pitch edit must re-upload (grid_scale_m is
 								// otherwise live-applied, excluded from the
-								// map fingerprint).
+								// map fingerprint). Two-field compare (hash +
+								// pitch float, exact: same clamped source) —
+								// no per-frame string formatting.
 								float dot_pitch = std::max(0.01f, ost.def.grid_scale_m);
-								std::string want = ost.soup_hash + '\x1f' + std::to_string(dot_pitch);
 								auto mhit = g.mesh_hashes.find(oid);
-								if (member and (mhit == g.mesh_hashes.end() or mhit->second != want))
+								auto phit = hidden_dot_pitch.find(oid);
+								if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash or
+								                phit == hidden_dot_pitch.end() or phit->second != dot_pitch))
 								{
 									g.renderer->set_mesh(oid, ost.soup, dot_pitch);
-									g.mesh_hashes[oid] = want;
+									g.mesh_hashes[oid] = ost.soup_hash;
+									hidden_dot_pitch[oid] = dot_pitch;
 								}
 								else if (not member and mhit != g.mesh_hashes.end())
 								{
 									g.renderer->remove_mesh(oid);
 									g.mesh_hashes.erase(mhit);
+									hidden_dot_pitch.erase(oid);
 								}
 							}
 							// Hash-side eviction (mirrors the feather groups): oids
@@ -2627,11 +2632,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								if (member)
 								{
 									float dot_pitch = std::max(0.01f, oit->second.def.grid_scale_m);
-									member = hit->second == oit->second.soup_hash + '\x1f' + std::to_string(dot_pitch);
+									auto phit = hidden_dot_pitch.find(hit->first);
+									member = hit->second == oit->second.soup_hash and
+									        phit != hidden_dot_pitch.end() and phit->second == dot_pitch;
 								}
 								if (not member)
 								{
 									g.renderer->remove_mesh(hit->first);
+									hidden_dot_pitch.erase(hit->first);
 									hit = g.mesh_hashes.erase(hit);
 								}
 								else
@@ -2646,6 +2654,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								for (auto & [key, _]: g.mesh_hashes)
 									g.renderer->remove_mesh(key);
 								g.mesh_hashes.clear();
+								hidden_dot_pitch.clear();
 							}
 						}
 						else
@@ -2706,6 +2715,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										acquired_groups.pop_back();
 										g.acquired = false;
 										g.active = false;
+										// Fail the frame: the command buffer
+										// may be half-open (inside a render
+										// pass) — never submit it.
+										throw;
 									}
 									mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
 									mask_draws += (int)mstats.draws;
@@ -2745,6 +2758,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						vk::Extent2D dext{(uint32_t)hidden_dots->swapchain().width(),
 						                  (uint32_t)hidden_dots->swapchain().height()};
 						hidden_dots_draws.reserve(hidden_silhouettes.size());
+						// proj[1][1] per eye, once (not per draw): only this
+						// element is ever read below.
+						float dots_proj11[2] = {scene::projection_matrix(sync_fov[0])[1][1],
+						                        scene::projection_matrix(sync_fov[1])[1][1]};
 						for (auto & s: hidden_silhouettes)
 						{
 							auto bb = hidden_group.renderer->borrowed_dot_buffers(s.mesh);
@@ -2767,7 +2784,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							d.index_count = mb->index_count;
 							for (uint32_t view = 0; view < 2; ++view)
 								d.view_params[view] = glm::vec3((float)dext.width, (float)dext.height,
-								                                scene::projection_matrix(sync_fov[view])[1][1]);
+								                                dots_proj11[view]);
 							// Scissor: shared full-res pixel bounds scaled
 							// into the half-res dots extent (+1px pad).
 							for (uint32_t view = 0; view < 2; ++view)
@@ -2801,7 +2818,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							if (not dots_empty)
 								break;
 						}
-						if (not hidden_dots_draws.empty() and not dots_empty)
+						// Inline-fallback slot safety: the renderer-owned
+						// depth_ image is single, so when the previous
+						// frame's async mask CB is still in flight (fence
+						// busy at frame top → this record runs inline),
+						// re-recording would CLEAR/sample over its live
+						// reads. Re-poll here, post video-wait: the fence
+						// often completed by now (then dots still draw);
+						// if still busy, sit out one spike frame.
+						bool dots_slot_safe =
+						        device.waitForFences(*mask_fence, VK_FALSE, 0) == vk::Result::eSuccess;
+						if (not hidden_dots_draws.empty() and not dots_empty and dots_slot_safe)
 						{
 							int idx = hidden_dots->acquire();
 							if (idx >= 0)
@@ -2821,6 +2848,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								{
 									spdlog::warn("Hidden dots record failed: {}", e.what());
 									hidden_dots->release();
+									// Fail the frame, not a poisoned CB (see
+									// the hidden mask catch above).
+									throw;
 								}
 							}
 						}

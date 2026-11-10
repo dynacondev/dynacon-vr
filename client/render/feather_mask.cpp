@@ -1613,7 +1613,13 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 		float pitch = dot_pitch_m;
 		size_t tris = soup.indices.size() / 3;
 		dots.reserve(tris);
-		for (size_t t = 0; t < tris; ++t)
+		// Input-driven budget (pitch floor 1cm, unbounded mesh area):
+		// over budget the partial lattice is worse than none (a
+		// half-dotted mesh misleads), so drop the whole bake with a
+		// warn. The mask cutout is unaffected.
+		constexpr size_t dot_budget = 262144; // 256k dots = 6MB @24B
+		bool over_budget = false;
+		for (size_t t = 0; t < tris and not over_budget; ++t)
 		{
 			glm::vec3 v[3];
 			for (int k = 0; k < 3; ++k)
@@ -1655,8 +1661,21 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 					center[u] = xu;
 					center[w] = xv;
 					dots.push_back({center, n});
+					if (dots.size() > dot_budget)
+					{
+						dots.clear();
+						over_budget = true;
+						spdlog::warn("Hidden dot lattice over budget (>{} dots) for '{}' at pitch {}m: skipping dots (mask cutout unaffected)",
+						             dot_budget, key, pitch);
+					}
 				}
 			}
+		}
+		if (not over_budget and dots.empty() and tris > 0)
+		{
+			// Non-degenerate mesh, no dots: pitch dwarfs the mesh (or an
+			// all-sliver soup) — the region reveals with no annotation.
+			spdlog::warn("Hidden dot lattice empty for '{}' at pitch {}m: object reveals unannotated", key, pitch);
 		}
 	}
 

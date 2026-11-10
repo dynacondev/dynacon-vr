@@ -757,8 +757,9 @@ private:
 	// (stale defaults): the hidden record passes tier/behavior literals.
 	mask_group hidden_group;
 	// Dot overlay over the revealed camera feed: fixed world-size dots in
-	// the config color, front faces only, no depth. Own swapchain,
-	// submitted after the flat layer, before gizmos. -1 = inactive.
+	// the config color, front faces only, sampled-depth occlusion (no
+	// depth attachment in the dots pass). Own swapchain, submitted after
+	// the flat layer, before gizmos. -1 = inactive.
 	std::unique_ptr<hidden_dots_renderer> hidden_dots;
 	int hidden_dots_image = -1;
 	bool hidden_dots_active = false;
@@ -776,6 +777,11 @@ private:
 	std::vector<hidden_silhouette_draw> hidden_silhouettes;
 	std::vector<feather_mask_renderer::instance_draw> hidden_mask_draws;
 	std::vector<hidden_dots_renderer::instance_draw> hidden_dots_draws;
+	// Baked dot pitch per hidden mesh (the lattice rides the upload, so a
+	// pitch edit must re-upload): compared as floats alongside the soup
+	// hash, no per-frame string formatting. Kept in step with
+	// hidden_group.mesh_hashes at the three sites below.
+	std::map<std::string, float> hidden_dot_pitch;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;

@@ -72,12 +72,17 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	// Rare path (first frame, video resize): nothing outstanding (we
 	// acquire + release within one frame, always paired below).
 	device->waitIdle();
+	// Free the descriptor sets while their pool is still alive:
+	// init_pipelines below recreates the pool, which implicitly frees
+	// (destroys the use of) any sets still held.
+	descriptor_sets.clear();
 	format_ = format;
 	extent_ = {hw, hh};
 	swapchain_ = xr::swapchain(inst, sess, *device, format, (int)hw, (int)hh, 1, 2);
 	spdlog::info("Hidden dots swapchain: {}x{} ({} images)", hw, hh, swapchain_.image_count());
 	init_pipelines(format);
-	// Depth target for the prepass (never sampled, device-local).
+	// Depth target for the prepass (sampled by the dots pass at the dot
+	// centers, device-local).
 	depth_ = image_allocation{
 	        *device,
 	        vk::ImageCreateInfo{
@@ -114,8 +119,8 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		                                               });
 	}
 	// One set per eye over the single-layer depth view (depth image is
-	// renderer-owned, so this runs on rebuild only, never per frame).
-	descriptor_sets.clear();
+	// renderer-owned, so this runs on rebuild only, never per frame;
+	// the old sets were freed above, ahead of the pool recreation).
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
 		vk::DescriptorSetAllocateInfo set_alloc{
@@ -543,51 +548,37 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		                        .minDepth = 0,
 		                        .maxDepth = 1,
 		                });
-		// Union of the draws' stream-side scissor rects (computed once per
+		// Per-draw scissor from the stream-side rects (computed once per
 		// object in the shared silhouette build): shading tracks object
-		// size instead of the fullscreen. The render-area CLEAR stays full
-		// (correctness); only draw fragments are culled. A zero union for
-		// this eye still begins/ends the pass (clear-only): the image
-		// starts UNDEFINED and the compositor samples the full rect.
-		vk::Rect2D scissor{.offset = {0, 0}, .extent = extents[eye]};
+		// size instead of the fullscreen, per draw rather than one union
+		// (a single behind-camera object must not force fullscreen for
+		// the rest). Degenerate draws are skipped outright (nothing
+		// visible: saves the draw call too). The render-area CLEAR stays
+		// full (correctness); an all-degenerate eye still begins/ends
+		// both passes (clear-only): the images start UNDEFINED and the
+		// compositor samples the full rect.
+		auto clamp_scissor = [&](const vk::Rect2D & r, const vk::Extent2D & ext, vk::Rect2D & out) {
+			int32_t x0 = std::max(r.offset.x, 0);
+			int32_t y0 = std::max(r.offset.y, 0);
+			int32_t x1 = std::min(r.offset.x + (int32_t)r.extent.width, (int32_t)ext.width);
+			int32_t y1 = std::min(r.offset.y + (int32_t)r.extent.height, (int32_t)ext.height);
+			if (x1 <= x0 or y1 <= y0)
+				return false;
+			out = vk::Rect2D{.offset = {x0, y0}, .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+			return true;
+		};
 		bool any = false;
+		for (const auto & d: draws)
 		{
-			int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
-			for (const auto & d: draws)
+			vk::Rect2D ignored;
+			if (d.index_count > 0 and d.dot_count > 0 and clamp_scissor(d.scissor[eye], extents[eye], ignored))
 			{
-				const auto & r = d.scissor[eye];
-				int32_t rx0 = std::max(r.offset.x, 0);
-				int32_t ry0 = std::max(r.offset.y, 0);
-				int32_t rx1 = std::min(r.offset.x + (int32_t)r.extent.width, (int32_t)extents[eye].width);
-				int32_t ry1 = std::min(r.offset.y + (int32_t)r.extent.height, (int32_t)extents[eye].height);
-				if (rx1 <= rx0 or ry1 <= ry0)
-					continue;
-				if (not any)
-				{
-					x0 = rx0;
-					y0 = ry0;
-					x1 = rx1;
-					y1 = ry1;
-					any = true;
-				}
-				else
-				{
-					x0 = std::min(x0, rx0);
-					y0 = std::min(y0, ry0);
-					x1 = std::max(x1, rx1);
-					y1 = std::max(y1, ry1);
-				}
+				any = true;
+				break;
 			}
-			if (any)
-				scissor = vk::Rect2D{.offset = {x0, y0},
-				                     .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
 		}
-		cmd.setScissor(0, scissor);
 		// Pass 1: depth prepass (mesh triangles resolve nearest-surface
-		// per pixel; reversed-Z: clear far 0, GREATER wins). A zero union
-		// for this eye still begins/ends both passes (clear-only): the
-		// images start UNDEFINED and the compositor samples the full
-		// color rect.
+		// per pixel; reversed-Z: clear far 0, GREATER wins).
 		vk::ClearValue depth_clear{};
 		depth_clear.depthStencil = {.depth = 0.f, .stencil = 0};
 		vk::RenderPassBeginInfo depth_begin{
@@ -603,8 +594,14 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *fill_pipeline);
 			for (const auto & d: draws)
 			{
-				if (d.index_count == 0)
+				// Unified skip with the dots loop below (index/dot/
+				// scissor): every dots-drawn draw was pushed here, so the
+				// single push below persists correctly into pass 2.
+				vk::Rect2D scissor;
+				if (d.index_count == 0 or d.dot_count == 0 or
+				    not clamp_scissor(d.scissor[eye], extents[eye], scissor))
 					continue;
+				cmd.setScissor(0, scissor);
 				cmd.bindVertexBuffers(0, d.vertex_buffer, (vk::DeviceSize)0);
 				cmd.bindIndexBuffer(d.index_buffer, (vk::DeviceSize)0, vk::IndexType::eUint32);
 				push pc{
@@ -638,17 +635,17 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 			cmd.bindVertexBuffers(0, (vk::Buffer)quad_, (vk::DeviceSize)0);
 			for (const auto & d: draws)
 			{
-				if (d.dot_count == 0)
+				// Same unified skip as the fill loop above (push persists
+				// across the pipeline bind + renderpass boundary: same
+				// layout, same command buffer — no second push needed).
+				vk::Rect2D scissor;
+				if (d.index_count == 0 or d.dot_count == 0 or
+				    not clamp_scissor(d.scissor[eye], extents[eye], scissor))
 					continue;
+				cmd.setScissor(0, scissor);
 				// Baked dot instances borrowed from the feather hidden
 				// renderer (owns upload + eviction); bound fresh per draw.
 				cmd.bindVertexBuffers(1, d.dot_buffer, (vk::DeviceSize)0);
-				push pc{
-				        .mvp = d.mvp[eye],
-				        .color_pitch = glm::vec4(d.color, d.pitch),
-				        .view_params = glm::vec4(d.view_params[eye], dot_radius_cells),
-				};
-				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
 				cmd.draw(6, d.dot_count, 0, 0);
 			}
 		}

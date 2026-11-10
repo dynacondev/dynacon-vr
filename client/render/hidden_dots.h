@@ -26,8 +26,10 @@
 // Screen-aligned by construction, so every dot is round from any angle
 // and the quad extends a full radius past the center, so triangle edges
 // never slice dots. Backfaces collapse in the vertex shader (facing test
-// on the baked normal; no depth test, always on top). One pipeline, one
-// pass, trivial circle fragment.
+// on the baked normal). Two pipelines, two passes: a D16 depth prepass
+// of the mesh, then the dots sample that depth at their CENTERS — whole
+// circles live or die, never half-chopped by geometry. Trivial circle
+// fragment with a 1px AA band and coverage fade at distance.
 //
 // Composited as ONE transparent projection layer (standard alpha blend,
 // above the flat passthrough, below gizmos/GUI) so the maxLayerCount
@@ -60,7 +62,7 @@ public:
 	// by both shaders (quad size + circle edge), so they can't disagree.
 	// Floor note: radii far below ~0.08 cells go subpixel at room range
 	// (2m, 5cm pitch) and fade by coverage — invisible, not broken.
-	static constexpr float dot_radius_cells = 0.01f;
+	static constexpr float dot_radius_cells = 0.005f;
 	// One silhouette draw: per-eye clip transforms (placement already
 	// baked in), dot color + pitch, per-eye scissor rects (dots pixel
 	// space, computed stream-side from the same cull corners), per-eye

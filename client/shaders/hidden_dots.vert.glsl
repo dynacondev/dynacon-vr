@@ -50,11 +50,12 @@ void main()
 	vec4 clip = pc.mvp * vec4(center + normal * 0.002, 1.0);
 	float w = clip.w;
 	// Front-facing test: the normal as a direction (w=0) through the
-	// MVP has clip w = -z_view(normal), so w < 0 means the normal has
-	// +z_view, i.e. points at the camera. Approximate only for faces
-	// nearly edge-on far off-axis (there the lateral terms outweigh
-	// n_z); those dots are merged streaks either way, so a slightly
-	// early/late pop there is accepted.
+	// MVP. The projection w-row is exactly (0,0,-1,0), so clip w is
+	// -z_view(normal) with no lateral terms: w < 0 ⟺ the normal points
+	// at the camera, exactly. Only caveat is non-uniform model scale
+	// (normals want the inverse-transpose): sign can err in a thin
+	// wedge around edge-on under strong anisotropy — accepted, those
+	// dots are merged streaks either way.
 	float facing = (pc.mvp * vec4(normal, 0.0)).w;
 	float pitch = max(pc.color_pitch.w, 1e-4);
 	float px_per_m = (pc.view_params.y * 0.5) * abs(pc.view_params.z) / max(w, 1e-3);
