@@ -2452,11 +2452,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// blur chain, no cutouts); reversed draws are never appended,
 				// so hidden always wins for safety.
 				{
-					bool have_hidden = false;
+					bool known_hidden = false; // map-known (placed or not)
+					bool have_hidden = false; // placed + mesh ready
 					for (auto & [oid, ost]: passthrough_objects)
 					{
 						(void)oid;
-						if (ost.def.type == "3d-passthrough-hidden" and ost.soup_ready and ost.fused.placed)
+						if (ost.def.type != "3d-passthrough-hidden")
+							continue;
+						known_hidden = true;
+						if (ost.soup_ready and ost.fused.placed)
 						{
 							have_hidden = true;
 							break;
@@ -2465,18 +2469,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					auto & g = hidden_group;
 					g.feather_px = 0;
 					g.projected = false;
-					if (not have_hidden)
+					if (known_hidden)
 					{
-						g.active = false;
-						if (g.renderer)
-						{
-							for (auto & [key, _]: g.mesh_hashes)
-								g.renderer->remove_mesh(key);
-							g.mesh_hashes.clear();
-						}
-					}
-					else
-					{
+						// Pre-warm (map-known, not necessarily placed):
+						// renderer + swapchain + intermediates ready before
+						// first placement so visible frames only rasterize,
+						// mirroring the feather groups. Meshes upload as
+						// soon as the soup is ready, even unplaced.
 						if (not g.renderer)
 							g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
 						if (not g.swapchain or g.swapchain.width() != mw or g.swapchain.height() != mh)
@@ -2495,7 +2494,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						{
 							if (ost.def.type != "3d-passthrough-hidden")
 								continue;
-							bool member = ost.soup_ready and ost.fused.placed;
+							bool member = ost.soup_ready;
 							auto mhit = g.mesh_hashes.find(oid);
 							if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash))
 							{
@@ -2508,6 +2507,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								g.mesh_hashes.erase(mhit);
 							}
 						}
+					}
+					if (not have_hidden)
+					{
+						g.active = false;
+						if (not known_hidden and g.renderer)
+						{
+							for (auto & [key, _]: g.mesh_hashes)
+								g.renderer->remove_mesh(key);
+							g.mesh_hashes.clear();
+						}
+					}
+					else
+					{
 						std::vector<feather_mask_renderer::instance_draw> draws;
 						for (auto & [oid, ost]: passthrough_objects)
 						{
@@ -3092,6 +3104,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				}
 				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - grid_t0).count();
+			}
+			if (not have_hidden_grid and not hidden_grid_hashes.empty())
+			{
+				// Map wipe / all hidden objects gone: drop stale GPU meshes
+				// (mirrors the hidden mask cleanup above).
+				if (hidden_grid)
+				{
+					for (auto & [key, _]: hidden_grid_hashes)
+						hidden_grid->remove_mesh(key);
+				}
+				hidden_grid_hashes.clear();
 			}
 		}
 

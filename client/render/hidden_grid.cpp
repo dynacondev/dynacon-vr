@@ -274,7 +274,11 @@ void hidden_grid_renderer::init_pipelines(vk::Format format)
 
 	vk::PipelineRasterizationStateCreateInfo rasterization{
 	        .polygonMode = vk::PolygonMode::eFill,
-	        .cullMode = vk::CullModeFlagBits::eBack,
+	        // No culling: hidden meshes are often open single-sided
+	        // furniture (desk planes), which must read from either side.
+	        // Depth (GREATER + write) still resolves self-occlusion for
+	        // closed volumes; open backfaces simply draw over.
+	        .cullMode = vk::CullModeFlagBits::eNone,
 	        .frontFace = vk::FrontFace::eCounterClockwise,
 	        .lineWidth = 1,
 	};
