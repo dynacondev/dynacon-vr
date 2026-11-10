@@ -212,9 +212,8 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 			if (obj.model_hash.empty())
 				spdlog::info("Passthrough object \"{}\" ({}): no model", label, obj.type);
 			else
-				spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes) grid {:.2f}m #{:02X}{:02X}{:02X} trigger {:.2f}m",
+				spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes) outline #{:02X}{:02X}{:02X} trigger {:.2f}m",
 				             label, obj.type, obj.model_hash.substr(0, 8), obj.model_size,
-				             (double)obj.grid_scale_m,
 				             (unsigned)lroundf(std::clamp(obj.grid_color[0], 0.f, 1.f) * 255.f),
 				             (unsigned)lroundf(std::clamp(obj.grid_color[1], 0.f, 1.f) * 255.f),
 				             (unsigned)lroundf(std::clamp(obj.grid_color[2], 0.f, 1.f) * 255.f),

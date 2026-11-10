@@ -665,13 +665,12 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		map_key += ';';
 		map_key += std::to_string(o.feather_px);
 		map_key += ';';
-		map_key += std::to_string(o.grid_scale_m);
-		map_key += ';';
 		for (float v: o.grid_color)
 			map_key += std::to_string(v) + ',';
 		map_key += ';';
-		// trigger_distance_m intentionally excluded: reserved for stage 2
-		// (unused today) and must not reset tracking on edit.
+		// grid_scale_m intentionally excluded alongside trigger_distance_m:
+		// both reserved (unused by the outline renderer today) and must
+		// not reset tracking on edit.
 	}
 	map_key += 'L';
 	map_key += map->passthrough_until_lock;
@@ -1693,13 +1692,7 @@ void scenes::stream::gui_fiducial_status()
 		}
 		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
 		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
-		std::string hidden_tag;
-		if (ost.def.type == "3d-passthrough-hidden")
-		{
-			char buf[64];
-			snprintf(buf, sizeof(buf), " (hidden grid %.2fm)", (double)ost.def.grid_scale_m);
-			hidden_tag = buf;
-		}
+		std::string hidden_tag = (ost.def.type == "3d-passthrough-hidden") ? _S(" (hidden)") : "";
 		ImGui::Text("%s %.40s%s%s%s%s: %zu tris, %s (stale %.1fs)",
 		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), depth_tag.c_str(), hidden_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}

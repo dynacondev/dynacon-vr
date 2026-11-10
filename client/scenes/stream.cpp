@@ -3006,38 +3006,38 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
 		}
 
-		// Hidden warning grid overlay: world-space triplanar lines + fresnel
-		// rim over the revealed camera feed. Records on the main command
-		// buffer (after the video wait, so a video stall never leaks the
-		// acquisition). Server eye timebase (server_mvp/sync_pose): the grid
-		// must register with the mask silhouette it annotates.
-		hidden_grid_image = -1;
-		hidden_grid_active = false;
+		// Hidden warning outline overlay: flat guardian-style rim around the
+		// revealed camera feed. Records on the main command buffer (after
+		// the video wait, so a video stall never leaks the acquisition).
+		// Server eye timebase (server_mvp): the rim must register with the
+		// mask silhouette it annotates.
+		hidden_outline_image = -1;
+		hidden_outline_active = false;
 		if (mask_frame)
 		{
-			bool known_hidden_grid = false; // map-known (placed or not)
-			bool have_hidden_grid = false; // placed + mesh ready
+			bool known_hidden_outline = false; // map-known (placed or not)
+			bool have_hidden_outline = false; // placed + mesh ready
 			for (auto & [oid, ost]: passthrough_objects)
 			{
 				(void)oid;
 				if (ost.def.type != "3d-passthrough-hidden")
 					continue;
-				known_hidden_grid = true;
+				known_hidden_outline = true;
 				if (ost.soup_ready and ost.fused.placed)
 				{
-					have_hidden_grid = true;
+					have_hidden_outline = true;
 					break;
 				}
 			}
-			if (known_hidden_grid)
+			if (known_hidden_outline)
 			{
-				auto grid_t0 = std::chrono::steady_clock::now();
-				if (not hidden_grid)
-					hidden_grid = std::make_unique<hidden_grid_renderer>(device, physical_device);
-				hidden_grid->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+				auto outline_t0 = std::chrono::steady_clock::now();
+				if (not hidden_outline)
+					hidden_outline = std::make_unique<hidden_outline_renderer>(device, physical_device);
+				hidden_outline->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
 				// Mesh sync rides soup readiness, not placement (mirrors the
 				// hidden mask): first-visible frames only rasterize.
-				for (auto hit = hidden_grid_hashes.begin(); hit != hidden_grid_hashes.end();)
+				for (auto hit = hidden_outline_hashes.begin(); hit != hidden_outline_hashes.end();)
 				{
 					auto oit = passthrough_objects.find(hit->first);
 					bool member = oit != passthrough_objects.end() and
@@ -3045,8 +3045,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					        oit->second.soup_hash == hit->second;
 					if (not member)
 					{
-						hidden_grid->remove_mesh(hit->first);
-						hit = hidden_grid_hashes.erase(hit);
+						hidden_outline->remove_mesh(hit->first);
+						hit = hidden_outline_hashes.erase(hit);
 					}
 					else
 						++hit;
@@ -3055,112 +3055,102 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready)
 						continue;
-					auto ghit = hidden_grid_hashes.find(oid);
-					if (ghit == hidden_grid_hashes.end() or ghit->second != ost.soup_hash)
+					auto ghit = hidden_outline_hashes.find(oid);
+					if (ghit == hidden_outline_hashes.end() or ghit->second != ost.soup_hash)
 					{
-						hidden_grid->set_mesh(oid, ost.soup);
-						hidden_grid_hashes[oid] = ost.soup_hash;
+						hidden_outline->set_mesh(oid, ost.soup);
+						hidden_outline_hashes[oid] = ost.soup_hash;
 					}
 				}
-				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - grid_t0).count();
+				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - outline_t0).count();
 			}
-			if (have_hidden_grid)
+			if (have_hidden_outline)
 			{
-				auto grid_t0 = std::chrono::steady_clock::now();
-				std::vector<hidden_grid_renderer::instance_draw> grid_draws;
+				auto outline_t0 = std::chrono::steady_clock::now();
+				std::vector<hidden_outline_renderer::instance_draw> outline_draws;
 				for (auto & [oid, ost]: passthrough_objects)
 				{
 					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
 						continue;
-					// Meshes synced in the map-known block above.
+					// Meshes synced in the map-known block above; the shell
+					// center comes from the uploaded bounds (skip when
+					// unknown — syncs above, so unexpected).
+					auto bounds = hidden_outline->mesh_bounds(oid);
+					if (not bounds)
+						continue;
+					// Frustum skip (1px margin, like the hidden mask; the
+					// 2cm shell sits inside the margin).
 					const auto & fu = ost.fused;
-					// Fused placements are always uniform (see the packet
-					// comment); the shader rebuilds the rigid transform
-					// from pos/quat/scale, so flag any divergence loudly.
-					assert(fu.world_scale.x == fu.world_scale.y and fu.world_scale.y == fu.world_scale.z);
 					glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
 					            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
 					glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
 					glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
 					                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
-					hidden_grid_renderer::instance_draw d;
+					hidden_outline_renderer::instance_draw d;
 					d.mesh = oid;
 					for (uint32_t view = 0; view < view_count; ++view)
-					{
 						d.mvp[view] = server_mvp[view] * model;
-						const auto & sp = sync_pose[view].position;
-						d.cam_pos[view] = glm::vec3(sp.x, sp.y, sp.z);
-					}
-					d.obj_pos = t;
-					d.obj_quat = q;
-					d.obj_scale = fu.world_scale.x;
-					d.grid_color = glm::vec3(ost.def.grid_color[0], ost.def.grid_color[1], ost.def.grid_color[2]);
-					d.grid_scale = std::max(0.01f, ost.def.grid_scale_m);
-					d.line_width_px = 1.5f;
-					// Frustum skip (1px margin, like the hidden mask).
-					bool visible = true;
-					if (auto bounds = hidden_grid->mesh_bounds(oid))
+					d.color = glm::vec3(ost.def.grid_color[0], ost.def.grid_color[1], ost.def.grid_color[2]);
+					d.obj_center = (bounds->first + bounds->second) * 0.5f;
+					bool visible = false;
+					for (uint32_t view = 0; view < 2 and not visible; ++view)
 					{
-						visible = false;
-						for (uint32_t view = 0; view < 2 and not visible; ++view)
+						bool any_front = false, any_behind = false, any_inside = false;
+						for (int corner = 0; corner < 8; ++corner)
 						{
-							bool any_front = false, any_behind = false, any_inside = false;
-							for (int corner = 0; corner < 8; ++corner)
+							glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+							               (corner & 2) ? bounds->second.y : bounds->first.y,
+							               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+							glm::vec4 c = d.mvp[view] * q4;
+							if (c.w < 0)
 							{
-								glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
-								               (corner & 2) ? bounds->second.y : bounds->first.y,
-								               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
-								glm::vec4 c = d.mvp[view] * q4;
-								if (c.w < 0)
-								{
-									any_behind = true;
-									continue;
-								}
-								any_front = true;
-								if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)extents[view].width * 0.5f)) and
-								    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)extents[view].height * 0.5f)) and c.z >= 0 and c.z <= c.w)
-									any_inside = true;
+								any_behind = true;
+								continue;
 							}
-							visible = any_front and (any_behind or any_inside);
+							any_front = true;
+							if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)extents[view].width * 0.5f)) and
+							    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)extents[view].height * 0.5f)) and c.z >= 0 and c.z <= c.w)
+								any_inside = true;
 						}
+						visible = any_front and (any_behind or any_inside);
 					}
 					if (not visible)
 						continue;
-					grid_draws.push_back(std::move(d));
+					outline_draws.push_back(std::move(d));
 				}
-				if (not grid_draws.empty())
+				if (not outline_draws.empty())
 				{
-					int idx = hidden_grid->acquire();
+					int idx = hidden_outline->acquire();
 					if (idx >= 0)
 					{
-						std::array<vk::Extent2D, 2> grid_ext;
+						std::array<vk::Extent2D, 2> outline_ext;
 						for (uint32_t view = 0; view < view_count; ++view)
-							grid_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+							outline_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
 						try
 						{
-							hidden_grid->record(command_buffer, (size_t)idx, grid_ext, grid_draws);
-							hidden_grid_image = idx;
-							hidden_grid_active = true;
+							hidden_outline->record(command_buffer, (size_t)idx, outline_ext, outline_draws);
+							hidden_outline_image = idx;
+							hidden_outline_active = true;
 						}
 						catch (std::exception & e)
 						{
-							spdlog::warn("Hidden grid record failed: {}", e.what());
-							hidden_grid->release();
+							spdlog::warn("Hidden outline record failed: {}", e.what());
+							hidden_outline->release();
 						}
 					}
 				}
-				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - grid_t0).count();
+				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - outline_t0).count();
 			}
-			if (not have_hidden_grid and not hidden_grid_hashes.empty())
+			if (not have_hidden_outline and not hidden_outline_hashes.empty())
 			{
 				// Map wipe / all hidden objects gone: drop stale GPU meshes
 				// (mirrors the hidden mask cleanup above).
-				if (hidden_grid)
+				if (hidden_outline)
 				{
-					for (auto & [key, _]: hidden_grid_hashes)
-						hidden_grid->remove_mesh(key);
+					for (auto & [key, _]: hidden_outline_hashes)
+						hidden_outline->remove_mesh(key);
 				}
-				hidden_grid_hashes.clear();
+				hidden_outline_hashes.clear();
 			}
 		}
 
@@ -3435,7 +3425,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				static bool last_submit_flat = true;
 				static bool last_submit_projected = false;
 				static bool last_hidden = false;
-				bool hidden_on = hidden_group.active or hidden_grid_active;
+				bool hidden_on = hidden_group.active or hidden_outline_active;
 				if (submit_flat != last_submit_flat or submit_projected != last_submit_projected or hidden_on != last_hidden)
 				{
 					last_submit_flat = submit_flat;
@@ -3611,11 +3601,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 		}
 
-		// Hidden warning grid: ONE transparent projection layer over the
+		// Hidden warning outline: ONE transparent projection layer over the
 		// revealed camera feed (server eye timebase, like the masks),
 		// below gizmos and GUI quads. Same discipline as the debug lines:
 		// standard alpha blend, no FB extensions.
-		if (hidden_grid_active and hidden_grid_image >= 0 and hidden_grid)
+		if (hidden_outline_active and hidden_outline_image >= 0 and hidden_outline)
 		{
 			std::array<XrCompositionLayerProjectionView, view_count> grid_views;
 			for (uint32_t view = 0; view < view_count; ++view)
@@ -3625,7 +3615,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				        .pose = sync_pose[view],
 				        .fov = sync_fov[view],
 				        .subImage = {
-				                .swapchain = hidden_grid->swapchain(),
+				                .swapchain = hidden_outline->swapchain(),
 				                .imageRect = {
 				                        .offset = {0, 0},
 				                        .extent = extents[view],
@@ -3639,9 +3629,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			                     grid_views);
 			// Paired with the acquire in the record phase above: the
 			// compositor takes the last released image; release after submit.
-			hidden_grid->release();
-			hidden_grid_active = false;
-			hidden_grid_image = -1;
+			hidden_outline->release();
+			hidden_outline_active = false;
+			hidden_outline_image = -1;
 		}
 
 		// Debug gizmo layer: ONE transparent projection layer for all debug
@@ -3864,9 +3854,9 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	// anyway).
 	mask_pipe_cache = feather_mask_renderer::pipeline_cache(device);
 	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
-	// Same for the hidden-object grid (two pipelines, milliseconds):
-	// first-visible hidden frames must only rasterize.
-	hidden_grid_renderer::warm_pipelines(device, physical_device, swapchain.format());
+	// Same for the hidden-object outline (two trivial pipelines): first-
+	// visible hidden frames must only rasterize.
+	hidden_outline_renderer::warm_pipelines(device, physical_device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()
