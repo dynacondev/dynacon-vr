@@ -448,13 +448,9 @@ Each `passthrough` entry has:
   for open meshes); keep them simple (room-size boxes are ideal, ~5k
   triangles budget). Both eyes fade together from a single per-frame
   headset distance. `"3d-passthrough-hidden"` renders the model as a
-  hard-edged always-on passthrough cutout on its own mask layer plus a
-  flat guardian-style warning outline around the silhouette (opaque,
-  fixed ~2cm world width at scale 1): reversed cuts never apply to it
-  (safety: hidden always wins), and it needs `model-path` like boundary
-  zones. Hidden meshes must be **closed volumes** like boundary meshes
-  (the outline is an inverted hull: open meshes degrade — solid from
-  behind, invisible from the front).
+  hard-edged always-on passthrough cutout on its own mask layer:
+  reversed cuts never apply to it (safety: hidden always wins), and it
+  needs `model-path` like boundary zones.
 - `id`: stable identifier (required, must be unique); `tag`:
   display-only label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required;
@@ -498,9 +494,9 @@ Each `passthrough` entry has:
 - `grid-scale`: reserved for future use (`3d-passthrough-hidden` only,
   default `0.1`). Parsed and forwarded but currently unused (the warning
   outline has a fixed world width); edits do not reset tracking.
-- `grid-color`: hidden warning outline color as a `"#RRGGBB"` hex string
-  (`3d-passthrough-hidden` only, default light blue `#80D4FF`, applied
-  live).
+- `grid-color`: reserved for future use (`3d-passthrough-hidden` only,
+  default light blue `#80D4FF`). Parsed and forwarded but currently
+  unused; edits do not reset tracking.
 - `trigger-distance`: proximity trigger distance in meters
   (`3d-passthrough-hidden` only, default `0.5`). Unused for now
   (hidden objects are always-on in stage 1); reserved for the

@@ -651,7 +651,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 	}
 	// Fingerprint: object identity (id/type/flags/model). Tags excluded
 	// (display-only); geometry/pose ride the soup + placements below.
-	// Outline color rides the fingerprint too so live edits reset.
 	for (const auto & o: map->objects)
 	{
 		map_key += 'O';
@@ -665,12 +664,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		map_key += ';';
 		map_key += std::to_string(o.feather_px);
 		map_key += ';';
-		for (float v: o.grid_color)
-			map_key += std::to_string(v) + ',';
-		map_key += ';';
-		// Outline color rides the fingerprint, so color edits reset
-		// tracking; grid_scale_m/trigger_distance_m are excluded
-		// (reserved, unused) and must not reset tracking on edit.
+		// grid_color/grid_scale_m/trigger_distance_m excluded (reserved
+		// for a future visibility method, unused by the cutout) and must
+		// not reset tracking on edit.
 	}
 	map_key += 'L';
 	map_key += map->passthrough_until_lock;

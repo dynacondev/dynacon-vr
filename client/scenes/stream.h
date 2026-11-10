@@ -28,7 +28,6 @@
 #include "render/debug_lines.h"
 #include "render/depth_overlay.h"
 #include "render/feather_mask.h"
-#include "render/hidden_outline.h"
 #include "render/imgui_impl.h"
 #include "render/passthrough_mesh.h"
 #include "scene.h"
@@ -748,20 +747,12 @@ private:
 	bool cutouts_punched = false;
 
 	// Hidden passthrough objects (3d-passthrough-hidden): hard-edged cutout
-	// on a dedicated mask layer plus the warning grid overlay above.
-	// The mask reuses the feather renderer at tier 0 (direct raster, no
-	// blur chain) but lives outside mask_groups: its own swapchain, never
-	// feathered, never cut by reversed draws (hidden always wins). Union B
-	// (flat) semantics at submit. Render thread only.
+	// on a dedicated mask layer. The mask reuses the feather renderer at
+	// tier 0 (direct raster, no blur chain) but lives outside mask_groups:
+	// its own swapchain, never feathered, never cut by reversed draws
+	// (hidden always wins). Union B (flat) semantics at submit.
+	// Render thread only.
 	mask_group hidden_group;
-	// Warning outline overlay over the revealed camera feed. Own swapchain,
-	// submitted after the flat layer, before gizmos. -1 = inactive.
-	std::unique_ptr<hidden_outline_renderer> hidden_outline;
-	int hidden_outline_image = -1;
-	bool hidden_outline_active = false;
-	// Uploaded outline meshes by object id (hash compare avoids re-upload;
-	// mirrors hidden_group.mesh_hashes for the mask side).
-	std::map<std::string, std::string> hidden_outline_hashes;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;
