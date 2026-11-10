@@ -2564,7 +2564,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 							if (not visible)
 								continue;
-							draws.push_back({oid, mvp, 1, false});
+							draws.push_back({oid, mvp, 1.f, false});
 						}
 						if (draws.empty())
 						{
