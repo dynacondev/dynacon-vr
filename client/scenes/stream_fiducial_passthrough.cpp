@@ -664,9 +664,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		map_key += ';';
 		map_key += std::to_string(o.feather_px);
 		map_key += ';';
-		// grid_color/pulse_strength excluded: live-applied tint, edits must
-		// not reset tracking. grid_scale_m/trigger_distance_m excluded too
-		// (reserved, unused by the cutout).
+		// pulse_strength excluded: live-applied blink, edits must not
+		// reset tracking. grid_color/grid_scale_m/trigger_distance_m
+		// excluded too (grid_color live-applied with the blink;
+		// grid_scale_m/trigger_distance_m reserved, unused).
 	}
 	map_key += 'L';
 	map_key += map->passthrough_until_lock;

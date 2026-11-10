@@ -494,20 +494,19 @@ Each `passthrough` entry has:
 - `grid-scale`: reserved for future use (`3d-passthrough-hidden` only,
   default `0.1`). Parsed and forwarded but currently unused; edits do
   not reset tracking.
-- `grid-color`: hidden warning wash color as a `"#RRGGBB"` hex string
+- `grid-color`: hidden warning blink color as a `"#RRGGBB"` hex string
   (`3d-passthrough-hidden` only, default light blue `#80D4FF`, applied
-  live). The mask silhouette resubmits above the flat feed tinted this
+  live). The mask silhouette resubmits above the flat feed in this
   color; all hidden objects share one layer, so the lowest-id placed
   object wins.
 - `trigger-distance`: proximity trigger distance in meters
   (`3d-passthrough-hidden` only, default `0.5`). Unused for now
   (hidden objects are always-on in stage 1); reserved for the
   near-field reveal.
-- `pulse-strength`: warning wash breath depth `0..1`
+- `pulse-strength`: warning blink on-duty `0..1`
   (`3d-passthrough-hidden` only, default `0.5`, clamped, applied live).
-  The wash alpha breathes `0.15+0.45·strength·s²` (≈0.15–0.6 at
-  strength 1, ~1.2Hz); `0` skips the wash layer (steady untinted
-  cutout). Edits do not reset tracking.
+  The opaque color flash strobes at ~1.2Hz, on-duty growing with this
+  (`0` = steady cutout, no flash); edits do not reset tracking.
 
 Poses compose as
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).

@@ -3453,17 +3453,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 		}
 
-		// Hidden warning wash: the mask image above is a white silhouette
-		// (mask RGB is ignored downstream), so resubmit the same image over
-		// the flat feed recolored by the config color with a breathing
-		// alpha. Zero new draws/rasters/swapchains: one extra compositor
+		// Hidden warning blink: the mask image above is a white silhouette,
+		// so resubmit the same image over the flat feed in the config color
+		// at full opacity, strobing with the heartbeat. Alpha scale is
+		// ignored on this runtime, so gradation is impossible — the layer
+		// submits on the beat's upper half and skips below it instead.
+		// Opaque color covers camera and game alike: VR never ghosts
+		// through. Zero new draws/rasters/swapchains: one extra compositor
 		// layer referencing the already-acquired image, released with the
-		// group drain above like the mask itself. One wash per shared
+		// group drain above like the mask itself. One blink per shared
 		// layer: the lowest-id placed object wins color and strength.
-		// Skipped when pulse-strength is 0 or the colorScaleBias extension
-		// is missing (steady cutout). Inside the mask-frame branch's
-		// aftermath (same level as gizmos): mask_frame gates staleness —
-		// the record phase that sets active runs under it too.
+		// pulse-strength scales the on-duty (0 = steady cutout); skipped
+		// without the colorScaleBias extension (RGB scale carries color).
 		if (mask_frame and hidden_group.active and composition_layer_color_scale_bias_supported)
 		{
 			const float * tint = nullptr;
@@ -3477,6 +3478,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				strength = ost.def.pulse_strength;
 				break;
 			}
+			bool blink_on = false;
 			if (tint and strength > 0)
 			{
 				double t = (double)frame_state.predictedDisplayTime * 1e-9;
@@ -3484,31 +3486,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// wobble after days of uptime.
 				double phase = std::fmod(t * 6.283185307179586 * 1.2, 6.283185307179586);
 				float s = 0.5f + 0.5f * std::sin((float)phase); // 2π·1.2Hz
-				float beat = strength * s * s;
-				// Faint floor so the region stays marked through the trough,
-				// peaking where the camera still reads through.
-				float wash_a = 0.15f + 0.45f * beat;
-				// Forensic heartbeat (2s throttle): distinguishes a frozen
-				// beat (math/time bug) from a runtime ignoring the alpha
-				// scale (values pulse here but the display stays steady).
-				{
-					static XrTime last_wash_log = 0;
-					XrTime now = instance.now();
-					if (now - last_wash_log > 2'000'000'000LL)
-					{
-						last_wash_log = now;
-						spdlog::info("Hidden wash: tint #{:02X}{:02X}{:02X} strength {:.2f} s {:.2f} beat {:.2f} alpha {:.2f}",
-						             (unsigned)lroundf(std::clamp(tint[0], 0.f, 1.f) * 255.f),
-						             (unsigned)lroundf(std::clamp(tint[1], 0.f, 1.f) * 255.f),
-						             (unsigned)lroundf(std::clamp(tint[2], 0.f, 1.f) * 255.f),
-						             (double)strength, (double)s, (double)beat, (double)wash_a);
-					}
-				}
+				// On-duty grows with strength (~10% at 0.1, ~50% at 1).
+				blink_on = s * s > 1.f - 0.5f * strength;
+			}
+			if (blink_on)
+			{
 				auto & g = hidden_group;
-				std::array<XrCompositionLayerProjectionView, view_count> wash_views;
+				std::array<XrCompositionLayerProjectionView, view_count> blink_views;
 				for (uint32_t view = 0; view < view_count; ++view)
 				{
-					wash_views[view] = {
+					blink_views[view] = {
 					        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
 					        .pose = sync_pose[view],
 					        .fov = sync_fov[view],
@@ -3524,11 +3511,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 				                     application::space(xr::spaces::world),
-				                     wash_views);
-				// White silhouette × color = config-color wash; alpha breathes.
-				// Standard source-alpha blend (like the gizmo layer: no FB
-				// extensions beyond the color scale/bias gated above).
-				set_color_scale_bias({tint[0], tint[1], tint[2], wash_a}, {0, 0, 0, 0});
+				                     blink_views);
+				// White silhouette × color = opaque config-color flash.
+				// Standard source-alpha blend, silhouette alpha is 0/1.
+				set_color_scale_bias({tint[0], tint[1], tint[2], 1}, {0, 0, 0, 0});
 			}
 		}
 
