@@ -1082,14 +1082,14 @@ struct passthrough_object
 	// symmetric smoothstep over +/- this distance around the mesh
 	// surface (0.5 at the surface); 0 = hard step. Default 0.3.
 	float transition_distance_m = 0.3f;
-	// Reserved for future use (3d-passthrough-hidden only): parsed and
-	// forwarded, but currently unused. Default 0.1.
-	float grid_scale_m = 0.1f;
+	// Hidden dot pitch in meters (3d-passthrough-hidden only): fixed
+	// world-size dots wrapping the mesh. Default 0.05.
+	float grid_scale_m = 0.05f;
 	// Hidden-object dot color as RGB 0..1, parsed server-side
 	// from a "#RRGGBB" hex string as-authored (no colorspace conversion).
 	// Tints the dot overlay (per-object color at draw time). Applied
-	// live. Default #80D4FF light blue.
-	std::array<float, 3> grid_color = {128.f / 255.f, 212.f / 255.f, 1.0f};
+	// live. Default #FF291A red.
+	std::array<float, 3> grid_color = {1.0f, 0.16f, 0.10f};
 	// Proximity trigger distance in meters (3d-passthrough-hidden only).
 	// Unused for now (always-on stage 1); reserved for the near-field
 	// reveal. Default 0.5.

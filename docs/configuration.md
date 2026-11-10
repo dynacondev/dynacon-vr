@@ -494,12 +494,12 @@ Each `passthrough` entry has:
   onto geometry, depth volumes always reveal the flat feed, and hidden
   objects always reveal the flat feed on their own layer.
 - `grid-scale`: hidden dot pitch in meters
-  (`3d-passthrough-hidden` only, default `0.1`, clamped to
+  (`3d-passthrough-hidden` only, default `0.05`, clamped to
   `[0.01, 1]`, applied live). Fixed world-size dots wrapping the mesh
   faces; all hidden objects share one layer, so the pitch is per-object
   at draw time.
 - `grid-color`: hidden dot color as a `"#RRGGBB"` hex string
-  (`3d-passthrough-hidden` only, default light blue `#80D4FF`, applied
+  (`3d-passthrough-hidden` only, default red `#FF291A`, applied
   live). Tints the dot overlay (per-object color at draw time).
 - `trigger-distance`: proximity trigger distance in meters
   (`3d-passthrough-hidden` only, default `0.5`). Unused for now
