@@ -1790,6 +1790,109 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// outputs, so no cross-submit semaphore is needed: the
 		// compositor joins via swapchain release (gated on the mask
 		// fence below).
+		// One hidden-silhouette build per frame, shared by the hidden mask
+		// draw list and the dots draw list + scissor: model/MVP/visibility
+		// computed once instead of per consumer (plus the old third copy,
+		// the scissor re-projection in the dots renderer, which rides the
+		// corners below). Unified 1px extents margin: a superset of the old
+		// mask mw/mh margin, so the mask may keep a ≤1px sliver it
+		// previously skipped — visually identical, exact for dots.
+		// Full-res pixel bounds per eye ride along for the dots scissor
+		// (any behind-camera corner → fullscreen that eye).
+		struct hidden_silhouette_draw
+		{
+			std::string mesh;
+			std::array<glm::mat4, 2> mvp;
+			std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
+			glm::vec3 color{0};
+			float pitch = 0.1f;
+		};
+		std::vector<hidden_silhouette_draw> hidden_silhouettes;
+		auto build_hidden_silhouettes = [&]() {
+			hidden_silhouettes.clear();
+			auto * fr = hidden_group.renderer.get();
+			if (not fr)
+				return;
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+					continue;
+				const auto & fu = ost.fused;
+				glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+				            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+				glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+				glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+				                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+				hidden_silhouette_draw s;
+				s.mesh = oid;
+				for (uint32_t view = 0; view < view_count; ++view)
+					s.mvp[view] = server_mvp[view] * model;
+				// Unknown bounds (sync above uploads before draws, so
+				// unexpected): keep the draw, fullscreen scissor.
+				for (uint32_t view = 0; view < 2; ++view)
+					s.px[view] = {0, 0, (float)extents[view].width, (float)extents[view].height};
+				// Frustum skip (draw on unknown bounds: mesh sync above
+				// uploads before draws, so unexpected — keep the draw).
+				bool visible = true;
+				if (auto bounds = fr->mesh_bounds(oid))
+				{
+					visible = false;
+					for (uint32_t view = 0; view < 2 and not visible; ++view)
+					{
+						bool any_front = false, any_behind = false, any_inside = false;
+						float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+						bool any_px = false;
+						for (int corner = 0; corner < 8; ++corner)
+						{
+							glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+							               (corner & 2) ? bounds->second.y : bounds->first.y,
+							               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+							glm::vec4 c = s.mvp[view] * q4;
+							if (c.w <= 0)
+							{
+								any_behind = true;
+								continue;
+							}
+							any_front = true;
+							if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)extents[view].width * 0.5f)) and
+							    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)extents[view].height * 0.5f)) and c.z >= 0 and c.z <= c.w)
+								any_inside = true;
+							float px = (c.x / c.w * 0.5f + 0.5f) * (float)extents[view].width;
+							float py = (c.y / c.w * 0.5f + 0.5f) * (float)extents[view].height;
+							if (not any_px)
+							{
+								x0 = x1 = px;
+								y0 = y1 = py;
+								any_px = true;
+							}
+							else
+							{
+								x0 = std::min(x0, px);
+								x1 = std::max(x1, px);
+								y0 = std::min(y0, py);
+								y1 = std::max(y1, py);
+							}
+						}
+						visible = any_front and (any_behind or any_inside);
+						if (any_behind or not any_px)
+						{
+							// Behind-camera corners poison the divide (or no
+							// corner projected): cover the eye fullscreen.
+							x0 = 0;
+							y0 = 0;
+							x1 = (float)extents[view].width;
+							y1 = (float)extents[view].height;
+						}
+						s.px[view] = {x0, y0, x1, y1};
+					}
+				}
+				if (not visible)
+					continue;
+				s.color = glm::vec3(ost.def.grid_color[0], ost.def.grid_color[1], ost.def.grid_color[2]);
+				s.pitch = std::max(0.01f, ost.def.grid_scale_m);
+				hidden_silhouettes.push_back(std::move(s));
+			}
+		};
 		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit) {
 			// Volume sensor from the shared frame (acquired once above).
 			// Content age + index rate feed the Volume heartbeat: age is
@@ -2551,52 +2654,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						else
 						{
+							// Silhouettes built once above (shared with the
+							// dots below): map straight to mask draws.
+							build_hidden_silhouettes();
 							std::vector<feather_mask_renderer::instance_draw> draws;
-							for (auto & [oid, ost]: passthrough_objects)
-							{
-								if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
-									continue;
-								const auto & fu = ost.fused;
-								glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
-								            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
-								glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
-								glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-								                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
-								std::array<glm::mat4, 2> mvp;
-								for (uint32_t view = 0; view < view_count; ++view)
-									mvp[view] = server_mvp[view] * model;
-								// Frustum skip (1px margin, hard edge: no feather
-								// bleed to preserve).
-								bool visible = true;
-								if (auto bounds = g.renderer->mesh_bounds(oid))
-								{
-									visible = false;
-									for (uint32_t view = 0; view < 2 and not visible; ++view)
-									{
-										bool any_front = false, any_behind = false, any_inside = false;
-										for (int corner = 0; corner < 8; ++corner)
-										{
-											glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
-											               (corner & 2) ? bounds->second.y : bounds->first.y,
-											               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
-											glm::vec4 c = mvp[view] * q4;
-											if (c.w < 0)
-											{
-												any_behind = true;
-												continue;
-											}
-											any_front = true;
-											if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)mw * 0.5f)) and
-											    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)mh * 0.5f)) and c.z >= 0 and c.z <= c.w)
-												any_inside = true;
-										}
-										visible = any_front and (any_behind or any_inside);
-									}
-								}
-								if (not visible)
-									continue;
-								draws.push_back({oid, mvp, opacity, false});
-							}
+							for (auto & s: hidden_silhouettes)
+								draws.push_back({s.mesh, s.mvp, opacity, false});
 							if (draws.empty())
 							{
 								g.active = false;
@@ -2656,6 +2719,99 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				};
 				record_hidden_mask(hidden_group, "Hidden mask", 1.f, true);
+				// Hidden dot overlay, recorded in the mask phase (async-safe:
+				// acquire happens here ahead of the video wait; every path
+				// below pairs it — record-throw, wait-timeout, submit, and
+				// the video-stall drain). Server eye timebase MVPs come from
+				// the shared silhouette build above (no recompute); mesh
+				// buffers are borrowed from the feather hidden renderer,
+				// whose upload flush ran in the mask record above in
+				// submission order (pending uploads report nullopt and show
+				// next frame).
+				hidden_dots_image = -1;
+				hidden_dots_active = false;
+				if (mask_frame)
+				{
+					bool known_hidden_dots = false;
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						(void)oid;
+						if (ost.def.type != "3d-passthrough-hidden")
+							continue;
+						known_hidden_dots = true;
+						break;
+					}
+					if (known_hidden_dots)
+					{
+						auto dots_t0 = std::chrono::steady_clock::now();
+						if (not hidden_dots)
+							hidden_dots = std::make_unique<hidden_dots_renderer>(device, physical_device);
+						hidden_dots->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+						mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
+					}
+					if (not hidden_silhouettes.empty() and hidden_dots and hidden_group.renderer)
+					{
+						auto dots_t0 = std::chrono::steady_clock::now();
+						vk::Extent2D dext{(uint32_t)hidden_dots->swapchain().width(),
+						                  (uint32_t)hidden_dots->swapchain().height()};
+						std::vector<hidden_dots_renderer::instance_draw> dots_draws;
+						dots_draws.reserve(hidden_silhouettes.size());
+						for (auto & s: hidden_silhouettes)
+						{
+							auto bb = hidden_group.renderer->borrowed_mesh_buffers(s.mesh);
+							if (not bb or bb->index_count == 0)
+								continue;
+							hidden_dots_renderer::instance_draw d;
+							d.mvp = s.mvp;
+							d.color = s.color;
+							d.pitch = s.pitch;
+							d.vertex_buffer = bb->vertex_buffer;
+							d.index_buffer = bb->index_buffer;
+							d.index_count = bb->index_count;
+							// Scissor: shared full-res pixel bounds scaled
+							// into the half-res dots extent (+1px pad).
+							for (uint32_t view = 0; view < 2; ++view)
+							{
+								float sx = (float)dext.width / (float)extents[view].width;
+								float sy = (float)dext.height / (float)extents[view].height;
+								int32_t x0 = (int32_t)std::max(0.f, s.px[view][0] * sx - 1.f);
+								int32_t y0 = (int32_t)std::max(0.f, s.px[view][1] * sy - 1.f);
+								int32_t x1 = (int32_t)std::min((float)dext.width, s.px[view][2] * sx + 1.f);
+								int32_t y1 = (int32_t)std::min((float)dext.height, s.px[view][3] * sy + 1.f);
+								d.scissor[view] = vk::Rect2D{.offset = {x0, y0},
+								                             .extent = {(uint32_t)std::max(x1 - x0, 0),
+								                                        (uint32_t)std::max(y1 - y0, 0)}};
+							}
+							dots_draws.push_back(d);
+						}
+						if (not dots_draws.empty())
+						{
+							int idx = hidden_dots->acquire();
+							if (idx >= 0)
+							{
+								std::array<vk::Extent2D, 2> dots_ext;
+								for (uint32_t view = 0; view < view_count; ++view)
+									dots_ext[view] = dext;
+								try
+								{
+									if (hidden_dots->record(rec_cmd, (size_t)idx, dots_ext, dots_draws))
+									{
+										hidden_dots_image = idx;
+										hidden_dots_active = true;
+									}
+									else
+										hidden_dots->release();
+								}
+								catch (std::exception & e)
+								{
+									spdlog::warn("Hidden dots record failed: {}", e.what());
+									hidden_dots->release();
+								}
+							}
+						}
+						mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
+					}
+				}
 			}
 		};
 
@@ -2721,6 +2877,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					g->swapchain.release();
 				}
 				acquired_groups.clear();
+				// Dots acquisition (mask phase runs ahead of the video
+				// wait): same pairing, released here on the stall path.
+				if (hidden_dots_image >= 0 and hidden_dots)
+				{
+					hidden_dots->release();
+					hidden_dots_image = -1;
+					hidden_dots_active = false;
+				}
 			}
 			session.end_frame(frame_state.predictedDisplayTime, {});
 			return;
@@ -3020,161 +3184,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				gizmo_lines->record(command_buffer, (size_t)dbg_image, eye_ext, eye_mvp, tris.data(), tris.size());
 			}
 			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
-		}
-
-		// Hidden dot overlay: fixed world-size dots in the config color over
-		// the revealed camera feed. Records on the main command buffer
-		// (after the video wait, so a video stall never leaks the
-		// acquisition). Server eye timebase (server_mvp): the dots must
-		// register with the mask silhouette they annotate.
-		hidden_dots_image = -1;
-		hidden_dots_active = false;
-		if (mask_frame)
-		{
-			bool known_hidden_dots = false; // map-known (placed or not)
-			bool have_hidden_dots = false; // placed + mesh ready
-			for (auto & [oid, ost]: passthrough_objects)
-			{
-				(void)oid;
-				if (ost.def.type != "3d-passthrough-hidden")
-					continue;
-				known_hidden_dots = true;
-				if (ost.soup_ready and ost.fused.placed)
-				{
-					have_hidden_dots = true;
-					break;
-				}
-			}
-			if (known_hidden_dots)
-			{
-				auto dots_t0 = std::chrono::steady_clock::now();
-				if (not hidden_dots)
-					hidden_dots = std::make_unique<hidden_dots_renderer>(device, physical_device);
-				hidden_dots->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
-				// Mesh sync rides soup readiness, not placement (mirrors the
-				// hidden mask): first-visible frames only rasterize.
-				for (auto hit = hidden_dots_hashes.begin(); hit != hidden_dots_hashes.end();)
-				{
-					auto oit = passthrough_objects.find(hit->first);
-					bool member = oit != passthrough_objects.end() and
-					        oit->second.def.type == "3d-passthrough-hidden" and oit->second.soup_ready and
-					        oit->second.soup_hash == hit->second;
-					if (not member)
-					{
-						hidden_dots->remove_mesh(hit->first);
-						hit = hidden_dots_hashes.erase(hit);
-					}
-					else
-						++hit;
-				}
-				for (auto & [oid, ost]: passthrough_objects)
-				{
-					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready)
-						continue;
-					auto ghit = hidden_dots_hashes.find(oid);
-					if (ghit == hidden_dots_hashes.end() or ghit->second != ost.soup_hash)
-					{
-						hidden_dots->set_mesh(oid, ost.soup);
-						hidden_dots_hashes[oid] = ost.soup_hash;
-					}
-				}
-				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
-			}
-			if (have_hidden_dots)
-			{
-				auto dots_t0 = std::chrono::steady_clock::now();
-				std::vector<hidden_dots_renderer::instance_draw> dots_draws;
-				for (auto & [oid, ost]: passthrough_objects)
-				{
-					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
-						continue;
-					// Meshes synced in the map-known block above (skip when
-					// unknown — syncs above, so unexpected).
-					auto bounds = hidden_dots->mesh_bounds(oid);
-					if (not bounds)
-						continue;
-					const auto & fu = ost.fused;
-					glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
-					            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
-					glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
-					glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-					                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
-					hidden_dots_renderer::instance_draw d;
-					d.mesh = oid;
-					for (uint32_t view = 0; view < view_count; ++view)
-						d.mvp[view] = server_mvp[view] * model;
-					d.color = glm::vec3(ost.def.grid_color[0], ost.def.grid_color[1], ost.def.grid_color[2]);
-					d.pitch = std::max(0.01f, ost.def.grid_scale_m);
-					// Frustum skip (1px margin, like the hidden mask; dots
-					// sit exactly on-surface, so the margin is exact).
-					bool visible = false;
-					for (uint32_t view = 0; view < 2 and not visible; ++view)
-					{
-						bool any_front = false, any_behind = false, any_inside = false;
-						for (int corner = 0; corner < 8; ++corner)
-						{
-							glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
-							               (corner & 2) ? bounds->second.y : bounds->first.y,
-							               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
-							glm::vec4 c = d.mvp[view] * q4;
-							if (c.w < 0)
-							{
-								any_behind = true;
-								continue;
-							}
-							any_front = true;
-							if (glm::abs(c.x) <= c.w * (1.f + 1.f / ((float)extents[view].width * 0.5f)) and
-							    glm::abs(c.y) <= c.w * (1.f + 1.f / ((float)extents[view].height * 0.5f)) and c.z >= 0 and c.z <= c.w)
-								any_inside = true;
-						}
-						visible = any_front and (any_behind or any_inside);
-					}
-					if (not visible)
-						continue;
-					dots_draws.push_back(std::move(d));
-				}
-				if (not dots_draws.empty())
-				{
-					int idx = hidden_dots->acquire();
-					if (idx >= 0)
-					{
-						// Half-res overlay: viewports/rects track the dots
-						// swapchain, the compositor upscales to the FOV.
-						std::array<vk::Extent2D, 2> dots_ext;
-						for (uint32_t view = 0; view < view_count; ++view)
-							dots_ext[view] = {(uint32_t)hidden_dots->swapchain().width(),
-							                  (uint32_t)hidden_dots->swapchain().height()};
-						try
-						{
-							if (hidden_dots->record(command_buffer, (size_t)idx, dots_ext, dots_draws))
-							{
-								hidden_dots_image = idx;
-								hidden_dots_active = true;
-							}
-							else
-								hidden_dots->release();
-						}
-						catch (std::exception & e)
-						{
-							spdlog::warn("Hidden dots record failed: {}", e.what());
-							hidden_dots->release();
-						}
-					}
-				}
-				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
-			}
-			if (not known_hidden_dots and not hidden_dots_hashes.empty())
-			{
-				// Map wipe: drop stale GPU meshes (mirrors the hidden mask
-				// cleanup above — meshes stay uploaded while map-known so
-				// track-loss/replace cycles only rasterize).
-				if (hidden_dots)
-				{
-					for (auto & [key, _]: hidden_dots_hashes)
-						hidden_dots->remove_mesh(key);
-				}
-				hidden_dots_hashes.clear();
-			}
 		}
 
 		// Environment-depth debug overlay: records the fullscreen

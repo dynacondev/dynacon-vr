@@ -760,9 +760,6 @@ private:
 	std::unique_ptr<hidden_dots_renderer> hidden_dots;
 	int hidden_dots_image = -1;
 	bool hidden_dots_active = false;
-	// Uploaded dot meshes by object id (hash compare avoids re-upload;
-	// mirrors hidden_group.mesh_hashes for the mask side).
-	std::map<std::string, std::string> hidden_dots_hashes;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;
