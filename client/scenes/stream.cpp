@@ -2601,12 +2601,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// the revealed feed.
 				auto record_hidden_mask = [&]() {
 					auto & g = hidden_group;
-					// Half-res working + submit (alert-grade, like the dots
-					// layer): tier-0 stays a hard-edged direct raster (no
-					// blur chain ever — tier comes from feather_px = 0, not
-					// resolution), the compositor upscales the half-rect.
-					int hmw = std::max(64, mw / 2);
-					int hmh = std::max(64, mh / 2);
+					// Quarter-res working + submit (alert-grade layers):
+					// tier-0 stays a hard-edged direct raster (no blur
+					// chain ever — tier comes from feather_px = 0, not
+					// resolution), the compositor upscales the
+					// quarter-rect (binary alpha: edge carries a ~1-texel
+					// upscale ramp; the quarter-res dots still annotate
+					// precisely). Reuses the tiered-quarter qw/qh size.
+					int hmw = qw;
+					int hmh = qh;
 					{
 						// State hoisted per frame above (shared with the
 						// nomask gate, dots record and submit).
@@ -2622,7 +2625,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// Dots renderer + shared sphere field, warmed here (ahead
 							// of the mask record below which renders into it): same
 							// hidden_known prewarm as the mask swapchain. Sized from
-							// the same half-res so the shared field extent agrees
+							// the same quarter-res so the shared field extent agrees
 							// exactly (dots halves its args: 2x in = 1x out). A
 							// rebuild recreates the sphere views the mask builds
 							// framebuffers against, so drop those first.
@@ -2741,7 +2744,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						{
 							// Silhouettes built once above (shared with the
 							// dots below): map straight to mask draws. The
-							// shared margin floors off the half-res mask
+							// shared margin floors off the quarter-res mask
 							// working size (conservative superset either way;
 							// the dots scissor reads the px bounds exactly).
 							build_hidden_silhouettes(hmw, hmh);
@@ -2898,7 +2901,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									feather_mask_renderer::hidden_cpu hstats{};
 									try
 									{
-										// Half-res proximity reveal (dedicated
+										// Quarter-res proximity reveal (dedicated
 										// hidden path beside feather record):
 										// sphere field first, silhouettes kept
 										// only where nearer (hard near-field
@@ -2911,7 +2914,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										};
 										// Shared sphere field (P4): dots-ensured in the prewarm
 										// above under the same hidden_known+mask_frame conditions,
-										// same half-res, so the image/views are live here.
+										// same quarter-res, so the image/views are live here.
 										feather_mask_renderer::hidden_sphere_field sphere_field{
 											.image = hidden_dots->sphere_image(),
 											.extent = hex,
@@ -2999,7 +3002,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								d.view_params[view] = glm::vec3((float)dext.width, (float)dext.height,
 								                                dots_proj11[view]);
 							// Scissor: shared full-res pixel bounds scaled
-							// into the half-res dots extent (+1px pad).
+							// into the quarter-res dots extent (+1px pad).
 							for (uint32_t view = 0; view < 2; ++view)
 							{
 								float sx = (float)dext.width / (float)extents[view].width;
@@ -3894,7 +3897,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// standard alpha blend, no FB extensions.
 		if (hidden_dots_active and hidden_dots_image >= 0 and hidden_dots)
 		{
-			// Half-res image rect: the runtime stretches it over the FOV.
+			// Quarter-res image rect: the runtime stretches it over the FOV.
 			XrExtent2Di dots_rect{(int32_t)hidden_dots->swapchain().width(),
 			                       (int32_t)hidden_dots->swapchain().height()};
 			std::array<XrCompositionLayerProjectionView, view_count> dots_views;

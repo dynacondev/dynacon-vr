@@ -62,9 +62,10 @@ void hidden_dots_renderer::warm_pipelines(vk::raii::Device & device, vk::raii::P
 
 bool hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h)
 {
-	// Half resolution: dots stay crisp (world-size pattern, still several
-	// px per dot at room range) while clear/store/shading quarter. The
-	// compositor upscales the submitted rect to the full FOV.
+	// Quarter of full (halved args): small/distant dots fade by coverage
+	// instead of popping (no shimmer), while clear/store/shading drop
+	// 16x vs full. The compositor upscales the submitted rect to the
+	// full FOV; binary alpha carries a ~1-texel upscale ramp.
 	uint32_t hw = ((uint32_t)w + 1) / 2;
 	uint32_t hh = ((uint32_t)h + 1) / 2;
 	if (ready() and format_ == format and extent_.width == hw and extent_.height == hh)
@@ -118,7 +119,7 @@ bool hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		                                                       },
 		                                               });
 	}
-	// Proximity sphere field: same D16 half-res shape, separate image
+	// Proximity sphere field: same D16 quarter-res shape, separate image
 	// (the mesh field clears far/0 for GREATER; this one clears near/1.0
 	// for LESS — the fields must not mix).
 	sphere_depth_ = image_allocation{

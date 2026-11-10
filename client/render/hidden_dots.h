@@ -174,12 +174,12 @@ private:
 	// color writes off): the dots sample its output, they don't
 	// depth-test against it. Shared layout (subset of push).
 	vk::raii::Pipeline fill_pipeline{nullptr};
-	// Depth target (D16, half-res, 2 layers + one single-layer view per
+	// Depth target (D16, quarter-res, 2 layers + one single-layer view per
 	// eye), recreated with the swapchain in ensure(). Sampled by the
 	// dots pass (nearest: exact texel, no cross-edge blending).
 	image_allocation depth_;
 	std::array<vk::raii::ImageView, 2> depth_views{nullptr, nullptr};
-	// Proximity sphere depth (D16, half-res, same shape): min-accumulated
+	// Proximity sphere depth (D16, quarter-res, same shape): min-accumulated
 	// furthest-exit field, sampled alongside the mesh depth (binding 1).
 	// SHARED with the feather mask hidden record: the mask renders the
 	// spheres into this image (same command buffer, earlier pass) and

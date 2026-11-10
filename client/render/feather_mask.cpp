@@ -21,6 +21,7 @@
 #include "vk/shader.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -1835,7 +1836,8 @@ vk::ImageView feather_mask_renderer::output_depth_view(vk::Extent2D extent, int 
 }
 
 void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, const hidden_sphere_field & field)
-{
+{	assert(field.extent.width == extent.width and field.extent.height == extent.height);
+
 	if (not hidden_ready)
 	{
 		hidden_ready = true;
@@ -2084,7 +2086,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 			// the borrowed view, so the scene must reset_targets()
 			// before the dots renderer dies or rebuilds (see
 			// hidden_sphere_field). Extent agreement is the scene's
-			// job — one half-res for mask, field and dots.
+			// job — one quarter-res for mask, field and dots.
 			vk::ImageView sphere_view = field.views[eye];
 			vk::ImageView color_atts[2] = {color_view, sphere_view};
 			vk::FramebufferCreateInfo color_fb{
@@ -2151,13 +2153,74 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(sphere_begin, vk::SubpassContents::eInline);
 		cmd.setViewport(0, full_vp);
-		cmd.setScissor(0, full_sc);
 		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hidden_sphere_pipe);
 		cmd.bindVertexBuffers(0, (vk::Buffer)hidden_sphere_verts_, (vk::DeviceSize)0);
 		for (const auto & s: spheres)
 		{
 			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 			                               raster_push{.mvp = s[eye], .opacity = 1});
+			// Per-sphere scissor from the containing cube (unit-sphere
+			// space corners through the MVP): a rigorous superset of the
+			// sphere coverage while every corner is in front (planar faces
+			// map line-to-line under perspective), +2px pad, clamped.
+			// Any corner at/behind the camera falls back to fullscreen:
+			// the eye-inside case always has one (corners surround the
+			// center), and a clipped box there would under-reveal
+			// (fail-unsafe: field stays clear, RP2 + dots both cut).
+			// NDC->pixel convention copies RP2 below. An empty clamped
+			// box means fully off-screen (superset empty) and skips.
+			bool sph_full = false;
+			float sx0 = 0, sy0 = 0, sx1 = 0, sy1 = 0;
+			bool sph_any = false;
+			for (int corner = 0; corner < 8 and not sph_full; ++corner)
+			{
+				glm::vec4 q4((corner & 1) ? 1.f : -1.f, (corner & 2) ? 1.f : -1.f,
+				               (corner & 4) ? 1.f : -1.f, 1);
+				glm::vec4 c = s[eye] * q4;
+				if (c.w <= 1e-6f)
+				{
+					sph_full = true;
+					break;
+				}
+				float px = (c.x / c.w * 0.5f + 0.5f) * (float)extent.width;
+				float py = (c.y / c.w * 0.5f + 0.5f) * (float)extent.height;
+				if (not sph_any)
+				{
+					sx0 = sx1 = px;
+					sy0 = sy1 = py;
+					sph_any = true;
+				}
+				else
+				{
+					sx0 = std::min(sx0, px);
+					sx1 = std::max(sx1, px);
+					sy0 = std::min(sy0, py);
+					sy1 = std::max(sy1, py);
+				}
+			}
+			if (sph_full)
+			{
+				cmd.setScissor(0, full_sc);
+			}
+			else
+			{
+				// Float-domain clamp first: radii are config-controlled with no
+				// upper bound, and an out-of-range float->int cast is UB that
+				// resolves (x86) to INT_MIN => wrongful skip => under-reveal
+				// (fail-unsafe). Clamped floats cast exactly.
+				float fx0 = std::min(std::max(sx0 - 2.f, 0.f), (float)extent.width);
+				float fy0 = std::min(std::max(sy0 - 2.f, 0.f), (float)extent.height);
+				float fx1 = std::min(std::max(sx1 + 2.f, 0.f), (float)extent.width);
+				float fy1 = std::min(std::max(sy1 + 2.f, 0.f), (float)extent.height);
+				int32_t ix0 = (int32_t)std::floor(fx0);
+				int32_t iy0 = (int32_t)std::floor(fy0);
+				int32_t ix1 = (int32_t)std::ceil(fx1);
+				int32_t iy1 = (int32_t)std::ceil(fy1);
+				if (ix1 <= ix0 or iy1 <= iy0)
+					continue;
+				cmd.setScissor(0, vk::Rect2D{.offset = {ix0, iy0},
+				                             .extent = {(uint32_t)(ix1 - ix0), (uint32_t)(iy1 - iy0)}});
+			}
 			cmd.draw(hidden_sphere_vert_count, 1, 0, 0);
 		}
 		cmd.endRenderPass();

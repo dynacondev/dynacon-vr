@@ -290,7 +290,7 @@ public:
 	// near-field reveal on its own layer. Dedicated path beside record()
 	// (shared logic untouched): RP1 rasters the proximity spheres into a
 	// depth field, RP2 rasters the silhouettes with a depth test against
-	// it, so only in-radius fragments write mask. Half-res working +
+	// it, so only in-radius fragments write mask. Quarter-res working +
 	// submit (alert-grade, like the dots layer); tier-0 direct raster
 	// (no blur/erode/volume/VR ever — bubbles never engage here).
 	// spheres: one MVP pair per proximity volume (model =
@@ -303,8 +303,9 @@ public:
 	// per frame, not two): RP1 renders into field.views at
 	// field.extent, RP2 tests against it, then the record transitions
 	// the image to shader-readable for the dots color pass later in
-	// the same command buffer. Extent MUST equal the dots half-res
-	// extent (the scene sizes both from one half-res); mismatched views
+	// the same command buffer. Extent MUST equal the quarter-res
+	// working extent (the scene sizes mask, field and dots from one
+	// quarter-res); mismatched views
 	// would misalign the gate. Borrowed-framebuffer discipline: the
 	// framebuffers built here reference the dots-owned views, so the
 	// scene must reset_targets() before the dots renderer dies or
