@@ -1834,19 +1834,7 @@ vk::ImageView feather_mask_renderer::output_depth_view(vk::Extent2D extent, int 
 	return *it->second.views[eye];
 }
 
-vk::ImageView feather_mask_renderer::hidden_sphere_view(vk::Extent2D extent, int eye)
-{
-	auto key = std::make_pair(extent.width, extent.height);
-	auto it = hidden_sphere_images.find(key);
-	if (it == hidden_sphere_images.end())
-	{
-		spdlog::info("Hidden proximity depth target: {}x{}", extent.width, extent.height);
-		it = hidden_sphere_images.emplace(key, make_depth_entry(extent)).first;
-	}
-	return *it->second.views[eye];
-}
-
-void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
+void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, const hidden_sphere_field & field)
 {
 	if (not hidden_ready)
 	{
@@ -2092,7 +2080,12 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 			};
 			tgt.views[eye] = vk::raii::ImageView(device, iv_info);
 			vk::ImageView color_view = *tgt.views[eye];
-			vk::ImageView sphere_view = hidden_sphere_view(extent, eye);
+			// Shared sphere field (dots-owned): the framebuffer bakes
+			// the borrowed view, so the scene must reset_targets()
+			// before the dots renderer dies or rebuilds (see
+			// hidden_sphere_field). Extent agreement is the scene's
+			// job — one half-res for mask, field and dots.
+			vk::ImageView sphere_view = field.views[eye];
 			vk::ImageView color_atts[2] = {color_view, sphere_view};
 			vk::FramebufferCreateInfo color_fb{
 			        .renderPass = *hidden_color_rp,
@@ -2123,17 +2116,17 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
                                           const std::vector<hidden_draw> & draws,
                                           const std::vector<std::array<glm::mat4, 2>> & spheres,
                                           hidden_cpu * cpu_stats,
-                                          const std::array<vk::Extent2D, 2> & full_extents)
+                                          const std::array<vk::Extent2D, 2> & full_extents,
+                                          const hidden_sphere_field & field)
 {
 	hidden_cpu local{};
 	section_clock raster_clk(&local.raster_ms);
 
 	for (auto & [key, mesh]: meshes)
 		flush_upload(cmd, mesh);
-	ensure_hidden(image, extent);
+	ensure_hidden(image, extent, field);
 	auto & tgt = hidden_targets[image];
-	auto sit = hidden_sphere_images.find({extent.width, extent.height});
-	VkImage sphere_image = *sit->second.image;
+	VkImage sphere_image = field.image;
 
 	for (int eye = 0; eye < 2; ++eye)
 	{
@@ -2235,6 +2228,29 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		}
 		cmd.endRenderPass();
 	}
+
+	// Shared-field handoff (P4): the dots color pass samples the sphere
+	// image later in this command buffer. Same-queue write→read needs an
+	// explicit transition — the barrier above only covered write→RP2
+	// attachment-read. Harmless when dots sits out (image simply unused).
+	vk::ImageMemoryBarrier sph_read{
+	        .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+	        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	        .oldLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+	        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	        .image = sphere_image,
+	        .subresourceRange = {
+	                .aspectMask = vk::ImageAspectFlagBits::eDepth,
+	                .baseMipLevel = 0,
+	                .levelCount = 1,
+	                .baseArrayLayer = 0,
+	                .layerCount = 2,
+	        },
+	};
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
+	                    vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, sph_read);
 
 	if (cpu_stats)
 		*cpu_stats = local;

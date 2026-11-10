@@ -639,8 +639,6 @@ void scenes::stream::on_unfocused()
 	input.reset();
 	left_hand.reset();
 	right_hand.reset();
-	prox_left_hand.reset();
-	prox_right_hand.reset();
 	apps.reset();
 
 	imgui_ctx.reset();
@@ -1541,6 +1539,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				break;
 			}
 		}
+		// Shared hand trackers: while a hidden map is live the proximity
+		// palms borrow the GUI pair (created on demand below), so the
+		// GUI must not reset them on interactability loss. Map-level
+		// (not placed-level): steady across placement flaps, zero
+		// per-frame cost when unplaced (no locates run).
+		hidden_wants_hands = hidden_known;
 		// Per-frame hidden working buffers (declared here, filled by the
 		// shared silhouette build in the mask phase; capacity survives).
 		hidden_silhouettes.clear();
@@ -1897,6 +1901,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						s.px[view] = {x0, y0, x1, y1};
 					}
+					// World-space AABB for the CPU proximity pre-gate
+					// (P0): model-space bounds through the model matrix
+					// (8 corners; the MVPs above already paid the
+					// expensive part). Unknown-bounds draws keep
+					// bounds_known=false and pass the gate conservatively.
+					glm::vec3 wmin(0), wmax(0);
+					for (int corner = 0; corner < 8; ++corner)
+					{
+						glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+						               (corner & 2) ? bounds->second.y : bounds->first.y,
+						               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+						glm::vec3 w = glm::vec3(model * q4);
+						if (corner == 0)
+						{
+							wmin = wmax = w;
+							continue;
+						}
+						wmin.x = std::min(wmin.x, w.x);
+						wmin.y = std::min(wmin.y, w.y);
+						wmin.z = std::min(wmin.z, w.z);
+						wmax.x = std::max(wmax.x, w.x);
+						wmax.y = std::max(wmax.y, w.y);
+						wmax.z = std::max(wmax.z, w.z);
+					}
+					s.world_min = wmin;
+					s.world_max = wmax;
+					s.bounds_known = true;
 				}
 				if (not visible)
 					continue;
@@ -2588,6 +2619,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// soon as the soup is ready, even unplaced.
 							if (not g.renderer)
 								g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+							// Dots renderer + shared sphere field, warmed here (ahead
+							// of the mask record below which renders into it): same
+							// hidden_known prewarm as the mask swapchain. Sized from
+							// the same half-res so the shared field extent agrees
+							// exactly (dots halves its args: 2x in = 1x out). A
+							// rebuild recreates the sphere views the mask builds
+							// framebuffers against, so drop those first.
+							if (mask_frame)
+							{
+								if (not hidden_dots)
+									hidden_dots = std::make_unique<hidden_dots_renderer>(device, physical_device);
+								if (hidden_dots->ensure(instance, session, swapchain.format(), hmw * 2, hmh * 2) and g.renderer)
+									g.renderer->reset_targets();
+							}
 							if (not g.swapchain or g.swapchain.width() != hmw or g.swapchain.height() != hmh)
 							{
 								// Rare path (first frame, video resize): nothing
@@ -2678,16 +2723,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								g.mesh_hashes.clear();
 								hidden_dot_pitch.clear();
 								// Map no longer carries hidden objects: drop
-								// the dots renderer too (swapchain + depth),
-								// not just the meshes. Recreated on demand
-								// under hidden_known below; nothing is
-								// submitted while inactive.
+								// the dots renderer too (swapchain + shared
+								// sphere field), not just the meshes. The mask
+								// framebuffers reference the dots-owned sphere
+								// views, so they must die first (reset_targets)
+								// — views die with the dots renderer. Recreated
+								// on demand under hidden_known below; nothing
+								// is submitted while inactive.
+								g.renderer->reset_targets();
 								hidden_dots.reset();
-								prox_left_hand.reset();
-								prox_right_hand.reset();
 							}
 						}
-						else
+						// Without the mask path nothing can display: skip the
+						// build, the locates and the record (the nomask gate
+						// above already warned). Uploads/prewarm still ran.
+						else if (mask_frame)
 						{
 							// Silhouettes built once above (shared with the
 							// dots below): map straight to mask draws. The
@@ -2704,17 +2754,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// One head entry per placed hidden object, each
 							// with its own live proximity-radius, plus one
 							// entry per tracked palm/grip with the same
-							// object's hand-proximity-radius (default 0.3):
+							// object's hand-proximity-radius:
 							// the min-accumulating field unions them (inside
 							// ANY = over-reveal, the safe direction).
 							proximity_spheres.clear();
 							proximity_spheres.reserve(hidden_silhouettes.size() * 3);
+							// Shared GUI pair (see hidden_wants_hands): the GUI leaves
+							// them alive while a hidden map is live; created here when
+							// it never ran (no GUI open). Positions are never culled
+							// — the P0 gate below only skips GPU work.
 							if (system.hand_tracking_supported())
 							{
-								if (not prox_left_hand)
-									prox_left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
-								if (not prox_right_hand)
-									prox_right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+								if (not left_hand)
+									left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
+								if (not right_hand)
+									right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
 							}
 							XrSpace prox_space = application::space(xr::spaces::world);
 							// Palm preferred, controller grip fallback, per
@@ -2739,8 +2793,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									return grip_pos->first;
 								return std::nullopt;
 							};
-							std::optional<glm::vec3> palm_l = hand_pos(prox_left_hand, xr::spaces::grip_left);
-							std::optional<glm::vec3> palm_r = hand_pos(prox_right_hand, xr::spaces::grip_right);
+							std::optional<glm::vec3> palm_l = hand_pos(left_hand, xr::spaces::grip_left);
+							std::optional<glm::vec3> palm_r = hand_pos(right_hand, xr::spaces::grip_right);
 							auto push_sphere = [&](glm::vec3 c, float r) {
 								if (r <= 0)
 									return; // degenerate: field stays cleared, fail-closed
@@ -2752,26 +2806,57 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									sm[view] = server_mvp[view] * sphere_model;
 								proximity_spheres.push_back(sm);
 							};
-							{
-								const auto & p0 = sync_pose[0].position;
-								const auto & p1 = sync_pose[1].position;
-								glm::vec3 center((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f,
-								                 (p0.z + p1.z) * 0.5f);
-								for (auto & s: hidden_silhouettes)
+							// Live radii per object (clamped, fail-closed at 0).
+							auto hidden_radii = [&](const std::string & mesh) {
+								float head_r = 0.25f, hand_r = 0.15f;
+								auto soit = passthrough_objects.find(mesh);
+								if (soit != passthrough_objects.end())
 								{
-									float head_r = 0.25f, hand_r = 0.15f;
-									auto soit = passthrough_objects.find(s.mesh);
-									if (soit != passthrough_objects.end())
-									{
-										head_r = std::max(0.f, soit->second.def.proximity_radius_m);
-										hand_r = std::max(0.f, soit->second.def.hand_proximity_radius_m);
-									}
-									push_sphere(center, head_r);
-									if (palm_l)
-										push_sphere(*palm_l, hand_r);
-									if (palm_r)
-										push_sphere(*palm_r, hand_r);
+									head_r = std::max(0.f, soit->second.def.proximity_radius_m);
+									hand_r = std::max(0.f, soit->second.def.hand_proximity_radius_m);
 								}
+								return std::make_pair(head_r, hand_r);
+							};
+							// Head center = midpoint of the sync eye positions.
+							const auto & p0 = sync_pose[0].position;
+							const auto & p1 = sync_pose[1].position;
+							glm::vec3 center((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f,
+							                 (p0.z + p1.z) * 0.5f);
+							// P0 CPU pre-gate: drop silhouettes fully outside every
+							// sphere (head + palms) before any acquire/record.
+							// Sphere-vs-world-AABB; test radii padded 2cm against
+							// edge flicker (the GPU field keeps the exact radii).
+							// Unknown bounds pass conservatively. Survivors feed the
+							// mask draws, the dots draws and the sphere MVPs below, so
+							// a closed gate costs ~zero GPU and no layers.
+							hidden_silhouettes.erase(
+								std::remove_if(hidden_silhouettes.begin(), hidden_silhouettes.end(),
+									[&](const hidden_silhouette_draw & s) {
+										if (not s.bounds_known)
+											return false;
+										auto [head_r, hand_r] = hidden_radii(s.mesh);
+										auto outside = [&](glm::vec3 c, float r) {
+											if (r <= 0)
+												return true;
+											float rr = r + 0.02f;
+											float dx = std::max({s.world_min.x - c.x, 0.f, c.x - s.world_max.x});
+											float dy = std::max({s.world_min.y - c.y, 0.f, c.y - s.world_max.y});
+											float dz = std::max({s.world_min.z - c.z, 0.f, c.z - s.world_max.z});
+											return dx * dx + dy * dy + dz * dz > rr * rr;
+										};
+										return outside(center, head_r) and
+											(not palm_l or outside(*palm_l, hand_r)) and
+											(not palm_r or outside(*palm_r, hand_r));
+									}),
+								hidden_silhouettes.end());
+							for (auto & s: hidden_silhouettes)
+							{
+								auto [head_r, hand_r] = hidden_radii(s.mesh);
+								push_sphere(center, head_r);
+								if (palm_l)
+									push_sphere(*palm_l, hand_r);
+								if (palm_r)
+									push_sphere(*palm_r, hand_r);
 							}
 							hidden_mask_draws.reserve(hidden_silhouettes.size());
 							for (auto & s: hidden_silhouettes)
@@ -2824,8 +2909,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										        vk::Extent2D{(uint32_t)extents[0].width, (uint32_t)extents[0].height},
 										        vk::Extent2D{(uint32_t)extents[1].width, (uint32_t)extents[1].height},
 										};
+										// Shared sphere field (P4): dots-ensured in the prewarm
+										// above under the same hidden_known+mask_frame conditions,
+										// same half-res, so the image/views are live here.
+										feather_mask_renderer::hidden_sphere_field sphere_field{
+											.image = hidden_dots->sphere_image(),
+											.extent = hex,
+											.views = {hidden_dots->sphere_view(0), hidden_dots->sphere_view(1)},
+										};
 										g.renderer->record_hidden(rec_cmd, g.swapchain.image(mask_index), hex,
-										                          hidden_mask_draws, proximity_spheres, &hstats, full_ext);
+										                          hidden_mask_draws, proximity_spheres, &hstats, full_ext,
+										                          sphere_field);
 									}
 									catch (std::exception & e)
 									{
@@ -2843,6 +2937,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									mask_draws += (int)hstats.draws;
 								}
 							}
+						}
+						else
+						{
+							g.active = false;
 						}
 					}
 				};
@@ -2863,15 +2961,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// Map-known state hoisted per frame above (shared with
 					// the mask record): prewarm while known so visible
 					// frames only rasterize.
-					if (hidden_known)
-					{
-						auto dots_t0 = std::chrono::steady_clock::now();
-						if (not hidden_dots)
-							hidden_dots = std::make_unique<hidden_dots_renderer>(device, physical_device);
-						hidden_dots->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
-						mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
-					}
-					if (not hidden_silhouettes.empty() and hidden_dots and hidden_group.renderer)
+					// Dots renderer + shared field are warmed in the mask prewarm
+					// above (same hidden_known gate). Fresh-field rule: dots only
+					// records when the mask recorded this frame (hidden_group.active)
+					// — otherwise the shared image holds last frame's field.
+					if (not hidden_silhouettes.empty() and hidden_dots and hidden_group.renderer and hidden_group.active)
 					{
 						auto dots_t0 = std::chrono::steady_clock::now();
 						vk::Extent2D dext{(uint32_t)hidden_dots->swapchain().width(),
@@ -2955,8 +3049,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								std::array<vk::Extent2D, 2> dots_ext{dext, dext};
 								try
 								{
-									if (hidden_dots->record(rec_cmd, (size_t)idx, dots_ext, hidden_dots_draws,
-									                          proximity_spheres))
+									if (hidden_dots->record(rec_cmd, (size_t)idx, dots_ext, hidden_dots_draws))
 									{
 										hidden_dots_image = idx;
 										hidden_dots_active = true;
@@ -3561,9 +3654,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					break;
 				}
 			}
-			// Hidden objects reveal the flat feed on their own layer
-			// (state hoisted per frame above).
-			if (hidden_placed)
+			// Hidden objects reveal the flat feed on their own layer: only
+			// while actually submitting (P1 — a placed-but-gated hidden
+			// object reveals nothing, so it must not pin the flat layer
+			// and its compositor cost).
+			if (hidden_group.active or hidden_dots_active)
 				need_flat = true;
 			if (cutouts_punched)
 				need_flat = true;

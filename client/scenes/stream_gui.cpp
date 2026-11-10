@@ -993,8 +993,11 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 				right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
 		}
 	}
-	else
+	else if (not hidden_wants_hands)
 	{
+		// A live hidden map borrows this pair for its proximity palms
+		// (created on demand in the mask phase): leave them alone while
+		// wanted, or the pair churns create/destroy every frame.
 		left_hand.reset();
 		right_hand.reset();
 	}

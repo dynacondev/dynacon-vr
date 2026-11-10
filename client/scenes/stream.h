@@ -773,6 +773,12 @@ private:
 		std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
 		glm::vec3 color{0};
 		float pitch = 0.1f;
+		// World-space mesh AABB for the CPU proximity pre-gate (P0):
+		// silhouettes fully outside every sphere are dropped before any
+		// acquire/record. bounds_known=false (upload pending) keeps the
+		// draw conservatively.
+		glm::vec3 world_min{0}, world_max{0};
+		bool bounds_known = false;
 	};
 	std::vector<hidden_silhouette_draw> hidden_silhouettes;
 	std::vector<feather_mask_renderer::hidden_draw> hidden_mask_draws;
@@ -783,14 +789,16 @@ private:
 	// hidden_group.mesh_hashes at the three sites below.
 	std::map<std::string, float> hidden_dot_pitch;
 	// Per-frame proximity spheres (model already placed): rebuilt when
-	// the mask phase builds draws below; the dots record reuses them.
+	// the mask phase builds draws below; the mask record renders them
+	// into the dots-owned shared field, the dots record only samples.
 	// Capacity survives clear(). Render thread only.
 	std::vector<std::array<glm::mat4, 2>> proximity_spheres;
-	// Dedicated hand trackers for the proximity palms (not the GUI
-	// pair: their lifecycle follows GUI interactability and would churn
-	// here). Created on demand under hidden_known, dropped with the map.
-	std::optional<xr::hand_tracker> prox_left_hand;
-	std::optional<xr::hand_tracker> prox_right_hand;
+	// The proximity palms borrow the GUI hand trackers (shared handles,
+	// per-frame positions — never culled): set from hidden_known at
+	// frame top so the GUI pair survives its interactability reset
+	// while a hidden map is live. No dedicated trackers (handle churn
+	// bought nothing: locate cost is per call, not per handle).
+	bool hidden_wants_hands = false;
 	// One-shot log when hidden objects exist but the runtime has no mask
 	// path (no alpha blend: hidden stays unrevealed, never flashes).
 	bool hidden_nomask_warned = false;

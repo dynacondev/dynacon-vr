@@ -19,7 +19,6 @@
 #include "render/hidden_dots.h"
 
 #include "render/feather_mask.h"
-#include "render/passthrough_mesh.h"
 #include "vk/shader.h"
 
 #include <algorithm>
@@ -61,7 +60,7 @@ void hidden_dots_renderer::warm_pipelines(vk::raii::Device & device, vk::raii::P
 	warm.init_pipelines(format);
 }
 
-void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h)
+bool hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h)
 {
 	// Half resolution: dots stay crisp (world-size pattern, still several
 	// px per dot at room range) while clear/store/shading quarter. The
@@ -69,7 +68,7 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	uint32_t hw = ((uint32_t)w + 1) / 2;
 	uint32_t hh = ((uint32_t)h + 1) / 2;
 	if (ready() and format_ == format and extent_.width == hw and extent_.height == hh)
-		return;
+		return false;
 	// Rare path (first frame, video resize): nothing outstanding (we
 	// acquire + release within one frame, always paired below).
 	device->waitIdle();
@@ -237,18 +236,9 @@ void hidden_dots_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 			        .layers = 1,
 			};
 			targets.back()[eye].depth_framebuffer = vk::raii::Framebuffer(*device, depth_fb_info);
-			vk::ImageView sphere_view = *sphere_views[eye];
-			vk::FramebufferCreateInfo sphere_fb_info{
-			        .renderPass = *depth_renderpass,
-			        .attachmentCount = 1,
-			        .pAttachments = &sphere_view,
-			        .width = extent_.width,
-			        .height = extent_.height,
-			        .layers = 1,
-			};
-			targets.back()[eye].sphere_framebuffer = vk::raii::Framebuffer(*device, sphere_fb_info);
 		}
 	}
+	return true;
 }
 
 int hidden_dots_renderer::acquire()
@@ -291,29 +281,6 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 		static const float corners[12] = {-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1};
 		std::memcpy(quad_.map(), corners, sizeof(corners));
 		quad_.unmap();
-	}
-	// Unit-sphere verts for the proximity prepass (non-indexed, outward
-	// CCW): expanded per frame by the stream-built sphere MVPs. One
-	// shared generator (passthrough_mesh): the hidden mask path uploads
-	// the same verts into its own buffer.
-	if (not sphere_verts_)
-	{
-		auto sphere = passthrough_mesh::unit_sphere_positions();
-		sphere_vert_count = (uint32_t)sphere.size();
-		sphere_verts_ = buffer_allocation{
-		        *device,
-		        vk::BufferCreateInfo{
-		                .size = sphere.size() * sizeof(XrVector3f),
-		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
-		        },
-		        VmaAllocationCreateInfo{
-		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
-		                .usage = VMA_MEMORY_USAGE_AUTO,
-		        },
-		        "hidden_dots sphere",
-		};
-		std::memcpy(sphere_verts_.map(), sphere.data(), sphere.size() * sizeof(XrVector3f));
-		sphere_verts_.unmap();
 	}
 	// Sampled-depth plumbing: binding 0 = mesh prepass output, binding 1
 	// = proximity sphere field (both single-layer per-eye views over one
@@ -624,50 +591,17 @@ void hidden_dots_renderer::init_pipelines(vk::Format format)
 	        .renderPass = *depth_renderpass,
 	};
 	fill_pipeline = vk::raii::Pipeline(*device, *pipe_cache, fill_pipeline_info);
-
-	// Proximity sphere twin: same stages/vertex input/RP/layout, but
-	// cull-front (inside/exit wall only, from any viewpoint) and LESS
-	// (min-accumulates the furthest exit across spheres into a 1.0-clear).
-	vk::PipelineRasterizationStateCreateInfo sphere_rasterization{
-	        .polygonMode = vk::PolygonMode::eFill,
-	        .cullMode = vk::CullModeFlagBits::eFront,
-	        .frontFace = vk::FrontFace::eCounterClockwise,
-	        .lineWidth = 1,
-	};
-	vk::PipelineDepthStencilStateCreateInfo sphere_depth_stencil{
-	        .depthTestEnable = VK_TRUE,
-	        .depthWriteEnable = VK_TRUE,
-	        .depthCompareOp = vk::CompareOp::eLess,
-	};
-	vk::GraphicsPipelineCreateInfo sphere_pipeline_info{
-	        .stageCount = 2,
-	        .pStages = fill_stages,
-	        .pVertexInputState = &fill_vertex_input,
-	        .pInputAssemblyState = &input_assembly,
-	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &sphere_rasterization,
-	        .pMultisampleState = &multisample,
-	        .pDepthStencilState = &sphere_depth_stencil,
-	        // Depth-only subpass: no color blend state (null, not a
-	        // zero-mask attachment).
-	        .pColorBlendState = nullptr,
-	        .pDynamicState = &dynamic,
-	        .layout = *pipeline_layout,
-	        .renderPass = *depth_renderpass,
-	};
-	sphere_pipeline = vk::raii::Pipeline(*device, *pipe_cache, sphere_pipeline_info);
 }
 
 bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
                                   const std::array<vk::Extent2D, 2> & extents,
-                                  const std::vector<instance_draw> & draws,
-                                  const std::vector<std::array<glm::mat4, 2>> & spheres)
+                                  const std::vector<instance_draw> & draws)
 {
 	if (draws.empty() or image_index >= targets.size())
 		return false;
 
 	// Clamp helper, hoisted (stateless: extent passed per call — one
-	// definition serves the prescan and all three passes below).
+	// definition serves the prescan and both passes below).
 	auto clamp_scissor = [&](const vk::Rect2D & r, const vk::Extent2D & ext, vk::Rect2D & out) {
 		int32_t x0 = std::max(r.offset.x, 0);
 		int32_t y0 = std::max(r.offset.y, 0);
@@ -697,7 +631,7 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		// the rest). Degenerate draws are skipped outright (nothing
 		// visible: saves the draw call too). The render-area CLEAR stays
 		// full (correctness); an all-degenerate eye still begins/ends
-		// all three passes (clear-only): the images start UNDEFINED and
+		// both passes (clear-only): the images start UNDEFINED and
 		// the compositor samples the full rect.
 		bool any = false;
 		for (const auto & d: draws)
@@ -746,39 +680,10 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 			}
 		}
 		cmd.endRenderPass();
-		// Pass 1b: proximity sphere field (furthest exit wins). own
-		// renderpass over the sphere image (near-clear 1.0 for LESS;
-		// reuses the depth RP object — same shape, different clear
-		// values/framebuffer). Full scissor: sphere coverage is unrelated
-		// to the object rects. Subpass dependency carries the hazard.
-		vk::ClearValue sphere_clear{};
-		sphere_clear.depthStencil = {.depth = 1.f, .stencil = 0};
-		vk::RenderPassBeginInfo sphere_begin{
-		        .renderPass = *depth_renderpass,
-		        .framebuffer = *tgt.sphere_framebuffer,
-		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
-		        .clearValueCount = 1,
-		        .pClearValues = &sphere_clear,
-		};
-		cmd.beginRenderPass(sphere_begin, vk::SubpassContents::eInline);
-		if (any and sphere_vert_count > 0)
-		{
-			cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *sphere_pipeline);
-			cmd.bindVertexBuffers(0, (vk::Buffer)sphere_verts_, (vk::DeviceSize)0);
-			for (const auto & sphere_mvp: spheres)
-			{
-				push pc{
-				        .mvp = sphere_mvp[eye],
-				        .color_pitch = glm::vec4(0, 0, 0, 1),
-				        .view_params = glm::vec4(0, 0, 0, 0),
-				};
-				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
-				cmd.draw(sphere_vert_count, 1, 0, 0);
-			}
-		}
-		cmd.endRenderPass();
-		// Pass 2: dots sample the stored depth at their CENTERS (whole
+		// (Pass 1b retired: the proximity sphere field is rendered once
+		// by the feather mask hidden record into the shared sphere image
+		// sampled below — same command buffer, earlier. See record().)
+		// Pass 2: dots sample the stored depths at their CENTERS (whole
 		// circles live or die — no per-pixel chop). The depth renderpass's
 		// subpass dependency carries the write→read hazard, no manual
 		// barrier.
@@ -808,7 +713,6 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 				// Baked dot instances borrowed from the feather hidden
 				// renderer (owns upload + eviction); bound fresh per draw.
 				// Per-draw push (not relying on fill-loop persistence:
-				// sphere draws push their own MVPs in the prepass, and
 				// multi-draw frames must not share the last push).
 				cmd.bindVertexBuffers(1, d.dot_buffer, (vk::DeviceSize)0);
 				push pc{

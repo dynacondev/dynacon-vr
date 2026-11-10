@@ -26,9 +26,10 @@
 // Screen-aligned by construction, so every dot is round from any angle
 // and the quad extends a full radius past the center, so triangle edges
 // never slice dots. Backfaces collapse in the vertex shader (facing test
-// on the baked normal). Three pipelines, three passes: a D16 mesh-depth
-// prepass plus a D16 sphere-field prepass, then the dots sample both
-// stored depths at their CENTERS — whole circles live or die, never
+// on the baked normal). Two pipelines, two passes: a D16 mesh-depth
+// prepass, then the dots sample it plus the mask-rendered proximity
+// sphere field (one sphere raster per frame, owned by the feather mask
+// hidden record) at their CENTERS — whole circles live or die, never
 // half-chopped by geometry. Trivial circle fragment with a 1px AA band
 // and coverage fade at distance.
 //
@@ -98,8 +99,11 @@ public:
 	static void warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format);
 
 	// (Re)create swapchain + targets + pipeline for format/size.
-	// waitIdle inside on rebuild; no-op when unchanged.
-	void ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h);
+	// waitIdle inside on rebuild; no-op when unchanged. Returns true
+	// when anything was rebuilt (swapchain, pipelines, depth targets):
+	// the feather mask hidden record builds framebuffers against the
+	// sphere views below and must drop them (reset_targets) on rebuild.
+	bool ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h);
 
 	bool ready() const
 	{
@@ -113,17 +117,17 @@ public:
 	// Record draws into both eye layers of the acquired image (union of
 	// the draws' scissor rects per eye; render-area CLEAR stays full).
 	// No-op (false) when draws is empty. extents size the per-eye
-	// viewports (the submitted layer rects). spheres are proximity
-	// boundary MVPs (one per sphere, both eyes; model = translate(center)
-	// * scale(radius), stream-built so the renderer stays timebase-free):
-	// drawn first into the prepass with a min-accumulating LESS test, so
-	// the stored field is the furthest exit = inside ANY sphere. Returns
-	// false without recording (caller must release the acquisition to
-	// keep pairing).
+	// viewports (the submitted layer rects). The proximity sphere field
+	// is NOT rasterized here: the feather mask hidden record renders it
+	// into sphere_depth_ below (same command buffer, earlier) and this
+	// pass only samples it — one sphere raster per frame, not two.
+	// Callers must only record after the mask record ran this frame
+	// (fresh field guaranteed); on mask skip frames the image holds
+	// last frame's field and dots must sit out. Returns false without
+	// recording (caller must release the acquisition to keep pairing).
 	bool record(vk::raii::CommandBuffer & cmd, size_t image_index,
 	            const std::array<vk::Extent2D, 2> & extents,
-	            const std::vector<instance_draw> & draws,
-	            const std::vector<std::array<glm::mat4, 2>> & spheres);
+	            const std::vector<instance_draw> & draws);
 
 	// Release the acquired image (after submit, before endFrame — the
 	// compositor takes the last released image).
@@ -132,6 +136,18 @@ public:
 	xr::swapchain & swapchain()
 	{
 		return swapchain_;
+	}
+
+	// Shared proximity sphere field (P4: written by the feather mask
+	// hidden record, sampled by the dots pass). Views die with this
+	// renderer — borrowers must reset first (see ensure()).
+	VkImage sphere_image() const
+	{
+		return sphere_depth_;
+	}
+	vk::ImageView sphere_view(int eye) const
+	{
+		return *sphere_views[eye];
 	}
 
 private:
@@ -158,11 +174,6 @@ private:
 	// color writes off): the dots sample its output, they don't
 	// depth-test against it. Shared layout (subset of push).
 	vk::raii::Pipeline fill_pipeline{nullptr};
-	// Proximity sphere pipeline (unit-sphere verts into the sphere depth
-	// image): cull-front keeps the inside/exit wall from any viewpoint;
-	// LESS min-accumulates the furthest exit across spheres. Same stages
-	// (dotfill), layout and renderpass as the mesh fill above.
-	vk::raii::Pipeline sphere_pipeline{nullptr};
 	// Depth target (D16, half-res, 2 layers + one single-layer view per
 	// eye), recreated with the swapchain in ensure(). Sampled by the
 	// dots pass (nearest: exact texel, no cross-edge blending).
@@ -170,6 +181,12 @@ private:
 	std::array<vk::raii::ImageView, 2> depth_views{nullptr, nullptr};
 	// Proximity sphere depth (D16, half-res, same shape): min-accumulated
 	// furthest-exit field, sampled alongside the mesh depth (binding 1).
+	// SHARED with the feather mask hidden record: the mask renders the
+	// spheres into this image (same command buffer, earlier pass) and
+	// transitions it to shader-readable; this renderer never writes it.
+	// Borrowed-framebuffer discipline (mask builds FBs against
+	// sphere_views): ensure() reports rebuilds so the mask can drop its
+	// FBs first — views die with this renderer.
 	image_allocation sphere_depth_;
 	std::array<vk::raii::ImageView, 2> sphere_views{nullptr, nullptr};
 	// One descriptor set per eye over the single-layer depth view above
@@ -182,10 +199,6 @@ private:
 	// once with the pipeline. Per-dot data arrives per draw as
 	// instanced attributes from the borrowed feather buffer.
 	buffer_allocation quad_;
-	// Unit-sphere verts (non-indexed, outward-CCW) for the proximity
-	// prepass, uploaded once. Expanded per frame by the sphere MVPs.
-	buffer_allocation sphere_verts_;
-	uint32_t sphere_vert_count = 0;
 
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;
@@ -196,7 +209,6 @@ private:
 		vk::raii::ImageView view{nullptr};
 		vk::raii::Framebuffer framebuffer{nullptr}; // color pass
 		vk::raii::Framebuffer depth_framebuffer{nullptr}; // mesh prepass
-		vk::raii::Framebuffer sphere_framebuffer{nullptr}; // sphere prepass
 	};
 	// [image][eye], parallel to the swapchain image list.
 	std::vector<std::array<target, 2>> targets;

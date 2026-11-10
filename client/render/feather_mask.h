@@ -299,6 +299,22 @@ public:
 	// furthest sphere exit (max distance), so coverage can only
 	// OVER-reveal (front-of-sphere imprecision, accepted); GREATER here
 	// would under-reveal (unsafe miss) and is forbidden.
+	// The sphere field is the dots-owned shared image (P4: one raster
+	// per frame, not two): RP1 renders into field.views at
+	// field.extent, RP2 tests against it, then the record transitions
+	// the image to shader-readable for the dots color pass later in
+	// the same command buffer. Extent MUST equal the dots half-res
+	// extent (the scene sizes both from one half-res); mismatched views
+	// would misalign the gate. Borrowed-framebuffer discipline: the
+	// framebuffers built here reference the dots-owned views, so the
+	// scene must reset_targets() before the dots renderer dies or
+	// rebuilds.
+	struct hidden_sphere_field
+	{
+		VkImage image = VK_NULL_HANDLE; // shared D16 2-layer field
+		vk::Extent2D extent{0, 0}; // must equal the mask extent below
+		std::array<vk::ImageView, 2> views{}; // per-eye single-layer
+	};
 	// One draw per silhouette: which uploaded mesh, per-eye transforms,
 	// opacity, and the full-res pixel bounds per eye (scaled to the mask
 	// extent for a per-draw scissor — the only tri-raster with one).
@@ -320,7 +336,8 @@ public:
 	                   const std::vector<hidden_draw> & draws,
 	                   const std::vector<std::array<glm::mat4, 2>> & spheres,
 	                   hidden_cpu * cpu_stats,
-	                   const std::array<vk::Extent2D, 2> & full_extents);
+	                   const std::array<vk::Extent2D, 2> & full_extents,
+	                   const hidden_sphere_field & field);
 
 	bool has_mesh() const
 	{
@@ -672,9 +689,8 @@ private:
 	vk::raii::Pipeline hidden_silhouette_pipe{nullptr};
 	buffer_allocation hidden_sphere_verts_;
 	uint32_t hidden_sphere_vert_count = 0;
-	// (Sphere depth images live beside output_depth below: the map needs
-	// depth_entry complete.)
-	vk::ImageView hidden_sphere_view(vk::Extent2D extent, int eye);
+	// (The sphere depth images moved to the dots renderer — P4 shared
+	// field. output_depth_view is declared with output_depth below.)
 	// Per-swapchain-image framebuffers for the two hidden passes (color
 	// + sphere-depth FBs per eye); dropped by reset_targets() with the
 	// rest (swapchain recreate = waitIdle'd upstream).
@@ -686,7 +702,7 @@ private:
 		std::array<vk::raii::Framebuffer, 2> sphere_framebuffers{nullptr, nullptr};
 	};
 	std::unordered_map<VkImage, hidden_frame_targets> hidden_targets;
-	void ensure_hidden(vk::Image image, vk::Extent2D extent);
+	void ensure_hidden(vk::Image image, vk::Extent2D extent, const hidden_sphere_field & field);
 	bool hidden_ready = false; // lazy RPs/pipes/sphere verts (first record_hidden)
 
 	// Framebuffers + views per swapchain image (images cycle; entries for
@@ -737,12 +753,6 @@ private:
 	};
 	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
 	vk::ImageView output_depth_view(vk::Extent2D extent, int eye);
-	// Extent-keyed sphere depth images for the hidden proximity path
-	// (mask side: attachment-only, never sampled; survives
-	// reset_targets() like output_depth — only a handful of quantized
-	// sizes ever exist). Same-queue CLEAR-every-frame makes cross-frame
-	// reuse safe in practice (output_depth precedent).
-	std::map<std::pair<uint32_t, uint32_t>, depth_entry> hidden_sphere_images;
 	// D16 depth image + per-eye views at an extent (depth-test-only
 	// raster: never sampled, device-local). Backs output_depth above and
 	// the intermediate raster companions in ensure_targets.

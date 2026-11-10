@@ -36,3 +36,13 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   1. Never route warning visibility through `colorScale.a` (ignored) or mask-image alpha alone (game bleed). Opaque matte + dipping reveal composes only honored channels.
   2. Mask-layer RGB is invisible by design (`mask.frag.glsl`: ZERO color blend factors, flat covers via DST_ALPHA) — any color warning must live above flat or manifest as alpha.
   3. When display disagrees with proven-oscillating logs, suspect the compositor channel, not the math: gate one variable per device round-trip with a throttled forensic log.
+
+## Hidden passthrough idle discipline: CPU pre-gate, activity-pinned flat, one sphere field
+
+- Proximity used to be evaluated only on the GPU (mask depth test, dots frag discards), so idle frames (object placed but out of range) paid full acquire/record/submit: 2 swapchain acquires, ~7 half-res passes incl. the sphere field rasterized TWICE (mask RP1 + dots Pass1b), 3 submitted layers (hidden mask, dots, flat pinned by placement).
+- Rules:
+  1. Gate on the CPU first (`stream.cpp` P0): world-space AABB per silhouette (baked in `build_hidden_silhouettes` from the model matrix) vs head+palm spheres, +2cm test-only hysteresis. Gate-miss erases the silhouette, so mask draws, dots draws and sphere MVPs all see survivors — idle costs ~zero GPU and no layers. Unknown bounds pass conservatively.
+  2. Pin `need_flat` on submit activity (`hidden_group.active or hidden_dots_active`), never placement — a gated object must not hold the flat compositor layer (P1).
+  3. One sphere raster per frame (P4): the dots-owned D16 field is THE shared image — mask RP1 renders into borrowed views, explicit barrier hands it to shader-readable for the dots pass later in the same command buffer, dots records only when the mask recorded (fresh-field rule). Next frame re-begins with initialLayout UNDEFINED + CLEAR (transient-target idiom, already precedented) — no transition back needed.
+  4. Borrowed-framebuffer discipline: mask FBs bake dots-owned views — `reset_targets()` before the dots renderer dies (map-drop) or rebuilds (`ensure()` now returns rebuilt). Destroying views first is a validation error / driver hazard.
+  5. Hands: every `locate()` is a full 26-joint IPC (no peek API) — cost is per call, not per handle. Proximity borrows the GUI pair (no dedicated trackers); `hidden_wants_hands` shields the pair from the GUI interactability reset while a hidden map is live.
