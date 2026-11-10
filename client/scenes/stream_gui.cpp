@@ -1368,12 +1368,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	auto gui_submit_t0 = std::chrono::steady_clock::now();
 	auto layers = imgui_ctx->end_frame();
 
-	// No menu depth while projected instances are live: depth-tested menu
-	// quads co-submitted with the triangle-mesh projected layer produce a
-	// head-locked solid ghost of the projected content (runtime
-	// compositing quirk). Conditioned on live instances so flat-only
-	// sessions keep full menu depth-testing.
-	bool menu_depth = not session.has_projected_instances();
+	// Menu quads use depth testing (the triangle-mesh projected layer
+	// that used to ghost them is gone: flat-only sessions keep full
+	// menu depth-testing unconditionally).
+	constexpr bool menu_depth = true;
 
 	// Display controllers and handle recentering
 	if (interactable)

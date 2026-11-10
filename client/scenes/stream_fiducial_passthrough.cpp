@@ -250,21 +250,6 @@ void scenes::stream::sync_fiducial_trackers(const to_headset::fiducial_map & map
 // downstream (hold-last) and the warm reference never advances to
 // garbage. Release on resolve / K>=2 consensus / teleport-silence.
 // First sighting (no reference) always accepts: unknowable without history.
-bool scenes::stream::surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const
-{
-	// Boundary zones never map camera onto geometry: they drive the
-	// global scene fade through the flat union's floor instead.
-	// Depth volumes reveal the flat reconstruction feed, never the
-	// projected layer. Hidden objects always reveal the flat feed on
-	// their own layer, never projected.
-	if (ost.def.type == "3d-boundary" or ost.def.type == "3d-boundary-reversed" or
-	    ost.def.type == "3d-depth-passthrough" or ost.def.type == "3d-passthrough-hidden")
-		return false;
-	if (auto it = projected_overrides.find(oid); it != projected_overrides.end())
-		return it->second;
-	return ost.def.surface_projected;
-}
-
 void scenes::stream::handle_user_presence(bool present)
 {
 	// Transitions only: the runtime may repeat the event.
@@ -660,8 +645,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		map_key += ';';
 		map_key += o.model_hash;
 		map_key += ';';
-		map_key += o.surface_projected ? 'P' : 'F';
-		map_key += ';';
 		map_key += std::to_string(o.feather_px);
 		map_key += ';';
 		// dot_color/dot_pitch_m excluded: live-applied (dot color +
@@ -712,11 +695,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		// One-shot hidden-nomask warn re-arms with the map (remove-all then
 		// re-add warns again).
 		hidden_nomask_warned = false;
-		// Projected instances are rebuilt from placements below (the
-		// per-frame sync destroys stale ones, the map wipe clears the
-		// rest).
-		projected_failed.clear();
-		session.clear_projected_instances();
 		// Full-passthrough-until-lock target: armed only when it names a
 		// fiducial id in this map (server validates too; belt and braces
 		// for mixed-version pairs). Latch cleared with everything else.
@@ -972,7 +950,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		double adt = bp.last_predicted > 0 ? (now - bp.last_predicted) * 1e-9 : fdt;
 		bp.last_predicted = now;
 		// Predict to display time, not now: the pose is consumed at
-		// predictedDisplayTime (mask raster, projected instances), so
+		// predictedDisplayTime (mask raster), so
 		// advancing only to now leaves ~1 frame of lag on moving boards.
 		// advance() converges without overshoot, so the extra horizon is
 		// safe; static boards are unaffected.
@@ -1147,66 +1125,6 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 	// one frame, same class as the window staleness).
 	update_boundary_fade(head_pos, have_head, now);
 
-	// ---- surface-projected instances: one geometry instance per placed,
-	// flagged object on the shared projected layer. Created on placement
-	// from the smoothed pose, updated every frame, destroyed on
-	// unselect/unplace. Reversed objects never qualify (they show game,
-	// not camera).
-	if (composition_layer_alpha_blend_supported)
-	{
-		for (auto & [oid, ost]: passthrough_objects)
-		{
-			bool want = ost.def.type == "3d-passthrough" and ost.soup_ready and ost.fused.placed and
-			        surface_projected_effective(oid, ost) and session.projected_passthrough_supported() and
-			        not projected_failed.contains(oid);
-			bool have = session.has_projected_instance(oid);
-			if (want and not have)
-			{
-				try
-				{
-					session.set_projected_instance_mesh(oid, ost.soup.vertices, ost.soup.indices, world_space,
-					                                    ost.fused.world_pose, ost.fused.world_scale);
-				}
-				catch (std::exception & e)
-				{
-					// Persistent per mesh (too big, runtime refused): skip
-					// retry so one bad mesh can't spam every frame. Cleared
-					// on map change with everything else.
-					projected_failed.insert(oid);
-					spdlog::warn("Projected instance \"{}\": upload failed (falling back to flat): {}", oid, e.what());
-				}
-			}
-			else if (have and not want)
-			{
-				session.remove_projected_instance(oid);
-				spdlog::info("Projected instance \"{}\" removed", oid);
-			}
-			if (want and session.has_projected_instance(oid))
-			{
-				try
-				{
-					// Server eye timebase: the projected geometry gates the
-					// same video frame as the mask alpha, so its transform
-					// rides the server display time (one common warp to
-					// display). Static-world caveat: latest fused pose is
-					// reused; moving boards would need a pose history.
-					session.update_projected_instance_transform(oid, world_space, sync_display_time,
-					                                            ost.fused.world_pose, ost.fused.world_scale);
-				}
-				catch (std::exception & e)
-				{
-					// Throttled: a persistently bad transform keeps last
-					// good state instead of spamming every frame.
-					static XrTime last_transform_warn = 0;
-					if (now - last_transform_warn > 5'000'000'000LL)
-					{
-						last_transform_warn = now;
-						spdlog::warn("Projected instance \"{}\": transform update failed: {}", oid, e.what());
-					}
-				}
-			}
-		}
-	}
 	fid_place_ms = fid_elapsed_ms();
 }
 
@@ -1431,35 +1349,6 @@ void scenes::stream::gui_passthrough()
 		if (dirty)
 			session.apply_passthrough_effects();
 		ImGui::EndDisabled();
-	}
-
-	ImGui::SeparatorText(_S("Surface-projected mapping"));
-	if (not composition_layer_alpha_blend_supported)
-		ImGui::Text("%s", _S("Needs the mask path (unavailable on this runtime)"));
-	for (auto & [oid, ost]: passthrough_objects)
-	{
-		if (ost.def.type != "3d-passthrough")
-			continue;
-		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
-		// Three-way state, cycled per click: as configured (no override
-		// stored) -> force on -> force off -> as configured ...
-		auto oit = projected_overrides.find(oid);
-		std::string mode = (oit == projected_overrides.end())
-		        ? (ost.def.surface_projected ? _S("As configured (on)") : _S("As configured (off)"))
-		        : (oit->second ? _S("Forced on") : _S("Forced off"));
-		std::string title = label + ": " + mode + "##projected_" + oid;
-		if (ImGui::Button(title.c_str()))
-		{
-			if (oit == projected_overrides.end())
-				projected_overrides[oid] = true;
-			else if (oit->second)
-				oit->second = false;
-			else
-				projected_overrides.erase(oit);
-			auto nit = projected_overrides.find(oid);
-			spdlog::info("Projected override \"{}\" {}", oid,
-			             nit == projected_overrides.end() ? "inherit" : (nit->second ? "on" : "off"));
-		}
 	}
 }
 
@@ -1692,11 +1581,10 @@ void scenes::stream::gui_fiducial_status()
 				            _S("Object"), label.c_str(), _S("zone, no solution"), stale_s);
 			continue;
 		}
-		std::string proj_tag = (!reversed && surface_projected_effective(oid, ost)) ? _S(" (projected)") : "";
 		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
 		std::string hidden_tag = (ost.def.type == "3d-passthrough-hidden") ? _S(" (hidden)") : "";
-		ImGui::Text("%s %.40s%s%s%s%s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", proj_tag.c_str(), depth_tag.c_str(), hidden_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		ImGui::Text("%s %.40s%s%s%s: %zu tris, %s (stale %.1fs)",
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", depth_tag.c_str(), hidden_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}
 	if (fiducial_trackers.empty())
 	{

@@ -23,7 +23,7 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Union-B mask merge: per-pixel MAX of up to 8 submitted mask images
+// Mask merge: per-pixel MAX of up to 8 submitted mask images
 // (feather groups + debug cutout group + hidden group). Every input
 // covers the same FOV, so one shared UV addresses all of them; the
 // linear sampler's bilinear tap IS the upscale for half/quarter-res

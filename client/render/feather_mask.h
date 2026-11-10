@@ -221,8 +221,7 @@ public:
 	// clears only.
 	// Cutouts are world-space quads (two triangles each) punched crisp
 	// through the finished mask at full alpha (mask 1 = reality), sharing
-	// one view-only MVP. Mask path only (the binary projected layer has
-	// no alpha control to punch through).
+	// one view-only MVP.
 	// Depth-volume layer (3d-depth-passthrough): furthest-point draws in
 	// display-eye MVP space plus the runtime D16 sensor view they test
 	// against (strict sensor < render, far hidden). Null = no volume in

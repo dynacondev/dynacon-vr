@@ -136,49 +136,6 @@ public:
 		return passthrough;
 	}
 
-	// Session-owned passthrough structs carry per-frame chains: reset
-	// before appending so a stale pointer can never survive the frame.
-	void reset_projected_chain()
-	{
-		if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-			fb->reset_projected_chain();
-	}
-
-	// Surface-projected passthrough mesh (XR_FB_triangle_mesh, Quest only).
-	// All helpers no-op when the runtime lacks support.
-	bool projected_passthrough_supported();
-	void set_projected_passthrough_mesh(
-	        std::span<const XrVector3f> vertices,
-	        std::span<const uint32_t> indices,
-	        XrSpace base_space,
-	        const XrPosef & pose,
-	        const XrVector3f & scale);
-	void clear_projected_passthrough_mesh();
-	bool has_projected_passthrough_mesh();
-	void update_projected_passthrough_transform(XrSpace base_space, XrTime time, const XrPosef & pose, const XrVector3f & scale);
-	// Layer header for the current frame, or nullptr when no mesh is set.
-	// Callers must submit it after the video projection layer (overlay).
-	XrCompositionLayerBaseHeader * projected_passthrough_layer();
-
-	// Per-object geometry instances on the projected layer (mask-path
-	// surface projection). All helpers no-op when the runtime lacks
-	// support.
-	void set_projected_instance_mesh(const std::string & key,
-	                                 std::span<const XrVector3f> vertices,
-	                                 std::span<const uint32_t> indices,
-	                                 XrSpace base_space,
-	                                 const XrPosef & pose,
-	                                 const XrVector3f & scale);
-	void remove_projected_instance(const std::string & key);
-	void clear_projected_instances();
-	bool has_projected_instance(const std::string & key);
-	bool has_projected_instances();
-	void update_projected_instance_transform(const std::string & key,
-	                                         XrSpace base_space,
-	                                         XrTime time,
-	                                         const XrPosef & pose,
-	                                         const XrVector3f & scale);
-
 	void set_performance_level(XrPerfSettingsDomainEXT, XrPerfSettingsLevelEXT);
 
 	bool boundary_visibility_supported() const

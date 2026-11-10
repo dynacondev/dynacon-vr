@@ -564,13 +564,6 @@ configuration::configuration()
 					else
 						o.feather_px = item["feather-px"];
 				}
-				if (item.contains("surface-projected"))
-				{
-					if (o.type == "3d-passthrough-reversed" or is_boundary or is_depth or is_hidden)
-						U_LOG_W("passthrough object \"%s\": surface-projected is not applicable to %s, ignoring", o.id.c_str(), o.type.c_str());
-					else
-						o.surface_projected = item["surface-projected"];
-				}
 				if (item.contains("transition-distance"))
 				{
 					if (not is_boundary)

@@ -97,7 +97,7 @@ struct configuration
 	struct passthrough_object
 	{
 		// Behavior type. "3d-passthrough" renders the model as a
-		// surface-projected passthrough cutout; "3d-passthrough-reversed"
+		// flat-feed passthrough cutout through the merged alpha layer; "3d-passthrough-reversed"
 		// reverse-cuts the model from every mask layer instead (game video
 		// shows through, depth-tested against covering windows). "3d-boundary"
 		// shows game video only inside the model volume (passthrough outside),
@@ -127,13 +127,6 @@ struct configuration
 		// 3d-passthrough-reversed, 3d-boundary(-reversed) and
 		// 3d-passthrough-hidden (warned + ignored).
 		float feather_px = 24;
-		// Surface-projected mapping: the headset projects camera imagery
-		// onto this object's mesh instead of the flat reconstruction feed.
-		// Disabled by default; opt in per object with true (plus a live
-		// in-headset override). Ignored for 3d-passthrough-reversed,
-		// 3d-boundary(-reversed), 3d-depth-passthrough and
-		// 3d-passthrough-hidden (warned).
-		bool surface_projected = false;
 		// Boundary fade width in meters (3d-boundary(-reversed) only):
 		// the scene cross-fades over +/- this distance around the mesh
 		// surface (symmetric smoothstep, 0.5 at the surface). 0 = hard

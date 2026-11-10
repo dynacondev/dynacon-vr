@@ -343,19 +343,6 @@ void scene::add_passthrough_layer()
 	        session.get_passthrough());
 }
 
-void scene::add_projected_passthrough_layer()
-{
-	// Session-owned struct, per-frame chains (see add_passthrough_layer):
-	// reset first so a stale alpha-blend pointer can never survive.
-	session.reset_projected_chain();
-	if (XrCompositionLayerBaseHeader * projected = session.projected_passthrough_layer())
-	{
-		layers.push_back(layer{
-		        .composition_layer = projected,
-		});
-	}
-}
-
 void scene::add_projection_layer(
         XrCompositionLayerFlags flags,
         XrSpace space,

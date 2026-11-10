@@ -18,12 +18,12 @@
 
 #pragma once
 
-// Union-B mask merge: one submitted alpha layer for the flat passthrough
+// Mask merge: one submitted alpha layer for the flat passthrough
 // feed. Per frame the compositor charges per layer (~10pp measured on
 // Quest 3), while each feather group / the debug cutout group / the
 // hidden group used to submit its own UNPREMULTIPLIED_ALPHA layer and
 // union them with REPLACE-then-ADD dst-alpha blending. This pass
-// MAX-combines every active B contributor into a single full-res image
+// MAX-combines every active contributor into a single full-res image
 // (any-mask-reveals-wins), submitted once with REPLACE.
 //
 // MAX preserves the safety theorems: hidden-wins-reversed (hidden only
