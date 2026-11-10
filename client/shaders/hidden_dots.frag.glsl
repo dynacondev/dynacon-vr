@@ -30,7 +30,7 @@ layout(push_constant) uniform PushConstants
 {
 	mat4 mvp;
 	vec4 color_pitch; // rgb: dot color, w: dot pitch (m)
-	vec4 view_params; // x: view W px, y: view H px, z: proj[1][1]
+	vec4 view_params; // x: view W px, y: view H px, z: proj[1][1], w: dot radius (cells)
 }
 pc;
 
@@ -39,7 +39,7 @@ void main()
 	float d = length(vUv);
 	float pitch = max(pc.color_pitch.w, 1e-4);
 	float px_per_m = (pc.view_params.y * 0.5) * abs(pc.view_params.z) / max(vW, 1e-3);
-	float r_px = 0.15 * pitch * px_per_m;
+	float r_px = pc.view_params.w * pitch * px_per_m;
 	float e = 1.0 / max(r_px, 1e-3);
 	float dot_ = (1.0 - smoothstep(1.0 - e, 1.0, d)) * clamp(r_px, 0.0, 1.0);
 	if (dot_ <= 0.001)

@@ -35,7 +35,7 @@ layout(push_constant) uniform PushConstants
 {
 	mat4 mvp;
 	vec4 color_pitch; // rgb: dot color, w: dot pitch (m)
-	vec4 view_params; // x: view W px, y: view H px, z: proj[1][1]
+	vec4 view_params; // x: view W px, y: view H px, z: proj[1][1], w: dot radius (cells)
 }
 pc;
 
@@ -52,7 +52,7 @@ void main()
 	float facing = (pc.mvp * vec4(normal, 0.0)).w;
 	float pitch = max(pc.color_pitch.w, 1e-4);
 	float px_per_m = (pc.view_params.y * 0.5) * abs(pc.view_params.z) / max(w, 1e-3);
-	float r_px = 0.15 * pitch * px_per_m;
+	float r_px = pc.view_params.w * pitch * px_per_m;
 	vUv = corner;
 	vW = w;
 	if (w <= 1e-6 || facing >= 0.0)

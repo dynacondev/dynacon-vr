@@ -34,7 +34,7 @@ struct push
 {
 	glm::mat4 mvp;
 	glm::vec4 color_pitch; // rgb: dot color, w: dot pitch (m)
-	glm::vec4 view_params; // x: view W px, y: view H px, z: proj[1][1], w: unused
+	glm::vec4 view_params; // x: view W px, y: view H px, z: proj[1][1], w: dot radius (cells)
 };
 static_assert(sizeof(push) == 96);
 } // namespace
@@ -400,7 +400,7 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 				push pc{
 				        .mvp = d.mvp[eye],
 				        .color_pitch = glm::vec4(d.color, d.pitch),
-				        .view_params = glm::vec4(d.view_params[eye], 0.f),
+				        .view_params = glm::vec4(d.view_params[eye], dot_radius_cells),
 				};
 				cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
 				cmd.draw(6, d.dot_count, 0, 0);
