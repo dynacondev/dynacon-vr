@@ -3420,47 +3420,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 					else
 						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
-					// Heartbeat tint in the config color: squared sine at 1.2Hz
-					// (~1.2 pulses/s), scaled by pulse-strength (0 = steady
-					// untinted cutout). One tint per shared layer: the
-					// lowest-id placed object wins.
-					// Composed with the veil floor lift below; skipped where
-					// the colorScaleBias extension is missing (untinted).
-					float pulse_rgb[3] = {1, 1, 1};
-					if (composition_layer_color_scale_bias_supported)
-					{
-						const float * tint = nullptr;
-						float strength = 0;
-						for (auto & [oid, ost]: passthrough_objects)
-						{
-							(void)oid;
-							if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
-								continue;
-							tint = ost.def.grid_color.data();
-							strength = ost.def.pulse_strength;
-							break;
-						}
-						if (tint and strength > 0)
-						{
-							double t = (double)frame_state.predictedDisplayTime * 1e-9;
-							// Reduce in double before narrowing: float phase
-							// would wobble after days of uptime.
-							double phase = std::fmod(t * 6.283185307179586 * 1.2, 6.283185307179586);
-							float s = 0.5f + 0.5f * std::sin((float)phase); // 2π·1.2Hz
-							float beat = strength * s * s;
-							for (int c = 0; c < 3; ++c)
-								pulse_rgb[c] = 1.f + (tint[c] - 1.f) * beat;
-						}
-					}
 					if (veil_lift and not proj_union)
 					{
 						if (first_group)
-							set_color_scale_bias({pulse_rgb[0], pulse_rgb[1], pulse_rgb[2], veil_s}, {0, 0, 0, 1 - veil_s});
+							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
 						else
-							set_color_scale_bias({pulse_rgb[0], pulse_rgb[1], pulse_rgb[2], veil_s}, {0, 0, 0, 0});
+							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
 					}
-					else if (composition_layer_color_scale_bias_supported)
-						set_color_scale_bias({pulse_rgb[0], pulse_rgb[1], pulse_rgb[2], 1}, {0, 0, 0, 0});
 					first_group = false;
 				}
 				// Each union's camera layer consumes its own alpha: A feeds
@@ -3484,6 +3450,69 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 					}
 				}
+			}
+		}
+
+		// Hidden warning wash: the mask image above is a white silhouette
+		// (mask RGB is ignored downstream), so resubmit the same image over
+		// the flat feed recolored by the config color with a breathing
+		// alpha. Zero new draws/rasters/swapchains: one extra compositor
+		// layer referencing the already-acquired image, released with the
+		// group drain below like the mask itself. One wash per shared
+		// layer: the lowest-id placed object wins color and strength.
+		// Skipped when pulse-strength is 0 or the colorScaleBias extension
+		// is missing (steady cutout). Inside the mask-frame branch's
+		// aftermath (same level as gizmos): mask_frame gates staleness —
+		// the record phase that sets active runs under it too.
+		if (mask_frame and hidden_group.active and composition_layer_color_scale_bias_supported)
+		{
+			const float * tint = nullptr;
+			float strength = 0;
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				(void)oid;
+				if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+					continue;
+				tint = ost.def.grid_color.data();
+				strength = ost.def.pulse_strength;
+				break;
+			}
+			if (tint and strength > 0)
+			{
+				double t = (double)frame_state.predictedDisplayTime * 1e-9;
+				// Reduce in double before narrowing: float phase would
+				// wobble after days of uptime.
+				double phase = std::fmod(t * 6.283185307179586 * 1.2, 6.283185307179586);
+				float s = 0.5f + 0.5f * std::sin((float)phase); // 2π·1.2Hz
+				float beat = strength * s * s;
+				// Faint floor so the region stays marked through the trough,
+				// peaking where the camera still reads through.
+				float wash_a = 0.15f + 0.45f * beat;
+				auto & g = hidden_group;
+				std::array<XrCompositionLayerProjectionView, view_count> wash_views;
+				for (uint32_t view = 0; view < view_count; ++view)
+				{
+					wash_views[view] = {
+					        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+					        .pose = sync_pose[view],
+					        .fov = sync_fov[view],
+					        .subImage = {
+					                .swapchain = g.swapchain,
+					                .imageRect = {
+					                        .offset = {0, 0},
+					                        .extent = {g.extent.width, g.extent.height},
+					                },
+					                .imageArrayIndex = view,
+					        },
+					};
+				}
+				add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+				                     application::space(xr::spaces::world),
+				                     wash_views);
+				// White silhouette × color = config-color wash; alpha breathes.
+				// Standard source-alpha blend (like the gizmo layer: no FB
+				// extensions beyond the color scale/bias gated above).
+				set_color_scale_bias({tint[0], tint[1], tint[2], wash_a}, {0, 0, 0, 0});
 			}
 		}
 
