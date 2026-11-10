@@ -3488,6 +3488,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Faint floor so the region stays marked through the trough,
 				// peaking where the camera still reads through.
 				float wash_a = 0.15f + 0.45f * beat;
+				// Forensic heartbeat (2s throttle): distinguishes a frozen
+				// beat (math/time bug) from a runtime ignoring the alpha
+				// scale (values pulse here but the display stays steady).
+				{
+					static XrTime last_wash_log = 0;
+					XrTime now = instance.now();
+					if (now - last_wash_log > 2'000'000'000LL)
+					{
+						last_wash_log = now;
+						spdlog::info("Hidden wash: tint #{:02X}{:02X}{:02X} strength {:.2f} s {:.2f} beat {:.2f} alpha {:.2f}",
+						             (unsigned)lroundf(std::clamp(tint[0], 0.f, 1.f) * 255.f),
+						             (unsigned)lroundf(std::clamp(tint[1], 0.f, 1.f) * 255.f),
+						             (unsigned)lroundf(std::clamp(tint[2], 0.f, 1.f) * 255.f),
+						             (double)strength, (double)s, (double)beat, (double)wash_a);
+					}
+				}
 				auto & g = hidden_group;
 				std::array<XrCompositionLayerProjectionView, view_count> wash_views;
 				for (uint32_t view = 0; view < view_count; ++view)
