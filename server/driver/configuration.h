@@ -122,14 +122,15 @@ struct configuration
 		// Passthrough window feather width in screen pixels (render-only,
 		// applied live). Mask stacks group by this value so each object
 		// feathers independently. Not accepted for
-		// 3d-passthrough-reversed and 3d-boundary(-reversed)
-		// (warned + ignored).
+		// 3d-passthrough-reversed, 3d-boundary(-reversed) and
+		// 3d-passthrough-hidden (warned + ignored).
 		float feather_px = 24;
 		// Surface-projected mapping: the headset projects camera imagery
 		// onto this object's mesh instead of the flat reconstruction feed.
 		// Disabled by default; opt in per object with true (plus a live
-		// in-headset override). Ignored for 3d-passthrough-reversed and
-		// 3d-boundary(-reversed) (warned).
+		// in-headset override). Ignored for 3d-passthrough-reversed,
+		// 3d-boundary(-reversed), 3d-depth-passthrough and
+		// 3d-passthrough-hidden (warned).
 		bool surface_projected = false;
 		// Boundary fade width in meters (3d-boundary(-reversed) only):
 		// the scene cross-fades over +/- this distance around the mesh

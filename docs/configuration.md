@@ -492,8 +492,8 @@ Each `passthrough` entry has:
   onto geometry, depth volumes always reveal the flat feed, and hidden
   objects always reveal the flat feed on their own layer.
 - `grid-scale`: reserved for future use (`3d-passthrough-hidden` only,
-  default `0.1`). Parsed and forwarded but currently unused (the warning
-  outline has a fixed world width); edits do not reset tracking.
+  default `0.1`). Parsed and forwarded but currently unused; edits do
+  not reset tracking.
 - `grid-color`: reserved for future use (`3d-passthrough-hidden` only,
   default light blue `#80D4FF`). Parsed and forwarded but currently
   unused; edits do not reset tracking.
