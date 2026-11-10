@@ -1083,8 +1083,8 @@ struct passthrough_object
 	// surface (0.5 at the surface); 0 = hard step. Default 0.3.
 	float transition_distance_m = 0.3f;
 	// Hidden dot pitch in meters (3d-passthrough-hidden only): fixed
-	// world-size dots wrapping the mesh. Default 0.075.
-	float dot_pitch_m = 0.075f;
+	// world-size dots wrapping the mesh. Default 0.05.
+	float dot_pitch_m = 0.05f;
 	// Hidden-object dot color as RGB 0..1, parsed server-side
 	// from a "#RRGGBB" hex string as-authored (no colorspace conversion).
 	// Tints the dot overlay (per-object color at draw time). Applied
@@ -1092,12 +1092,12 @@ struct passthrough_object
 	std::array<float, 3> dot_color = {1.0f, 0.16f, 0.10f};
 	// Proximity reveal radius in meters (3d-passthrough-hidden only):
 	// the cutout and dots show only where the mesh sits inside this
-	// distance of the head (hard near-field edge). Default 0.5.
-	float proximity_radius_m = 0.5f;
+	// distance of the head (hard near-field edge). Default 0.25.
+	float proximity_radius_m = 0.25f;
 	// Hand proximity reveal radius in meters (3d-passthrough-hidden
 	// only): same gate measured from each palm (hand tracking) or
-	// controller grip pose as fallback. Default 0.3.
-	float hand_proximity_radius_m = 0.3f;
+	// controller grip pose as fallback. Default 0.15.
+	float hand_proximity_radius_m = 0.15f;
 };
 
 // Origin alignment (headset-side): re-base outgoing tracking so the

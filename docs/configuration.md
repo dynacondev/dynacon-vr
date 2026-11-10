@@ -495,7 +495,7 @@ Each `passthrough` entry has:
   onto geometry, depth volumes always reveal the flat feed, and hidden
   objects always reveal the flat feed on their own layer.
 - `dot-pitch`: hidden dot pitch in meters
-  (`3d-passthrough-hidden` only, default `0.075`, clamped to
+  (`3d-passthrough-hidden` only, default `0.05`, clamped to
   `[0.01, 1]`, applied live). Fixed world-size dots wrapping the mesh
   faces; all hidden objects share one layer, so the pitch is per-object
   at draw time.
@@ -503,11 +503,11 @@ Each `passthrough` entry has:
   (`3d-passthrough-hidden` only, default red `#FF291A`, applied
   live). Tints the dot overlay (per-object color at draw time).
 - `proximity-radius`: near-field reveal radius in meters
-  (`3d-passthrough-hidden` only, default `0.5`, clamped to `>= 0`,
+  (`3d-passthrough-hidden` only, default `0.25`, clamped to `>= 0`,
   applied live). The cutout and dots show only where the mesh sits
   inside this distance of the head (hard edge); `0` reveals nothing.
 - `hand-proximity-radius`: same gate measured from each hand in meters
-  (`3d-passthrough-hidden` only, default `0.3`, clamped to `>= 0`,
+  (`3d-passthrough-hidden` only, default `0.15`, clamped to `>= 0`,
   applied live). Uses palm tracking when valid, else the controller
   grip pose.
 

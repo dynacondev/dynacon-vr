@@ -2759,7 +2759,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								                 (p0.z + p1.z) * 0.5f);
 								for (auto & s: hidden_silhouettes)
 								{
-									float head_r = 0.5f, hand_r = 0.3f;
+									float head_r = 0.25f, hand_r = 0.15f;
 									auto soit = passthrough_objects.find(s.mesh);
 									if (soit != passthrough_objects.end())
 									{
