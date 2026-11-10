@@ -1898,8 +1898,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				if (not visible)
 					continue;
-				s.color = glm::vec3(ost.def.grid_color[0], ost.def.grid_color[1], ost.def.grid_color[2]);
-				s.pitch = std::max(0.01f, ost.def.grid_scale_m);
+				s.color = glm::vec3(ost.def.dot_color[0], ost.def.dot_color[1], ost.def.dot_color[2]);
+				s.pitch = std::max(0.01f, ost.def.dot_pitch_m);
 				hidden_silhouettes.push_back(std::move(s));
 			}
 		};
@@ -2603,19 +2603,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									continue;
 								bool member = ost.soup_ready;
 								// The baked dot lattice rides the upload, so a
-								// pitch edit must re-upload (grid_scale_m is
+								// pitch edit must re-upload (dot-pitch is
 								// otherwise live-applied, excluded from the
 								// map fingerprint). Two-field compare (hash +
 								// pitch float, exact: same clamped source) —
 								// no per-frame string formatting.
 								// Scale-corrected: the lattice bakes in
-								// object units but grid_scale_m is world
+								// object units but dot-pitch is world
 								// meters, so divide by the model scale (max
 								// axis: never denser than configured under
 								// non-uniform scale). Without this a 0.1x
 								// model bakes a 10x over-dense lattice and
 								// the radius knob reads 10x off.
-								float dot_pitch_world = std::max(0.01f, ost.def.grid_scale_m);
+								float dot_pitch_world = std::max(0.01f, ost.def.dot_pitch_m);
 								float model_scale = std::max({std::abs(ost.fused.world_scale.x),
 								                              std::abs(ost.fused.world_scale.y),
 								                              std::abs(ost.fused.world_scale.z), 1e-6f});
@@ -2647,7 +2647,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								        oit->second.soup_ready;
 								if (member)
 								{
-									float want_world = std::max(0.01f, oit->second.def.grid_scale_m);
+									float want_world = std::max(0.01f, oit->second.def.dot_pitch_m);
 									float want_scale = std::max({std::abs(oit->second.fused.world_scale.x),
 									                             std::abs(oit->second.fused.world_scale.y),
 									                             std::abs(oit->second.fused.world_scale.z), 1e-6f});
@@ -2696,26 +2696,35 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// of the sync eye positions, same timebase as
 							// server_mvp by construction (NOT the fiducial
 							// head_pos, which runs on predicted timebase).
+							// One entry per placed hidden object, each with
+							// its own live proximity-radius: the
+							// min-accumulating field unions them (inside ANY
+							// = over-reveal, the safe direction).
 							proximity_spheres.clear();
+							proximity_spheres.reserve(hidden_silhouettes.size());
 							{
 								const auto & p0 = sync_pose[0].position;
 								const auto & p1 = sync_pose[1].position;
 								glm::vec3 center((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f,
 								                 (p0.z + p1.z) * 0.5f);
-								// Hardwired v1 radius (trigger_distance_m is
-								// its future config home, already parsed).
-								constexpr float proximity_radius_m = 0.4f;
-								glm::mat4 sphere_model =
-								        glm::translate(glm::mat4(1), center) *
-								        glm::scale(glm::mat4(1), glm::vec3(proximity_radius_m));
-								std::array<glm::mat4, 2> sm;
-								for (uint32_t view = 0; view < view_count; ++view)
-									sm[view] = server_mvp[view] * sphere_model;
-								proximity_spheres.push_back(sm);
+								for (auto & s: hidden_silhouettes)
+								{
+									float radius = 0.5f;
+									auto soit = passthrough_objects.find(s.mesh);
+									if (soit != passthrough_objects.end())
+										radius = std::max(0.f, soit->second.def.proximity_radius_m);
+									glm::mat4 sphere_model =
+									        glm::translate(glm::mat4(1), center) *
+									        glm::scale(glm::mat4(1), glm::vec3(radius));
+									std::array<glm::mat4, 2> sm;
+									for (uint32_t view = 0; view < view_count; ++view)
+										sm[view] = server_mvp[view] * sphere_model;
+									proximity_spheres.push_back(sm);
+								}
 							}
 							hidden_mask_draws.reserve(hidden_silhouettes.size());
 							for (auto & s: hidden_silhouettes)
-								hidden_mask_draws.push_back({s.mesh, s.mvp, 1.f, false});
+								hidden_mask_draws.push_back({s.mesh, s.mvp, 1.f, s.px});
 							if (hidden_mask_draws.empty())
 							{
 								g.active = false;
@@ -2760,8 +2769,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										// edge — v1 flips the overlay from
 										// always-on to proximity-gated).
 										vk::Extent2D hex{(uint32_t)hmw, (uint32_t)hmh};
+										std::array<vk::Extent2D, 2> full_ext{
+										        vk::Extent2D{(uint32_t)extents[0].width, (uint32_t)extents[0].height},
+										        vk::Extent2D{(uint32_t)extents[1].width, (uint32_t)extents[1].height},
+										};
 										g.renderer->record_hidden(rec_cmd, g.swapchain.image(mask_index), hex,
-										                          hidden_mask_draws, proximity_spheres, &hstats);
+										                          hidden_mask_draws, proximity_spheres, &hstats, full_ext);
 									}
 									catch (std::exception & e)
 									{

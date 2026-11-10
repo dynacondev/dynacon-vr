@@ -666,6 +666,19 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	if (draws.empty() or image_index >= targets.size())
 		return false;
 
+	// Clamp helper, hoisted (stateless: extent passed per call — one
+	// definition serves the prescan and all three passes below).
+	auto clamp_scissor = [&](const vk::Rect2D & r, const vk::Extent2D & ext, vk::Rect2D & out) {
+		int32_t x0 = std::max(r.offset.x, 0);
+		int32_t y0 = std::max(r.offset.y, 0);
+		int32_t x1 = std::min(r.offset.x + (int32_t)r.extent.width, (int32_t)ext.width);
+		int32_t y1 = std::min(r.offset.y + (int32_t)r.extent.height, (int32_t)ext.height);
+		if (x1 <= x0 or y1 <= y0)
+			return false;
+		out = vk::Rect2D{.offset = {x0, y0}, .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+		return true;
+	};
+
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
 		auto & tgt = targets[image_index][eye];
@@ -686,15 +699,6 @@ bool hidden_dots_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		// full (correctness); an all-degenerate eye still begins/ends
 		// all three passes (clear-only): the images start UNDEFINED and
 		// the compositor samples the full rect.
-		auto clamp_scissor = [&](const vk::Rect2D & r, const vk::Extent2D & ext, vk::Rect2D & out) {			int32_t x0 = std::max(r.offset.x, 0);
-			int32_t y0 = std::max(r.offset.y, 0);
-			int32_t x1 = std::min(r.offset.x + (int32_t)r.extent.width, (int32_t)ext.width);
-			int32_t y1 = std::min(r.offset.y + (int32_t)r.extent.height, (int32_t)ext.height);
-			if (x1 <= x0 or y1 <= y0)
-				return false;
-			out = vk::Rect2D{.offset = {x0, y0}, .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
-			return true;
-		};
 		bool any = false;
 		for (const auto & d: draws)
 		{

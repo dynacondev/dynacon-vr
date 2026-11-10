@@ -775,7 +775,7 @@ private:
 		float pitch = 0.1f;
 	};
 	std::vector<hidden_silhouette_draw> hidden_silhouettes;
-	std::vector<feather_mask_renderer::instance_draw> hidden_mask_draws;
+	std::vector<feather_mask_renderer::hidden_draw> hidden_mask_draws;
 	std::vector<hidden_dots_renderer::instance_draw> hidden_dots_draws;
 	// Baked dot pitch per hidden mesh (the lattice rides the upload, so a
 	// pitch edit must re-upload): compared as floats alongside the soup

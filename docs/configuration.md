@@ -447,9 +447,10 @@ Each `passthrough` entry has:
   **closed volumes** (inside/outside comes from ray parity, undefined
   for open meshes); keep them simple (room-size boxes are ideal, ~5k
   triangles budget). Both eyes fade together from a single per-frame
-  headset distance. `"3d-passthrough-hidden"` renders the model as a
-  hard-edged always-on passthrough cutout on its own mask layer, plus a
-  dot-grid overlay in `grid-color` over the revealed feed (front faces
+  headset distance. `"3d-passthrough-hidden"` reveals the flat feed
+  where the model sits inside the proximity radius around the head
+  (hard-edged near-field cutout on its own mask layer, plus a
+  dot overlay in `dot-color` over the revealed feed (front faces
   only, so hidden meshes read best as **closed volumes** like boundary
   meshes): reversed cuts never apply to it (safety: hidden always wins),
   and it needs `model-path` like boundary zones.
@@ -493,18 +494,18 @@ Each `passthrough` entry has:
   zones never map camera
   onto geometry, depth volumes always reveal the flat feed, and hidden
   objects always reveal the flat feed on their own layer.
-- `grid-scale`: hidden dot pitch in meters
+- `dot-pitch`: hidden dot pitch in meters
   (`3d-passthrough-hidden` only, default `0.05`, clamped to
   `[0.01, 1]`, applied live). Fixed world-size dots wrapping the mesh
   faces; all hidden objects share one layer, so the pitch is per-object
   at draw time.
-- `grid-color`: hidden dot color as a `"#RRGGBB"` hex string
+- `dot-color`: hidden dot color as a `"#RRGGBB"` hex string
   (`3d-passthrough-hidden` only, default red `#FF291A`, applied
   live). Tints the dot overlay (per-object color at draw time).
-- `trigger-distance`: proximity trigger distance in meters
-  (`3d-passthrough-hidden` only, default `0.5`). Unused for now
-  (hidden objects are always-on in stage 1); reserved for the
-  near-field reveal.
+- `proximity-radius`: near-field reveal radius in meters
+  (`3d-passthrough-hidden` only, default `0.5`, clamped to `>= 0`,
+  applied live). The cutout and dots show only where the mesh sits
+  inside this distance of the head (hard edge); `0` reveals nothing.
 - `pulse-strength`: reserved, currently unused
   (`3d-passthrough-hidden` only, default `0.5`, clamped). Parsed and
   forwarded for config compatibility; the client renders a steady cutout.

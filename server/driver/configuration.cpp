@@ -585,36 +585,36 @@ configuration::configuration()
 						}
 					}
 				}
-				if (item.contains("grid-scale"))
+				if (item.contains("dot-pitch"))
 				{
 					if (not is_hidden)
-						U_LOG_W("passthrough object \"%s\": grid-scale is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
-					else if (not item["grid-scale"].is_number())
-						U_LOG_W("passthrough object \"%s\": grid-scale must be a number of meters, ignoring", o.id.c_str());
+						U_LOG_W("passthrough object \"%s\": dot-pitch is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["dot-pitch"].is_number())
+						U_LOG_W("passthrough object \"%s\": dot-pitch must be a number of meters, ignoring", o.id.c_str());
 					else
 					{
-						o.grid_scale_m = item["grid-scale"];
-						if (o.grid_scale_m < 0.01f)
+						o.dot_pitch_m = item["dot-pitch"];
+						if (o.dot_pitch_m < 0.01f)
 						{
-							U_LOG_W("passthrough object \"%s\": grid-scale too small, clamping to 0.01", o.id.c_str());
-							o.grid_scale_m = 0.01f;
+							U_LOG_W("passthrough object \"%s\": dot-pitch too small, clamping to 0.01", o.id.c_str());
+							o.dot_pitch_m = 0.01f;
 						}
-						else if (o.grid_scale_m > 1.0f)
+						else if (o.dot_pitch_m > 1.0f)
 						{
-							U_LOG_W("passthrough object \"%s\": grid-scale too large, clamping to 1", o.id.c_str());
-							o.grid_scale_m = 1.0f;
+							U_LOG_W("passthrough object \"%s\": dot-pitch too large, clamping to 1", o.id.c_str());
+							o.dot_pitch_m = 1.0f;
 						}
 					}
 				}
-				if (item.contains("grid-color"))
+				if (item.contains("dot-color"))
 				{
 					if (not is_hidden)
-						U_LOG_W("passthrough object \"%s\": grid-color is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
-					else if (not item["grid-color"].is_string())
-						U_LOG_W("passthrough object \"%s\": grid-color must be a \"#RRGGBB\" hex string, ignoring", o.id.c_str());
+						U_LOG_W("passthrough object \"%s\": dot-color is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["dot-color"].is_string())
+						U_LOG_W("passthrough object \"%s\": dot-color must be a \"#RRGGBB\" hex string, ignoring", o.id.c_str());
 					else
 					{
-						const std::string hex = item["grid-color"];
+						const std::string hex = item["dot-color"];
 						auto nibble = [](char c) -> int {
 							if (c >= '0' and c <= '9')
 								return c - '0';
@@ -637,24 +637,24 @@ configuration::configuration()
 							rgb[i] = hi * 16 + lo;
 						}
 						if (not ok)
-							U_LOG_W("passthrough object \"%s\": invalid grid-color \"%s\", expected \"#RRGGBB\", ignoring", o.id.c_str(), hex.c_str());
+							U_LOG_W("passthrough object \"%s\": invalid dot-color \"%s\", expected \"#RRGGBB\", ignoring", o.id.c_str(), hex.c_str());
 						else
-							o.grid_color = {rgb[0] / 255.f, rgb[1] / 255.f, rgb[2] / 255.f};
+							o.dot_color = {rgb[0] / 255.f, rgb[1] / 255.f, rgb[2] / 255.f};
 					}
 				}
-				if (item.contains("trigger-distance"))
+				if (item.contains("proximity-radius"))
 				{
 					if (not is_hidden)
-						U_LOG_W("passthrough object \"%s\": trigger-distance is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
-					else if (not item["trigger-distance"].is_number())
-						U_LOG_W("passthrough object \"%s\": trigger-distance must be a number of meters, ignoring", o.id.c_str());
+						U_LOG_W("passthrough object \"%s\": proximity-radius is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["proximity-radius"].is_number())
+						U_LOG_W("passthrough object \"%s\": proximity-radius must be a number of meters, ignoring", o.id.c_str());
 					else
 					{
-						o.trigger_distance_m = item["trigger-distance"];
-						if (o.trigger_distance_m < 0)
+						o.proximity_radius_m = item["proximity-radius"];
+						if (o.proximity_radius_m < 0)
 						{
-							U_LOG_W("passthrough object \"%s\": negative trigger-distance, clamping to 0", o.id.c_str());
-							o.trigger_distance_m = 0;
+							U_LOG_W("passthrough object \"%s\": negative proximity-radius, clamping to 0", o.id.c_str());
+							o.proximity_radius_m = 0;
 						}
 					}
 				}

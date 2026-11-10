@@ -299,6 +299,16 @@ public:
 	// furthest sphere exit (max distance), so coverage can only
 	// OVER-reveal (front-of-sphere imprecision, accepted); GREATER here
 	// would under-reveal (unsafe miss) and is forbidden.
+	// One draw per silhouette: which uploaded mesh, per-eye transforms,
+	// opacity, and the full-res pixel bounds per eye (scaled to the mask
+	// extent for a per-draw scissor — the only tri-raster with one).
+	struct hidden_draw
+	{
+		std::string mesh;
+		std::array<glm::mat4, 2> mvp;
+		float opacity = 1;
+		std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
+	};
 	struct hidden_cpu
 	{
 		double raster_ms = 0;
@@ -307,9 +317,10 @@ public:
 	void record_hidden(vk::raii::CommandBuffer & cmd,
 	                   vk::Image image,
 	                   vk::Extent2D extent,
-	                   const std::vector<instance_draw> & draws,
+	                   const std::vector<hidden_draw> & draws,
 	                   const std::vector<std::array<glm::mat4, 2>> & spheres,
-	                   hidden_cpu * cpu_stats);
+	                   hidden_cpu * cpu_stats,
+	                   const std::array<vk::Extent2D, 2> & full_extents);
 
 	bool has_mesh() const
 	{

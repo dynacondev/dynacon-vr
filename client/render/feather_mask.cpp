@@ -2120,9 +2120,10 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
                                           vk::Image image,
                                           vk::Extent2D extent,
-                                          const std::vector<instance_draw> & draws,
+                                          const std::vector<hidden_draw> & draws,
                                           const std::vector<std::array<glm::mat4, 2>> & spheres,
-                                          hidden_cpu * cpu_stats)
+                                          hidden_cpu * cpu_stats,
+                                          const std::array<vk::Extent2D, 2> & full_extents)
 {
 	hidden_cpu local{};
 	section_clock raster_clk(&local.raster_ms);
@@ -2191,9 +2192,12 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 
 		// RP2: silhouettes, kept only where nearer than the sphere exit
 		// (GREATER, no depth write). Hard near-field edge by design.
+		// Per-draw scissor from the shared full-res bounds (scaled into
+		// the mask extent +1px pad): the only tri-raster with one, so
+		// small objects shade small. RenderArea stays full (correctness).
 		vk::ClearValue hidden_clears[2]{};
 		hidden_clears[0].color.float32.fill(0);
-		hidden_clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
+		hidden_clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0}; // dead by LOAD, ignored
 		vk::RenderPassBeginInfo color_begin{
 		        .renderPass = *hidden_color_rp,
 		        .framebuffer = *tgt.framebuffers[eye],
@@ -2203,15 +2207,25 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(color_begin, vk::SubpassContents::eInline);
 		cmd.setViewport(0, full_vp);
-		cmd.setScissor(0, full_sc);
 		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hidden_silhouette_pipe);
 		for (const auto & d: draws)
 		{
-			if (d.reverse)
-				continue;
 			auto mit = meshes.find(d.mesh);
 			if (mit == meshes.end() or mit->second.index_count == 0)
 				continue;
+			// Per-draw scissor from the shared full-res bounds (scaled
+			// into the mask extent +1px pad, clamped; degenerate draws
+			// skipped). RenderArea stays full (correctness).
+			float msx = (float)extent.width / (float)full_extents[eye].width;
+			float msy = (float)extent.height / (float)full_extents[eye].height;
+			int32_t x0 = (int32_t)std::max(0.f, d.px[eye][0] * msx - 1.f);
+			int32_t y0 = (int32_t)std::max(0.f, d.px[eye][1] * msy - 1.f);
+			int32_t x1 = (int32_t)std::min((float)extent.width, d.px[eye][2] * msx + 1.f);
+			int32_t y1 = (int32_t)std::min((float)extent.height, d.px[eye][3] * msy + 1.f);
+			if (x1 <= x0 or y1 <= y0)
+				continue;
+			cmd.setScissor(0, vk::Rect2D{.offset = {x0, y0},
+			                             .extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}});
 			cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
 			cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
 			cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,

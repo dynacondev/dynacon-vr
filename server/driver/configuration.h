@@ -105,9 +105,10 @@ struct configuration
 		// volumes. "3d-depth-passthrough" reveals the flat feed where the
 		// runtime depth map resolves inside the model volume (depth-tested
 		// volume, feathered like a normal window). "3d-passthrough-hidden"
-		// renders the model as a hard-edged always-on passthrough cutout
-		// on its own mask layer (reversed cuts never apply), plus a
-		// dot-grid overlay in the config color over the revealed feed.
+		// reveals the flat feed where the model sits inside the proximity
+		// radius around the head (hard-edged near-field cutout on its own
+		// mask layer, reversed cuts never apply), plus a dot overlay in
+		// the config color over the revealed feed.
 		// Unknown types are skipped with a warning (forward-compat).
 		std::string type = "3d-passthrough";
 		std::string id;
@@ -141,17 +142,18 @@ struct configuration
 		// Hidden dot pitch in meters (3d-passthrough-hidden only): fixed
 		// world-size dots wrapping the mesh (default 0.05, clamped to
 		// [0.01, 1]). Ignored for other types (warned).
-		float grid_scale_m = 0.05f;
+		float dot_pitch_m = 0.05f;
 		// Hidden-object dot color as RGB 0..1, parsed from a
 		// "#RRGGBB" hex string as-authored (no colorspace conversion;
 		// default #FF291A red). Tints the dot overlay (per-object
 		// color at draw time). Applied live. Ignored for other types
 		// (warned).
-		std::array<float, 3> grid_color = {1.0f, 0.16f, 0.10f};
-		// Proximity trigger distance in meters (3d-passthrough-hidden
-		// only). Unused for now (always-on stage 1); reserved for the
-		// near-field reveal. Default 0.5, clamped to >= 0.
-		float trigger_distance_m = 0.5f;
+		std::array<float, 3> dot_color = {1.0f, 0.16f, 0.10f};
+		// Proximity reveal radius in meters (3d-passthrough-hidden
+		// only): the cutout and dots show only where the mesh sits
+		// inside this distance of the head (hard near-field edge).
+		// Default 0.5, clamped to >= 0. Applied live.
+		float proximity_radius_m = 0.5f;
 		// Reserved, currently unused (3d-passthrough-hidden only):
 		// parsed and forwarded for config compatibility; the client
 		// renders a steady cutout. Default 0.5, clamped to [0, 1].

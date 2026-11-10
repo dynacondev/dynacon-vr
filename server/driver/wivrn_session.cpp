@@ -574,9 +574,9 @@ void wivrn_session::send_fiducial_map()
 		        .feather_px = entry.feather_px,
 		        .surface_projected = entry.surface_projected,
 		        .transition_distance_m = entry.transition_distance_m,
-		        .grid_scale_m = entry.grid_scale_m,
-		        .grid_color = entry.grid_color,
-		        .trigger_distance_m = entry.trigger_distance_m,
+		        .dot_pitch_m = entry.dot_pitch_m,
+		        .dot_color = entry.dot_color,
+		        .proximity_radius_m = entry.proximity_radius_m,
 		        .pulse_strength = entry.pulse_strength,
 		};
 
