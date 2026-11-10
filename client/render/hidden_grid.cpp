@@ -18,6 +18,7 @@
 
 #include "render/hidden_grid.h"
 
+#include "render/feather_mask.h"
 #include "vk/shader.h"
 
 #include <algorithm>
@@ -61,6 +62,22 @@ hidden_grid_renderer::hidden_grid_renderer(vk::raii::Device & device, vk::raii::
         device(&device),
         physical_device(&physical_device)
 {
+}
+
+std::shared_ptr<vk::raii::PipelineCache> hidden_grid_renderer::pipeline_cache(vk::raii::Device & device)
+{
+	// Same process-wide object the feather mask renderer shares (one entry
+	// per VkDevice): keeps a single cache alive across both renderers.
+	return feather_mask_renderer::pipeline_cache(device);
+}
+
+void hidden_grid_renderer::warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format)
+{
+	// Throwaway renderer: its pipeline compiles populate the shared
+	// cache above, so the first real grid pays ~nothing. Only two
+	// pipelines (vs the feather stack), so this is milliseconds.
+	hidden_grid_renderer warm(device, physical_device);
+	warm.init_pipelines(format);
 }
 
 void hidden_grid_renderer::ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h)
@@ -229,6 +246,7 @@ std::optional<std::pair<glm::vec3, glm::vec3>> hidden_grid_renderer::mesh_bounds
 
 void hidden_grid_renderer::init_pipelines(vk::Format format)
 {
+	pipe_cache = pipeline_cache(*device);
 	auto vert = load_shader(*device, "hidden_grid.vert");
 	auto frag = load_shader(*device, "hidden_grid.frag");
 
@@ -389,7 +407,7 @@ void hidden_grid_renderer::init_pipelines(vk::Format format)
 	        .layout = *pipeline_layout,
 	        .renderPass = *renderpass,
 	};
-	pipeline = vk::raii::Pipeline(*device, nullptr, pipeline_info);
+	pipeline = vk::raii::Pipeline(*device, *pipe_cache, pipeline_info);
 }
 
 void hidden_grid_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,

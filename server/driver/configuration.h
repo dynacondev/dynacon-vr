@@ -141,10 +141,10 @@ struct configuration
 		// world-space triplanar line spacing in meters (default 0.1,
 		// clamped to [0.01, 1]). Ignored for other types (warned).
 		float grid_scale_m = 0.1f;
-		// Hidden-object warning grid color as linear RGB 0..1, parsed
-		// from a "#RRGGBB" hex string (default light blue). Ignored for
-		// other types (warned).
-		std::array<float, 3> grid_color = {0.5f, 0.83f, 1.0f};
+		// Hidden-object warning grid color as RGB 0..1, parsed from a
+		// "#RRGGBB" hex string as-authored (no colorspace conversion;
+		// default #80D4FF light blue). Ignored for other types (warned).
+		std::array<float, 3> grid_color = {128.f / 255.f, 212.f / 255.f, 1.0f};
 		// Proximity trigger distance in meters (3d-passthrough-hidden
 		// only). Unused for now (always-on stage 1); reserved for the
 		// near-field reveal. Default 0.5, clamped to >= 0.

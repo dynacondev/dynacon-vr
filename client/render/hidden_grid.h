@@ -33,9 +33,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <glm/mat4x4.hpp>
 #include <glm/vec3.hpp>
@@ -66,14 +68,28 @@ public:
 		std::array<glm::mat4, 2> mvp;
 		glm::vec3 obj_pos{0};
 		glm::quat obj_quat{1, 0, 0, 0};
+		// Uniform object scale (fused placements are always uniform; the
+		// clip MVP stays correct regardless, but the world-space grid
+		// would shear under a non-uniform scale).
 		float obj_scale = 1;
-		glm::vec3 grid_color{0.5f, 0.83f, 1.0f};
+		glm::vec3 grid_color{128.f / 255.f, 212.f / 255.f, 1.0f};
 		float grid_scale = 0.1f; // world-space line spacing, meters
 		std::array<glm::vec3, 2> cam_pos{};
 		float line_width_px = 1.5f;
 	};
 
 	explicit hidden_grid_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
+
+	// Shared driver pipeline cache (one per device, same object the
+	// feather mask renderer uses): every renderer compiles distinct
+	// pipelines, but sharing keeps one cache object alive across them.
+	// Held by each renderer, so the cache outlives its users but dies
+	// with the last one. Render-thread only.
+	static std::shared_ptr<vk::raii::PipelineCache> pipeline_cache(vk::raii::Device & device);
+	// Force a first build now (e.g. at first video swapchain, before any
+	// map exists) instead of paying driver compiles on the first visible
+	// frame. A throwaway renderer populates the cache above.
+	static void warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format);
 
 	// (Re)create swapchain + targets + pipelines for format/size.
 	// waitIdle inside on rebuild; no-op when unchanged.
@@ -118,6 +134,7 @@ private:
 
 	vk::raii::Device * device = nullptr;
 	vk::raii::PhysicalDevice * physical_device = nullptr;
+	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::RenderPass renderpass{nullptr};

@@ -2507,6 +2507,23 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								g.mesh_hashes.erase(mhit);
 							}
 						}
+						// Hash-side eviction (mirrors the feather groups): oids
+						// deleted or retyped away from hidden are never
+						// visited above, so sweep them here.
+						for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
+						{
+							auto oit = passthrough_objects.find(hit->first);
+							bool member = oit != passthrough_objects.end() and
+							        oit->second.def.type == "3d-passthrough-hidden" and
+							        oit->second.soup_ready and oit->second.soup_hash == hit->second;
+							if (not member)
+							{
+								g.renderer->remove_mesh(hit->first);
+								hit = g.mesh_hashes.erase(hit);
+							}
+							else
+								++hit;
+						}
 					}
 					if (not have_hidden)
 					{
@@ -2998,28 +3015,34 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		hidden_grid_active = false;
 		if (mask_frame)
 		{
-			bool have_hidden_grid = false;
+			bool known_hidden_grid = false; // map-known (placed or not)
+			bool have_hidden_grid = false; // placed + mesh ready
 			for (auto & [oid, ost]: passthrough_objects)
 			{
 				(void)oid;
-				if (ost.def.type == "3d-passthrough-hidden" and ost.soup_ready and ost.fused.placed)
+				if (ost.def.type != "3d-passthrough-hidden")
+					continue;
+				known_hidden_grid = true;
+				if (ost.soup_ready and ost.fused.placed)
 				{
 					have_hidden_grid = true;
 					break;
 				}
 			}
-			if (have_hidden_grid)
+			if (known_hidden_grid)
 			{
 				auto grid_t0 = std::chrono::steady_clock::now();
 				if (not hidden_grid)
 					hidden_grid = std::make_unique<hidden_grid_renderer>(device, physical_device);
 				hidden_grid->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+				// Mesh sync rides soup readiness, not placement (mirrors the
+				// hidden mask): first-visible frames only rasterize.
 				for (auto hit = hidden_grid_hashes.begin(); hit != hidden_grid_hashes.end();)
 				{
 					auto oit = passthrough_objects.find(hit->first);
 					bool member = oit != passthrough_objects.end() and
 					        oit->second.def.type == "3d-passthrough-hidden" and oit->second.soup_ready and
-					        oit->second.fused.placed and oit->second.soup_hash == hit->second;
+					        oit->second.soup_hash == hit->second;
 					if (not member)
 					{
 						hidden_grid->remove_mesh(hit->first);
@@ -3028,10 +3051,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					else
 						++hit;
 				}
-				std::vector<hidden_grid_renderer::instance_draw> grid_draws;
 				for (auto & [oid, ost]: passthrough_objects)
 				{
-					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready)
 						continue;
 					auto ghit = hidden_grid_hashes.find(oid);
 					if (ghit == hidden_grid_hashes.end() or ghit->second != ost.soup_hash)
@@ -3039,7 +3061,23 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						hidden_grid->set_mesh(oid, ost.soup);
 						hidden_grid_hashes[oid] = ost.soup_hash;
 					}
+				}
+				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - grid_t0).count();
+			}
+			if (have_hidden_grid)
+			{
+				auto grid_t0 = std::chrono::steady_clock::now();
+				std::vector<hidden_grid_renderer::instance_draw> grid_draws;
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					// Meshes synced in the map-known block above.
 					const auto & fu = ost.fused;
+					// Fused placements are always uniform (see the packet
+					// comment); the shader rebuilds the rigid transform
+					// from pos/quat/scale, so flag any divergence loudly.
+					assert(fu.world_scale.x == fu.world_scale.y and fu.world_scale.y == fu.world_scale.z);
 					glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
 					            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
 					glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
@@ -3098,9 +3136,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						std::array<vk::Extent2D, 2> grid_ext;
 						for (uint32_t view = 0; view < view_count; ++view)
 							grid_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
-						hidden_grid->record(command_buffer, (size_t)idx, grid_ext, grid_draws);
-						hidden_grid_image = idx;
-						hidden_grid_active = true;
+						try
+						{
+							hidden_grid->record(command_buffer, (size_t)idx, grid_ext, grid_draws);
+							hidden_grid_image = idx;
+							hidden_grid_active = true;
+						}
+						catch (std::exception & e)
+						{
+							spdlog::warn("Hidden grid record failed: {}", e.what());
+							hidden_grid->release();
+						}
 					}
 				}
 				mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - grid_t0).count();
@@ -3818,6 +3864,9 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	// anyway).
 	mask_pipe_cache = feather_mask_renderer::pipeline_cache(device);
 	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
+	// Same for the hidden-object grid (two pipelines, milliseconds):
+	// first-visible hidden frames must only rasterize.
+	hidden_grid_renderer::warm_pipelines(device, physical_device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()

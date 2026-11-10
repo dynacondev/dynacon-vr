@@ -1066,15 +1066,16 @@ struct passthrough_object
 	// Passthrough window feather width in screen pixels (alpha-gradient
 	// blend band around the mesh silhouette). Mask stacks group by this
 	// value so each object feathers independently. 0 disables feathering.
-	// Not accepted for 3d-passthrough-reversed and 3d-boundary(-reversed)
-	// (warned + ignored on the server).
+	// Not accepted for 3d-passthrough-reversed, 3d-boundary(-reversed)
+	// and 3d-passthrough-hidden (warned + ignored on the server).
 	float feather_px = 24;
 	// Surface-projected mapping: the headset projects camera imagery onto
 	// this object's mesh (geometry instance on the projected passthrough
 	// layer) instead of the flat reconstruction feed. Disabled by default;
 	// opt in per object with true (plus a live in-headset override).
-	// Ignored for 3d-passthrough-reversed and 3d-boundary(-reversed)
-	// (warned + ignored on the server).
+	// Ignored for 3d-passthrough-reversed, 3d-boundary(-reversed),
+	// 3d-depth-passthrough and 3d-passthrough-hidden (warned + ignored
+	// on the server).
 	bool surface_projected = false;
 	// Boundary fade width in meters (3d-boundary(-reversed) only):
 	// symmetric smoothstep over +/- this distance around the mesh
@@ -1083,9 +1084,10 @@ struct passthrough_object
 	// Hidden-object warning grid (3d-passthrough-hidden only): world-space
 	// triplanar line spacing in meters. Default 0.1.
 	float grid_scale_m = 0.1f;
-	// Hidden-object warning grid color as linear RGB 0..1 (parsed
-	// server-side from a "#RRGGBB" hex string). Default light blue.
-	std::array<float, 3> grid_color = {0.5f, 0.83f, 1.0f};
+	// Hidden-object warning grid color as RGB 0..1, parsed server-side
+	// from a "#RRGGBB" hex string as-authored (no colorspace conversion).
+	// Default #80D4FF light blue.
+	std::array<float, 3> grid_color = {128.f / 255.f, 212.f / 255.f, 1.0f};
 	// Proximity trigger distance in meters (3d-passthrough-hidden only).
 	// Unused for now (always-on stage 1); reserved for the near-field
 	// reveal. Default 0.5.

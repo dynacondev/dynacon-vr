@@ -670,8 +670,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		for (float v: o.grid_color)
 			map_key += std::to_string(v) + ',';
 		map_key += ';';
-		map_key += std::to_string(o.trigger_distance_m);
-		map_key += ';';
+		// trigger_distance_m intentionally excluded: reserved for stage 2
+		// (unused today) and must not reset tracking on edit.
 	}
 	map_key += 'L';
 	map_key += map->passthrough_until_lock;

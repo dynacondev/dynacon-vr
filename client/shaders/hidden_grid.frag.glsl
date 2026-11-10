@@ -66,13 +66,16 @@ void main()
 	float wpx = max(pc.cam_pos_width.w, 0.5);
 	float line = 1.0 - smoothstep(wpx - 1.0, wpx, line_d);
 
-	// Fresnel rim, same pixel thickness.
+	// Fresnel rim, same pixel thickness. Pixel distance to the silhouette
+	// is (1-fres)/fwidth: fres is 0 at the facing center (rim 0) and 1
+	// at the edge (rim 1).
 	float fres = pow(1.0 - abs(dot(n, v)), 3.0);
-	float rim_d = fres / max(fwidth(fres), 1e-4);
+	float rim_d = (1.0 - fres) / max(fwidth(fres), 1e-4);
 	float rim = 1.0 - smoothstep(wpx - 1.0, wpx, rim_d);
 
-	float a = clamp(line + rim, 0.0, 1.0);
+	float rc = clamp(rim, 0.0, 1.0);
+	float a = max(line, rc);
 	if (a <= 0.001)
 		discard;
-	out_color = vec4(pc.grid_col_scale.rgb * line + rim_color * rim, a);
+	out_color = vec4(mix(pc.grid_col_scale.rgb, rim_color, rc), a);
 }
