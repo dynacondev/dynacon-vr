@@ -33,14 +33,16 @@
 //
 // HARD CAP, DOCUMENTED: max_inputs = 8 contributor images. Past that
 // the caller drops extras with a loud log (no fallback submit path —
-// >8 B groups means a config the merge was never sized for, and
+// >8 contributors means a config the merge was never sized for, and
 // dropping coverage under-reveals, so the error must stay visible).
 // Typical configs carry 1-3.
 //
-// No push constants (the 8 static taps make the reduction
-// count-independent: unused slots re-bind an active input's view, and
-// max() over duplicates is neutral), no derivatives, no depth, no
-// mat3/ternaries (Adreno rule). Own swapchain, render thread only.
+// 4B FRAG-only count push (uniform early-out over the static taps:
+// unused slots still re-bind an active input's view, but taps past
+// the count never execute, so cost scales with real inputs; vert
+// declares nothing, so no VERT|FRAG mismatch trap), no derivatives,
+// no depth, no mat3/ternaries (Adreno rule). Own swapchain, render
+// thread only.
 
 #include <cstddef>
 #include <cstdint>
@@ -63,7 +65,7 @@ class union_merge_renderer
 public:
 	// Hard input cap (see above): more contributors than this are
 	// dropped by the caller with an error, never merged, never
-	// submitted on a fallback path. Typical configs carry 1-3.
+	// submitted on a fallback path. Typical configs carry 1-3. Typical configs carry 1-3.
 	// 8 is the static sampler-binding count in
 	// union_merge_mv.frag.glsl (src0..src7, no descriptor indexing
 	// per the Adreno rule): raising max_inputs requires adding

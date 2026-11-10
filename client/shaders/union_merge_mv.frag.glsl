@@ -39,7 +39,10 @@ layout(location = 0) out vec4 out_color;
 // extension, no dynamic indexing for Adreno to miscompile, no
 // per-fragment early-out (loop-free, derivatives stay uniform).
 // Unused slots bind an already-active input's view again (same view
-// in several slots is legal); max() over duplicates is neutral.
+// in several slots is legal); a uniform push-constant count skips
+// taps past the active inputs (uniform control flow — skipped
+// texture() calls never execute — so cost scales with real inputs,
+// not with the 8 slots).
 // RGB is zero: downstream the REPLACE blend preserves dst color and
 // the veil bias touches alpha only, so mask RGB is ignored.
 layout(set = 0, binding = 0) uniform sampler2DArray src0;
@@ -51,16 +54,33 @@ layout(set = 0, binding = 5) uniform sampler2DArray src5;
 layout(set = 0, binding = 6) uniform sampler2DArray src6;
 layout(set = 0, binding = 7) uniform sampler2DArray src7;
 
+// Active input count (1..8), pushed per draw. Uniform across the
+// draw, so the branches below are uniform control flow: skipped
+// taps never execute (no derivatives in this shader, nothing to
+// diverge). Static indexing throughout — Adreno-safe.
+layout(push_constant) uniform Push
+{
+	int count;
+}
+pc;
+
 void main()
 {
 	vec3 buv = vec3(uv, float(gl_ViewIndex));
 	float a = texture(src0, buv).a;
-	a = max(a, texture(src1, buv).a);
-	a = max(a, texture(src2, buv).a);
-	a = max(a, texture(src3, buv).a);
-	a = max(a, texture(src4, buv).a);
-	a = max(a, texture(src5, buv).a);
-	a = max(a, texture(src6, buv).a);
-	a = max(a, texture(src7, buv).a);
+	if (pc.count > 1)
+		a = max(a, texture(src1, buv).a);
+	if (pc.count > 2)
+		a = max(a, texture(src2, buv).a);
+	if (pc.count > 3)
+		a = max(a, texture(src3, buv).a);
+	if (pc.count > 4)
+		a = max(a, texture(src4, buv).a);
+	if (pc.count > 5)
+		a = max(a, texture(src5, buv).a);
+	if (pc.count > 6)
+		a = max(a, texture(src6, buv).a);
+	if (pc.count > 7)
+		a = max(a, texture(src7, buv).a);
 	out_color = vec4(0.0, 0.0, 0.0, a);
 }

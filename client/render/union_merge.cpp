@@ -22,9 +22,25 @@
 #include "vk/shader.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #include <spdlog/spdlog.h>
+
+namespace
+{
+// Mirrors union_merge_mv.frag.glsl Push: active input count (1..8)
+// for the uniform tap early-out. 4B, far below the 128-byte Vulkan
+// minimum (no maxPushConstantsSize check needed); FRAG-only range,
+// and the vertex shader declares no push block, so the mask_mv
+// offset trap (mismatched vert/frag blocks under a shared range) is
+// structurally impossible.
+struct push
+{
+	int32_t count = 0;
+};
+static_assert(sizeof(push) == 4);
+} // namespace
 
 union_merge_renderer::union_merge_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device) :
         device(&device),
@@ -228,13 +244,20 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	        .dynamicStateCount = 2,
 	        .pDynamicStates = dynamics,
 	};
-	// Descriptor set only: NO push range (there are no push
-	// constants — and a VERT|FRAG shared range with mismatched
-	// vert/frag blocks would re-trigger the mask_mv offset trap).
+	// Descriptor set only, plus a 4B FRAG-only count range (the
+	// vertex shader declares no push block — a VERT|FRAG shared range
+	// with mismatched vert/frag blocks would re-trigger the mask_mv
+	// offset trap, so the range stays FRAG-only by design).
+	vk::PushConstantRange push_range{
+	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	        .offset = 0,
+	        .size = sizeof(push),
+	};
 	vk::PipelineLayoutCreateInfo layout_info{
 	        .setLayoutCount = 1,
 	        .pSetLayouts = &*descriptor_layout,
-	        .pushConstantRangeCount = 0,
+	        .pushConstantRangeCount = 1,
+	        .pPushConstantRanges = &push_range,
 	};
 	pipeline_layout = vk::raii::PipelineLayout(*device, layout_info);
 
@@ -398,6 +421,11 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set, {});
+	// Active input count for the uniform tap early-out (volume_virt
+	// FRAG-only precedent): identical for every invocation in the
+	// draw, so skipped taps never execute. inputs.size() is 1..8
+	// (checked on entry).
+	cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, push{.count = (int32_t)inputs.size()});
 	// Fullscreen triangle (blur.vert: 3 verts, no vertex buffers).
 	cmd.draw(3, 1, 0, 0);
 	cmd.endRenderPass();
