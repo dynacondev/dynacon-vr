@@ -389,6 +389,22 @@ private:
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
 
+	// Multiview twins of the raster path (mask_mv.vert/frag, 132B
+	// push): one draw broadcasts to both layers. Same CLEAR/STORE
+	// OPTIMAL shape as the per-eye passes above; framebuffer-compatible
+	// with the V-upscale MV framebuffers for the non-depth path.
+	vk::raii::RenderPass renderpass_mv{nullptr};
+	vk::raii::RenderPass depth_renderpass_mv{nullptr};
+	vk::raii::RenderPass raster_r8_renderpass_mv{nullptr};
+	vk::raii::RenderPass raster_r8_depth_renderpass_mv{nullptr};
+	vk::raii::PipelineLayout silhouette_mv_layout{nullptr};
+	vk::raii::Pipeline pipeline_mv{nullptr};
+	vk::raii::Pipeline depth_pipeline_mv{nullptr};
+	vk::raii::Pipeline reverse_pipeline_mv{nullptr};
+	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
+	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
+	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
+
 	// R8 variants of the raster path for the single-channel blur
 	// intermediates (same shaders: mask.frag replicates opacity to all
 	// channels, so one body serves R8 (.r) and RGBA8 (.a) targets).
@@ -496,6 +512,8 @@ private:
 		// gl_ViewIndex) and render into blur_fb_mv.
 		vk::raii::ImageView view_array{nullptr};
 		vk::raii::Framebuffer blur_fb_mv{nullptr};
+		// Multiview raster target: same array view under the raster MV pass.
+		vk::raii::Framebuffer raster_fb_mv{nullptr};
 		// Depth-tested raster companions (D16, same extent as the color
 		// target above): depth image + views shared by both eyes' layers,
 		// plus one color+depth framebuffer per eye for the seed raster.
@@ -505,6 +523,9 @@ private:
 		vk::raii::DeviceMemory depth_memory{nullptr};
 		std::vector<vk::raii::ImageView> depth_views;
 		std::vector<vk::raii::Framebuffer> raster_depth_fbs;
+		vk::raii::ImageView depth_view_array{nullptr};
+		// Multiview depth companion: one layers=2 color+depth FB under the raster MV depth pass.
+		vk::raii::Framebuffer raster_depth_fb_mv{nullptr};
 	};
 	blur_target target_a;
 	blur_target target_b;
@@ -739,7 +760,7 @@ private:
 		std::array<vk::raii::Framebuffer, 2> framebuffers;
 		// Multiview V-upscale target: array view + layers=2
 		// framebuffer under blur_renderpass_mv. Per-eye framebuffers
-		// above stay (tier-0 raster, cutout punch).
+		// above stay (cutout punch only; raster is multiview now).
 		vk::raii::ImageView view_array{nullptr};
 		vk::raii::Framebuffer framebuffer_mv{nullptr};
 		// Depth-tested raster companions for tier-0 direct raster (color +
@@ -748,6 +769,8 @@ private:
 		// lazily on first reversed use (has_depth); positive-only targets
 		// stay lean.
 		std::array<vk::raii::Framebuffer, 2> depth_framebuffers;
+		// Multiview tier-0 raster depth companion: one layers=2 color+depth FB.
+		vk::raii::Framebuffer depth_framebuffer_mv{nullptr};
 		bool has_depth = false;
 		frame_targets(vk::Extent2D extent_,
 		              std::array<vk::raii::ImageView, 2> views_,
@@ -775,9 +798,11 @@ private:
 		vk::raii::Image image{nullptr};
 		vk::raii::DeviceMemory memory{nullptr};
 		std::vector<vk::raii::ImageView> views;
+		vk::raii::ImageView view_array{nullptr};
 	};
 	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
 	vk::ImageView output_depth_view(vk::Extent2D extent, int eye);
+	vk::ImageView output_depth_array_view(vk::Extent2D extent);
 	// D16 depth image + per-eye views at an extent (depth-test-only
 	// raster: never sampled, device-local). Backs output_depth above and
 	// the intermediate raster companions in ensure_targets.
