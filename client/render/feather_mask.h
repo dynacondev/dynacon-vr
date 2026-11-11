@@ -213,8 +213,8 @@ public:
 
 	// Record silhouettes + blur chain for both eyes into the layers of an
 	// acquired swapchain image. No-op when no mesh is set. The image must
-	// be unused (UNDEFINED is fine); it is left in GENERAL for the
-	// compositor. extent sizes the intermediates (full); out_extent sizes
+	// be unused (UNDEFINED is fine); it is left in COLOR_ATTACHMENT_OPTIMAL
+	// for the compositor. extent sizes the intermediates (full); out_extent sizes
 	// the submitted image and its passes (half for feathered groups: V
 	// writes half pixels, the compositor upscales on submit; equal for
 	// tier-0). Feather selects the tier as documented; rasterize=false

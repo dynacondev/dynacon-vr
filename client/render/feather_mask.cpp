@@ -264,7 +264,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eGeneral,
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference color_ref{
 	        .attachment = 0,
@@ -292,7 +292,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
 	        // Intermediates only (never submitted): optimal layout keeps
-	        // Adreno UBWC compression live. Submitted images stay GENERAL.
+	        // Adreno UBWC compression live. Submitted images also stay OPTIMAL.
 	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference raster_r8_ref{
@@ -320,8 +320,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eLoad,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
-	        .initialLayout = vk::ImageLayout::eGeneral,
-	        .finalLayout = vk::ImageLayout::eGeneral,
+	        .initialLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference cutout_ref{
 	        .attachment = 0,
@@ -376,7 +376,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// attachment joins the color attachment (same color formats as above,
 	// so two renderpasses). Depth is test-only (never sampled) and always
 	// cleared: no layout history is ever assumed.
-	auto make_depth_renderpass = [&](vk::Format color_format, vk::ImageLayout color_final = vk::ImageLayout::eGeneral) {
+	auto make_depth_renderpass = [&](vk::Format color_format, vk::ImageLayout color_final = vk::ImageLayout::eColorAttachmentOptimal) {
 		vk::AttachmentDescription attachments[2] = {
 		        {
 		                .format = color_format,
@@ -490,7 +490,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eGeneral,
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference blur_color_ref{
 	        .attachment = 0,
@@ -1350,7 +1350,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// seed's own MV framebuffer is reused (loadOp is not part of render
 	// pass compatibility). Two renderpasses: R8 intermediates (tier 1 +
 	// tiered seeds, COLOR_OPTIMAL) and RGBA8 submitted images (tier 0,
-	// GENERAL).
+	// COLOR_OPTIMAL).
 	{
 		uint32_t mv_view_mask = 0b11, mv_corr_mask = 0b11;
 		vk::RenderPassMultiviewCreateInfo volume_mv_rp_info{
@@ -1389,8 +1389,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .samples = vk::SampleCountFlagBits::e1,
 		        .loadOp = vk::AttachmentLoadOp::eLoad,
 		        .storeOp = vk::AttachmentStoreOp::eStore,
-		        .initialLayout = vk::ImageLayout::eGeneral,
-		        .finalLayout = vk::ImageLayout::eGeneral,
+		        .initialLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 		};
 		vk::AttachmentReference max_rgb8_ref{
 		        .attachment = 0,
@@ -3171,9 +3171,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = e});
 	};
 
-	// Same-queue read-after-write between passes. Intermediates live
-	// in OPTIMAL layouts (UBWC on); submitted images stay GENERAL and
-	// never pass through here.
+	// Same-queue read-after-write between passes. All images live
+	// in OPTIMAL layouts (UBWC on).
 	// Full-image range: the multiview chain reads both layers together,
 	// so per-eye narrowing no longer applies (one barrier replaces two).
 	auto transfer_barrier = [&](vk::Image img, vk::ImageLayout old_layout, vk::ImageLayout new_layout,
@@ -3195,7 +3194,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 	// Post-write: color write out, shader read in. old_layout is the
 	// pass's final layout (ATTACH from standalone passes, GENERAL
-	// from the merged triple); new is always READ_ONLY.
+	// from the merged triple only); new is always READ_ONLY.
 	auto make_readable = [&](vk::Image img, vk::ImageLayout old_layout = vk::ImageLayout::eColorAttachmentOptimal) {
 		transfer_barrier(img,
 		                 old_layout,
@@ -3209,7 +3208,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// discards (always legal, no first-use tracking); every R8 target
 	// is fully overwritten (DONT_CARE load), and the discard drops the
 	// tile load on TBDR. Not used before raster (initial Undefined
-	// covers) or the GENERAL submit upscale.
+	// covers) or the OPTIMAL submit upscale.
 	auto make_writable = [&](vk::Image img) {
 		transfer_barrier(img,
 		                 vk::ImageLayout::eUndefined,
@@ -3812,7 +3811,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// to the volume path: the compare above ran fullscreen so
 				// every bin texel outside the object footprint reads back
 				// keep (1).
-				vk::ImageLayout seed_layout = seed_is_rgb8 ? vk::ImageLayout::eGeneral : vk::ImageLayout::eColorAttachmentOptimal;
+				vk::ImageLayout seed_layout = vk::ImageLayout::eColorAttachmentOptimal;
 				vk::ImageMemoryBarrier merge_barrier{
 				        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 				        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
@@ -4039,7 +4038,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// LOAD-after-write ordering, same as the cutout punch
 				// barrier below: without it a tile GPU may MAX against
 				// stale seed tiles.
-				vk::ImageLayout seed_layout = seed_is_rgb8 ? vk::ImageLayout::eGeneral : vk::ImageLayout::eColorAttachmentOptimal;
+				vk::ImageLayout seed_layout = vk::ImageLayout::eColorAttachmentOptimal;
 				vk::ImageMemoryBarrier merge_barrier{
 					        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 					        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
@@ -4369,8 +4368,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		vk::ImageMemoryBarrier cut_barrier{
 		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 		        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
-		        .oldLayout = vk::ImageLayout::eGeneral,
-		        .newLayout = vk::ImageLayout::eGeneral,
+		        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
 		        .image = image,
 		        .subresourceRange = {
 		                .aspectMask = vk::ImageAspectFlagBits::eColor,
@@ -4475,8 +4474,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	vk::ImageMemoryBarrier barrier{
 	        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 	        .dstAccessMask = vk::AccessFlagBits::eMemoryRead,
-	        .oldLayout = vk::ImageLayout::eGeneral,
-	        .newLayout = vk::ImageLayout::eGeneral,
+	        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	        .image = image,
 	        .subresourceRange = {
 	                .aspectMask = vk::ImageAspectFlagBits::eColor,

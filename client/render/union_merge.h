@@ -75,12 +75,13 @@ public:
 	// One merge input: a just-recorded contributor image plus its
 	// multiview array view (both layers, BORROWED from the owning
 	// feather renderer — same-frame use only, never cached here).
-	// general_layout: true for feather/debug images (end GENERAL:
-	// availability barrier only, sampled as GENERAL so the next
-	// frame's cutout LOAD re-begin still matches), false for the
-	// hidden image (ends COLOR_ATTACHMENT_OPTIMAL: transitioned to
-	// SHADER_READ_ONLY for the merge; its next record re-begins
-	// UNDEFINED+CLEAR, so no transition back is needed).
+	// general_layout: true for feather/debug images (end
+	// COLOR_ATTACHMENT_OPTIMAL: availability barrier only, sampled
+	// as OPTIMAL so the same-frame cutout LOAD re-begin still
+	// matches), false for the hidden image (ends
+	// COLOR_ATTACHMENT_OPTIMAL: transitioned to SHADER_READ_ONLY
+	// for the merge; its next record re-begins UNDEFINED+CLEAR, so
+	// no transition back is needed).
 	struct input
 	{
 		vk::Image image;
@@ -139,8 +140,8 @@ private:
 	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
-	// Single-attachment multiview renderpass (CLEAR/STORE/GENERAL:
-	// submitted image, feather-compositor precedent) + MAX pipeline
+	// Single-attachment multiview renderpass (CLEAR/STORE/OPTIMAL:
+	// submitted image, keeps UBWC live like the feather groups) + MAX pipeline
 	// (fullscreen triangle, no vertex input, no blending — one write
 	// wins, the submit-time REPLACE builds the dst-alpha union).
 	vk::raii::RenderPass renderpass{nullptr};

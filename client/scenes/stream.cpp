@@ -3196,13 +3196,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								// dropped with an error below, never a fallback path —
 								// >8 contributors under-reveals by construction, so the
 								// error must stay visible.
-								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(g, true, merge_inputs))
+								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(g, false, merge_inputs))
 									merge_ok = false;
 							}
 							if (merge_ok and debug_group.active)
 							{
 								++merge_b_count;
-								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(debug_group, true, merge_inputs))
+								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(debug_group, false, merge_inputs))
 									merge_ok = false;
 							}
 							if (merge_b_count > union_merge_renderer::max_inputs)

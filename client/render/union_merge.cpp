@@ -268,16 +268,15 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	};
 	pipeline_layout = vk::raii::PipelineLayout(*device, layout_info);
 
-	// Single-attachment multiview renderpass (CLEAR/STORE/GENERAL:
-	// submitted image, feather-compositor precedent — GENERAL keeps
-	// the submit path identical to the feather groups it replaces).
+	// Single-attachment multiview renderpass (CLEAR/STORE/OPTIMAL:
+	// submitted image, keeps Adreno UBWC live like the feather groups).
 	vk::AttachmentDescription attachment{
 	        .format = format,
 	        .samples = vk::SampleCountFlagBits::e1,
 	        .loadOp = vk::AttachmentLoadOp::eClear,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eGeneral,
+	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	};
 	vk::AttachmentReference color_ref{
 	        .attachment = 0,
@@ -338,11 +337,12 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	}
 
 	// Write→read hazard (same command buffer): every input was just
-	// written as a color attachment. Feather/debug images stay GENERAL
-	// (availability only — the next frame's cutout LOAD re-begin
-	// requires GENERAL, so no layout change here); the hidden image
-	// leaves COLOR_ATTACHMENT_OPTIMAL and transitions to SHADER_READ
-	// (its next record re-begins UNDEFINED+CLEAR, so no way back).
+	// written as a color attachment. Feather/debug/hidden images all
+	// end OPTIMAL now. Feather/debug stay OPTIMAL here (availability
+	// only — sampled as OPTIMAL so the same-frame cutout LOAD
+	// re-begin still matches); the hidden image transitions to
+	// SHADER_READ (its next record re-begins UNDEFINED+CLEAR, so no
+	// way back; feather likewise re-begins UNDEFINED next frame).
 	std::vector<vk::ImageMemoryBarrier> barriers;
 	barriers.reserve(inputs.size());
 	for (auto & in: inputs)
@@ -350,8 +350,8 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		barriers.push_back(vk::ImageMemoryBarrier{
 		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-		        .oldLayout = in.general_layout ? vk::ImageLayout::eGeneral : vk::ImageLayout::eColorAttachmentOptimal,
-		        .newLayout = in.general_layout ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+		        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		        .newLayout = in.general_layout ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eShaderReadOnlyOptimal,
 		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		        .image = in.image,
@@ -384,7 +384,7 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		infos[i] = vk::DescriptorImageInfo{
 		        .sampler = *sampler,
 		        .imageView = in.view_array,
-		        .imageLayout = in.general_layout ? vk::ImageLayout::eGeneral : vk::ImageLayout::eShaderReadOnlyOptimal,
+		        .imageLayout = in.general_layout ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eShaderReadOnlyOptimal,
 		};
 	}
 	std::vector<vk::WriteDescriptorSet> writes;
@@ -442,8 +442,8 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	vk::ImageMemoryBarrier out_barrier{
 	        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 	        .dstAccessMask = vk::AccessFlagBits::eMemoryRead,
-	        .oldLayout = vk::ImageLayout::eGeneral,
-	        .newLayout = vk::ImageLayout::eGeneral,
+	        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
 	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	        .image = swapchain_.image(image_index),
