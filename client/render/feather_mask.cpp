@@ -1888,7 +1888,7 @@ vk::ImageView feather_mask_renderer::output_depth_array_view(vk::Extent2D extent
 		spdlog::info("Fiducial mask depth target: {}x{}", extent.width, extent.height);
 		it = output_depth.emplace(key, make_depth_entry(extent)).first;
 	}
-	if (not it->second.view_array)
+	if (*it->second.view_array == VK_NULL_HANDLE)
 	{
 		it->second.view_array = vk::raii::ImageView(device,
 		        vk::ImageViewCreateInfo{
