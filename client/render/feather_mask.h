@@ -182,7 +182,7 @@ public:
 		double punch_ms = 0;  // marker-window cutout punch
 		double total_ms = 0;  // whole record() body, incl. target setup
 		int tier = -1;        // selected tier, -1 = bypass/clear-only/empty
-		size_t draws = 0;     // silhouette drawIndexed calls (both eyes)
+		size_t draws = 0;     // silhouette drawIndexed calls (one per MV broadcast)
 		float box_frac = 1;   // scissor-box area fraction (0-1) at working
 		                      // res; 1 = fullscreen fallback. Diagnostic for
 		                      // cull effectiveness (log only, no plot).
@@ -405,29 +405,9 @@ private:
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
 
-	// R8 variants of the raster path for the single-channel blur
-	// intermediates (same shaders: mask.frag replicates opacity to all
-	// channels, so one body serves R8 (.r) and RGBA8 (.a) targets).
-	// Renderpasses differ by format only; layout is shared (format-free).
-	vk::raii::RenderPass raster_r8_renderpass{nullptr};
-	vk::raii::Pipeline raster_r8_pipeline{nullptr};
-
-	// Depth-tested raster variants for reversed draws
-	// (3d-passthrough-reversed): same shaders/layout, plus a D16 depth
-	// attachment. Positives write depth (GREATER: the shared projection
-	// is reversed-Z, near = 1, far = 0) and overwrite color as
-	// before; reversed draws test GREATER without writing depth and MIN-blend
-	// (1 - fade) into color, so a negative cuts only where it is nearer
-	// than the positives covering that pixel. Two format variants like
-	// the plain raster path (RGBA8 submitted images, R8 intermediates).
-	// Engaged per record() call only when a reversed draw exists;
-	// positive-only frames keep the legacy passes bit-identically.
-	vk::raii::RenderPass depth_renderpass{nullptr};
-	vk::raii::Pipeline depth_pipeline{nullptr};
-	vk::raii::Pipeline reverse_pipeline{nullptr};
-	vk::raii::RenderPass raster_r8_depth_renderpass{nullptr};
-	vk::raii::Pipeline raster_r8_depth_pipeline{nullptr};
-	vk::raii::Pipeline raster_r8_reverse_pipeline{nullptr};
+	// R8 variants of the raster path are multiview-only now
+	// (raster_r8_renderpass_mv below); the per-eye R8/depth R8 paths
+	// were retired with the silhouette MV conversion.
 
 	// LOAD variant of the raster pass for the marker window cutout: same
 	// single-attachment shape (framebuffer-compatible with the above), so
@@ -461,8 +441,8 @@ private:
 	// width: two 1D min passes (H then V, radius = ceil bleed) compose an
 	// exact (2r+1)^2 box. Same fullscreen vertex shader/layout as blur
 	// (24-byte push) and R8 standalone shape as the downsample pass, so
-	// it records into any single-attachment R8 framebuffer (A/B blur_fbs,
-	// eblur blur_fbs) with no new renderpasses or targets.
+	// it records into any single-attachment R8 MV framebuffer (A/B
+	// raster_fb_mv, eblur raster_fb_mv) with no new renderpasses.
 	// Triple-subpass pipes (subpass index is baked in: erode runs in
 	// subpasses 0/1, blur-H in 2). Shared by both triple renderpasses.
 	vk::raii::Pipeline triple_erode_0{nullptr};
@@ -503,9 +483,6 @@ private:
 	{
 		vk::raii::Image image{nullptr};
 		vk::raii::DeviceMemory memory{nullptr};
-		std::vector<vk::raii::ImageView> views;
-		std::vector<vk::raii::Framebuffer> raster_fbs;
-		std::vector<vk::raii::Framebuffer> blur_fbs;
 		// Multiview sampling + render target: 2D-array view over both
 		// layers and one layers=2 framebuffer. The _mv fullscreen
 		// passes read via view_array (sampler2DArray indexed by
@@ -515,14 +492,11 @@ private:
 		// Multiview raster target: same array view under the raster MV pass.
 		vk::raii::Framebuffer raster_fb_mv{nullptr};
 		// Depth-tested raster companions (D16, same extent as the color
-		// target above): depth image + views shared by both eyes' layers,
-		// plus one color+depth framebuffer per eye for the seed raster.
-		// Built for raster sources only (A, down levels); blur-only
-		// targets (B, eblur) leave these null.
+		// target above): depth image shared by both layers. Built for
+		// raster sources only (A, down levels); blur-only targets (B,
+		// eblur) leave these null.
 		vk::raii::Image depth_image{nullptr};
 		vk::raii::DeviceMemory depth_memory{nullptr};
-		std::vector<vk::raii::ImageView> depth_views;
-		std::vector<vk::raii::Framebuffer> raster_depth_fbs;
 		vk::raii::ImageView depth_view_array{nullptr};
 		// Multiview depth companion: one layers=2 color+depth FB under the raster MV depth pass.
 		vk::raii::Framebuffer raster_depth_fb_mv{nullptr};
@@ -559,19 +533,9 @@ private:
 	// Presmooth radius (blur-spread units = texels at 320): stairs
 	// smaller than ~2x this vanish into a stable gradient. 4 -> ~8px.
 	static constexpr float volume_smooth_spread = 1.4f;
-	struct volume_push
-	{
-		glm::mat4 mvp;
-		float near_z = 0.1f;
-		float far_z = 10.f;
-	};
-	vk::raii::RenderPass volume_raster_renderpass{nullptr};
-	vk::raii::PipelineLayout volume_raster_layout{nullptr};
-	vk::raii::Pipeline volume_raster_pipeline{nullptr};
-	// Multiview twins of the volume/VR raster (volume_mv.vert, 136B
-	// MVP-pair push): one draw broadcasts to both layers. Same
-	// CLEAR/STORE/OPTIMAL R16 attachments plus viewMask=both; dedicated
-	// layout so the 72B per-eye layout stays untouched.
+	// Multiview volume/VR raster (volume_mv.vert, 136B MVP-pair push):
+	// one draw broadcasts to both layers. Same CLEAR/STORE/OPTIMAL R16
+	// attachments plus viewMask=both.
 	struct volume_mv_push
 	{
 		std::array<glm::mat4, 2> mvp;
@@ -582,15 +546,14 @@ private:
 	vk::raii::PipelineLayout volume_raster_layout_mv{nullptr};
 	vk::raii::Pipeline volume_raster_pipeline_mv{nullptr};
 	vk::raii::Pipeline vr_raster_pipeline_mv{nullptr};
-	// VR-occlusion object raster: same shaders (volume.vert +
-	// volume_raster.frag encode eye depth as sensor-compatible D) and
-	// push layout as the volume raster above, but nearest-point state:
-	// cull-nothing + MIN blend over a far (1.0) clear, so the closest
-	// surface wins order-independently. Cull-nothing (not back) keeps
-	// single-sided windows visible from either side; closed meshes still
-	// resolve to the front wall. The compare gates on <0.9999, so the
-	// far clear reads back as empty, never as geometry.
-	vk::raii::Pipeline vr_raster_pipeline{nullptr};
+	// VR-occlusion object raster: same shaders (volume_mv.vert +
+	// volume_raster_mv.frag encode eye depth as sensor-compatible D),
+	// nearest-point state: cull-nothing + MIN blend over a far (1.0)
+	// clear, so the closest surface wins order-independently.
+	// Cull-nothing (not back) keeps single-sided windows visible from
+	// either side; closed meshes still resolve to the front wall. The
+	// compare gates on <0.9999, so the far clear reads back as empty,
+	// never as geometry.
 	// Compare (fullscreen _mv, 2 samplers: sensor D16 + volume R16).
 	// Dedicated CLEAR renderpass over volume_bin.blur_fb_mv (same R8 MV
 	// shape as the blur intermediates; loadOp is not part of render-pass
@@ -669,7 +632,7 @@ private:
 	blur_target volume_depth; // R16 furthest-D canvas (320, 2 layers)
 	blur_target vr_depth; // R16 nearest-D canvas (depth-res, 2 layers):
 	// object depth for the VR-occlusion compare above. Far (1.0) clear,
-	// MIN blend, cull-nothing (see vr_raster_pipeline).
+	// MIN blend, cull-nothing (see vr_raster_pipeline_mv).
 	blur_target volume_virt; // R16 virtual-depth D canvas (320, 2 layers):
 	// SBS meters->D conversion output, cleared to far, sampled by the
 	// volume compare pass alongside volume_depth. Own MV framebuffer
@@ -742,14 +705,12 @@ private:
 	vk::raii::RenderPass hidden_color_rp{nullptr};
 	vk::raii::Pipeline hidden_sphere_pipe{nullptr};
 	vk::raii::Pipeline hidden_silhouette_pipe{nullptr};
-	// Dedicated layout for the hidden multiview pipes (132B MVP-pair
-	// push range; the shared raster_push layout stays 68B for the
-	// per-eye feather paths).
-	vk::raii::PipelineLayout hidden_mv_layout{nullptr};
+	// (silhouette_mv_layout above, built in the ctor, serves the hidden
+	// pipes too — identical 132B range, one layout for all MV mask pipes).
 	buffer_allocation hidden_sphere_verts_;
 	uint32_t hidden_sphere_vert_count = 0;
 	// (The sphere depth images moved to the dots renderer — P4 shared
-	// field. output_depth_view is declared with output_depth below.)
+	// field. output_depth_array_view is declared with output_depth below.)
 	// Per-swapchain-image multiview framebuffers for the two hidden
 	// passes (color + sphere-depth, layers=2 each); dropped by
 	// reset_targets() with the rest (swapchain recreate = waitIdle'd
@@ -777,19 +738,15 @@ private:
 		// above stay (cutout punch only; raster is multiview now).
 		vk::raii::ImageView view_array{nullptr};
 		vk::raii::Framebuffer framebuffer_mv{nullptr};
-		// Depth-tested raster companions for tier-0 direct raster (color +
-		// depth, under depth_renderpass): same color views as above plus a
-		// cached submitted-size depth view (see output_depth below). Built
-		// lazily on first reversed use (has_depth); positive-only targets
-		// stay lean.
-		std::array<vk::raii::Framebuffer, 2> depth_framebuffers;
-		// Multiview tier-0 raster depth companion: one layers=2 color+depth FB.
+		// Depth-tested raster companion for tier-0 direct raster (color +
+		// depth): one layers=2 color+depth FB under depth_renderpass_mv,
+		// built lazily on first reversed use (has_depth); positive-only
+		// targets stay lean.
 		vk::raii::Framebuffer depth_framebuffer_mv{nullptr};
 		bool has_depth = false;
 		frame_targets(vk::Extent2D extent_,
 		              std::array<vk::raii::ImageView, 2> views_,
 		              std::array<vk::raii::Framebuffer, 2> framebuffers_,
-		              std::array<vk::raii::Framebuffer, 2> depth_framebuffers_,
 		              bool has_depth_,
 		              vk::raii::ImageView view_array_ = nullptr,
 		              vk::raii::Framebuffer framebuffer_mv_ = nullptr) :
@@ -798,27 +755,24 @@ private:
 		        framebuffers(std::move(framebuffers_)),
 		        view_array(std::move(view_array_)),
 		        framebuffer_mv(std::move(framebuffer_mv_)),
-		        depth_framebuffers(std::move(depth_framebuffers_)),
 		        has_depth(has_depth_)
 		{
 		}
 	};
 	std::unordered_map<VkImage, frame_targets> targets;
-	// Submitted-size D16 depth views for the tier-0 depth raster above:
+	// Submitted-size D16 depth array view for the tier-0 MV depth raster:
 	// cached by extent (swapchain-independent, survives reset_targets();
 	// only a handful of quantized submit sizes ever exist).
 	struct depth_entry
 	{
 		vk::raii::Image image{nullptr};
 		vk::raii::DeviceMemory memory{nullptr};
-		std::vector<vk::raii::ImageView> views;
 		vk::raii::ImageView view_array{nullptr};
 	};
 	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
-	vk::ImageView output_depth_view(vk::Extent2D extent, int eye);
 	vk::ImageView output_depth_array_view(vk::Extent2D extent);
-	// D16 depth image + per-eye views at an extent (depth-test-only
-	// raster: never sampled, device-local). Backs output_depth above and
-	// the intermediate raster companions in ensure_targets.
+	// D16 depth image + array view at an extent (depth-test-only raster:
+	// never sampled, device-local). Backs output_depth above and the
+	// intermediate raster companions in ensure_targets.
 	depth_entry make_depth_entry(vk::Extent2D extent);
 };

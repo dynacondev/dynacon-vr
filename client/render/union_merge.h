@@ -75,18 +75,13 @@ public:
 	// One merge input: a just-recorded contributor image plus its
 	// multiview array view (both layers, BORROWED from the owning
 	// feather renderer — same-frame use only, never cached here).
-	// general_layout: true for feather/debug images (end
-	// COLOR_ATTACHMENT_OPTIMAL: availability barrier only, sampled
-	// as OPTIMAL so the same-frame cutout LOAD re-begin still
-	// matches), false for the hidden image (ends
-	// COLOR_ATTACHMENT_OPTIMAL: transitioned to SHADER_READ_ONLY
-	// for the merge; its next record re-begins UNDEFINED+CLEAR, so
-	// no transition back is needed).
+	// All contributors end COLOR_ATTACHMENT_OPTIMAL and transition to
+	// SHADER_READ_ONLY for the merge; every next record re-begins
+	// UNDEFINED+CLEAR, so no transition back is needed.
 	struct input
 	{
 		vk::Image image;
 		vk::ImageView view_array;
-		bool general_layout = true;
 	};
 
 	explicit union_merge_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);

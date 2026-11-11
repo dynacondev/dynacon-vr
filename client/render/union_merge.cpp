@@ -337,12 +337,9 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	}
 
 	// Write→read hazard (same command buffer): every input was just
-	// written as a color attachment. Feather/debug/hidden images all
-	// end OPTIMAL now. Feather/debug stay OPTIMAL here (availability
-	// only — sampled as OPTIMAL so the same-frame cutout LOAD
-	// re-begin still matches); the hidden image transitions to
-	// SHADER_READ (its next record re-begins UNDEFINED+CLEAR, so no
-	// way back; feather likewise re-begins UNDEFINED next frame).
+	// written as a color attachment and ends OPTIMAL. Transition to
+	// SHADER_READ for the merge; every next record re-begins
+	// UNDEFINED+CLEAR, so no transition back is needed.
 	std::vector<vk::ImageMemoryBarrier> barriers;
 	barriers.reserve(inputs.size());
 	for (auto & in: inputs)
@@ -351,7 +348,7 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
 		        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-		        .newLayout = in.general_layout ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eShaderReadOnlyOptimal,
+		        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		        .image = in.image,
@@ -384,7 +381,7 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		infos[i] = vk::DescriptorImageInfo{
 		        .sampler = *sampler,
 		        .imageView = in.view_array,
-		        .imageLayout = in.general_layout ? vk::ImageLayout::eColorAttachmentOptimal : vk::ImageLayout::eShaderReadOnlyOptimal,
+		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		};
 	}
 	std::vector<vk::WriteDescriptorSet> writes;

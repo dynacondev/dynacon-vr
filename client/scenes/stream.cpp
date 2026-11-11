@@ -3149,7 +3149,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// False refuses the WHOLE merge below (the merge drops
 							// this frame, loudly — never submit a partial union:
 							// skipping coverage under-reveals.
-							auto push_merge_input = [&](mask_group & g, bool general_layout, std::vector<union_merge_renderer::input> & out) {
+							auto push_merge_input = [&](mask_group & g, std::vector<union_merge_renderer::input> & out) {
 								if (g.image_index < 0 or (size_t)g.image_index >= g.swapchain.image_count())
 								{
 									// Defensive only (active groups always hold an
@@ -3168,7 +3168,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								out.push_back(union_merge_renderer::input{
 								        .image = img,
 								        .view_array = g.renderer->submitted_view_array(img),
-								        .general_layout = general_layout,
 								});
 								return true;
 							};
@@ -3181,7 +3180,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							if (hidden_group.active)
 							{
 								++merge_b_count;
-								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(hidden_group, false, merge_inputs))
+								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(hidden_group, merge_inputs))
 									merge_ok = false;
 							}
 							for (auto & [feather_key, g]: mask_groups)
@@ -3196,13 +3195,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								// dropped with an error below, never a fallback path —
 								// >8 contributors under-reveals by construction, so the
 								// error must stay visible.
-								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(g, false, merge_inputs))
+								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(g, merge_inputs))
 									merge_ok = false;
 							}
 							if (merge_ok and debug_group.active)
 							{
 								++merge_b_count;
-								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(debug_group, false, merge_inputs))
+								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(debug_group, merge_inputs))
 									merge_ok = false;
 							}
 							if (merge_b_count > union_merge_renderer::max_inputs)
