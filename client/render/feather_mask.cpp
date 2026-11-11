@@ -1214,7 +1214,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		vr_raster_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), vr_raster_info);
 		// Multiview twins: same R16 CLEAR/STORE/OPTIMAL attachment plus
-		// viewMask=both, volume_mv.vert (MVP pair) + same fragment.
+		// viewMask=both, volume_mv.vert (MVP pair) + matching fragment
+		// twin (push blocks must agree byte-for-byte — mask_mv precedent).
 		if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(volume_mv_push))
 			throw std::runtime_error("feather volume multiview needs 136B push constants");
 		{
@@ -1230,6 +1231,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 			volume_raster_layout_mv = vk::raii::PipelineLayout(device, mv_layout_info);
 		}
 		auto volume_mv_vert = load_shader(device, "volume_mv.vert");
+		auto volume_mv_frag = load_shader(device, "volume_raster_mv.frag");
 		vk::PipelineShaderStageCreateInfo volume_mv_stages[2] = {
 		        {
 		                .stage = vk::ShaderStageFlagBits::eVertex,
@@ -1238,7 +1240,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        },
 		        {
 		                .stage = vk::ShaderStageFlagBits::eFragment,
-		                .module = **volume_stages[1].module,
+		                .module = **volume_mv_frag,
 		                .pName = "main",
 		        },
 		};
