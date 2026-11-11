@@ -568,6 +568,20 @@ private:
 	vk::raii::RenderPass volume_raster_renderpass{nullptr};
 	vk::raii::PipelineLayout volume_raster_layout{nullptr};
 	vk::raii::Pipeline volume_raster_pipeline{nullptr};
+	// Multiview twins of the volume/VR raster (volume_mv.vert, 136B
+	// MVP-pair push): one draw broadcasts to both layers. Same
+	// CLEAR/STORE/OPTIMAL R16 attachments plus viewMask=both; dedicated
+	// layout so the 72B per-eye layout stays untouched.
+	struct volume_mv_push
+	{
+		std::array<glm::mat4, 2> mvp;
+		float near_z = 0.1f;
+		float far_z = 10.f;
+	};
+	vk::raii::RenderPass volume_raster_renderpass_mv{nullptr};
+	vk::raii::PipelineLayout volume_raster_layout_mv{nullptr};
+	vk::raii::Pipeline volume_raster_pipeline_mv{nullptr};
+	vk::raii::Pipeline vr_raster_pipeline_mv{nullptr};
 	// VR-occlusion object raster: same shaders (volume.vert +
 	// volume_raster.frag encode eye depth as sensor-compatible D) and
 	// push layout as the volume raster above, but nearest-point state:

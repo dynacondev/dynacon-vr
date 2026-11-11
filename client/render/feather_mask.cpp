@@ -1055,6 +1055,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// (The VR-occlusion chain for 3d-passthrough windows is separate and
 	// high-res: see ensure_vr_targets.)
 	static_assert(sizeof(volume_push) == 72);
+	static_assert(sizeof(volume_mv_push) == 136);
 	static_assert(sizeof(volume_homography) == 128);
 	{
 		auto volume_vert = load_shader(device, "volume.vert");
@@ -1212,6 +1213,77 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .renderPass = *volume_raster_renderpass,
 		};
 		vr_raster_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), vr_raster_info);
+		// Multiview twins: same R16 CLEAR/STORE/OPTIMAL attachment plus
+		// viewMask=both, volume_mv.vert (MVP pair) + same fragment.
+		if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(volume_mv_push))
+			throw std::runtime_error("feather volume multiview needs 136B push constants");
+		{
+			vk::PushConstantRange mv_push_range{
+			        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
+			        .offset = 0,
+			        .size = sizeof(volume_mv_push),
+			};
+			vk::PipelineLayoutCreateInfo mv_layout_info{
+			        .pushConstantRangeCount = 1,
+			        .pPushConstantRanges = &mv_push_range,
+			};
+			volume_raster_layout_mv = vk::raii::PipelineLayout(device, mv_layout_info);
+		}
+		auto volume_mv_vert = load_shader(device, "volume_mv.vert");
+		vk::PipelineShaderStageCreateInfo volume_mv_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **volume_mv_vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **volume_stages[1].module,
+		                .pName = "main",
+		        },
+		};
+		uint32_t vol_mv_mask = 0b11, vol_mv_corr = 0b11;
+		vk::RenderPassMultiviewCreateInfo vol_mv_info{
+		        .subpassCount = 1,
+		        .pViewMasks = &vol_mv_mask,
+		        .correlationMaskCount = 1,
+		        .pCorrelationMasks = &vol_mv_corr,
+		};
+		volume_raster_renderpass_mv = vk::raii::RenderPass(device, vk::RenderPassCreateInfo{
+		        .pNext = &vol_mv_info,
+		        .attachmentCount = 1,
+		        .pAttachments = &volume_raster_attachment,
+		        .subpassCount = 1,
+		        .pSubpasses = &volume_raster_subpass,
+		});
+		vk::GraphicsPipelineCreateInfo volume_mv_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = volume_mv_stages,
+		        .pVertexInputState = &volume_vertex_input,
+		        .pInputAssemblyState = &volume_input_assembly,
+		        .pViewportState = &volume_viewport_state,
+		        .pRasterizationState = &volume_rasterization,
+		        .pMultisampleState = &volume_multisample,
+		        .pColorBlendState = &volume_blend,
+		        .pDynamicState = &volume_dynamic,
+		        .layout = *volume_raster_layout_mv,
+		        .renderPass = *volume_raster_renderpass_mv,
+		};
+		volume_raster_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), volume_mv_pipeline_info);
+		vk::GraphicsPipelineCreateInfo vr_mv_raster_info{
+		        .stageCount = 2,
+		        .pStages = volume_mv_stages,
+		        .pVertexInputState = &volume_vertex_input,
+		        .pInputAssemblyState = &volume_input_assembly,
+		        .pViewportState = &volume_viewport_state,
+		        .pRasterizationState = &vr_rasterization,
+		        .pMultisampleState = &volume_multisample,
+		        .pColorBlendState = &vr_blend,
+		        .pDynamicState = &volume_dynamic,
+		        .layout = *volume_raster_layout_mv,
+		        .renderPass = *volume_raster_renderpass_mv,
+		};
+		vr_raster_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), vr_mv_raster_info);
 	}
 	// Compare: fullscreen _mv binary flatten (sensor D16 + volume R16).
 	// Renders into volume_bin.blur_fb_mv under the shared R8 MV pass
@@ -3043,6 +3115,18 @@ void feather_mask_renderer::ensure_volume_targets()
 	                        .layerCount = 2,
 	                },
 	        });
+	{
+		vk::ImageView raw_mv = *volume_depth.view_array;
+		volume_depth.raster_fb_mv = vk::raii::Framebuffer(device,
+		        vk::FramebufferCreateInfo{
+		                .renderPass = *volume_raster_renderpass_mv,
+		                .attachmentCount = 1,
+		                .pAttachments = &raw_mv,
+		                .width = ve.width,
+		                .height = ve.height,
+		                .layers = 2,
+		        });
+	}
 
 	// Virtual-depth D canvas (R16, same 320px 2-layer shape): SBS
 	// meters->D conversion output, cleared to far. Own MV framebuffer
@@ -3227,6 +3311,18 @@ void feather_mask_renderer::ensure_vr_targets(vk::Extent2D eye)
 		vr_depth.raster_fbs.emplace_back(device, fb_info);
 	}
 	vr_depth.view_array = make_array_view(*vr_depth.image, volume_depth_format);
+	{
+		vk::ImageView raw_mv = *vr_depth.view_array;
+		vr_depth.raster_fb_mv = vk::raii::Framebuffer(device,
+		        vk::FramebufferCreateInfo{
+		                .renderPass = *volume_raster_renderpass_mv,
+		                .attachmentCount = 1,
+		                .pAttachments = &raw_mv,
+		                .width = eye.width,
+		                .height = eye.height,
+		                .layers = 2,
+		        });
+	}
 
 	// Virtual-depth D canvas: SBS meters->D conversion output, cleared
 	// to far. Own MV framebuffer (vr_virt_fb_mv) under the shared
@@ -4031,32 +4127,30 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				vk::ClearValue vclear{};
 				const float far1[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 				std::memcpy(vclear.color.float32, far1, sizeof(far1));
-				for (int eye = 0; eye < 2; ++eye)
+				// Single multiview raster (was 2 per-eye begins).
+				vk::RenderPassBeginInfo begin_vr{
+				        .renderPass = *volume_raster_renderpass_mv,
+				        .framebuffer = *vr_depth.raster_fb_mv,
+				        .renderArea = {.offset = {0, 0}, .extent = ve},
+				        .clearValueCount = 1,
+				        .pClearValues = &vclear,
+				};
+				cmd.beginRenderPass(begin_vr, vk::SubpassContents::eInline);
+				set_full_viewport(ve);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *vr_raster_pipeline_mv);
+				for (const auto & d: volume->vr_draws)
 				{
-					vk::RenderPassBeginInfo begin_vr{
-					        .renderPass = *volume_raster_renderpass,
-					        .framebuffer = *vr_depth.raster_fbs[eye],
-					        .renderArea = {.offset = {0, 0}, .extent = ve},
-					        .clearValueCount = 1,
-					        .pClearValues = &vclear,
-					};
-					cmd.beginRenderPass(begin_vr, vk::SubpassContents::eInline);
-					set_full_viewport(ve);
-					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *vr_raster_pipeline);
-					for (const auto & d: volume->vr_draws)
-					{
-						auto mit = meshes.find(d.mesh);
-						if (mit == meshes.end() or mit->second.index_count == 0)
-							continue;
-						cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-						cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-						cmd.pushConstants<volume_push>(*volume_raster_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-						                               volume_push{.mvp = d.mvp[eye], .near_z = volume->near_z, .far_z = volume->far_z});
-						cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-						++n_draws;
-					}
-					cmd.endRenderPass();
+					auto mit = meshes.find(d.mesh);
+					if (mit == meshes.end() or mit->second.index_count == 0)
+						continue;
+					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+					cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+					cmd.pushConstants<volume_mv_push>(*volume_raster_layout_mv, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+					                                  volume_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .near_z = volume->near_z, .far_z = volume->far_z});
+					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+					++n_draws;
 				}
+				cmd.endRenderPass();
 			}
 			make_readable(*vr_depth.image);
 			convert_virt_canvas(vr_virt, vr_virt_fb_mv, ve, vr_virt_done);
@@ -4202,32 +4296,30 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				}
 				vk::ClearValue vclear{};
 				vclear.color.float32.fill(0);
-				for (int eye = 0; eye < 2; ++eye)
+				// Single multiview raster (was 2 per-eye begins).
+				vk::RenderPassBeginInfo begin_vol{
+				        .renderPass = *volume_raster_renderpass_mv,
+				        .framebuffer = *volume_depth.raster_fb_mv,
+				        .renderArea = {.offset = {0, 0}, .extent = ve},
+				        .clearValueCount = 1,
+				        .pClearValues = &vclear,
+				};
+				cmd.beginRenderPass(begin_vol, vk::SubpassContents::eInline);
+				set_full_viewport(ve);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *volume_raster_pipeline_mv);
+				for (const auto & d: volume->draws)
 				{
-					vk::RenderPassBeginInfo begin_vol{
-					        .renderPass = *volume_raster_renderpass,
-					        .framebuffer = *volume_depth.raster_fbs[eye],
-					        .renderArea = {.offset = {0, 0}, .extent = ve},
-					        .clearValueCount = 1,
-					        .pClearValues = &vclear,
-					};
-					cmd.beginRenderPass(begin_vol, vk::SubpassContents::eInline);
-					set_full_viewport(ve);
-					cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *volume_raster_pipeline);
-					for (const auto & d: volume->draws)
-					{
-						auto mit = meshes.find(d.mesh);
-						if (mit == meshes.end() or mit->second.index_count == 0)
-							continue;
-						cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-						cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-						cmd.pushConstants<volume_push>(*volume_raster_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-						                               volume_push{.mvp = d.mvp[eye], .near_z = volume->near_z, .far_z = volume->far_z});
-						cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-						++n_draws;
-					}
-					cmd.endRenderPass();
+					auto mit = meshes.find(d.mesh);
+					if (mit == meshes.end() or mit->second.index_count == 0)
+						continue;
+					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+					cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+					cmd.pushConstants<volume_mv_push>(*volume_raster_layout_mv, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+					                                  volume_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .near_z = volume->near_z, .far_z = volume->far_z});
+					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+					++n_draws;
 				}
+				cmd.endRenderPass();
 			}
 			volume_stamp(1);
 			make_readable(*volume_depth.image);
