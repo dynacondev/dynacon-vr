@@ -3764,16 +3764,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// objects for one raster site. The caller engages depth whenever a
 	// reversed draw exists; positive-only calls stay on the legacy triple
 	// bit-identically (same passes, pipes and clears as before).
-	struct raster_site
-	{
-		vk::Framebuffer color_fb;
-		vk::Framebuffer depth_fb;
-		vk::Pipeline pipe;
-		vk::Pipeline depth_pipe;
-		vk::Pipeline rev_pipe;
-		vk::RenderPass rp;
-		vk::RenderPass depth_rp;
-	};
 	// Multiview raster target bundle: one layers=2 framebuffer per path.
 	struct raster_site_mv
 	{
@@ -3784,51 +3774,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		vk::Pipeline rev_pipe;
 		vk::RenderPass rp;
 		vk::RenderPass depth_rp;
-	};
-	auto raster_silhouette = [&](const raster_site & site, vk::Extent2D e, int eye, bool use_depth) {
-		std::array<vk::ClearValue, 2> clears{};
-		clears[0].color.float32.fill(0);
-		// 0 = far plane under the reversed-Z projection (near = 1).
-		clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
-		vk::RenderPassBeginInfo begin_info{
-		        .renderPass = use_depth ? site.depth_rp : site.rp,
-		        .framebuffer = use_depth ? site.depth_fb : site.color_fb,
-		        .renderArea = {.offset = {0, 0}, .extent = e},
-		        .clearValueCount = use_depth ? 2u : 1u,
-		        .pClearValues = clears.data(),
-		};
-		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		set_full_viewport(e);
-		// Two polarity passes in depth mode (positives depth-write first,
-		// reversed MIN-cuts second: at most one pipe rebind, no allocation),
-		// one legacy pass otherwise. Legacy mode never sees reversed draws
-		// (the caller engages depth whenever one exists); skipped
-		// defensively so a polarity can never masquerade as a fill.
-		for (int pass = 0; pass < (use_depth ? 2 : 1); ++pass)
-		{
-			bool rev_pass = use_depth && pass == 1;
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (use_depth ? site.depth_pipe : site.pipe));
-			for (const auto & d: draws)
-			{
-				if (d.reverse != rev_pass)
-					continue;
-				auto mit = meshes.find(d.mesh);
-				if (mit == meshes.end() or mit->second.index_count == 0)
-					continue;
-				cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-				cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-				// Reversed draws push the hole strength (1 - fade): fresh
-				// placements subtract nothing (no reality blob where no
-				// window exists), fully faded cut fully. The blur chain is
-				// linear, so the ramp feathers like any fade.
-				float v = d.reverse ? 1.f - d.opacity : d.opacity;
-				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-				                               raster_push{.mvp = d.mvp[eye], .opacity = v});
-				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-				++n_draws;
-			}
-		}
-		cmd.endRenderPass();
 	};
 	// Multiview silhouette raster: one draw broadcasts to both layers via
 	// mask_mv.vert (gl_ViewIndex selects the MVP). Same polarity passes as
