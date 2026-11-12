@@ -34,7 +34,6 @@
 #include <IconsFontAwesome7.h>
 #include <chrono>
 #include <cmath>
-#include <imspinner.h>
 #include <glm/ext.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/gtc/matrix_access.hpp>

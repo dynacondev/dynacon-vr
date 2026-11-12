@@ -67,7 +67,7 @@ private:
 	std::mt19937 rng_;
 	bool was_active_ = false;
 	XrTime activated_t0_ = 0; // rising-edge time: plane i spawns at + i * spawn_interval
-	// per-activation livery bag: one of each paint, orange first, shuffled.
+	// per-activation livery bag: one of each paint (orange included), shuffled.
 	// Guarantees variety (no all-session hidden colors) with orange always
 	// present; reshuffled on every re-show.
 	std::vector<size_t> livery_bag_;
