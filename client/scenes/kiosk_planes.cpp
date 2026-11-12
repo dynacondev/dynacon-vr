@@ -60,20 +60,6 @@ constexpr float rate_smooth = 3.0f;  // pitch/yaw target blending rate (1/s); ro
 constexpr float bank_coord_gain = 0.6f; // coordinated bank per yaw rate
 constexpr float bank_max = 1.0f;     // bank clamp (radians)
 constexpr float bank_relax = 5.0f;    // bank return rate toward coordinated value (1/s): tracks, not chases
-// formation flying: leader flies solo maneuvers, the rest pursue slots
-constexpr double form_gap_lo = 6.0; // next formation starts 6-10s after activation...
-constexpr double form_gap_hi = 10.0;
-constexpr double form_cool_lo = 15.0; // ...and 15-35s after each breakup
-constexpr double form_cool_hi = 35.0;
-constexpr double form_dur_lo = 3.0; // formation holds 3-10s
-constexpr double form_dur_hi = 10.0;
-constexpr float form_gain = 5.0f;    // slot-pursuit steering gain (hotter than the leash)
-constexpr float form_max_rate = 2.2f; // slot-pursuit rate cap (rad/s)
-constexpr float form_catchup = 1.2f; // speed boost per meter of along-track error
-constexpr float form_speed_max = 1.0f; // catch-up cap (m/s)
-constexpr float form_lock_radius = 0.6f; // inside this, match the leader's velocity (rock-solid hold)
-constexpr float leader_holdback = 0.6f; // leader speed factor until the formation is joined
-constexpr float join_radius = 0.6f; // a member counts as joined inside this distance
 // Fixed det=+1 basis flips the apparent bank sense vs the old mirrored
 // frame: positive bank about +dir lifts the inside wing (leans OUT), so
 // the coordinated default is -1. Flip only if planes lean out of turns.
@@ -99,23 +85,6 @@ constexpr size_t trail_indices_per_plane = (trail_points - 1) * 4 * 6;
 constexpr size_t trail_max_verts = size_t(plane_count) * trail_verts_per_plane;
 constexpr size_t trail_max_indices = size_t(plane_count) * trail_indices_per_plane;
 constexpr size_t trail_vert_bytes = trail_max_verts * sizeof(trail_vertex);
-
-// formation slot offsets in the leader frame (right, up, fwd), meters;
-// slot 0 is the leader (origin). Echelon sides are coined at pick time.
-static const std::vector<std::vector<glm::vec3>> formation_shapes = {
-        {{0, 0, 0}, {-0.35f, 0, -0.30f}}, // pair echelon left
-        {{0, 0, 0}, {0.35f, 0, -0.30f}}, // pair echelon right
-        {{0, 0, 0}, {0, 0.05f, -0.45f}}, // pair line astern
-        {{0, 0, 0}, {-0.35f, 0, -0.30f}, {0.35f, 0, -0.30f}}, // vic
-        {{0, 0, 0}, {-0.35f, 0, -0.30f}, {-0.70f, 0, -0.60f}}, // echelon3 left
-        {{0, 0, 0}, {0.35f, 0, -0.30f}, {0.70f, 0, -0.60f}}, // echelon3 right
-        {{0, 0, 0}, {0, 0.05f, -0.45f}, {0, 0.10f, -0.90f}}, // astern3
-        {{0, 0, 0}, {-0.35f, 0, -0.30f}, {0.35f, 0, -0.30f}, {0, 0.10f, -0.65f}}, // diamond
-        {{0, 0, 0}, {-0.35f, 0, -0.30f}, {0.40f, 0, -0.30f}, {0.75f, 0, -0.60f}}, // finger-four
-        {{0, 0, 0}, {-0.35f, 0, -0.30f}, {-0.70f, 0, -0.60f}, {-1.05f, 0, -0.90f}}, // echelon4 left
-        {{0, 0, 0}, {0.35f, 0, -0.30f}, {0.70f, 0, -0.60f}, {1.05f, 0, -0.90f}}, // echelon4 right
-        {{0, 0, 0}, {0, 0.05f, -0.45f}, {0, 0.10f, -0.90f}, {0, 0.15f, -1.35f}}, // astern4
-};
 
 double smoothstep(double e0, double e1, double x)
 {
@@ -375,21 +344,16 @@ void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 	// matching lateral axis (up x dir); rebuilt on the first frame anyway
 	f.right = glm::vec3(std::cos(yaw0), 0.f, -std::sin(yaw0));
 	f.speed = std::uniform_real_distribution<float>(cruise_lo, cruise_hi)(rng_);
-	f.eff_speed = f.speed;
 	f.bank = 0.f;
 	f.pitch_rate = f.yaw_rate = f.roll_rate = 0.f;
 	f.pitch_tgt = f.yaw_tgt = f.roll_tgt = 0.f;
 	f.man_t = 0.;
 	f.prev_now = 0;
 	// fresh flight state below; clear any stale trail so a re-show never
-	// streaks across the scene from the old position. Formation fields are
-	// reset on the rising edge (no spawn can occur mid-formation), cleared
-	// here too in case that ordering ever changes.
+	// streaks across the scene from the old position
 	f.trail.clear();
 	f.trail_t.clear();
 	f.last_sample_t = 0;
-	f.formation_slot = -1;
-	f.form_w = 0.f;
 	// fresh livery every spawn: construction-time draws could hide a color
 	// all session. The spawn is invisible (pre-fade), so the swap never pops.
 	// Logcat records the pick for on-device color forensics.
@@ -421,74 +385,6 @@ void kiosk_planes::apply_livery(plane & f)
 	// trails follow the livery body color
 	f.trail_tint = body_tint;
 	spdlog::info("kiosk_planes: spawn livery {}", p.name);
-}
-
-void kiosk_planes::start_formation(XrTime now)
-{
-	// gather the spawned fleet; need at least a pair
-	std::vector<size_t> candidates;
-	for (size_t i = 0; i < planes_.size(); ++i)
-	{
-		if (planes_[i].spawned)
-			candidates.push_back(i);
-	}
-	if (candidates.size() < 2)
-	{
-		next_formation_t_ = now + XrDuration(5. * 1e9); // retry soon
-		return;
-	}
-	std::shuffle(candidates.begin(), candidates.end(), rng_);
-	size_t count = std::uniform_int_distribution<size_t>(2, candidates.size())(rng_);
-	// shapes valid for this headcount only
-	std::vector<int> shapes;
-	for (size_t s = 0; s < formation_shapes.size(); ++s)
-	{
-		if (formation_shapes[s].size() == count)
-			shapes.push_back(int(s));
-	}
-	if (shapes.empty())
-	{
-		next_formation_t_ = now + XrDuration(5. * 1e9);
-		return;
-	}
-	formation_shape_ = shapes[std::uniform_int_distribution<size_t>(0, shapes.size() - 1)(rng_)];
-	formation_leader_ = int(candidates[0]);
-	for (size_t i = 0; i < planes_.size(); ++i)
-		planes_[i].formation_slot = -1;
-	planes_[formation_leader_].formation_slot = 0;
-	for (size_t k = 1; k < count; ++k)
-	{
-		plane & f = planes_[candidates[k]];
-		f.formation_slot = int(k);
-		// slaved: maneuver timers frozen (rates unused while slaved; seeded
-		// from applied pursuit below for release continuity), no relax
-		// fight, no leash. Slot steering slews in via form_w.
-		f.loop_maneuver = false;
-		f.roll_free = false;
-		f.roll_rate = 0.f;
-		f.form_w = 0.f;
-	}
-	formation_active_ = true;
-	formation_end_t_ = now + XrDuration(std::uniform_real_distribution<double>(form_dur_lo, form_dur_hi)(rng_) * 1e9);
-	spdlog::info("kiosk_planes: formation shape {} with {} planes (leader {})", formation_shape_, count, formation_leader_);
-}
-
-void kiosk_planes::release_formation()
-{
-	for (auto & f: planes_)
-	{
-		if (f.formation_slot < 0)
-			continue;
-		// the leader keeps its ongoing solo maneuver; followers get a fresh
-		// enveloped one, smooth by construction
-		if (f.spawned && f.formation_slot != 0)
-			pick_maneuver(f);
-		f.formation_slot = -1;
-	}
-	formation_active_ = false;
-	formation_leader_ = -1;
-	formation_shape_ = -1;
-	next_formation_t_ = 0; // rearmed by the caller with now
 }
 
 void kiosk_planes::pick_maneuver(plane & f)
@@ -566,49 +462,12 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			f.spawned = false;
 			f.spawn_t0 = 0;
 			f.bias_w = 1.f;
-			f.formation_slot = -1;
 		}
 		livery_bag_ = {2, 1, 3, 0};
 		std::shuffle(livery_bag_.begin(), livery_bag_.end(), rng_);
 		livery_next_ = 0;
-		formation_active_ = false;
-		formation_leader_ = -1;
-		formation_shape_ = -1;
-		formation_locked_ = false;
-		next_formation_t_ = now + XrDuration(std::uniform_real_distribution<double>(form_gap_lo, form_gap_hi)(rng_) * 1e9);
 	}
 	was_active_ = active;
-
-	// formation scheduler: breakup on schedule, start when due
-	if (active && formation_active_ && now >= formation_end_t_)
-	{
-		release_formation();
-		next_formation_t_ = now + XrDuration(std::uniform_real_distribution<double>(form_cool_lo, form_cool_hi)(rng_) * 1e9);
-	}
-	if (active && !formation_active_ && now >= next_formation_t_)
-		start_formation(now);
-
-	// formation join state, computed before the per-plane loop so the
-	// leader can hold back until the wingmen are actually in their slots
-	formation_locked_ = false;
-	if (active && formation_active_)
-	{
-		const plane & lead = planes_[size_t(formation_leader_)];
-		glm::vec3 lup = glm::cross(lead.dir, lead.right);
-		formation_locked_ = true;
-		for (const auto & f: planes_)
-		{
-			if (f.formation_slot <= 0 || not f.spawned)
-				continue;
-			glm::vec3 off = formation_shapes[size_t(formation_shape_)][size_t(f.formation_slot)];
-			glm::vec3 want = lead.pos + lead.right * off.x + lup * off.y + lead.dir * off.z;
-			if (glm::length(want - f.pos) > join_radius)
-			{
-				formation_locked_ = false;
-				break;
-			}
-		}
-	}
 
 	for (size_t slot = 0; slot < planes_.size(); ++slot)
 	{
@@ -661,63 +520,52 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		if (dt <= 0.)
 			continue;
 
-		const bool slaved = formation_active_ && f.formation_slot > 0;
-		if (not slaved)
+		f.man_t -= dt;
+		f.man_age += dt;
+		// figures terminate on completed angle (2pi minus a breath — the
+		// residual at threshold is single-digit degrees, then the next
+		// figure ramps in) or once the exit ramp has decayed the rate to
+		// ~zero; the backstop only catches a figure that somehow stalls.
+		// Time-based maneuvers terminate on the clock.
+		bool figure = f.loop_maneuver || f.roll_free;
+		bool done = f.man_t <= 0.;
+		if (not done && figure)
 		{
-			f.man_t -= dt;
-			f.man_age += dt;
-			// figures terminate on completed angle (2pi minus a breath — the
-			// residual at threshold is single-digit degrees, then the next
-			// figure ramps in) or once the exit ramp has decayed the rate to
-			// ~zero; the backstop only catches a figure that somehow stalls.
-			// Time-based maneuvers terminate on the clock.
-			bool figure = f.loop_maneuver || f.roll_free;
-			bool done = f.man_t <= 0.;
-			if (not done && figure)
-			{
-				double rate_now = f.loop_maneuver ? std::abs(f.pitch_rate) : std::abs(f.roll_rate);
-				double rate_tgt = f.loop_maneuver ? std::abs(f.pitch_tgt) : std::abs(f.roll_tgt);
-				done = f.man_angle >= 2. * std::numbers::pi - 0.2 ||
-				       (f.man_age > f.man_dur && rate_now < 0.08 * rate_tgt);
-			}
-			if (done)
-				pick_maneuver(f);
+			double rate_now = f.loop_maneuver ? std::abs(f.pitch_rate) : std::abs(f.roll_rate);
+			double rate_tgt = f.loop_maneuver ? std::abs(f.pitch_tgt) : std::abs(f.roll_tgt);
+			done = f.man_angle >= 2. * std::numbers::pi - 0.2 ||
+			       (f.man_age > f.man_dur && rate_now < 0.08 * rate_tgt);
+		}
+		if (done)
+			pick_maneuver(f);
 
-			// maneuver envelope: smoothstep in and out of the targets so figures
-			// join through near-zero curvature with continuous derivatives — no
-			// straight-to-curve jump at either end. Ramps clamp to a fraction of
-			// short figures. Figures ramps out by angle (a timed exit would
-			// stall the rate before the 2pi closes); time-based maneuvers ramp
-			// out by the clock. The bias stays outside the envelope (smooth).
-			double ramp = std::min(0.7, 0.35 * f.man_dur);
-			float env_in = float(smoothstep(0., ramp, f.man_age));
-			float env_out;
-			double nominal_rate = 0.;
-			if (f.loop_maneuver)
-				nominal_rate = std::abs(f.pitch_tgt);
-			else if (f.roll_free)
-				nominal_rate = std::abs(f.roll_tgt);
-			if (nominal_rate > 0.)
-				env_out = 1.f - float(smoothstep(2. * std::numbers::pi - nominal_rate * ramp, 2. * std::numbers::pi, f.man_angle));
-			else
-				env_out = 1.f - float(smoothstep(f.man_dur - ramp, f.man_dur, f.man_age));
-			float env = env_in * env_out;
-			const float blend = std::min(1.f, float(dt * rate_smooth));
-			f.pitch_rate += (f.pitch_tgt * env - f.pitch_rate) * blend;
-			f.yaw_rate += (f.yaw_tgt * env - f.yaw_rate) * blend;
-			f.roll_rate = f.roll_tgt * env; // visual only: envelope spins rolls up/down, no snap
-			if (f.loop_maneuver)
-				f.man_angle += f.pitch_rate * float(dt);
-			else if (f.roll_free)
-				f.man_angle += std::abs(f.roll_rate) * float(dt);
-		}
+		// maneuver envelope: smoothstep in and out of the targets so figures
+		// join through near-zero curvature with continuous derivatives — no
+		// straight-to-curve jump at either end. Ramps clamp to a fraction of
+		// short figures. Figures ramps out by angle (a timed exit would
+		// stall the rate before the 2pi closes); time-based maneuvers ramp
+		// out by the clock. The bias stays outside the envelope (smooth).
+		double ramp = std::min(0.7, 0.35 * f.man_dur);
+		float env_in = float(smoothstep(0., ramp, f.man_age));
+		float env_out;
+		double nominal_rate = 0.;
+		if (f.loop_maneuver)
+			nominal_rate = std::abs(f.pitch_tgt);
+		else if (f.roll_free)
+			nominal_rate = std::abs(f.roll_tgt);
+		if (nominal_rate > 0.)
+			env_out = 1.f - float(smoothstep(2. * std::numbers::pi - nominal_rate * ramp, 2. * std::numbers::pi, f.man_angle));
 		else
-		{
-			// slaved follower: maneuver timers frozen, slot steering slewed
-			// in instead. Rates are set directly below (capped), eased by
-			// form_w — the join transient reads as a deliberate rejoin.
-			f.form_w += (1.f - f.form_w) * std::min(1.f, float(dt * 2.5f));
-		}
+			env_out = 1.f - float(smoothstep(f.man_dur - ramp, f.man_dur, f.man_age));
+		float env = env_in * env_out;
+		const float blend = std::min(1.f, float(dt * rate_smooth));
+		f.pitch_rate += (f.pitch_tgt * env - f.pitch_rate) * blend;
+		f.yaw_rate += (f.yaw_tgt * env - f.yaw_rate) * blend;
+		f.roll_rate = f.roll_tgt * env; // visual only: envelope spins rolls up/down, no snap
+		if (f.loop_maneuver)
+			f.man_angle += f.pitch_rate * float(dt);
+		else if (f.roll_free)
+			f.man_angle += std::abs(f.roll_rate) * float(dt);
 
 		// Flight frame, rebuilt every frame from the current dir: right =
 		// up×dir throughout (the intuitive dir×up order mirrors the
@@ -740,69 +588,29 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		}
 		glm::vec3 u = glm::cross(f.dir, r);
 
-		float yaw = 0.f, pitch = 0.f;
-		glm::vec3 to_slot{0.f};
-		if (not slaved)
+		// moth-to-light: steer toward the live anchor, stronger the further
+		// past comfort; a tendency, never a wall. Fully stood down mid-loop
+		// (planar figures close exactly), and slewed everywhere else: the
+		// gate ramps over ~0.25s so loop boundaries never step the rate.
+		float bias_gate = f.loop_maneuver ? 0.f : 1.f;
+		f.bias_w += (bias_gate - f.bias_w) * std::min(1.f, float(dt * 4.0));
+		float yaw_bias = 0.f, pitch_bias = 0.f;
+		glm::vec3 to_anchor = anchor_pos - f.pos;
+		float dist = glm::length(to_anchor);
+		if (dist > comfort_r && dist > 1e-4f)
 		{
-			// moth-to-light: steer toward the live anchor, stronger the further
-			// past comfort; a tendency, never a wall. Fully stood down mid-loop
-			// (planar figures close exactly), and slewed everywhere else: the
-			// gate ramps over ~0.25s so loop boundaries never step the rate.
-			float bias_gate = f.loop_maneuver ? 0.f : 1.f;
-			f.bias_w += (bias_gate - f.bias_w) * std::min(1.f, float(dt * 4.0));
-			float yaw_bias = 0.f, pitch_bias = 0.f;
-			glm::vec3 to_anchor = anchor_pos - f.pos;
-			float dist = glm::length(to_anchor);
-			if (dist > comfort_r && dist > 1e-4f)
-			{
-				glm::vec3 want = to_anchor / dist;
-				glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
-				float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
-				yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w * f.bias_w;
-				pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w * f.bias_w;
-			}
-			yaw = f.yaw_rate + yaw_bias;
-			pitch = f.pitch_rate + pitch_bias;
-			// model planes don't rocket: cap climb/dive authority everywhere
-			// except loops, which need the full pitch rate for the figure.
-			// Followers are exempt too: the slot may demand a steep
-			// intercept, and the attitude clamp below still bounds the path.
-			if (not f.loop_maneuver && not slaved)
-				pitch = std::clamp(pitch, -pitch_max_rate, pitch_max_rate);
+			glm::vec3 want = to_anchor / dist;
+			glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
+			float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
+			yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w * f.bias_w;
+			pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w * f.bias_w;
 		}
-		else
-		{
-			// slot pursuit in the leader frame: no leash (the slot may sit
-			// outside it) and no maneuver targets. Steering is direct and
-			// capped, eased in by form_w, so the join reads as a rejoin.
-			// Close in, blend from pursuit to leader-velocity matching: that
-			// kills relative drift and the formation holds rock-solid
-			// instead of orbiting the slot.
-			const plane & lead = planes_[size_t(formation_leader_)];
-			glm::vec3 lup = glm::cross(lead.dir, lead.right);
-			glm::vec3 off = formation_shapes[size_t(formation_shape_)][size_t(f.formation_slot)];
-			glm::vec3 want = lead.pos + lead.right * off.x + lup * off.y + lead.dir * off.z;
-			to_slot = want - f.pos;
-			float pdist = glm::length(to_slot);
-			if (pdist > 1e-4f)
-			{
-				glm::vec3 corr = to_slot - f.dir * glm::dot(to_slot, f.dir);
-				float lock = 1.f - std::min(1.f, pdist / form_lock_radius);
-				float yp = form_gain * glm::dot(corr, r);
-				float pp = form_gain * glm::dot(corr, u);
-				glm::vec3 corr_a = lead.dir - f.dir * glm::dot(lead.dir, f.dir);
-				float ya = form_gain * glm::dot(corr_a, r);
-				float pa = form_gain * glm::dot(corr_a, u);
-				float ym = yp + (ya - yp) * lock;
-				float pm = pp + (pa - pp) * lock;
-				yaw = std::clamp(ym, -form_max_rate, form_max_rate) * f.form_w;
-				pitch = std::clamp(pm, -form_max_rate, form_max_rate) * f.form_w;
-			}
-			// seed the frozen solo rates from applied pursuit: release then
-			// resumes from pursuit-consistent rates instead of stale ones
-			f.yaw_rate = yaw;
-			f.pitch_rate = pitch;
-		}
+		float yaw = f.yaw_rate + yaw_bias;
+		float pitch = f.pitch_rate + pitch_bias;
+		// model planes don't rocket: cap climb/dive authority everywhere
+		// except loops, which need the full pitch rate for the figure.
+		if (not f.loop_maneuver)
+			pitch = std::clamp(pitch, -pitch_max_rate, pitch_max_rate);
 
 		f.dir = glm::normalize(f.dir + (r * yaw + u * pitch) * float(dt));
 		if (not f.loop_maneuver)
@@ -821,26 +629,9 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			// Without this the orientation basis below carries shear.
 			f.right = glm::normalize(r - f.dir * glm::dot(r, f.dir));
 		}
-		// speed follows climb angle: slower uphill, faster downhill.
-		// Followers instead match the leader plus a closing term so the
-		// join reads as a rejoin (hurry when behind, check when ahead).
-		float speed;
-		if (not slaved)
-		{
-			speed = std::clamp(f.speed * (1.f - climb_factor * f.dir.y), speed_min, speed_max);
-			// formation leader holds back until the wingmen are in their
-			// slots — otherwise it cruises off while they chase forever
-			if (formation_active_ && f.formation_slot == 0 && not formation_locked_)
-				speed *= leader_holdback;
-		}
-		else
-		{
-			const plane & lead = planes_[size_t(formation_leader_)];
-			float along = glm::dot(to_slot, f.dir);
-			speed = std::clamp(lead.eff_speed + form_catchup * along, speed_min, form_speed_max);
-		}
+		// speed follows climb angle: slower uphill, faster downhill
+		float speed = std::clamp(f.speed * (1.f - climb_factor * f.dir.y), speed_min, speed_max);
 		f.pos += f.dir * speed * float(dt);
-		f.eff_speed = speed;
 
 		// rolls integrate; everything relaxes toward the coordinated bank
 		// for the current yaw rate. Wrap first: a finished roll is 2pi,
