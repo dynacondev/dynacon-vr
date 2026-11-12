@@ -53,6 +53,9 @@ constexpr float rate_smooth = 3.0f;  // maneuver target blending rate (1/s)
 constexpr float bank_coord_gain = 0.6f; // coordinated bank per yaw rate
 constexpr float bank_max = 1.0f;     // bank clamp (radians)
 constexpr float bank_relax = 2.0f;    // bank return rate toward coordinated value (1/s)
+// Mirrored basis flips the apparent bank direction; flip once on device if
+// planes lean out of their turns instead of into them.
+constexpr float bank_sign = 1.f;
 
 double smoothstep(double e0, double e1, double x)
 {
@@ -362,8 +365,8 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			glm::vec3 want = to_anchor / dist;
 			glm::vec3 r = f.right;
 			if (std::abs(f.dir.y) < 0.98f)
-				r = glm::normalize(glm::cross(f.dir, glm::vec3{0.f, 1.f, 0.f}));
-			glm::vec3 u = glm::cross(r, f.dir);
+				r = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
+			glm::vec3 u = glm::cross(f.dir, r);
 			glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
 			float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
 			yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w;
@@ -372,14 +375,17 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		float yaw = f.yaw_rate + yaw_bias;
 		float pitch = f.pitch_rate + pitch_bias;
 
-		// re-orthogonalized lateral axis (loops go vertical; keep the cache
-		// valid without letting it drift)
+		// Flight frame uses right = up×dir throughout. The intuitive dir×up
+		// order mirrors the orientation basis below to det=-1, and quat_cast
+		// of that is garbage (squish/shrink, nose off velocity) — so this
+		// order is load-bearing, not aesthetic. Re-orthogonalized every
+		// valid frame (loops go vertical; the cache only covers those).
 		if (std::abs(f.dir.y) < 0.98f)
 		{
-			f.right = glm::normalize(glm::cross(f.dir, glm::vec3{0.f, 1.f, 0.f}));
+			f.right = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
 			f.right = glm::normalize(f.right - f.dir * glm::dot(f.right, f.dir));
 		}
-		glm::vec3 up0 = glm::cross(f.right, f.dir);
+		glm::vec3 up0 = glm::cross(f.dir, f.right);
 		f.dir = glm::normalize(f.dir + (f.right * yaw + up0 * pitch) * float(dt));
 		f.pos += f.dir * f.speed * float(dt);
 
@@ -392,10 +398,13 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		f.bank += (bank_tgt - f.bank) * std::min(1.f, float(dt * bank_relax));
 
 		node->position = f.pos;
-		// basis verified on device: right=+X, up=+Y, nose=+Z maps onto dir,
-		// so positive bank (with positive yaw) leans into the turn
-		glm::quat orient = glm::quat_cast(glm::mat3(f.right, glm::cross(f.right, f.dir), f.dir));
-		node->orientation = glm::angleAxis(f.bank, f.dir) * orient;
+		// Orientation basis, same convention as the flight frame: columns
+		// (up×dir, dir×right, dir) have det=+1, a valid rotation mapping
+		// local +Z (nose) onto dir. Built from the final dir so the frame
+		// is exactly orthonormal — a stale axis here shears the model.
+		glm::vec3 basis_up = glm::cross(f.dir, f.right);
+		glm::quat orient = glm::quat_cast(glm::mat3(f.right, basis_up, f.dir));
+		node->orientation = glm::angleAxis(bank_sign * f.bank, f.dir) * orient;
 	}
 }
 
