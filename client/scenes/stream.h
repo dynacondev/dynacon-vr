@@ -170,6 +170,9 @@ private:
 	std::optional<input_profile> input;
 	static inline const uint32_t layer_controllers = 1 << 0;
 	static inline const uint32_t layer_rays = 1 << 1;
+	// Engine trails render only in the below-GUI pass so they can never
+	// cover the overlay panels.
+	static inline const uint32_t layer_trails = 1 << 2;
 
 	// Size of the composition layer used for the controllers
 	uint32_t width;

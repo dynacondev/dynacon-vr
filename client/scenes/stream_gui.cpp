@@ -1109,7 +1109,15 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 
 	// model planes parked around the waiting overlay (hidden otherwise)
 	if (kiosk_planes_)
-		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown);
+	{
+		std::optional<glm::vec3> camera;
+		if (not live_views.empty())
+		{
+			const auto & p = live_views[0].pose.position;
+			camera = glm::vec3(p.x, p.y, p.z);
+		}
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown, camera);
+	}
 
 	ImVec2 viewport_size(imgui_ctx->layers()[0].vp_size.x, imgui_ctx->layers()[0].vp_size.y);
 	ImVec2 content_size{viewport_size - ImVec2{tab_width, 0} - margin_around_window * 2};
@@ -1491,7 +1499,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		             width,
 		             height,
 		             composition_layer_depth_test_supported,
-		             composition_layer_depth_test_supported ? layer_rays : layer_controllers | layer_rays,
+		             composition_layer_depth_test_supported ? layer_rays : layer_controllers | layer_rays | layer_trails,
 		             {});
 		if (composition_layer_depth_test_supported)
 			set_depth_test(true, XR_COMPARE_OP_LESS_FB);

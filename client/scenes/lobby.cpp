@@ -1209,6 +1209,10 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	}
 #endif
 
+	kiosk_camera.reset();
+	if (head_position)
+		kiosk_camera = head_position->first;
+
 	std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_layers = draw_gui(frame_state.predictedDisplayTime);
 
 #if WIVRN_CLIENT_DEBUG_MENU
@@ -1263,7 +1267,7 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	        render_width,
 	        render_height,
 	        composition_layer_depth_test_supported,
-	        composition_layer_depth_test_supported ? layer_lobby | layer_controllers : layer_lobby,
+	        composition_layer_depth_test_supported ? layer_lobby | layer_controllers | layer_trails : layer_lobby | layer_trails,
 	        clear_color,
 	        true);
 
@@ -1545,7 +1549,7 @@ void scenes::lobby::on_focused()
 	setup_passthrough();
 	discover.emplace();
 
-	kiosk_planes_.emplace(*this, layer_controllers);
+	kiosk_planes_.emplace(*this, layer_controllers, layer_trails);
 
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);

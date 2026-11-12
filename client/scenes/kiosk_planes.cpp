@@ -25,9 +25,11 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <glm/ext/matrix_transform.hpp>
 #include <glm/geometric.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <numbers>
 #include <spdlog/spdlog.h>
@@ -62,6 +64,27 @@ constexpr float bank_relax = 5.0f;    // bank return rate toward coordinated val
 // frame: positive bank about +dir lifts the inside wing (leans OUT), so
 // the coordinated default is -1. Flip only if planes lean out of turns.
 constexpr float bank_sign = -1.f;
+
+// Engine trail ribbon: resampled while moving, fades out by age.
+constexpr size_t trail_points = 60;
+constexpr double trail_sample_dt = 1. / 30.;
+constexpr double trail_max_age = trail_points * trail_sample_dt;
+constexpr float trail_width_head = 0.02f;  // ribbon half-width at the engine (m)
+constexpr float trail_width_tail = 0.055f; // ... at the faded end
+constexpr float trail_alpha_max = 0.15f;
+constexpr float trail_gap = 0.05f; // emitter hangs behind the tail along the flight direction
+
+struct trail_vertex
+{
+	glm::vec4 position;
+	glm::vec4 color;
+};
+
+constexpr size_t trail_verts_per_plane = trail_points * 5;
+constexpr size_t trail_indices_per_plane = (trail_points - 1) * 4 * 6;
+constexpr size_t trail_max_verts = size_t(plane_count) * trail_verts_per_plane;
+constexpr size_t trail_max_indices = size_t(plane_count) * trail_indices_per_plane;
+constexpr size_t trail_vert_bytes = trail_max_verts * sizeof(trail_vertex);
 
 double smoothstep(double e0, double e1, double x)
 {
@@ -104,7 +127,7 @@ glm::vec3 random_in_ball(std::mt19937 & rng, float radius)
 namespace wivrn
 {
 
-kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
+kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_layer_mask) :
         scene_(scene), rng_(std::random_device{}())
 {
 	for (int i = 0; i < plane_count; ++i)
@@ -127,6 +150,7 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 		        std::clamp(paint.base.y + jitter(rng_), 0.f, 1.f),
 		        std::clamp(paint.base.z + jitter(rng_), 0.f, 1.f),
 		};
+		f.trail_tint = body_tint; // overwritten by apply_livery at spawn
 		// add_gltf shares mesh objects (and their materials) across
 		// instantiations: deep-copy each mesh so per-plane material clones
 		// don't leak into the other planes. GPU buffers stay shared.
@@ -183,6 +207,115 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 		visit(entity);
 		planes_.push_back(std::move(f));
 	}
+
+	// Measure the model OBB in plane-root space for the trail emitter: walk
+	// the first plane's subtree accumulating node transforms (the file's
+	// own rotations live on child nodes, so the raw primitive OBBs alone
+	// point the wrong way).
+	glm::vec3 obb_min{std::numeric_limits<float>::max()};
+	glm::vec3 obb_max{std::numeric_limits<float>::lowest()};
+	std::function<void(entt::entity, const glm::mat4 &)> measure = [&](entt::entity e, const glm::mat4 & parent) {
+		const auto & n = scene_.world.get<components::node>(e);
+		glm::mat4 m = parent * (glm::translate(glm::mat4(1), n.position) * glm::mat4(n.orientation) * glm::scale(glm::mat4(1), n.scale));
+		if (n.mesh)
+		{
+			for (auto & prim: n.mesh->primitives)
+			{
+				for (int i = 0; i < 8; ++i)
+				{
+					glm::vec3 corner{
+					        (i & 1) ? prim.obb_max.x : prim.obb_min.x,
+					        (i & 2) ? prim.obb_max.y : prim.obb_min.y,
+					        (i & 4) ? prim.obb_max.z : prim.obb_min.z,
+					};
+					glm::vec3 w = m * glm::vec4(corner, 1);
+					obb_min.x = std::min(obb_min.x, w.x);
+					obb_min.y = std::min(obb_min.y, w.y);
+					obb_min.z = std::min(obb_min.z, w.z);
+					obb_max.x = std::max(obb_max.x, w.x);
+					obb_max.y = std::max(obb_max.y, w.y);
+					obb_max.z = std::max(obb_max.z, w.z);
+				}
+			}
+		}
+		for (auto && [child, child_node]: scene_.world.view<components::node>().each())
+		{
+			if (child_node.parent == e)
+				measure(child, m);
+		}
+	};
+	measure(planes_.front().root, glm::mat4(1));
+	// Nose points along +Z: emit at the tail center.
+	tail_root = {(obb_min.x + obb_max.x) * 0.5f, (obb_min.y + obb_max.y) * 0.5f, obb_min.z};
+
+	// Shared trail ribbon: one node/primitive holding every plane's
+	// camera-facing strip (debug_draw shaders: unlit position+color).
+	trail_entity = scene_.world.create();
+	auto & trail_node = scene_.world.emplace<components::node>(trail_entity);
+	trail_node.name = "kiosk-trails";
+	trail_node.layer_mask = trail_layer_mask;
+	trail_node.visible = false;
+
+	trail_mesh = std::make_shared<renderer::mesh>();
+	auto & prim = trail_mesh->primitives.emplace_back();
+	prim.indexed = true;
+	prim.index_type = vk::IndexType::eUint16;
+	prim.index_offset = trail_vert_bytes;
+	prim.topology = vk::PrimitiveTopology::eTriangleList;
+	prim.cull_mode = vk::CullModeFlagBits::eNone;
+	prim.vertex_shader = "debug_draw.vert";
+	prim.layout.add_vertex_attribute("Position", vk::Format::eR32G32B32A32Sfloat, 0, 0);
+	prim.layout.add_vertex_attribute("Color", vk::Format::eR32G32B32A32Sfloat, 0, 1);
+	prim.obb_min = {-10.f, -10.f, -10.f};
+	prim.obb_max = {10.f, 10.f, 10.f};
+	prim.material_ = scene_.create_material([](renderer::material & m) {
+		m.name = "kiosk-trail";
+		m.fragment_shader = "debug_draw.frag";
+		m.blend_enable = true;
+		// Additive: overlapping trail segments sum order-independently
+		// instead of slicing each other out with sorted over-blends.
+		m.blend_additive = true;
+		m.depth_write_enable = false;
+	});
+
+	trail_buffer = std::make_shared<buffer_allocation>(
+	        scene_.device,
+	        vk::BufferCreateInfo{
+	                .size = trail_vert_bytes + trail_max_indices * sizeof(uint16_t),
+	                .usage = vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eIndexBuffer,
+	        },
+	        VmaAllocationCreateInfo{
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+	        },
+	        "kiosk_planes::trails");
+
+	// Fixed strip topology: one independent 5-wide quad strip per plane.
+	// The across-width alpha profile (0 at the edges) makes the ribbon
+	// soft on all sides; length fade is written per-vertex each frame.
+	auto * index = reinterpret_cast<uint16_t *>(trail_buffer->map()) + trail_vert_bytes / sizeof(uint16_t);
+	for (int p = 0; p < plane_count; ++p)
+	{
+		for (size_t j = 0; j < trail_points - 1; ++j)
+		{
+			for (size_t k = 0; k < 4; ++k)
+			{
+				uint16_t a = uint16_t(p * trail_verts_per_plane + 5 * j + k);
+				*index++ = a;
+				*index++ = a + 1;
+				*index++ = a + 5;
+				*index++ = a + 1;
+				*index++ = a + 6;
+				*index++ = a + 5;
+			}
+		}
+	}
+
+	prim.vertex_offset.push_back(0);
+	prim.vertex_count = uint32_t(trail_max_verts);
+	prim.index_count = uint32_t(trail_max_indices);
+	trail_mesh->buffer = trail_buffer;
+	trail_node.mesh = trail_mesh;
 }
 
 void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
@@ -213,6 +346,11 @@ void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 	f.pitch_tgt = f.yaw_tgt = f.roll_tgt = 0.f;
 	f.man_t = 0.;
 	f.prev_now = 0;
+	// fresh flight state below; clear any stale trail so a re-show never
+	// streaks across the scene from the old position
+	f.trail.clear();
+	f.trail_t.clear();
+	f.last_sample_t = 0;
 	// fresh livery every spawn: construction-time draws could hide a color
 	// all session. The spawn is invisible (pre-fade), so the swap never pops.
 	// Logcat records the pick for on-device color forensics.
@@ -241,6 +379,8 @@ void kiosk_planes::apply_livery(plane & f)
 			f.base_colors[i] = glm::vec4(body_tint, 1.f);
 		}
 	}
+	// trails follow the livery body color
+	f.trail_tint = body_tint;
 	spdlog::info("kiosk_planes: spawn livery {}", p.name);
 }
 
@@ -295,7 +435,7 @@ void kiosk_planes::pick_maneuver(plane & f)
 	f.man_angle = 0.;
 }
 
-void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active)
+void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera)
 {
 	(void)anchor_orient; // placement is position-only; heading is random
 	if (active && !was_active_)
@@ -499,6 +639,118 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		glm::vec3 basis_up = glm::cross(f.dir, f.right);
 		glm::quat orient = glm::quat_cast(glm::mat3(f.right, basis_up, f.dir));
 		node->orientation = glm::angleAxis(bank_sign * f.bank, f.dir) * orient;
+
+		// record the engine position for the trail ribbon: the measured
+		// tail offset is already in world units at the construction
+		// scale, so only the orientation applies (uniform scale). The
+		// sample hangs behind the tail so the ribbon never touches the
+		// body. A long stall (hidden overlay, hitches) clears the trail
+		// instead of streaking across the scene on resume.
+		glm::vec3 tail = f.pos + node->orientation * tail_root - f.dir * trail_gap;
+		if (f.last_sample_t != 0 and double(now - f.last_sample_t) * 1e-9 > 0.5)
+		{
+			f.trail.clear();
+			f.trail_t.clear();
+		}
+		if (f.last_sample_t == 0 or double(now - f.last_sample_t) * 1e-9 >= trail_sample_dt)
+		{
+			f.trail.push_back(tail);
+			f.trail_t.push_back(now);
+			if (f.trail.size() > trail_points)
+			{
+				f.trail.erase(f.trail.begin());
+				f.trail_t.erase(f.trail_t.begin());
+			}
+			f.last_sample_t = now;
+		}
+		if (auto * trail_node = scene_.world.try_get<components::node>(trail_entity))
+			trail_node->visible = active;
+		f.trail_alpha = alpha;
+	}
+
+	if (active)
+		build_trail(camera, now);
+}
+
+void kiosk_planes::build_trail(const std::optional<glm::vec3> & camera, XrTime now)
+{
+	auto * verts = reinterpret_cast<trail_vertex *>(trail_buffer->map());
+	const glm::vec3 up{0.f, 1.f, 0.f};
+
+	for (int p = 0; p < plane_count; ++p)
+	{
+		const plane & f = planes_[size_t(p)];
+		trail_vertex * out = verts + size_t(p) * trail_verts_per_plane;
+
+		// slot j=0 is the newest sample; pad short trails with the oldest
+		// point (written at zero alpha below) so the fixed index buffer
+		// always has valid data. Fade keys off real sample age, not slot
+		// index, so a young trail never shows a hard end.
+		glm::vec3 ring[trail_points];
+		float ring_age[trail_points]{};
+		const size_t n = f.trail.size();
+		const bool live = n >= 2;
+		for (size_t j = 0; j < trail_points; ++j)
+		{
+			const size_t src = live ? n - 1 - std::min(j, n - 1) : 0;
+			ring[j] = live ? f.trail[src] : glm::vec3(0.f);
+			ring_age[j] = live ? float(double(now - f.trail_t[src]) * 1e-9) : 0.f;
+		}
+
+		glm::vec3 last_side{1.f, 0.f, 0.f};
+		for (size_t j = 0; j < trail_points; ++j)
+		{
+			const float t = float(j) / float(trail_points - 1); // 0 = engine, 1 = faded end
+			const glm::vec3 & pt = ring[j];
+
+			glm::vec3 dir = ring[std::min(j + 1, trail_points - 1)] - ring[j > 0 ? j - 1 : j];
+			glm::vec3 side = last_side;
+			if (glm::length(dir) > 1e-6f)
+			{
+				glm::vec3 dir_n = dir / glm::length(dir);
+				glm::vec3 axis = camera ? (*camera - pt) : up;
+				if (glm::length(axis) > 1e-6f)
+				{
+					glm::vec3 s = glm::cross(dir_n, axis / glm::length(axis));
+					if (glm::length(s) > 1e-4f)
+						side = s / glm::length(s);
+					else
+					{
+						s = glm::cross(dir_n, up);
+						if (glm::length(s) > 1e-4f)
+							side = s / glm::length(s);
+					}
+				}
+				last_side = side;
+			}
+
+			const float width = trail_width_head + (trail_width_tail - trail_width_head) * t;
+			// gradual age falloff (long tail, not a hard end) times a head
+			// ramp over the first segments, so a young trail can never show
+			// a bright leading edge. The tail ramp keys off the live point
+			// count (not the slot index): padding duplicates the oldest
+			// sample, so without it a young trail would end in a bright
+			// streak cut off at the last live point.
+			const float age_frac = std::clamp(ring_age[j] / float(trail_max_age), 0.f, 1.f);
+			const float envelope = std::pow(1.f - age_frac, 1.5f);
+			const float head_ramp = float(smoothstep(0., 8., double(j)));
+			const float tail_ramp = j < n ? 1.f - float(smoothstep(double(n > 4 ? n - 4 : 0), double(n > 1 ? n - 1 : 0), double(j))) : 0.f;
+			// tint follows the plane's livery body color
+			const float a = live ? trail_alpha_max * f.trail_alpha * envelope * head_ramp * tail_ramp : 0.f;
+			const glm::vec3 tint = f.trail_tint * a;
+
+			// soft across-width profile: transparent edges, bright core
+			constexpr float across[5] = {-1.f, -0.5f, 0.f, 0.5f, 1.f};
+			constexpr float across_alpha[5] = {0.f, 0.6f, 1.f, 0.6f, 1.f};
+			for (size_t k = 0; k < 5; ++k)
+			{
+				const float ak = a * across_alpha[k];
+				out[5 * j + k] = {
+				        glm::vec4(pt + side * (across[k] * width * 0.5f), 1.f),
+				        glm::vec4(tint * across_alpha[k], ak), // premultiplied
+				};
+			}
+		}
 	}
 }
 

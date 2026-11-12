@@ -63,6 +63,10 @@ struct pipeline_info
 	vk::FrontFace front_face = vk::FrontFace::eClockwise;
 	vk::PrimitiveTopology topology = vk::PrimitiveTopology::eTriangleList;
 	bool blend_enable = false;
+	// Additive compositing (ONE, ONE) instead of premultiplied alpha
+	// blending. Order-independent: overlapping transparent fragments sum
+	// instead of sorting-dependent over blends.
+	bool blend_additive = false;
 	bool depth_test_enable = true;
 	bool depth_write_enable = true;
 
