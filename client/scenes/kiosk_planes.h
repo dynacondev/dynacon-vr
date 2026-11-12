@@ -69,7 +69,8 @@ private:
 		glm::vec3 pos{0.f};
 		glm::vec3 dir{0.f, 0.f, -1.f}; // unit flight direction
 		glm::vec3 right{1.f, 0.f, 0.f}; // cached lateral axis (rebuilt unless near-vertical)
-		float speed = 0.35f; // constant cruise (m/s)
+		float speed = 0.35f; // base cruise (m/s); live speed is climb-coupled
+		float bias_w = 1.f; // leash-bias gate: slewed, never snapped (loop stand-down)
 		float bank = 0.f; // smoothed visual bank (radians, wrapped to [-pi, pi])
 		float pitch_rate = 0.f, yaw_rate = 0.f, roll_rate = 0.f; // smoothed rates (rad/s)
 		float pitch_tgt = 0.f, yaw_tgt = 0.f, roll_tgt = 0.f; // maneuver targets (rad/s)

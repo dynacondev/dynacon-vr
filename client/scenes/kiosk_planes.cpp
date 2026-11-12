@@ -279,7 +279,7 @@ void kiosk_planes::pick_maneuver(plane & f)
 			f.roll_free = false;
 			f.loop_maneuver = true;
 			f.man_dur = 2. * std::numbers::pi / f.pitch_tgt;
-			f.man_t = 1.5 * f.man_dur; // backstop; the 2pi angle below terminates first
+			f.man_t = 2.0 * f.man_dur; // backstop only; the angle test below terminates first
 			break;
 		case 3: // barrel roll: one full revolution with a hint of yaw
 			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.1f, 0.3f)(rng_);
@@ -288,7 +288,7 @@ void kiosk_planes::pick_maneuver(plane & f)
 			f.roll_free = true;
 			f.loop_maneuver = false;
 			f.man_dur = 2. * std::numbers::pi / std::abs(f.roll_tgt);
-			f.man_t = 1.5 * f.man_dur; // backstop; the 2pi angle below terminates first
+			f.man_t = 2.0 * f.man_dur; // backstop only; the angle test below terminates first
 			break;
 	}
 	f.man_age = 0.;
@@ -307,6 +307,7 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		{
 			f.spawned = false;
 			f.spawn_t0 = 0;
+			f.bias_w = 1.f;
 		}
 		livery_bag_ = {2, 1, 3, 0};
 		std::shuffle(livery_bag_.begin(), livery_bag_.end(), rng_);
@@ -367,12 +368,21 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 
 		f.man_t -= dt;
 		f.man_age += dt;
-		// figures terminate on completed angle (exact 2pi regardless of the
-		// envelope below); time-based maneuvers terminate on the clock, and
-		// the backstop catches a figure that somehow stalls short.
-		if (f.man_t <= 0.)
-			pick_maneuver(f);
-		else if ((f.loop_maneuver || f.roll_free) && f.man_angle >= 2. * std::numbers::pi - 0.2)
+		// figures terminate on completed angle (2pi minus a breath — the
+		// residual at threshold is single-digit degrees, then the next
+		// figure ramps in) or once the exit ramp has decayed the rate to
+		// ~zero; the backstop only catches a figure that somehow stalls.
+		// Time-based maneuvers terminate on the clock.
+		bool figure = f.loop_maneuver || f.roll_free;
+		bool done = f.man_t <= 0.;
+		if (not done && figure)
+		{
+			double rate_now = f.loop_maneuver ? std::abs(f.pitch_rate) : std::abs(f.roll_rate);
+			double rate_tgt = f.loop_maneuver ? std::abs(f.pitch_tgt) : std::abs(f.roll_tgt);
+			done = f.man_angle >= 2. * std::numbers::pi - 0.2 ||
+			       (f.man_age > f.man_dur && rate_now < 0.08 * rate_tgt);
+		}
+		if (done)
 			pick_maneuver(f);
 
 		// maneuver envelope: smoothstep in and out of the targets so figures
@@ -413,6 +423,8 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		glm::vec3 r = f.right;
 		if (not f.loop_maneuver)
 		{
+			// NaN guard more than anything now: the attitude clamp keeps
+			// normal flight far from the pole, so this branch is routine.
 			if (std::abs(f.dir.y) < 0.98f)
 			{
 				r = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
@@ -423,22 +435,21 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		glm::vec3 u = glm::cross(f.dir, r);
 
 		// moth-to-light: steer toward the live anchor, stronger the further
-		// past comfort. Capped well below loop pitch rates so figures can
-		// range out; a tendency, never a wall. Fully suppressed mid-loop:
-		// the accumulator below counts only maneuver rates, so any bias
-		// during the figure would over-rotate past 2pi (ending backwards
-		// with a frame flip on exit). A planar loop is position-neutral
-		// anyway, so the leash loses nothing by standing down.
+		// past comfort; a tendency, never a wall. Fully stood down mid-loop
+		// (planar figures close exactly), and slewed everywhere else: the
+		// gate ramps over ~0.25s so loop boundaries never step the rate.
+		float bias_gate = f.loop_maneuver ? 0.f : 1.f;
+		f.bias_w += (bias_gate - f.bias_w) * std::min(1.f, float(dt * 4.0));
 		float yaw_bias = 0.f, pitch_bias = 0.f;
 		glm::vec3 to_anchor = anchor_pos - f.pos;
 		float dist = glm::length(to_anchor);
-		if (not f.loop_maneuver && dist > comfort_r && dist > 1e-4f)
+		if (dist > comfort_r && dist > 1e-4f)
 		{
 			glm::vec3 want = to_anchor / dist;
 			glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
 			float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
-			yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w;
-			pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w;
+			yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w * f.bias_w;
+			pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w * f.bias_w;
 		}
 		float yaw = f.yaw_rate + yaw_bias;
 		float pitch = f.pitch_rate + pitch_bias;
