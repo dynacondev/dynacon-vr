@@ -3216,38 +3216,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									              merge_b_count - union_merge_renderer::max_inputs);
 								}
 							}
-							// Dots sidecar: the just-recorded dots image rides the
-							// merge as binding 8 (same-frame borrow, never
-							// cached). Dots implies hidden mask input above, so
-							// the mask list is never empty here; a null view
-							// (retired image) refuses the whole merge loudly —
-							// never a partial union.
-							const union_merge_renderer::input * dots_sidecar = nullptr;
-							union_merge_renderer::input dots_input{};
-							if (hidden_dots_active and hidden_dots_image >= 0 and hidden_dots)
-							{
-								vk::Image dots_img = hidden_dots->swapchain().image((size_t)hidden_dots_image);
-								vk::ImageView dots_view = hidden_dots->submitted_view_array(dots_img);
-								if (dots_view == vk::ImageView{})
-								{
-									static XrTime last_dots_input_log = 0;
-									XrTime dots_input_now = instance.now();
-									if (dots_input_now - last_dots_input_log > 1'000'000'000LL)
-									{
-										last_dots_input_log = dots_input_now;
-										spdlog::error("Union merge dropping dots sidecar with no submitted view (dots recorded but view retired)");
-									}
-									merge_ok = false;
-								}
-								else
-								{
-									dots_input = union_merge_renderer::input{
-									        .image = dots_img,
-									        .view_array = dots_view,
-									};
-									dots_sidecar = &dots_input;
-								}
-							}
 							if (merge_ok and not merge_inputs.empty())
 							{
 								int merge_idx = -1;
@@ -3260,7 +3228,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									if (merge_idx >= 0)
 									{
 										vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
-										if (merge_renderer->record(rec_cmd, (size_t)merge_idx, merge_ext, merge_inputs, dots_sidecar))
+										if (merge_renderer->record(rec_cmd, (size_t)merge_idx, merge_ext, merge_inputs))
 										{
 											merge_image = merge_idx;
 											merge_this_frame = true;
@@ -3857,12 +3825,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (mask_frame)
 		{
 			// Single-union compositing: every mask contributor is
-			// MAX-merged into one layer (submitted once with color
-			// ADDITIVE + alpha REPLACE), which the flat camera layer
-			// consumes (camera x alpha + video x (1 - alpha)). The
-			// hidden dots ride the same layer (premultiplied RGB
-			// holed out of alpha). Video (opaque) was already added
-			// above, then the merged mask, then flat, then debug/GUI.
+			// MAX-merged into one alpha layer (submitted once with
+			// REPLACE, color preserved), which the flat camera layer
+			// consumes (camera x alpha + video x (1 - alpha)). Video
+			// (opaque) was already added above, then the merged mask,
+			// then flat, then debug/GUI.
 			//
 			// This branch has no window groups yet (no objects, no blur):
 			// the union holds only the debug cutout group. Debug
@@ -3989,10 +3956,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// to max_inputs, extras dropped with an error at record)
 			// into the merge target (merge_this_frame, evaluated once
 			// at record — never recomputed here). ONE layer, always
-			// color ADDITIVE (premultiplied dots RGB) + alpha REPLACE,
-			// veil bias once. The old per-group REPLACE/ADD chain is
-			// gone with the layers it cost (~10pp each on Quest 3);
-			// the dots sidecar rides this layer, so no second layer.
+			// REPLACE, veil bias once. The old per-group REPLACE/ADD
+			// chain is gone with the layers it cost (~10pp each on
+			// Quest 3).
 			if (not veil_hard_out and merge_this_frame and merge_image >= 0 and merge_renderer)
 			{
 				XrExtent2Di merge_rect{(int32_t)merge_renderer->swapchain().width(),
@@ -4019,18 +3985,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
 				                     application::space(xr::spaces::world),
 				                     mask_views);
-				// Color ADDITIVE (mask RGB is 0; only premultiplied
-				// dots RGB adds over video) + alpha REPLACE. Mask-only
-				// pixels are bit-identical to the old REPLACE (dst
-				// preserved, alpha replaced); dot pixels carry glow
-				// the flat layer passes through via the alpha hole.
-				set_alpha_blend(XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+				set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 				if (veil_lift)
 				{
 					// Coverage·s + (1−s), once: max() and the lift
 					// commute (s ≥ 0), so lifting after the merge
-					// equals lifting every input before it. RGB scale
-					// is 1 (dots preserved through the veil).
+					// equals lifting every input before it. RGB
+					// untouched (ignored downstream anyway).
 					set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
 				}
 				// Paired with the acquire in the record phase above:
@@ -4049,14 +4010,37 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 		}
 
-		// Hidden dots ride the merge layer (binding 8 sidecar: premultiplied
-		// dot RGB holed out of the merged alpha) — no separate layer, so no
-		// compositor per-layer cost. The merge record above already consumed
-		// the dots image in the mask command buffer; release the pairing here.
-		// hidden_dots_active stays "dots merged" through the flat decision
-		// above (need_flat) and is cleared here with the image.
+		// Hidden dot overlay: ONE transparent projection layer over the
+		// revealed camera feed (server eye timebase, like the masks),
+		// below gizmos and GUI quads. Same discipline as the debug lines:
+		// standard alpha blend, no FB extensions.
 		if (hidden_dots_active and hidden_dots_image >= 0 and hidden_dots)
 		{
+			// Quarter-res image rect: the runtime stretches it over the FOV.
+			XrExtent2Di dots_rect{(int32_t)hidden_dots->swapchain().width(),
+			                       (int32_t)hidden_dots->swapchain().height()};
+			std::array<XrCompositionLayerProjectionView, view_count> dots_views;
+			for (uint32_t view = 0; view < view_count; ++view)
+			{
+				dots_views[view] = {
+				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+				        .pose = sync_pose[view],
+				        .fov = sync_fov[view],
+				        .subImage = {
+				                .swapchain = hidden_dots->swapchain(),
+				                .imageRect = {
+				                        .offset = {0, 0},
+				                        .extent = dots_rect,
+				                },
+				                .imageArrayIndex = view,
+				        },
+				};
+			}
+			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+			                     application::space(xr::spaces::world),
+			                     dots_views);
+			// Paired with the acquire in the record phase above: the
+			// compositor takes the last released image; release after submit.
 			hidden_dots->release();
 			hidden_dots_active = false;
 			hidden_dots_image = -1;
