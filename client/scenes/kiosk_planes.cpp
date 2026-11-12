@@ -50,6 +50,10 @@ constexpr float leash_r = 0.5f;      // bias reaches full strength here (m)
 constexpr float bias_gain = 2.0f;    // steering gain toward the anchor
 constexpr float bias_max_rate = 0.8f; // bias steering cap (rad/s): loops (1.2+) overrule it locally
 constexpr float pitch_max_rate = 0.35f; // climb/dive cap (rad/s); loops are exempt
+constexpr float max_climb_sin = 0.55f; // flight-path angle cap outside loops (~33deg): rate caps alone still walk the nose vertical over seconds
+constexpr float climb_factor = 0.5f; // speed follows climb angle: 0.5x uphill, 1.5x downhill
+constexpr float speed_min = 0.18f;   // effective speed clamp (m/s)
+constexpr float speed_max = 0.65f;
 constexpr float rate_smooth = 3.0f;  // pitch/yaw target blending rate (1/s); roll snaps (visual only)
 constexpr float bank_coord_gain = 0.6f; // coordinated bank per yaw rate
 constexpr float bank_max = 1.0f;     // bank clamp (radians)
@@ -369,22 +373,39 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		// roll_rate is snapped on maneuver pick (visual only); no smoothing,
 		// so a decayed rate can't drag extra spin past a roll's end.
 
+		// Flight frame, rebuilt every frame from the current dir: right =
+		// up×dir throughout (the intuitive dir×up order mirrors the
+		// orientation basis below to det=-1, and quat_cast of that is
+		// garbage — so this order is load-bearing, not aesthetic).
+		// Loops freeze the frame: the axis stays fixed for the whole
+		// figure, so the loop is exactly planar about one axis and can
+		// pass through vertical with no pole snap on entry or exit.
+		glm::vec3 r = f.right;
+		if (not f.loop_maneuver)
+		{
+			if (std::abs(f.dir.y) < 0.98f)
+			{
+				r = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
+				r = glm::normalize(r - f.dir * glm::dot(r, f.dir));
+			}
+			f.right = r;
+		}
+		glm::vec3 u = glm::cross(f.dir, r);
+
 		// moth-to-light: steer toward the live anchor, stronger the further
 		// past comfort. Capped well below loop pitch rates so figures can
-		// range out; a tendency, never a wall.
+		// range out; a tendency, never a wall. Loops stay planar: in-plane
+		// (pitch) correction only, no out-of-plane yaw.
 		float yaw_bias = 0.f, pitch_bias = 0.f;
 		glm::vec3 to_anchor = anchor_pos - f.pos;
 		float dist = glm::length(to_anchor);
 		if (dist > comfort_r && dist > 1e-4f)
 		{
 			glm::vec3 want = to_anchor / dist;
-			glm::vec3 r = f.right;
-			if (std::abs(f.dir.y) < 0.98f)
-				r = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
-			glm::vec3 u = glm::cross(f.dir, r);
 			glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
 			float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
-			yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w;
+			if (not f.loop_maneuver)
+				yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w;
 			pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w;
 		}
 		float yaw = f.yaw_rate + yaw_bias;
@@ -394,23 +415,26 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		if (not f.loop_maneuver)
 			pitch = std::clamp(pitch, -pitch_max_rate, pitch_max_rate);
 
-		// Flight frame uses right = up×dir throughout. The intuitive dir×up
-		// order mirrors the orientation basis below to det=-1, and quat_cast
-		// of that is garbage (squish/shrink, nose off velocity) — so this
-		// order is load-bearing, not aesthetic. Re-orthogonalized every
-		// valid frame (loops go vertical; the cache only covers those).
-		if (std::abs(f.dir.y) < 0.98f)
+		f.dir = glm::normalize(f.dir + (r * yaw + u * pitch) * float(dt));
+		if (not f.loop_maneuver)
 		{
-			f.right = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
-			f.right = glm::normalize(f.right - f.dir * glm::dot(f.right, f.dir));
+			// attitude clamp, not just rate: sustained bias could still walk
+			// the nose to vertical over seconds. Loops are exempt (the
+			// figure needs the full circle); everything else stays under
+			// max_climb_sin so the pole is never approached outside a loop.
+			if (std::abs(f.dir.y) > max_climb_sin)
+			{
+				f.dir.y = std::copysign(max_climb_sin, f.dir.y);
+				f.dir = glm::normalize(f.dir);
+			}
+			// re-orthogonalize against the FINAL dir: the frame above is
+			// perpendicular to the pre-integration dir, off by yaw*dt.
+			// Without this the orientation basis below carries shear.
+			f.right = glm::normalize(r - f.dir * glm::dot(r, f.dir));
 		}
-		glm::vec3 up0 = glm::cross(f.dir, f.right);
-		f.dir = glm::normalize(f.dir + (f.right * yaw + up0 * pitch) * float(dt));
-		// re-orthogonalize against the FINAL dir: the cache above is
-		// perpendicular to the pre-integration dir, off by yaw*dt. Without
-		// this the orientation basis below carries shear into quat_cast.
-		f.right = glm::normalize(f.right - f.dir * glm::dot(f.right, f.dir));
-		f.pos += f.dir * f.speed * float(dt);
+		// speed follows climb angle: slower uphill, faster downhill
+		float speed = std::clamp(f.speed * (1.f - climb_factor * f.dir.y), speed_min, speed_max);
+		f.pos += f.dir * speed * float(dt);
 
 		// rolls integrate; everything relaxes toward the coordinated bank
 		// for the current yaw rate. Wrap first: a finished roll is 2pi,
