@@ -1107,7 +1107,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	wivrn::ui::set_hover_haptic([this] { imgui_ctx->vibrate_on_hover(); });
 	wivrn::ui::set_tooltip_hook([this](const char * text) { imgui_ctx->tooltip(text); });
 
-	// model planes parked around the waiting overlay (hidden otherwise)
+	// model planes parked around the waiting overlay (hidden otherwise).
+	// Same swatter gathering as the lobby: hands when tracked, grips when
+	// located (hands don't exist here while non-interactable, so this is
+	// usually grips-only — identical logic, graceful degradation).
 	if (kiosk_planes_)
 	{
 		std::optional<glm::vec3> camera;
@@ -1116,7 +1119,8 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			const auto & p = live_views[0].pose.position;
 			camera = glm::vec3(p.x, p.y, p.z);
 		}
-		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown, camera);
+		auto swatters = wivrn::kiosk_planes::gather_swatters(predicted_display_time, world_space, left_hand, right_hand);
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown, camera, swatters);
 	}
 
 	ImVec2 viewport_size(imgui_ctx->layers()[0].vp_size.x, imgui_ctx->layers()[0].vp_size.y);

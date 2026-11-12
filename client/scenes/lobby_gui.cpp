@@ -1082,9 +1082,15 @@ std::vector<std::pair<int, XrCompositionLayerQuad>> scenes::lobby::draw_gui(XrTi
 	// kiosk overlay is display-only: no controller interaction
 	imgui_ctx->set_controllers_enabled(!kiosk_shown);
 
-	// model planes parked around the overlay panel (hidden otherwise)
+	// model planes parked around the overlay panel (hidden otherwise).
+	// Swatters are gathered in the height-offset world space the planes
+	// live in: hand palms + index tips when tracked, grips when located.
 	if (kiosk_planes_)
-		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, kiosk_shown, kiosk_camera);
+	{
+		XrSpace world_space = height_offset_space;
+		auto swatters = wivrn::kiosk_planes::gather_swatters(predicted_display_time, world_space, left_hand, right_hand);
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, kiosk_shown, kiosk_camera, swatters);
+	}
 
 	ImGuiStyle & style = ImGui::GetStyle();
 	style.FontScaleMain = wivrn::ui::current().font_scale * wivrn::ui::metrics::font_base;

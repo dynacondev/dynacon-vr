@@ -20,6 +20,7 @@
 #pragma once
 
 #include "render/scene_components.h"
+#include "xr/hand_tracker.h"
 #include <entt/entity/fwd.hpp>
 #include <glm/vec3.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -52,9 +53,19 @@ public:
 	// uses it once (positions freeze once spawned), and the containment bias
 	// steers toward its live position every frame. camera is the viewer
 	// position for billboarding the trails; without it the ribbons fall back
-	// to facing up. Inactive planes are hidden; re-showing replays the
-	// one-by-one spawn-in.
-	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera);
+	// to facing up. swatters are hand/controller positions in the same world
+	// space as the planes (stable order helps velocity tracking, but any
+	// order works): a plane within swat_radius of one is swatted into a
+	// gravity fall and stays down for the rest of the showing (no respawn).
+	// Inactive planes are hidden; re-showing replays the one-by-one spawn-in.
+	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera, const std::vector<glm::vec3> & swatters = {});
+
+	// Shared swatter gathering so lobby and stream behave identically: hand
+	// palms + index tips when hands are the tracked input source, controller
+	// grips whenever they locate (physical controllers exist even when
+	// hidden). Missing sources are simply absent; callers pass the result
+	// straight to update().
+	static std::vector<glm::vec3> gather_swatters(XrTime when, XrSpace space, std::optional<xr::hand_tracker> & left, std::optional<xr::hand_tracker> & right);
 
 private:
 	struct plane
@@ -92,6 +103,13 @@ private:
 		XrTime last_sample_t = 0;
 		float trail_alpha = 0.f;
 		glm::vec3 trail_tint{1.f};
+		// swatted state: ballistic gravity fall with tumble, fading out.
+		// gone planes stay down for the rest of the showing (no respawn).
+		bool shot_down = false;
+		bool gone = false;
+		glm::vec3 shot_vel{0.f};
+		float shot_tumble = 0.f;
+		double shot_age = 0.;
 	};
 
 	::scene & scene_;
@@ -110,6 +128,11 @@ private:
 	entt::entity trail_entity = entt::null;
 	std::shared_ptr<renderer::mesh> trail_mesh;
 	std::shared_ptr<buffer_allocation> trail_buffer;
+	// swatter velocity tracking: previous frame's points in caller order, so
+	// the fling inherits hand momentum. Cleared while inactive; new indices
+	// after a count change start at zero velocity.
+	std::vector<glm::vec3> prev_swatters_;
+	XrTime prev_swat_now_ = 0;
 	// Emitter in construction-time world units (tail center of the measured
 	// model OBB at origin); only the plane orientation applies per frame
 	// since the node scale never changes after construction.

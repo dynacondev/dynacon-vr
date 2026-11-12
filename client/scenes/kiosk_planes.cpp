@@ -19,6 +19,7 @@
 
 #include "kiosk_planes.h"
 
+#include "application.h"
 #include "scene.h"
 #include <algorithm>
 #include <array>
@@ -64,6 +65,17 @@ constexpr float bank_relax = 5.0f;    // bank return rate toward coordinated val
 // frame: positive bank about +dir lifts the inside wing (leans OUT), so
 // the coordinated default is -1. Flip only if planes lean out of turns.
 constexpr float bank_sign = -1.f;
+
+// Swatting: a hand/controller within this distance knocks the plane out
+// of the sky. Gravity is diorama-scale (real 9.8 reads as a dropped stone
+// at 1m); the fall fades over swat_fade, then the plane stays down.
+constexpr float swat_radius = 0.12f; // collision tolerance around the plane center (m)
+constexpr float swat_gravity = 3.5f; // fall acceleration (m/s^2)
+constexpr double swat_fade = 1.2; // fall duration = fade-out time (s)
+constexpr float swat_vel_max = 6.f; // per-point hand-velocity clamp (m/s)
+constexpr float swat_shove = 1.2f; // fling strength away from the contact
+constexpr float swat_up_pop = 0.7f; // upward pop so the fall reads as an arc, not a drop
+constexpr float swat_speed_max = 2.5f; // initial fall-velocity clamp (m/s)
 
 // Engine trail ribbon: resampled while moving, fades out by age.
 constexpr size_t trail_points = 60;
@@ -321,6 +333,41 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_
 	trail_node.mesh = trail_mesh;
 }
 
+std::vector<glm::vec3> kiosk_planes::gather_swatters(XrTime when, XrSpace space, std::optional<xr::hand_tracker> & left, std::optional<xr::hand_tracker> & right)
+{
+	std::vector<glm::vec3> out;
+	auto try_hand = [&](std::optional<xr::hand_tracker> & hand) {
+		if (not hand)
+			return;
+		auto located = hand->locate(space, when);
+		if (not located or not located->is_input_source())
+			return;
+		// gate only the consumed joints: a partially occluded hand (common
+		// mid-swat, fingers curled) still yields palm + index tip even when
+		// other joints in the array are untracked
+		auto flags_ok = [](const xr::hand_tracker::joint & j) {
+			constexpr XrSpaceLocationFlags want = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+			return (j.first.locationFlags & want) == want;
+		};
+		if (not (flags_ok(located->joints[XR_HAND_JOINT_PALM_EXT]) and flags_ok(located->joints[XR_HAND_JOINT_INDEX_TIP_EXT])))
+			return;
+		const auto & palm = located->joints[XR_HAND_JOINT_PALM_EXT].first.pose.position;
+		const auto & tip = located->joints[XR_HAND_JOINT_INDEX_TIP_EXT].first.pose.position;
+		out.emplace_back(palm.x, palm.y, palm.z);
+		out.emplace_back(tip.x, tip.y, tip.z);
+	};
+	try_hand(left);
+	try_hand(right);
+	// controller grips whenever they locate: the physical controllers are
+	// in the user's hands even when hand tracking is the input source
+	for (auto grip: {xr::spaces::grip_left, xr::spaces::grip_right})
+	{
+		if (auto location = application::locate_controller(application::space(grip), space, when))
+			out.push_back(location->first);
+	}
+	return out;
+}
+
 void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 {
 	// random position in a ball around the overlay; frozen here so later
@@ -349,6 +396,12 @@ void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 	f.pitch_tgt = f.yaw_tgt = f.roll_tgt = 0.f;
 	f.man_t = 0.;
 	f.prev_now = 0;
+	// swat state is per-showing: a respawned plane flies clean
+	f.shot_down = false;
+	f.gone = false;
+	f.shot_vel = glm::vec3{0.f};
+	f.shot_tumble = 0.f;
+	f.shot_age = 0.;
 	// fresh flight state below; clear any stale trail so a re-show never
 	// streaks across the scene from the old position
 	f.trail.clear();
@@ -445,7 +498,7 @@ void kiosk_planes::pick_maneuver(plane & f)
 	f.man_angle = 0.;
 }
 
-void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera)
+void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera, const std::vector<glm::vec3> & swatters)
 {
 	(void)anchor_orient; // placement is position-only; heading is random
 	// the below-GUI passes always include the trails layer: hide the ribbon
@@ -462,12 +515,44 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			f.spawned = false;
 			f.spawn_t0 = 0;
 			f.bias_w = 1.f;
+			// swatted planes come back with the replay
+			f.shot_down = false;
+			f.gone = false;
+			f.shot_age = 0.;
 		}
 		livery_bag_ = {2, 1, 3, 0};
 		std::shuffle(livery_bag_.begin(), livery_bag_.end(), rng_);
 		livery_next_ = 0;
 	}
 	was_active_ = active;
+
+	// swatter velocities from successive positions (caller order is stable;
+	// new indices start at zero velocity). Cleared while hidden so a
+	// re-show never inherits stale momentum.
+	std::vector<glm::vec3> swat_vels(swatters.size(), glm::vec3{0.f});
+	if (not active)
+	{
+		prev_swatters_.clear();
+		prev_swat_now_ = 0;
+	}
+	else
+	{
+		double sdt = 0.;
+		if (prev_swat_now_ != 0)
+			sdt = std::clamp(double(now - prev_swat_now_) * 1e-9, 0., 0.1);
+		if (sdt > 1e-6)
+		{
+			for (size_t i = 0; i < swatters.size() && i < prev_swatters_.size(); ++i)
+			{
+				glm::vec3 v = (swatters[i] - prev_swatters_[i]) / float(sdt);
+				if (glm::length(v) > swat_vel_max)
+					v = v / glm::length(v) * swat_vel_max;
+				swat_vels[i] = v;
+			}
+		}
+		prev_swatters_ = swatters;
+		prev_swat_now_ = now;
+	}
 
 	for (size_t slot = 0; slot < planes_.size(); ++slot)
 	{
@@ -491,6 +576,13 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		{
 			spawn_at(f, anchor_pos);
 			f.spawn_t0 = due;
+		}
+		if (f.gone)
+		{
+			// swatted out earlier: stays down for the rest of the showing
+			node->visible = false;
+			f.trail_alpha = 0.f;
+			continue;
 		}
 		node->visible = true;
 
@@ -520,130 +612,196 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		if (dt <= 0.)
 			continue;
 
-		f.man_t -= dt;
-		f.man_age += dt;
-		// figures terminate on completed angle (2pi minus a breath — the
-		// residual at threshold is single-digit degrees, then the next
-		// figure ramps in) or once the exit ramp has decayed the rate to
-		// ~zero; the backstop only catches a figure that somehow stalls.
-		// Time-based maneuvers terminate on the clock.
-		bool figure = f.loop_maneuver || f.roll_free;
-		bool done = f.man_t <= 0.;
-		if (not done && figure)
+		if (not f.shot_down && alpha >= 0.99f)
 		{
-			double rate_now = f.loop_maneuver ? std::abs(f.pitch_rate) : std::abs(f.roll_rate);
-			double rate_tgt = f.loop_maneuver ? std::abs(f.pitch_tgt) : std::abs(f.roll_tgt);
-			done = f.man_angle >= 2. * std::numbers::pi - 0.2 ||
-			       (f.man_age > f.man_dur && rate_now < 0.08 * rate_tgt);
+			// swat test: a hand/controller inside the tolerance knocks the
+			// plane out of the sky. Only fully faded-in planes can be hit.
+			for (size_t i = 0; i < swatters.size(); ++i)
+			{
+				glm::vec3 d = f.pos - swatters[i];
+				if (glm::dot(d, d) > swat_radius * swat_radius)
+					continue;
+				// contact: fling away from the hand with its momentum, pop
+				// upward so the fall arcs, tumble hard. Maneuver state is
+				// abandoned; the plane stays down (no respawn).
+				glm::vec3 away = glm::length(d) > 1e-4f ? d / glm::length(d) : glm::vec3{0.f, 1.f, 0.f};
+				f.shot_vel = f.dir * (f.speed * 0.5f) + away * swat_shove + glm::vec3{0.f, swat_up_pop, 0.f} + swat_vels[i] * 0.8f;
+				if (glm::length(f.shot_vel) > swat_speed_max)
+					f.shot_vel = f.shot_vel / glm::length(f.shot_vel) * swat_speed_max;
+				f.shot_tumble = (std::uniform_real_distribution<float>(0.f, 1.f)(rng_) < 0.5f ? -1.f : 1.f) * std::uniform_real_distribution<float>(8.f, 16.f)(rng_);
+				f.shot_age = 0.;
+				f.shot_down = true;
+				spdlog::info("kiosk_planes: plane {} swatted", slot);
+				break;
+			}
 		}
-		if (done)
-			pick_maneuver(f);
 
-		// maneuver envelope: smoothstep in and out of the targets so figures
-		// join through near-zero curvature with continuous derivatives — no
-		// straight-to-curve jump at either end. Ramps clamp to a fraction of
-		// short figures. Figures ramps out by angle (a timed exit would
-		// stall the rate before the 2pi closes); time-based maneuvers ramp
-		// out by the clock. The bias stays outside the envelope (smooth).
-		double ramp = std::min(0.7, 0.35 * f.man_dur);
-		float env_in = float(smoothstep(0., ramp, f.man_age));
-		float env_out;
-		double nominal_rate = 0.;
-		if (f.loop_maneuver)
-			nominal_rate = std::abs(f.pitch_tgt);
-		else if (f.roll_free)
-			nominal_rate = std::abs(f.roll_tgt);
-		if (nominal_rate > 0.)
-			env_out = 1.f - float(smoothstep(2. * std::numbers::pi - nominal_rate * ramp, 2. * std::numbers::pi, f.man_angle));
-		else
-			env_out = 1.f - float(smoothstep(f.man_dur - ramp, f.man_dur, f.man_age));
-		float env = env_in * env_out;
-		const float blend = std::min(1.f, float(dt * rate_smooth));
-		f.pitch_rate += (f.pitch_tgt * env - f.pitch_rate) * blend;
-		f.yaw_rate += (f.yaw_tgt * env - f.yaw_rate) * blend;
-		f.roll_rate = f.roll_tgt * env; // visual only: envelope spins rolls up/down, no snap
-		if (f.loop_maneuver)
-			f.man_angle += f.pitch_rate * float(dt);
-		else if (f.roll_free)
-			f.man_angle += std::abs(f.roll_rate) * float(dt);
-
-		// Flight frame, rebuilt every frame from the current dir: right =
-		// up×dir throughout (the intuitive dir×up order mirrors the
-		// orientation basis below to det=-1, and quat_cast of that is
-		// garbage — so this order is load-bearing, not aesthetic).
-		// Loops freeze the frame: the axis stays fixed for the whole
-		// figure, so the loop is exactly planar about one axis and can
-		// pass through vertical with no pole snap on entry or exit.
-		glm::vec3 r = f.right;
-		if (not f.loop_maneuver)
+		if (f.shot_down)
 		{
-			// NaN guard more than anything now: the attitude clamp keeps
-			// normal flight far from the pole, so this branch is routine.
+			// swatted: gravity fall with tumble, fading out. Maneuvers and
+			// the leash are abandoned; the nose follows the fall velocity.
+			// The materials were already written with the spawn fade above,
+			// so they are rewritten here with the fall fade folded in.
+			f.shot_age += dt;
+			f.shot_vel.y -= swat_gravity * float(dt);
+			f.pos += f.shot_vel * float(dt);
+			if (glm::length(f.shot_vel) > 1e-3f)
+			{
+				glm::vec3 fall = f.shot_vel / glm::length(f.shot_vel);
+				f.dir = glm::normalize(glm::mix(f.dir, fall, std::min(1.f, float(dt * 2.5f))));
+			}
 			if (std::abs(f.dir.y) < 0.98f)
 			{
-				r = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
-				r = glm::normalize(r - f.dir * glm::dot(r, f.dir));
+				glm::vec3 r = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
+				f.right = glm::normalize(r - f.dir * glm::dot(r, f.dir));
 			}
-			f.right = r;
-		}
-		glm::vec3 u = glm::cross(f.dir, r);
-
-		// moth-to-light: steer toward the live anchor, stronger the further
-		// past comfort; a tendency, never a wall. Fully stood down mid-loop
-		// (planar figures close exactly), and slewed everywhere else: the
-		// gate ramps over ~0.25s so loop boundaries never step the rate.
-		float bias_gate = f.loop_maneuver ? 0.f : 1.f;
-		f.bias_w += (bias_gate - f.bias_w) * std::min(1.f, float(dt * 4.0));
-		float yaw_bias = 0.f, pitch_bias = 0.f;
-		glm::vec3 to_anchor = anchor_pos - f.pos;
-		float dist = glm::length(to_anchor);
-		if (dist > comfort_r && dist > 1e-4f)
-		{
-			glm::vec3 want = to_anchor / dist;
-			glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
-			float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
-			yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w * f.bias_w;
-			pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w * f.bias_w;
-		}
-		float yaw = f.yaw_rate + yaw_bias;
-		float pitch = f.pitch_rate + pitch_bias;
-		// model planes don't rocket: cap climb/dive authority everywhere
-		// except loops, which need the full pitch rate for the figure.
-		if (not f.loop_maneuver)
-			pitch = std::clamp(pitch, -pitch_max_rate, pitch_max_rate);
-
-		f.dir = glm::normalize(f.dir + (r * yaw + u * pitch) * float(dt));
-		if (not f.loop_maneuver)
-		{
-			// attitude clamp, not just rate: sustained bias could still walk
-			// the nose to vertical over seconds. Loops are exempt (the
-			// figure needs the full circle); everything else stays under
-			// max_climb_sin so the pole is never approached outside a loop.
-			if (std::abs(f.dir.y) > max_climb_sin)
+			f.bank += f.shot_tumble * float(dt);
+			f.bank = std::atan2(std::sin(f.bank), std::cos(f.bank));
+			float fall_k = std::clamp(1.f - float(f.shot_age / swat_fade), 0.f, 1.f);
+			alpha *= fall_k;
+			for (size_t i = 0; i < f.materials.size(); ++i)
 			{
-				f.dir.y = std::copysign(max_climb_sin, f.dir.y);
-				f.dir = glm::normalize(f.dir);
+				auto & material = f.materials[i];
+				material->staging.base_color_factor = glm::vec4(glm::vec3(f.base_colors[i]) * alpha, alpha);
+				material->staging.base_emissive_factor = glm::vec4(f.base_emissives[i] * alpha, 0.f);
+				std::memcpy(material->buffer->map(), &material->staging, sizeof(material->staging));
+				material->buffer->unmap();
 			}
-			// re-orthogonalize against the FINAL dir: the frame above is
-			// perpendicular to the pre-integration dir, off by yaw*dt.
-			// Without this the orientation basis below carries shear.
-			f.right = glm::normalize(r - f.dir * glm::dot(r, f.dir));
+			if (f.shot_age >= swat_fade)
+			{
+				f.gone = true;
+				node->visible = false;
+				f.trail_alpha = 0.f;
+				continue;
+			}
 		}
-		// speed follows climb angle: slower uphill, faster downhill
-		float speed = std::clamp(f.speed * (1.f - climb_factor * f.dir.y), speed_min, speed_max);
-		f.pos += f.dir * speed * float(dt);
+		else
+		{
+			f.man_t -= dt;
+			f.man_age += dt;
+			// figures terminate on completed angle (2pi minus a breath — the
+			// residual at threshold is single-digit degrees, then the next
+			// figure ramps in) or once the exit ramp has decayed the rate to
+			// ~zero; the backstop only catches a figure that somehow stalls.
+			// Time-based maneuvers terminate on the clock.
+			bool figure = f.loop_maneuver || f.roll_free;
+			bool done = f.man_t <= 0.;
+			if (not done && figure)
+			{
+				double rate_now = f.loop_maneuver ? std::abs(f.pitch_rate) : std::abs(f.roll_rate);
+				double rate_tgt = f.loop_maneuver ? std::abs(f.pitch_tgt) : std::abs(f.roll_tgt);
+				done = f.man_angle >= 2. * std::numbers::pi - 0.2 ||
+				       (f.man_age > f.man_dur && rate_now < 0.08 * rate_tgt);
+			}
+			if (done)
+				pick_maneuver(f);
 
-		// rolls integrate; everything relaxes toward the coordinated bank
-		// for the current yaw rate. Wrap first: a finished roll is 2pi,
-		// which is 0 — relaxing unwrapped would spin all the way back.
-		// bank tracks the applied (post-clamp, post-bias) yaw — that is 1/R at
-		// constant speed, i.e. corner-radius-driven — fast enough to read as
-		// linked, not chasing. Rolls own the bank outright: no pull mid-roll.
-		float bank_tgt = std::clamp(yaw * bank_coord_gain, -bank_max, bank_max);
-		f.bank += f.roll_rate * float(dt);
-		f.bank = std::atan2(std::sin(f.bank), std::cos(f.bank));
-		if (not f.roll_free)
-			f.bank += (bank_tgt - f.bank) * std::min(1.f, float(dt * bank_relax));
+			// maneuver envelope: smoothstep in and out of the targets so figures
+			// join through near-zero curvature with continuous derivatives — no
+			// straight-to-curve jump at either end. Ramps clamp to a fraction of
+			// short figures. Figures ramps out by angle (a timed exit would
+			// stall the rate before the 2pi closes); time-based maneuvers ramp
+			// out by the clock. The bias stays outside the envelope (smooth).
+			double ramp = std::min(0.7, 0.35 * f.man_dur);
+			float env_in = float(smoothstep(0., ramp, f.man_age));
+			float env_out;
+			double nominal_rate = 0.;
+			if (f.loop_maneuver)
+				nominal_rate = std::abs(f.pitch_tgt);
+			else if (f.roll_free)
+				nominal_rate = std::abs(f.roll_tgt);
+			if (nominal_rate > 0.)
+				env_out = 1.f - float(smoothstep(2. * std::numbers::pi - nominal_rate * ramp, 2. * std::numbers::pi, f.man_angle));
+			else
+				env_out = 1.f - float(smoothstep(f.man_dur - ramp, f.man_dur, f.man_age));
+			float env = env_in * env_out;
+			const float blend = std::min(1.f, float(dt * rate_smooth));
+			f.pitch_rate += (f.pitch_tgt * env - f.pitch_rate) * blend;
+			f.yaw_rate += (f.yaw_tgt * env - f.yaw_rate) * blend;
+			f.roll_rate = f.roll_tgt * env; // visual only: envelope spins rolls up/down, no snap
+			if (f.loop_maneuver)
+				f.man_angle += f.pitch_rate * float(dt);
+			else if (f.roll_free)
+				f.man_angle += std::abs(f.roll_rate) * float(dt);
+
+			// Flight frame, rebuilt every frame from the current dir: right =
+			// up×dir throughout (the intuitive dir×up order mirrors the
+			// orientation basis below to det=-1, and quat_cast of that is
+			// garbage — so this order is load-bearing, not aesthetic).
+			// Loops freeze the frame: the axis stays fixed for the whole
+			// figure, so the loop is exactly planar about one axis and can
+			// pass through vertical with no pole snap on entry or exit.
+			glm::vec3 r = f.right;
+			if (not f.loop_maneuver)
+			{
+				// NaN guard more than anything now: the attitude clamp keeps
+				// normal flight far from the pole, so this branch is routine.
+				if (std::abs(f.dir.y) < 0.98f)
+				{
+					r = glm::normalize(glm::cross(glm::vec3{0.f, 1.f, 0.f}, f.dir));
+					r = glm::normalize(r - f.dir * glm::dot(r, f.dir));
+				}
+				f.right = r;
+			}
+			glm::vec3 u = glm::cross(f.dir, r);
+
+			// moth-to-light: steer toward the live anchor, stronger the further
+			// past comfort; a tendency, never a wall. Fully stood down mid-loop
+			// (planar figures close exactly), and slewed everywhere else: the
+			// gate ramps over ~0.25s so loop boundaries never step the rate.
+			float bias_gate = f.loop_maneuver ? 0.f : 1.f;
+			f.bias_w += (bias_gate - f.bias_w) * std::min(1.f, float(dt * 4.0));
+			float yaw_bias = 0.f, pitch_bias = 0.f;
+			glm::vec3 to_anchor = anchor_pos - f.pos;
+			float dist = glm::length(to_anchor);
+			if (dist > comfort_r && dist > 1e-4f)
+			{
+				glm::vec3 want = to_anchor / dist;
+				glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
+				float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
+				yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w * f.bias_w;
+				pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w * f.bias_w;
+			}
+			float yaw = f.yaw_rate + yaw_bias;
+			float pitch = f.pitch_rate + pitch_bias;
+			// model planes don't rocket: cap climb/dive authority everywhere
+			// except loops, which need the full pitch rate for the figure.
+			if (not f.loop_maneuver)
+				pitch = std::clamp(pitch, -pitch_max_rate, pitch_max_rate);
+
+			f.dir = glm::normalize(f.dir + (r * yaw + u * pitch) * float(dt));
+			if (not f.loop_maneuver)
+			{
+				// attitude clamp, not just rate: sustained bias could still walk
+				// the nose to vertical over seconds. Loops are exempt (the
+				// figure needs the full circle); everything else stays under
+				// max_climb_sin so the pole is never approached outside a loop.
+				if (std::abs(f.dir.y) > max_climb_sin)
+				{
+					f.dir.y = std::copysign(max_climb_sin, f.dir.y);
+					f.dir = glm::normalize(f.dir);
+				}
+				// re-orthogonalize against the FINAL dir: the frame above is
+				// perpendicular to the pre-integration dir, off by yaw*dt.
+				// Without this the orientation basis below carries shear.
+				f.right = glm::normalize(r - f.dir * glm::dot(r, f.dir));
+			}
+			// speed follows climb angle: slower uphill, faster downhill
+			float speed = std::clamp(f.speed * (1.f - climb_factor * f.dir.y), speed_min, speed_max);
+			f.pos += f.dir * speed * float(dt);
+
+			// rolls integrate; everything relaxes toward the coordinated bank
+			// for the current yaw rate. Wrap first: a finished roll is 2pi,
+			// which is 0 — relaxing unwrapped would spin all the way back.
+			// bank tracks the applied (post-clamp, post-bias) yaw — that is 1/R at
+			// constant speed, i.e. corner-radius-driven — fast enough to read as
+			// linked, not chasing. Rolls own the bank outright: no pull mid-roll.
+			float bank_tgt = std::clamp(yaw * bank_coord_gain, -bank_max, bank_max);
+			f.bank += f.roll_rate * float(dt);
+			f.bank = std::atan2(std::sin(f.bank), std::cos(f.bank));
+			if (not f.roll_free)
+				f.bank += (bank_tgt - f.bank) * std::min(1.f, float(dt * bank_relax));
+		} // else branch: solo curvature-integrator flight (shot_down falls above)
 
 		node->position = f.pos;
 		// Orientation basis, same convention as the flight frame: columns
