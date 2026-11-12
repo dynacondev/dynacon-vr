@@ -408,6 +408,20 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	static std::atomic<uint64_t> triage_commits{0};
 	static std::atomic<uint64_t> triage_warped{0};
 	static std::atomic<uint64_t> triage_straight{0};
+	// Straight-frame attribution (logging only, no behavior change):
+	// no_depth = color-only fast path, i.e. no depth layer arrived
+	// (the xrizer-plain case); disabled = depth arrived but
+	// reprojection off; multilayer = squash path (layer_count != 1
+	// or non-projection type); multilayer_depth = subset of those
+	// that carried depth (warp stood down); predict = pose
+	// prediction failed; degenerate = reproject() rejected a view
+	// (non-finite pose or bad frustum).
+	static std::atomic<uint64_t> triage_straight_no_depth{0};
+	static std::atomic<uint64_t> triage_straight_disabled{0};
+	static std::atomic<uint64_t> triage_straight_multilayer{0};
+	static std::atomic<uint64_t> triage_straight_multilayer_depth{0};
+	static std::atomic<uint64_t> triage_straight_predict{0};
+	static std::atomic<uint64_t> triage_straight_degenerate{0};
 	static std::atomic<uint64_t> triage_drop_busy{0};
 	static std::atomic<uint64_t> triage_drop_acquire{0};
 	static std::atomic<uint64_t> triage_gap_over{0};
@@ -453,6 +467,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		uint64_t triage_n_commits = triage_commits.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_warped = triage_warped.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_straight = triage_straight.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_no_depth = triage_straight_no_depth.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_disabled = triage_straight_disabled.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_multilayer = triage_straight_multilayer.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_multilayer_depth = triage_straight_multilayer_depth.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_predict = triage_straight_predict.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_degenerate = triage_straight_degenerate.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_drop_busy = triage_drop_busy.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_drop_acquire = triage_drop_acquire.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_gap_over = triage_gap_over.exchange(0, std::memory_order_relaxed);
@@ -483,10 +503,16 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		double triage_warp_avg_us = triage_n_warp_samples ? double(triage_n_warp_ns_sum) / double(triage_n_warp_samples) / 1000.0 : 0.0;
 		float triage_warp_gpu_max_us = warp_gpu_window_max_us;
 		warp_gpu_window_max_us = 0;
-		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu presented %llu skipped_idr %llu skipped_busy %llu depth_presented %llu depth_idr %llu depth_busy %llu enc_data %llu enc_empty %llu sender_max %llu sender_empty %llu fid_stall %llu",
+		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu straight_detail no_depth %llu disabled %llu multilayer %llu multilayer_depth %llu predict %llu degenerate %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu presented %llu skipped_idr %llu skipped_busy %llu depth_presented %llu depth_idr %llu depth_busy %llu enc_data %llu enc_empty %llu sender_max %llu sender_empty %llu fid_stall %llu",
 		        (unsigned long long)triage_n_commits,
 		        (unsigned long long)triage_n_warped,
 		        (unsigned long long)triage_n_straight,
+		        (unsigned long long)triage_n_straight_no_depth,
+		        (unsigned long long)triage_n_straight_disabled,
+		        (unsigned long long)triage_n_straight_multilayer,
+		        (unsigned long long)triage_n_straight_multilayer_depth,
+		        (unsigned long long)triage_n_straight_predict,
+		        (unsigned long long)triage_n_straight_degenerate,
 		        (unsigned long long)triage_n_drop_busy,
 		        (unsigned long long)triage_n_drop_acquire,
 		        (unsigned long long)triage_n_gap_over,
@@ -611,6 +637,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	std::array<float, 2> src_far_z{1000, 1000};
 	std::array<xrt_pose, 2> src_pose{};
 	bool has_depth_src = false;
+	// Straight attribution inputs (logging only): which path this
+	// commit took and whether prediction succeeded.
+	bool triage_fast_path = false;
+	bool triage_squash_has_depth = false;
+	bool triage_dst_ok = true;
 
 	// Latest predicted warp target, filled by the entry point below and
 	// consumed by the foveation reroute when a warp recorded.
@@ -626,6 +657,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		const auto & layer = layer_accum.layers[0];
 		has_depth_src = layer.data.type == XRT_LAYER_PROJECTION_DEPTH;
+		triage_fast_path = true;
 		for (int view = 0; view < 2; ++view)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
@@ -662,6 +694,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		bool squash_has_depth = false;
 		for (uint32_t li = 0; li < layer_accum.layer_count; ++li)
 			squash_has_depth = squash_has_depth or layer_accum.layers[li].data.type == XRT_LAYER_PROJECTION_DEPTH;
+		triage_squash_has_depth = squash_has_depth;
 		if (squash_has_depth)
 		{
 			static std::atomic<uint64_t> last_stand_down_ns{0};
@@ -766,6 +799,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        &head,
 		        dst_fov.data(),
 		        dst_pose.data()) == XRT_SUCCESS;
+		triage_dst_ok = dst_ok;
 		if (dst_ok)
 		{
 			for (int view = 0; view < 2; ++view)
@@ -817,7 +851,26 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	if (warped)
 		triage_warped.fetch_add(1, std::memory_order_relaxed);
 	else
+	{
 		triage_straight.fetch_add(1, std::memory_order_relaxed);
+		if (not has_depth_src)
+		{
+			if (triage_fast_path)
+				triage_straight_no_depth.fetch_add(1, std::memory_order_relaxed);
+			else
+			{
+				triage_straight_multilayer.fetch_add(1, std::memory_order_relaxed);
+				if (triage_squash_has_depth)
+					triage_straight_multilayer_depth.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		else if (not depth_reprojection_enabled)
+			triage_straight_disabled.fetch_add(1, std::memory_order_relaxed);
+		else if (not triage_dst_ok)
+			triage_straight_predict.fetch_add(1, std::memory_order_relaxed);
+		else
+			triage_straight_degenerate.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	if (session.get_info().eye_gaze)
 	{
