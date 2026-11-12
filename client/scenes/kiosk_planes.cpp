@@ -438,6 +438,10 @@ void kiosk_planes::pick_maneuver(plane & f)
 void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera)
 {
 	(void)anchor_orient; // placement is position-only; heading is random
+	// the below-GUI passes always include the trails layer: hide the ribbon
+	// here, the per-plane loop below only runs its visible branch on active
+	if (auto * trail_node = scene_.world.try_get<components::node>(trail_entity))
+		trail_node->visible = active;
 	if (active && !was_active_)
 	{
 		// (re)opening: replay the one-by-one spawn-in from scratch, with a
@@ -741,7 +745,7 @@ void kiosk_planes::build_trail(const std::optional<glm::vec3> & camera, XrTime n
 
 			// soft across-width profile: transparent edges, bright core
 			constexpr float across[5] = {-1.f, -0.5f, 0.f, 0.5f, 1.f};
-			constexpr float across_alpha[5] = {0.f, 0.6f, 1.f, 0.6f, 1.f};
+			constexpr float across_alpha[5] = {0.f, 0.6f, 1.f, 0.6f, 0.f};
 			for (size_t k = 0; k < 5; ++k)
 			{
 				const float ak = a * across_alpha[k];

@@ -109,7 +109,6 @@ private:
 	// camera-facing strip, rebuilt on the CPU each frame.
 	entt::entity trail_entity = entt::null;
 	std::shared_ptr<renderer::mesh> trail_mesh;
-	std::shared_ptr<renderer::material> trail_material;
 	std::shared_ptr<buffer_allocation> trail_buffer;
 	// Emitter in construction-time world units (tail center of the measured
 	// model OBB at origin); only the plane orientation applies per frame

@@ -1474,7 +1474,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			             width,
 			             height,
 			             true,
-			             layer_controllers,
+			             layer_controllers | layer_trails,
 			             {});
 			set_depth_test(true, XR_COMPARE_OP_ALWAYS_FB);
 		}
@@ -1499,7 +1499,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		             width,
 		             height,
 		             composition_layer_depth_test_supported,
-		             composition_layer_depth_test_supported ? layer_rays : layer_controllers | layer_rays | layer_trails,
+		             composition_layer_depth_test_supported ? layer_rays : layer_controllers | layer_rays,
 		             {});
 		if (composition_layer_depth_test_supported)
 			set_depth_test(true, XR_COMPARE_OP_LESS_FB);

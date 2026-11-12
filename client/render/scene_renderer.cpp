@@ -885,7 +885,9 @@ vk::raii::Pipeline scene_renderer::create_pipeline(const pipeline_info & info)
 	                        .srcColorBlendFactor = vk::BlendFactor::eOne,
 	                        .dstColorBlendFactor = info.blend_additive ? vk::BlendFactor::eOne : vk::BlendFactor::eOneMinusSrcAlpha,
 	                        .colorBlendOp = vk::BlendOp::eAdd,
-	                        .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+	                        // additive trails must not pump the layer alpha the XR
+	                        // compositor uses: preserve dst, ignore src.
+	                        .srcAlphaBlendFactor = info.blend_additive ? vk::BlendFactor::eZero : vk::BlendFactor::eOne,
 	                        .dstAlphaBlendFactor = info.blend_additive ? vk::BlendFactor::eOne : vk::BlendFactor::eOneMinusSrcAlpha,
 	                        .alphaBlendOp = vk::BlendOp::eAdd,
 	                        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA}},
@@ -1299,6 +1301,8 @@ void scene_renderer::render(
 		        .topology = primitive.topology,
 		        .blend_enable = material->blend_enable,
 		        .blend_additive = material->blend_additive,
+		        .depth_test_enable = material->depth_test_enable,
+		        .depth_write_enable = material->depth_write_enable,
 
 		        .nb_texcoords = 2, // TODO
 		        .skinning = !node.joints.empty(),
