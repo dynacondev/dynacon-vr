@@ -29,19 +29,17 @@
 
 namespace
 {
-// Mirrors union_merge_mv.frag.glsl Push: active mask input count
-// (1..8) for the uniform tap early-out plus the dots-sidecar present
-// flag. 8B, far below the 128-byte Vulkan minimum (no
-// maxPushConstantsSize check needed); FRAG-only range, and the vertex
-// shader declares no push block, so the mask_mv offset trap
-// (mismatched vert/frag blocks under a shared range) is structurally
-// impossible.
+// Mirrors union_merge_mv.frag.glsl Push: active input count (1..8)
+// for the uniform tap early-out. 4B, far below the 128-byte Vulkan
+// minimum (no maxPushConstantsSize check needed); FRAG-only range,
+// and the vertex shader declares no push block, so the mask_mv
+// offset trap (mismatched vert/frag blocks under a shared range) is
+// structurally impossible.
 struct push
 {
 	int32_t count = 0;
-	int32_t use_dots = 0;
 };
-static_assert(sizeof(push) == 8);
+static_assert(sizeof(push) == 4);
 } // namespace
 
 union_merge_renderer::union_merge_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device) :
@@ -142,12 +140,10 @@ void union_merge_renderer::release()
 void union_merge_renderer::init_pipelines(vk::Format format)
 {
 	pipe_cache = pipeline_cache(*device);
-	// 9 static sampler2DArray bindings, fragment-only (bindings 0..7
-	// mask inputs, binding 8 dots sidecar). No vertex input, no push
-	// constants — the reduction is count-independent.
-	static constexpr uint32_t binding_count = max_inputs + 1;
-	vk::DescriptorSetLayoutBinding bindings[binding_count];
-	for (uint32_t i = 0; i < binding_count; ++i)
+	// 8 static sampler2DArray bindings, fragment-only (no vertex
+	// input, no push constants — the reduction is count-independent).
+	vk::DescriptorSetLayoutBinding bindings[max_inputs];
+	for (uint32_t i = 0; i < max_inputs; ++i)
 	{
 		bindings[i] = vk::DescriptorSetLayoutBinding{
 		        .binding = i,
@@ -157,7 +153,7 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 		};
 	}
 	descriptor_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
-	                                                                 .bindingCount = binding_count,
+	                                                                 .bindingCount = max_inputs,
 	                                                                 .pBindings = bindings,
 	                                                         });
 	// Linear + ClampToEdge (feather sampler precedent): the bilinear
@@ -183,7 +179,7 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	// next frame rewrites the other.
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = 2 * (max_inputs + 1),
+	        .descriptorCount = 2 * max_inputs,
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
 	        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
@@ -239,9 +235,8 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	        .depthTestEnable = VK_FALSE,
 	        .depthWriteEnable = VK_FALSE,
 	};
-	// No blending: a single write per pixel (MAX mask alpha holed by
-	// dots coverage, premultiplied dots RGB); the submit-time blend
-	// does color ADDITIVE + alpha REPLACE (ONE, ONE / ONE, ZERO).
+	// No blending: a single MAX write per pixel; the submit-time
+	// REPLACE builds the dst-alpha union (like every mask target).
 	vk::PipelineColorBlendAttachmentState blend_attachment{
 	        .blendEnable = VK_FALSE,
 	        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
@@ -326,8 +321,7 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 }
 
 bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
-                                  vk::Extent2D extent, std::span<const input> inputs,
-                                  const input * dots)
+                                  vk::Extent2D extent, std::span<const input> inputs)
 {
 	if (inputs.empty() or inputs.size() > max_inputs or image_index >= targets.size())
 		return false;
@@ -341,20 +335,13 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		if (in.view_array == vk::ImageView{})
 			return false;
 	}
-	// Dots sidecar (same borrowed lifetime, same-frame use only): a
-	// null view with a non-null pointer is the same retired-image
-	// hazard as above — refuse the whole merge, never a partial one.
-	// Null pointer = masks only (valid: no dots recorded this frame).
-	bool use_dots = dots != nullptr;
-	if (use_dots and dots->view_array == vk::ImageView{})
-		return false;
 
 	// Write→read hazard (same command buffer): every input was just
 	// written as a color attachment and ends OPTIMAL. Transition to
 	// SHADER_READ for the merge; every next record re-begins
 	// UNDEFINED+CLEAR, so no transition back is needed.
 	std::vector<vk::ImageMemoryBarrier> barriers;
-	barriers.reserve(inputs.size() + (use_dots ? 1 : 0));
+	barriers.reserve(inputs.size());
 	for (auto & in: inputs)
 	{
 		barriers.push_back(vk::ImageMemoryBarrier{
@@ -372,23 +359,6 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		        },
 		});
 	}
-	if (use_dots)
-	{
-		barriers.push_back(vk::ImageMemoryBarrier{
-		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-		        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-		        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .image = dots->image,
-		        .subresourceRange = {
-		                .aspectMask = vk::ImageAspectFlagBits::eColor,
-		                .levelCount = 1,
-		                .layerCount = 2,
-		        },
-		});
-	}
 	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
 	                    vk::PipelineStageFlagBits::eFragmentShader,
 	                    {},
@@ -398,15 +368,13 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 
 	// Descriptor write (per call: contributor images cycle
 	// independently, so nothing is stable across frames). Unused
-	// mask slots re-bind input 0's view (same view in several slots
-	// is legal; max() over duplicates is neutral). Binding 8 is the
-	// dots sidecar (input 0 re-bound when inactive; the shader only
-	// taps it when use_dots is set). Ping-pong parity: the other set
-	// may still be read by a prior in-flight command buffer (inline
-	// fallback while the async CB flies).
+	// slots re-bind input 0's view (same view in several slots is
+	// legal; max() over duplicates is neutral). Ping-pong parity:
+	// the other set may still be read by a prior in-flight command
+	// buffer (inline fallback while the async CB flies).
 	set_parity = !set_parity;
 	vk::DescriptorSet set = *descriptor_sets[set_parity ? 1 : 0];
-	vk::DescriptorImageInfo infos[max_inputs + 1];
+	vk::DescriptorImageInfo infos[max_inputs];
 	for (uint32_t i = 0; i < max_inputs; ++i)
 	{
 		auto & in = inputs[std::min<size_t>(i, inputs.size() - 1)];
@@ -416,14 +384,9 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		};
 	}
-	infos[max_inputs] = vk::DescriptorImageInfo{
-	        .sampler = *sampler,
-	        .imageView = use_dots ? dots->view_array : inputs[0].view_array,
-	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	};
 	std::vector<vk::WriteDescriptorSet> writes;
-	writes.reserve(max_inputs + 1);
-	for (uint32_t i = 0; i < max_inputs + 1; ++i)
+	writes.reserve(max_inputs);
+	for (uint32_t i = 0; i < max_inputs; ++i)
 	{
 		writes.push_back(vk::WriteDescriptorSet{
 		        .dstSet = set,
@@ -462,11 +425,11 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set, {});
-	// Active mask count + dots flag for the uniform tap early-out
-	// (volume_virt FRAG-only precedent): identical for every
-	// invocation in the draw, so skipped taps never execute.
-	// inputs.size() is 1..8 (checked on entry).
-	cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, push{.count = (int32_t)inputs.size(), .use_dots = use_dots ? 1 : 0});
+	// Active input count for the uniform tap early-out (volume_virt
+	// FRAG-only precedent): identical for every invocation in the
+	// draw, so skipped taps never execute. inputs.size() is 1..8
+	// (checked on entry).
+	cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, push{.count = (int32_t)inputs.size()});
 	// Fullscreen triangle (blur.vert: 3 verts, no vertex buffers).
 	cmd.draw(3, 1, 0, 0);
 	cmd.endRenderPass();

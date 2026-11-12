@@ -263,20 +263,6 @@ void hidden_dots_renderer::release()
 	swapchain_.release();
 }
 
-vk::ImageView hidden_dots_renderer::submitted_view_array(vk::Image image) const
-{
-	// Targets parallel the swapchain image list (ensure() builds one
-	// entry per image): scan for the handle. Linear is fine (a
-	// handful of images, called once per frame at most).
-	const auto images = swapchain_.images();
-	for (size_t i = 0; i < images.size() and i < targets.size(); ++i)
-	{
-		if (images[i] == image)
-			return *targets[i].view;
-	}
-	return vk::ImageView{};
-}
-
 void hidden_dots_renderer::init_pipelines(vk::Format format)
 {
 	pipe_cache = pipeline_cache(*device);
