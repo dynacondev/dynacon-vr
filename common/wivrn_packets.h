@@ -321,6 +321,13 @@ struct settings_changed
 	uint32_t fps_divider = 1;
 	uint32_t bitrate_bps;
 
+	// Server-side ADB CPU/GPU pin (SideQuest-style setprop override),
+	// applied by the server when a streaming session is active:
+	// -1 = Auto (no override, the app's own perf hints rule),
+	// otherwise a forced level 0 (slowest) .. 6 (fastest).
+	int8_t cpu_level_override = -1;
+	int8_t gpu_level_override = -1;
+
 	// Whether the server should mirror the gamepad to a virtual uinput device;
 	// gamepad inputs are always forwarded for the OpenXR path
 	bool mirror_gamepad = false;
