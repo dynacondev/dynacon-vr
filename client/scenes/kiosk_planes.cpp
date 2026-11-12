@@ -379,10 +379,14 @@ void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 	f.man_t = 0.;
 	f.prev_now = 0;
 	// fresh flight state below; clear any stale trail so a re-show never
-	// streaks across the scene from the old position
+	// streaks across the scene from the old position. Formation fields are
+	// reset on the rising edge (no spawn can occur mid-formation), cleared
+	// here too in case that ordering ever changes.
 	f.trail.clear();
 	f.trail_t.clear();
 	f.last_sample_t = 0;
+	f.formation_slot = -1;
+	f.form_w = 0.f;
 	// fresh livery every spawn: construction-time draws could hide a color
 	// all session. The spawn is invisible (pre-fade), so the swap never pops.
 	// Logcat records the pick for on-device color forensics.
@@ -453,8 +457,9 @@ void kiosk_planes::start_formation(XrTime now)
 	{
 		plane & f = planes_[candidates[k]];
 		f.formation_slot = int(k);
-		// freeze solo state: no maneuver timers, no relax fight, no leash.
-		// Rates decay out below; the slot blend slews steering in.
+		// slaved: maneuver timers frozen (rates unused while slaved; seeded
+		// from applied pursuit below for release continuity), no relax
+		// fight, no leash. Slot steering slews in via form_w.
 		f.loop_maneuver = false;
 		f.roll_free = false;
 		f.roll_rate = 0.f;
@@ -471,9 +476,11 @@ void kiosk_planes::release_formation()
 	{
 		if (f.formation_slot < 0)
 			continue;
+		// the leader keeps its ongoing solo maneuver; followers get a fresh
+		// enveloped one, smooth by construction
+		if (f.spawned && f.formation_slot != 0)
+			pick_maneuver(f);
 		f.formation_slot = -1;
-		if (f.spawned)
-			pick_maneuver(f); // fresh enveloped maneuver: smooth by construction
 	}
 	formation_active_ = false;
 	formation_leader_ = -1;
@@ -751,6 +758,10 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 				yaw = std::clamp(form_gain * glm::dot(corr, r), -form_max_rate, form_max_rate) * f.form_w;
 				pitch = std::clamp(form_gain * glm::dot(corr, u), -form_max_rate, form_max_rate) * f.form_w;
 			}
+			// seed the frozen solo rates from applied pursuit: release then
+			// resumes from pursuit-consistent rates instead of stale ones
+			f.yaw_rate = yaw;
+			f.pitch_rate = pitch;
 		}
 
 		f.dir = glm::normalize(f.dir + (r * yaw + u * pitch) * float(dt));
