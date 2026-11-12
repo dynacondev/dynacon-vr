@@ -21,7 +21,6 @@
 
 #include "scene.h"
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <functional>
 #include <glm/geometric.hpp>
@@ -62,12 +61,15 @@ const paint paints[]{
 
 glm::vec3 random_in_ball(std::mt19937 & rng, float radius)
 {
-	// rejection sampling: uniform in the unit ball, scaled to radius
+	// rejection sampling: uniform in the ball, scaled to radius
 	std::uniform_real_distribution<float> dist(-1.f, 1.f);
-	glm::vec3 v(dist(rng), dist(rng), dist(rng));
-	if (glm::dot(v, v) > 1.f || glm::dot(v, v) < 1e-6f)
-		return {0.f, 0.f, 0.f};
-	return v * radius;
+	for (;;)
+	{
+		glm::vec3 v(dist(rng), dist(rng), dist(rng));
+		float l2 = glm::dot(v, v);
+		if (l2 <= 1.f && l2 >= 1e-6f)
+			return v * radius;
+	}
 }
 } // namespace
 
@@ -88,7 +90,7 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 		// independently; textures stay shared, only flags and the uniform
 		// staging are per-plane. The white body part gets a per-plane
 		// paint job from the palette above.
-		flight f;
+		plane f;
 		f.root = entity;
 		const paint & paint = paints[std::uniform_int_distribution<size_t>(0, std::size(paints) - 1)(rng_)];
 		std::uniform_real_distribution<float> jitter(-paint.variance, paint.variance);
@@ -151,11 +153,11 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask) :
 			}
 		};
 		visit(entity);
-		flights_.push_back(std::move(f));
+		planes_.push_back(std::move(f));
 	}
 }
 
-void kiosk_planes::spawn_at(flight & f, const glm::vec3 & anchor_pos)
+void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 {
 	// random position in a ball around the overlay; frozen here so later
 	// panel motion never perturbs a spawned plane
@@ -179,7 +181,7 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 	{
 		// (re)opening: replay the one-by-one spawn-in from scratch
 		activated_t0_ = now;
-		for (auto & f: flights_)
+		for (auto & f: planes_)
 		{
 			f.spawned = false;
 			f.spawn_t0 = 0;

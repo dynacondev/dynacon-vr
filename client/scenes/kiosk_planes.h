@@ -36,7 +36,7 @@ namespace wivrn
 // Small fleet of model planes for the kiosk waiting overlays, shared by the
 // lobby and stream scenes. Clean slate: no pathing. Planes spawn one by one
 // at random positions within 1m of the overlay panel, fade in, then stay
-// put forever (eternal: no flights, no fade-outs, no respawns). Create once
+// put forever (eternal: no flight paths, no fade-outs, no respawns). Create once
 // the scene world exists (on_focused), update every frame the overlay may
 // show, destroy with the scene (planes hold entities in the scene registry).
 class kiosk_planes
@@ -50,7 +50,7 @@ public:
 	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active);
 
 private:
-	struct flight
+	struct plane
 	{
 		entt::entity root;
 		std::vector<std::shared_ptr<renderer::material>> materials;
@@ -63,12 +63,12 @@ private:
 	};
 
 	::scene & scene_;
-	std::vector<flight> flights_;
+	std::vector<plane> planes_;
 	std::mt19937 rng_;
 	bool was_active_ = false;
 	XrTime activated_t0_ = 0; // rising-edge time: plane i spawns at + i * spawn_interval
 
-	void spawn_at(flight & f, const glm::vec3 & anchor_pos);
+	void spawn_at(plane & f, const glm::vec3 & anchor_pos);
 };
 
 } // namespace wivrn
