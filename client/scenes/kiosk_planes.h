@@ -115,6 +115,7 @@ private:
 	XrTime next_formation_t_ = 0; // earliest time to start the next formation
 	int formation_leader_ = -1;
 	int formation_shape_ = -1;
+	bool formation_locked_ = false; // all members within join_radius of slot (leader holds back until then)
 
 	// Shared engine-trail ribbon: one node/primitive holding every plane's
 	// camera-facing strip, rebuilt on the CPU each frame.

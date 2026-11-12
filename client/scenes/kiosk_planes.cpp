@@ -61,16 +61,19 @@ constexpr float bank_coord_gain = 0.6f; // coordinated bank per yaw rate
 constexpr float bank_max = 1.0f;     // bank clamp (radians)
 constexpr float bank_relax = 5.0f;    // bank return rate toward coordinated value (1/s): tracks, not chases
 // formation flying: leader flies solo maneuvers, the rest pursue slots
-constexpr double form_gap_lo = 12.0; // next formation starts 12-20s after activation...
-constexpr double form_gap_hi = 20.0;
+constexpr double form_gap_lo = 6.0; // next formation starts 6-10s after activation...
+constexpr double form_gap_hi = 10.0;
 constexpr double form_cool_lo = 15.0; // ...and 15-35s after each breakup
 constexpr double form_cool_hi = 35.0;
 constexpr double form_dur_lo = 3.0; // formation holds 3-10s
 constexpr double form_dur_hi = 10.0;
-constexpr float form_gain = 3.0f;    // slot-pursuit steering gain (hotter than the leash)
-constexpr float form_max_rate = 1.5f; // slot-pursuit rate cap (rad/s)
-constexpr float form_catchup = 0.8f; // speed boost per meter of along-track error
-constexpr float form_speed_max = 0.85f; // catch-up cap (m/s)
+constexpr float form_gain = 5.0f;    // slot-pursuit steering gain (hotter than the leash)
+constexpr float form_max_rate = 2.2f; // slot-pursuit rate cap (rad/s)
+constexpr float form_catchup = 1.2f; // speed boost per meter of along-track error
+constexpr float form_speed_max = 1.0f; // catch-up cap (m/s)
+constexpr float form_lock_radius = 0.6f; // inside this, match the leader's velocity (rock-solid hold)
+constexpr float leader_holdback = 0.6f; // leader speed factor until the formation is joined
+constexpr float join_radius = 0.6f; // a member counts as joined inside this distance
 // Fixed det=+1 basis flips the apparent bank sense vs the old mirrored
 // frame: positive bank about +dir lifts the inside wing (leans OUT), so
 // the coordinated default is -1. Flip only if planes lean out of turns.
@@ -571,6 +574,7 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		formation_active_ = false;
 		formation_leader_ = -1;
 		formation_shape_ = -1;
+		formation_locked_ = false;
 		next_formation_t_ = now + XrDuration(std::uniform_real_distribution<double>(form_gap_lo, form_gap_hi)(rng_) * 1e9);
 	}
 	was_active_ = active;
@@ -583,6 +587,28 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 	}
 	if (active && !formation_active_ && now >= next_formation_t_)
 		start_formation(now);
+
+	// formation join state, computed before the per-plane loop so the
+	// leader can hold back until the wingmen are actually in their slots
+	formation_locked_ = false;
+	if (active && formation_active_)
+	{
+		const plane & lead = planes_[size_t(formation_leader_)];
+		glm::vec3 lup = glm::cross(lead.dir, lead.right);
+		formation_locked_ = true;
+		for (const auto & f: planes_)
+		{
+			if (f.formation_slot <= 0 || not f.spawned)
+				continue;
+			glm::vec3 off = formation_shapes[size_t(formation_shape_)][size_t(f.formation_slot)];
+			glm::vec3 want = lead.pos + lead.right * off.x + lup * off.y + lead.dir * off.z;
+			if (glm::length(want - f.pos) > join_radius)
+			{
+				formation_locked_ = false;
+				break;
+			}
+		}
+	}
 
 	for (size_t slot = 0; slot < planes_.size(); ++slot)
 	{
@@ -739,7 +765,9 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			pitch = f.pitch_rate + pitch_bias;
 			// model planes don't rocket: cap climb/dive authority everywhere
 			// except loops, which need the full pitch rate for the figure.
-			if (not f.loop_maneuver)
+			// Followers are exempt too: the slot may demand a steep
+			// intercept, and the attitude clamp below still bounds the path.
+			if (not f.loop_maneuver && not slaved)
 				pitch = std::clamp(pitch, -pitch_max_rate, pitch_max_rate);
 		}
 		else
@@ -747,16 +775,28 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			// slot pursuit in the leader frame: no leash (the slot may sit
 			// outside it) and no maneuver targets. Steering is direct and
 			// capped, eased in by form_w, so the join reads as a rejoin.
+			// Close in, blend from pursuit to leader-velocity matching: that
+			// kills relative drift and the formation holds rock-solid
+			// instead of orbiting the slot.
 			const plane & lead = planes_[size_t(formation_leader_)];
 			glm::vec3 lup = glm::cross(lead.dir, lead.right);
 			glm::vec3 off = formation_shapes[size_t(formation_shape_)][size_t(f.formation_slot)];
 			glm::vec3 want = lead.pos + lead.right * off.x + lup * off.y + lead.dir * off.z;
 			to_slot = want - f.pos;
-			if (glm::length(to_slot) > 1e-4f)
+			float pdist = glm::length(to_slot);
+			if (pdist > 1e-4f)
 			{
 				glm::vec3 corr = to_slot - f.dir * glm::dot(to_slot, f.dir);
-				yaw = std::clamp(form_gain * glm::dot(corr, r), -form_max_rate, form_max_rate) * f.form_w;
-				pitch = std::clamp(form_gain * glm::dot(corr, u), -form_max_rate, form_max_rate) * f.form_w;
+				float lock = 1.f - std::min(1.f, pdist / form_lock_radius);
+				float yp = form_gain * glm::dot(corr, r);
+				float pp = form_gain * glm::dot(corr, u);
+				glm::vec3 corr_a = lead.dir - f.dir * glm::dot(lead.dir, f.dir);
+				float ya = form_gain * glm::dot(corr_a, r);
+				float pa = form_gain * glm::dot(corr_a, u);
+				float ym = yp + (ya - yp) * lock;
+				float pm = pp + (pa - pp) * lock;
+				yaw = std::clamp(ym, -form_max_rate, form_max_rate) * f.form_w;
+				pitch = std::clamp(pm, -form_max_rate, form_max_rate) * f.form_w;
 			}
 			// seed the frozen solo rates from applied pursuit: release then
 			// resumes from pursuit-consistent rates instead of stale ones
@@ -786,7 +826,13 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		// join reads as a rejoin (hurry when behind, check when ahead).
 		float speed;
 		if (not slaved)
+		{
 			speed = std::clamp(f.speed * (1.f - climb_factor * f.dir.y), speed_min, speed_max);
+			// formation leader holds back until the wingmen are in their
+			// slots — otherwise it cruises off while they chase forever
+			if (formation_active_ && f.formation_slot == 0 && not formation_locked_)
+				speed *= leader_holdback;
+		}
 		else
 		{
 			const plane & lead = planes_[size_t(formation_leader_)];
