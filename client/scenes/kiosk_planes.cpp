@@ -53,9 +53,10 @@ constexpr float rate_smooth = 3.0f;  // maneuver target blending rate (1/s)
 constexpr float bank_coord_gain = 0.6f; // coordinated bank per yaw rate
 constexpr float bank_max = 1.0f;     // bank clamp (radians)
 constexpr float bank_relax = 2.0f;    // bank return rate toward coordinated value (1/s)
-// Mirrored basis flips the apparent bank direction; flip once on device if
-// planes lean out of their turns instead of into them.
-constexpr float bank_sign = 1.f;
+// Fixed det=+1 basis flips the apparent bank sense vs the old mirrored
+// frame: positive bank about +dir lifts the inside wing (leans OUT), so
+// the coordinated default is -1. Flip only if planes lean out of turns.
+constexpr float bank_sign = -1.f;
 
 double smoothstep(double e0, double e1, double x)
 {
@@ -199,7 +200,8 @@ void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 	f.pos = pos;
 	// match the spawn orientation above: identity nose +Z rotated by yaw0
 	f.dir = glm::vec3(std::sin(yaw0), 0.f, std::cos(yaw0));
-	f.right = glm::vec3(1.f, 0.f, 0.f);
+	// matching lateral axis (up x dir); rebuilt on the first frame anyway
+	f.right = glm::vec3(std::cos(yaw0), 0.f, -std::sin(yaw0));
 	f.speed = std::uniform_real_distribution<float>(cruise_lo, cruise_hi)(rng_);
 	f.bank = 0.f;
 	f.pitch_rate = f.yaw_rate = f.roll_rate = 0.f;
@@ -387,6 +389,10 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		}
 		glm::vec3 up0 = glm::cross(f.dir, f.right);
 		f.dir = glm::normalize(f.dir + (f.right * yaw + up0 * pitch) * float(dt));
+		// re-orthogonalize against the FINAL dir: the cache above is
+		// perpendicular to the pre-integration dir, off by yaw*dt. Without
+		// this the orientation basis below carries shear into quat_cast.
+		f.right = glm::normalize(f.right - f.dir * glm::dot(f.right, f.dir));
 		f.pos += f.dir * f.speed * float(dt);
 
 		// rolls integrate; everything relaxes toward the coordinated bank
