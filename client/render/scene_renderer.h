@@ -27,7 +27,9 @@
 #include <glm/vec2.hpp>
 #include <glm/vec3.hpp>
 #include <glm/vec4.hpp>
+#include <map>
 #include <span>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 #include <vulkan/vulkan.hpp>
@@ -125,15 +127,20 @@ class scene_renderer
 
 		image_allocation multisample_image;
 		vk::raii::ImageView multisample_view = nullptr;
+
+		// Only used with MSAA + keep_depth_buffer: transient multisample
+		// depth rendered into, resolved to the swapchain depth (depth_view).
+		image_allocation multisample_depth_image;
+		vk::raii::ImageView multisample_depth_view = nullptr;
 	};
 
 	struct renderpass
 	{
 		vk::raii::RenderPass renderpass = nullptr;
-		vk::AttachmentReference color_attachment;
-		vk::AttachmentReference depth_attachment;
-		std::optional<vk::AttachmentReference> resolve_attachment;          // Only used if MSAA is enabled
-		std::optional<vk::AttachmentReference> fragment_density_attachment; // Only used if fragment density map is enabled
+		vk::AttachmentReference2 color_attachment;
+		vk::AttachmentReference2 depth_attachment;
+		std::optional<vk::AttachmentReference2> resolve_attachment;       // Only used if MSAA is enabled
+		std::optional<vk::AttachmentReference2> depth_resolve_attachment; // Only used if MSAA is enabled with keep_depth_buffer
 		int attachment_count;
 	};
 
@@ -151,11 +158,17 @@ class scene_renderer
 	std::unordered_map<renderpass_info, renderpass> renderpasses;
 	std::unordered_map<output_image_info, output_image> output_images;
 	std::unordered_map<pipeline_info, vk::raii::Pipeline> pipelines;
+	// MSAA support probe results, keyed by (color_format, depth_format, keep_depth_buffer)
+	std::map<std::tuple<vk::Format, vk::Format, bool>, vk::SampleCountFlagBits> msaa_support_cache;
 	utils::cache<std::string, shader, shader_loader> shader_cache;
 
 	output_image & get_output_image_data(const output_image_info & info);
 	vk::raii::Pipeline & get_pipeline(const pipeline_info & info);
 	renderpass & get_renderpass(const renderpass_info & info);
+
+	// Returns e4 when 4x MSAA is usable for the given formats (e1 otherwise).
+	// Honors the msaa_enabled config option and the WIVRN_MSAA env override.
+	vk::SampleCountFlagBits preferred_msaa_samples(vk::Format color_format, vk::Format depth_format, bool keep_depth_buffer);
 
 	vk::raii::DescriptorSetLayout layout_0; // Descriptor set 0: per-frame/view data (UBO), per-instance data (UBO + SSBO), per-material data (5 combined image samplers and 1 uniform buffer)
 
