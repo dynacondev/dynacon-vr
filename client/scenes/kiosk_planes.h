@@ -84,6 +84,9 @@ private:
 		double man_age = 0.; // elapsed time in the current maneuver (seconds)
 		double man_angle = 0.; // accumulated figure angle (loops/rolls terminate at 2pi)
 		XrTime prev_now = 0; // dt clock (0 = uninitialized)
+		float eff_speed = 0.35f; // effective speed applied last frame (followers read the leader's)
+		int formation_slot = -1; // -1 solo, 0 formation leader, >0 follower slot
+		float form_w = 0.f; // slot-pursuit blend: slewed in on join, instant out on release
 		// engine trail history (world space, newest last) with sample
 		// timestamps so the fade keys off real age; trail_tint follows the
 		// livery body color. trail_alpha mirrors the plane fade.
@@ -104,6 +107,14 @@ private:
 	// present; reshuffled on every re-show.
 	std::vector<size_t> livery_bag_;
 	size_t livery_next_ = 0;
+	// formation state: the slot-0 plane keeps flying solo maneuvers while
+	// the others pursue fixed offsets in its frame, then everyone is
+	// released back to solo flight. No path copying: followers steer.
+	bool formation_active_ = false;
+	XrTime formation_end_t_ = 0;
+	XrTime next_formation_t_ = 0; // earliest time to start the next formation
+	int formation_leader_ = -1;
+	int formation_shape_ = -1;
 
 	// Shared engine-trail ribbon: one node/primitive holding every plane's
 	// camera-facing strip, rebuilt on the CPU each frame.
@@ -119,6 +130,8 @@ private:
 	void apply_livery(plane & f);
 	void pick_maneuver(plane & f);
 	void build_trail(const std::optional<glm::vec3> & camera, XrTime now);
+	void start_formation(XrTime now);
+	void release_formation();
 };
 
 } // namespace wivrn
