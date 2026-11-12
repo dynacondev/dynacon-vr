@@ -21,6 +21,7 @@
 
 #include "scene.h"
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <functional>
 #include <glm/geometric.hpp>
@@ -28,6 +29,7 @@
 #include <iterator>
 #include <map>
 #include <numbers>
+#include <spdlog/spdlog.h>
 #include <string>
 
 namespace
@@ -49,15 +51,19 @@ double smoothstep(double e0, double e1, double x)
 // glass, emissive and dark/metal parts stay as authored
 struct paint
 {
+	const char * name;
 	glm::vec3 base;
 	float variance;
 };
 const paint paints[]{
-        {{1.f, 1.f, 1.f}, 0.f},                        // white
-        {{0.62f, 0.62f, 0.62f}, 0.12f},                // grey
-        {{0.75f, 0.38f, 0.04f}, 0.14f},                // dark dynacon orange
-        {{0.03f, 0.06f, 0.36f}, 0.10f},                // dark #0E1B8D navy
+        {"white", {1.f, 1.f, 1.f}, 0.f},
+        {"grey", {0.62f, 0.62f, 0.62f}, 0.12f},
+        {"orange", {0.95f, 0.27f, 0.02f}, 0.06f}, // vivid dynacon orange: high red, low green so it never reads yellow
+        {"navy", {0.03f, 0.06f, 0.36f}, 0.10f},   // dark #0E1B8D indigo
 };
+// fallback draw weights when the per-activation livery bag is exhausted
+// (shouldn't happen): mostly orange, some grey and navy, white rare
+const std::array<double, std::size(paints)> paint_weights{1.0, 3.0, 6.0, 2.0};
 
 glm::vec3 random_in_ball(std::mt19937 & rng, float radius)
 {
@@ -171,7 +177,35 @@ void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 	// level random heading; model nose points along +Z
 	std::uniform_real_distribution<float> yaw_dist(0.f, 2.f * std::numbers::pi_v<float>);
 	node->orientation = glm::angleAxis(yaw_dist(rng_), glm::vec3(0.f, 1.f, 0.f));
+	// fresh livery every spawn: construction-time draws could hide a color
+	// all session. The spawn is invisible (pre-fade), so the swap never pops.
+	// Logcat records the pick for on-device color forensics.
+	apply_livery(f);
 	f.spawned = true;
+}
+
+void kiosk_planes::apply_livery(plane & f)
+{
+	// per-activation bag first (guaranteed variety), weighted draw fallback
+	// (shouldn't happen: bag covers the fleet)
+	const paint & p = livery_next_ < livery_bag_.size()
+	        ? paints[livery_bag_[livery_next_++]]
+	        : paints[std::discrete_distribution<size_t>(paint_weights.begin(), paint_weights.end())(rng_)];
+	std::uniform_real_distribution<float> jitter(-p.variance, p.variance);
+	const glm::vec3 body_tint{
+	        std::clamp(p.base.x + jitter(rng_), 0.f, 1.f),
+	        std::clamp(p.base.y + jitter(rng_), 0.f, 1.f),
+	        std::clamp(p.base.z + jitter(rng_), 0.f, 1.f),
+	};
+	for (size_t i = 0; i < f.materials.size(); ++i)
+	{
+		if (f.materials[i]->name == "Material-kiosk")
+		{
+			f.materials[i]->staging.base_color_factor = glm::vec4(body_tint, 1.f);
+			f.base_colors[i] = glm::vec4(body_tint, 1.f);
+		}
+	}
+	spdlog::info("kiosk_planes: spawn livery {}", p.name);
 }
 
 void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active)
@@ -179,13 +213,17 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 	(void)anchor_orient; // placement is position-only; heading is random
 	if (active && !was_active_)
 	{
-		// (re)opening: replay the one-by-one spawn-in from scratch
+		// (re)opening: replay the one-by-one spawn-in from scratch, with a
+		// fresh shuffled livery bag (one of each paint, orange guaranteed)
 		activated_t0_ = now;
 		for (auto & f: planes_)
 		{
 			f.spawned = false;
 			f.spawn_t0 = 0;
 		}
+		livery_bag_ = {2, 1, 3, 0};
+		std::shuffle(livery_bag_.begin(), livery_bag_.end(), rng_);
+		livery_next_ = 0;
 	}
 	was_active_ = active;
 

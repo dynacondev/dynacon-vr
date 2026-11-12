@@ -896,13 +896,8 @@ void scenes::stream::gui_applications()
 
 void scenes::stream::gui_kiosk_waiting()
 {
-	const auto & t = wivrn::ui::current();
-
-	// spinner + title on one row, matching the lobby kiosk overlay
+	// title on its own row, matching the lobby kiosk overlay
 	ImGui::PushFont(nullptr, constants::gui::font_size_large);
-	const float r = ImGui::GetFontSize() * 0.55f;
-	ImSpinner::SpinnerAng("kiosk-waiting", r, wivrn::ui::metrics::app_spinner_thickness, ImColor{t.accent}, ImColor{t.card}, 6, 4.7124f);
-	ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 2);
 	ImGui::TextUnformatted(_S("Waiting for Simulation"));
 	ImGui::PopFont();
 }
