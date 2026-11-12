@@ -301,7 +301,7 @@ public:
 	// (shared logic untouched): RP1 rasters the proximity spheres into a
 	// depth field, RP2 rasters the silhouettes with a depth test against
 	// it, so only in-radius fragments write mask. Quarter-res working +
-	// submit (alert-grade, like the dots layer); tier-0 direct raster
+	// submit (alert-grade); tier-0 direct raster
 	// (no blur/erode/volume/VR ever — bubbles never engage here).
 	// spheres: one MVP pair per proximity volume (model =
 	// translate(center) * scale(radius)), stream-built so this stays

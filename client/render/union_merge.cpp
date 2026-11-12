@@ -256,7 +256,7 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	        .dynamicStateCount = 2,
 	        .pDynamicStates = dynamics,
 	};
-	// Descriptor set only, plus a 4B FRAG-only count range (the
+	// Descriptor set only, plus an 8B FRAG-only count + use_dots range (the
 	// vertex shader declares no push block — a VERT|FRAG shared range
 	// with mismatched vert/frag blocks would re-trigger the mask_mv
 	// offset trap, so the range stays FRAG-only by design).
