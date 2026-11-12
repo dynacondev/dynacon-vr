@@ -526,7 +526,7 @@ private:
 	// above, VR cut candidates in 3d-passthrough windows count even when
 	// no 3d-depth-passthrough volume is placed). wanted = any feather
 	// group carried window positives this frame; paired/missing split
-	// that by strict depth pairing (missing only when depth_expected).
+	// that by tolerant (±1) depth pairing (missing only when depth_expected).
 	// Windowed + 5s heartbeat in accumulate_metrics ("VRoccl:" line).
 	bool vr_frame_wanted = false; // set by the mask record loop (any group, any_positive)
 	bool vr_frame_virt_paired = false; // set alongside volume_frame_virt_paired when any_vr ran

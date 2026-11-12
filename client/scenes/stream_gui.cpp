@@ -275,8 +275,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		if (volume_frame_virt_paired)
 			++volume_win_virt_paired;
 		// Expected-but-missing: the color frame's view_info says the
-		// server packed depth for this frame_idx, yet strict pairing
-		// found none — wire loss or pairing miss, never by-design.
+		// server packed depth for this frame_idx, yet tolerant (±1)
+		// pairing found none — wire loss or pairing miss, never by-design.
 		else if (blit_handles.size() > depth_stream_index and blit_handles[0] and not blit_handles[depth_stream_index] and
 		         blit_handles[0]->view_info.depth_expected)
 			++volume_win_virt_missing;
@@ -325,7 +325,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	// frames even when no depth volume is placed, where the Volume block
 	// above stays silent). wanted = any group carried window positives;
 	// paired = the VR cut ran; missing = wanted but depth_expected with
-	// no strict pairing (the flicker frame: mask stays passthrough).
+	// no tolerant (±1) pairing (the flicker frame: mask stays passthrough).
 	if (vr_frame_wanted)
 	{
 		++vr_win_frames;

@@ -1289,6 +1289,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		glm::quat iq = glm::conjugate(aq);
 		video_unshift.emplace(iq, iq * -ap);
 	}
+	// Origin-alignment counter-shift applied to any server-stamped pose
+	// before it is submitted into unshifted world space (video poses
+	// above, depth reference eye below — one helper so the two can never
+	// drift apart).
+	auto apply_unshift = [&](XrPosef p) {
+		if (not video_unshift)
+			return p;
+		auto & [iq, ip] = *video_unshift;
+		glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+		glm::vec3 v(p.position.x, p.position.y, p.position.z);
+		glm::quat rq = iq * q;
+		glm::vec3 rp = iq * v + ip;
+		p.orientation = {rq.x, rq.y, rq.z, rq.w};
+		p.position = {rp.x, rp.y, rp.z};
+		return p;
+	};
 	for (size_t i = 0; i < view_count + use_alpha; ++i)
 	{
 		auto & blit_handle = current_blit_handles[i];
@@ -1359,20 +1375,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (i < view_count)
 		{
 			foveation[i] = blit_handle->view_info.foveation[i];
-			pose[i] = blit_handle->view_info.pose[i];
-			if (video_unshift)
-			{
-				auto & [iq, ip] = *video_unshift;
-				glm::quat q(pose[i].orientation.w,
-				            pose[i].orientation.x,
-				            pose[i].orientation.y,
-				            pose[i].orientation.z);
-				glm::vec3 p(pose[i].position.x, pose[i].position.y, pose[i].position.z);
-				glm::quat rq = iq * q;
-				glm::vec3 rp = iq * p + ip;
-				pose[i].orientation = {rq.x, rq.y, rq.z, rq.w};
-				pose[i].position = {rp.x, rp.y, rp.z};
-			}
+			pose[i] = apply_unshift(blit_handle->view_info.pose[i]);
 			fov[i] = blit_handle->view_info.fov[i];
 			// colour image
 			images[i] = {
@@ -1508,11 +1511,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// video layer's own pose/fov, i.e. the eye the server rendered).
 	// Raster and virt must share parametrization for the compare, and
 	// raster-eye must equal submit-pose for the runtime warp — the union
-	// merge submits one layer with one pose, so the switch is frame-wide,
-	// never per-group. Per-eye fallback to color, then live, when the
-	// depth eye is unpaired or degenerate (partial pairing / teardown
-	// races). Static-world caveat: latest fused object poses and live
-	// vote positions reused here; moving boards would need a pose history.
+	// merge submits one layer with one pose, so both eyes switch together
+	// (never per-group), each falling back to color, then live,
+	// independently when the depth eye is unpaired or degenerate
+	// (partial pairing / teardown races). Divergent color eyes skip the
+	// switch outright: depth is left-anchored, so the right eye stays on
+	// its own color pose there. Static-world caveat: latest fused object
+	// poses and live vote positions reused here; moving boards would need
+	// a pose history.
 	auto depth_eye_valid = [](const XrPosef & p, const XrFovf & f) {
 		float n2 = p.orientation.w * p.orientation.w + p.orientation.x * p.orientation.x +
 		        p.orientation.y * p.orientation.y + p.orientation.z * p.orientation.z;
@@ -1530,31 +1536,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		return true;
 	};
 	auto & sync_depth_handle = current_blit_handles[depth_stream_index];
+	// Divergent color eyes (fallback path picked different frame_idx per
+	// eye): the depth frame is anchored to the left eye, so a frame-wide
+	// switch would drive the right eye's raster/submit from an unrelated
+	// frame. Stay on per-eye color there, exactly as before.
+	bool color_divergent = current_blit_handles[0] != nullptr and current_blit_handles[1] != nullptr and
+	        current_blit_handles[0]->feedback.frame_index != current_blit_handles[1]->feedback.frame_index;
 	std::array<XrPosef, view_count> sync_pose{};
 	std::array<XrFovf, view_count> sync_fov{};
 	std::array<bool, view_count> sync_is_depth_eye{};
 	for (uint32_t view = 0; view < view_count; ++view)
 	{
 		bool have_eye = view < current_blit_handles.size() and current_blit_handles[view] != nullptr;
-		bool have_depth_eye = sync_depth_handle != nullptr and
+		bool have_depth_eye = not color_divergent and sync_depth_handle != nullptr and
 		        depth_eye_valid(sync_depth_handle->view_info.pose[view], sync_depth_handle->view_info.fov[view]);
 		if (have_depth_eye)
 		{
 			sync_is_depth_eye[view] = true;
-			sync_pose[view] = sync_depth_handle->view_info.pose[view];
-			if (video_unshift)
-			{
-				auto & [iq, ip] = *video_unshift;
-				glm::quat q(sync_pose[view].orientation.w,
-				            sync_pose[view].orientation.x,
-				            sync_pose[view].orientation.y,
-				            sync_pose[view].orientation.z);
-				glm::vec3 p(sync_pose[view].position.x, sync_pose[view].position.y, sync_pose[view].position.z);
-				glm::quat rq = iq * q;
-				glm::vec3 rp = iq * p + ip;
-				sync_pose[view].orientation = {rq.x, rq.y, rq.z, rq.w};
-				sync_pose[view].position = {rp.x, rp.y, rp.z};
-			}
+			sync_pose[view] = apply_unshift(sync_depth_handle->view_info.pose[view]);
 			sync_fov[view] = sync_depth_handle->view_info.fov[view];
 		}
 		else
@@ -1938,11 +1937,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			volume_compare_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - remap_t0).count();
 		}
 
-		// View-only transforms for the mask record below. Server eye
-		// (sync_pose/sync_fov): the video frame's pose, so the silhouette
-		// raster, VR/volume draws and cutout punch share the eye the
-		// server rendered (one common warp). world_mvp stays live for
-		// gizmos/debug viz (independent overlays).
+		// View-only transforms for the mask record below. Reference eye
+		// (sync_pose/sync_fov): the depth frame's eye when the mask chain
+		// is depth-eyed, else the video frame's pose — so the silhouette
+		// raster, VR/volume draws and cutout punch always share the eye
+		// the submitted mask layer is posed with (one warp per layer).
+		// world_mvp stays live for gizmos/debug viz (independent overlays).
 		std::array<glm::mat4, view_count> world_mvp;
 		for (uint32_t view = 0; view < view_count; ++view)
 			world_mvp[view] = scene::projection_matrix(mask_fov[view]) * scene::view_matrix(mask_pose[view]);
@@ -2449,7 +2449,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// virtual depth (resolved below); it rides the same
 					// positives, so no extra culling pass.
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					// Strict virtual-depth pairing (shared by the volume
+					// Tolerant virtual-depth pairing (shared by the volume
 					// reveal and the VR occlusion): null when the color
 					// frame had no depth warp.
 					bool virt_paired = false;
@@ -2479,7 +2479,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					// Forensics for the VR-flicker hypothesis: window positives
 					// exist (a 3d-passthrough cutout wants the VR cut) but
-					// strict depth pairing failed, so the mask stays 1
+					// strict depth pairing failed (exact and ±1 neighbor
+					// both absent), so the mask stays 1
 					// (passthrough) where VR should have won. Throttled 1s;
 					// the common_frame depth-miss line carries the
 					// frame_idx/window detail, this one marks the visible
