@@ -791,6 +791,43 @@ configuration::configuration()
 		if (auto it = json.find("early-start"); it != json.end())
 			early_start = *it;
 
+		if (auto it = json.find("adb"); it != json.end())
+		{
+			if (not it->is_object())
+				U_LOG_W("adb must be an object, ignoring");
+			else
+			{
+				if (auto jt = it->find("enabled"); jt != it->end())
+				{
+					if (jt->is_boolean())
+						adb.enabled = jt->get<bool>();
+					else
+						U_LOG_W("adb.enabled must be a boolean, ignoring");
+				}
+				if (auto jt = it->find("binary"); jt != it->end())
+				{
+					if (jt->is_string())
+						adb.binary = jt->get<std::string>();
+					else
+						U_LOG_W("adb.binary must be a string, ignoring");
+				}
+				if (auto jt = it->find("target"); jt != it->end())
+				{
+					if (jt->is_string())
+						adb.target = jt->get<std::string>();
+					else
+						U_LOG_W("adb.target must be a string, ignoring");
+				}
+				if (auto jt = it->find("timeout-s"); jt != it->end())
+				{
+					if (jt->is_number_integer() and jt->get<int>() > 0)
+						adb.timeout_s = jt->get<int>();
+					else
+						U_LOG_W("adb.timeout-s must be a positive integer, ignoring");
+				}
+			}
+		}
+
 		if (auto it = json.find("openvr-compat-path"); it != json.end())
 		{
 			if (it->is_null())

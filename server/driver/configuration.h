@@ -209,6 +209,24 @@ struct configuration
 	reprojection reprojection;
 
 	bool debug_gui = false;
+
+	// Server-side ADB clock override (SideQuest-style setprop): pins the
+	// headset CPU/GPU levels requested via settings_changed while a
+	// session is active. Best-effort only; every failure is logged and
+	// the session continues with the app's own perf hints.
+	struct adb_power
+	{
+		bool enabled = true;
+		// adb binary; under flatpak this runs as `flatpak-spawn --host <binary>`
+		std::string binary = "adb";
+		// explicit `adb -s` selector, empty = derive from the headset's
+		// control-connection peer IP as <ip>:5555 (wireless ADB)
+		std::string target;
+		// per-command timeout, seconds
+		int timeout_s = 5;
+	};
+	adb_power adb;
+
 	bool use_steamvr_lh = false;
 	std::optional<int64_t> lh_max_extrapolation;
 	std::optional<float> lh_stick_deadzone;

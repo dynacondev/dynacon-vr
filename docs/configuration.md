@@ -182,6 +182,34 @@ automatically reconnects (up to 3 attempts) once the fresh session
 is up. Applications attached to the early session do not survive
 the restart and need relaunching.
 
+## `adb`
+Default value: `{"enabled": true, "binary": "adb", "target": "", "timeout-s": 5}`
+
+Server-side CPU/GPU clock override (SideQuest-style `setprop`): pins the
+headset levels requested in the client's system settings while a session
+is active, including past the passthrough caps that limit in-app hints.
+Best-effort only — every failure is logged on the server and streaming
+continues with the app's own performance hints.
+
+The headset needs wireless ADB reachable from the PC (paired once with
+`adb pair` / `adb connect`). With no explicit `target`, the server
+addresses the headset at its control-connection IP as `<ip>:5555`. Set
+`target` to use an explicit `adb -s` selector (e.g. a USB serial).
+Overrides are cleared when the session ends; a headset reboot also
+clears them (debug properties are not persistent).
+
+### Example
+```json
+{
+	"adb": {
+		"enabled": true,
+		"binary": "adb",
+		"target": "",
+		"timeout-s": 5
+	}
+}
+```
+
 ## `openvr-compat-path`
 Default value: unset
 
