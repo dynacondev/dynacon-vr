@@ -73,9 +73,10 @@ constexpr float swat_radius = 0.12f; // collision tolerance around the plane cen
 constexpr float swat_gravity = 3.5f; // fall acceleration (m/s^2)
 constexpr double swat_fade = 1.2; // fall duration = fade-out time (s)
 constexpr float swat_vel_max = 6.f; // per-point hand-velocity clamp (m/s)
-constexpr float swat_shove = 1.2f; // fling strength away from the contact
-constexpr float swat_up_pop = 0.7f; // upward pop so the fall reads as an arc, not a drop
-constexpr float swat_speed_max = 2.5f; // initial fall-velocity clamp (m/s)
+constexpr float swat_shove = 0.55f; // fling strength away from the contact
+constexpr float swat_up_pop = 0.55f; // upward pop so the fall arcs, not a drop
+constexpr float swat_momentum = 0.5f; // hand-velocity inheritance factor
+constexpr float swat_speed_max = 1.2f; // initial fall-velocity clamp (m/s)
 
 // Engine trail ribbon: resampled while moving, fades out by age.
 constexpr size_t trail_points = 60;
@@ -625,7 +626,7 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 				// upward so the fall arcs, tumble hard. Maneuver state is
 				// abandoned; the plane stays down (no respawn).
 				glm::vec3 away = glm::length(d) > 1e-4f ? d / glm::length(d) : glm::vec3{0.f, 1.f, 0.f};
-				f.shot_vel = f.dir * (f.speed * 0.5f) + away * swat_shove + glm::vec3{0.f, swat_up_pop, 0.f} + swat_vels[i] * 0.8f;
+				f.shot_vel = f.dir * (f.speed * 0.5f) + away * swat_shove + glm::vec3{0.f, swat_up_pop, 0.f} + swat_vels[i] * swat_momentum;
 				if (glm::length(f.shot_vel) > swat_speed_max)
 					f.shot_vel = f.shot_vel / glm::length(f.shot_vel) * swat_speed_max;
 				f.shot_tumble = (std::uniform_real_distribution<float>(0.f, 1.f)(rng_) < 0.5f ? -1.f : 1.f) * std::uniform_real_distribution<float>(8.f, 16.f)(rng_);
