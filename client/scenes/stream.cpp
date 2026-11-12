@@ -802,16 +802,48 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, scenes::stream::deco
 			spdlog::warn("Common-frame fallback selected:{} divergent={}", sel, divergent);
 		}
 	}
-	// Virtual depth (stream 3) never joins the common-frame intersection:
-	// strict frame_idx pairing with the selected color frame, else null
-	// (the volume compare skips the virtual term for that frame). No
-	// hold-last: stale virtual depth occludes wrong pixels. Note the
-	// fallback path above pairs per-decoder nearest, so depth follows
-	// the left eye there (warn path only, same strict rule otherwise).
-	if (result[0])
-		result[depth_stream_index] = decoders[depth_stream_index].frame(result[0]->feedback.frame_index);
+	// Virtual depth (stream 3) pairs with the selected color frame by
+	// frame_idx, tolerating ±1 (exact first, then nearest, ties to the
+	// older): depth trails (or, on a color stall, leads) color by a frame
+	// when either stream jitters, and strict equality turned that into a
+	// dropped VR cut. Index-based, never time-based: depth N is registered
+	// to color N's eye, and nearest index keeps the pair registered. The
+	// scan covers the decoder's own 3-slot window, so skew is bounded and
+	// no ancient frame can ever pair (no hold-last). Gated on
+	// depth_expected (a straight server frame must never pair a
+	// neighboring warped frame's depth) and on the decoder being live.
+	// Left-anchored: depth follows result[0], as before.
+	if (result[0] and result[0]->view_info.depth_expected and decoders[depth_stream_index].decoder)
+	{
+		uint64_t target = result[0]->feedback.frame_index;
+		if (auto exact = decoders[depth_stream_index].frame(target))
+			result[depth_stream_index] = std::move(exact);
+		else
+		{
+			int64_t best_ad = 2; // sentinel: any |d|<=1 wins
+			int64_t best_d = 0;
+			std::shared_ptr<shard_accumulator::blit_handle> best;
+			for (const auto & h: decoders[depth_stream_index].latest_frames)
+			{
+				if (not h)
+					continue;
+				int64_t d = (int64_t)h->feedback.frame_index - (int64_t)target;
+				int64_t ad = d < 0 ? -d : d;
+				if (ad > 1)
+					continue;
+				if (ad < best_ad or (ad == best_ad and d < best_d))
+				{
+					best_ad = ad;
+					best_d = d;
+					best = h;
+				}
+			}
+			result[depth_stream_index] = std::move(best);
+		}
+	}
 	// Forensics for the color-without-depth hypothesis: expected (server
-	// packed depth for this frame_idx) but strict pairing found none.
+	// packed depth for this frame_idx) but even tolerant (±1) pairing
+	// found none.
 	// Throttled 1s: isolated single-frame misses each log, sustained
 	// outages don't spam. The depth decoder window is dumped so wire
 	// loss (frame never arrived) reads apart from pairing miss (frame
@@ -1443,8 +1475,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Mask record/submit views: server eye timebase, not live predicted.
 	// The mask alpha composites with server video (and the VR-occlusion
 	// compare tests server virtual depth against the object raster), so
-	// raster + submit share the video frame's pose/fov and the runtime
-	// applies one common warp to display. Live views stay live for GUI,
+	// raster + submit share one reference eye and the runtime warps each
+	// layer to display from its own submitted pose. The reference eye is
+	// the paired depth frame's eye whenever depth is paired (identical
+	// values on exact pairing) and the color eye otherwise — so the
+	// compare never mixes viewpoints while the video stays on the color
+	// eye it was rendered for. Live views stay live for GUI,
 	// gizmos and the depth debug viz (independent overlays).
 	// Falls back to the live pose when no server frame is paired.
 	std::array<XrPosef, view_count> mask_pose = pose;
@@ -1468,18 +1504,64 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	}
 
 	// Sync eye for everything that composites with server video: the
-	// video layer's own pose/fov (pose[]/fov[] above), i.e. the eye the
-	// server rendered. Per-eye fallback to live when that eye unpaired
-	// (partial pairing / teardown races). Static-world caveat: latest
-	// fused object poses and live vote positions reused here; moving
-	// boards would need a pose history.
+	// reference eye (depth frame's eye when depth is paired, else the
+	// video layer's own pose/fov, i.e. the eye the server rendered).
+	// Raster and virt must share parametrization for the compare, and
+	// raster-eye must equal submit-pose for the runtime warp — the union
+	// merge submits one layer with one pose, so the switch is frame-wide,
+	// never per-group. Per-eye fallback to color, then live, when the
+	// depth eye is unpaired or degenerate (partial pairing / teardown
+	// races). Static-world caveat: latest fused object poses and live
+	// vote positions reused here; moving boards would need a pose history.
+	auto depth_eye_valid = [](const XrPosef & p, const XrFovf & f) {
+		float n2 = p.orientation.w * p.orientation.w + p.orientation.x * p.orientation.x +
+		        p.orientation.y * p.orientation.y + p.orientation.z * p.orientation.z;
+		if (not (n2 > 0.5f and n2 < 2.0f))
+			return false;
+		if (not (std::isfinite(p.orientation.w) and std::isfinite(p.orientation.x) and std::isfinite(p.orientation.y) and
+		         std::isfinite(p.orientation.z) and std::isfinite(p.position.x) and std::isfinite(p.position.y) and
+		         std::isfinite(p.position.z)))
+			return false;
+		if (not (std::isfinite(f.angleLeft) and std::isfinite(f.angleRight) and std::isfinite(f.angleUp) and
+		         std::isfinite(f.angleDown)))
+			return false;
+		if (f.angleRight - f.angleLeft < 1e-4f or f.angleUp - f.angleDown < 1e-4f)
+			return false;
+		return true;
+	};
+	auto & sync_depth_handle = current_blit_handles[depth_stream_index];
 	std::array<XrPosef, view_count> sync_pose{};
 	std::array<XrFovf, view_count> sync_fov{};
+	std::array<bool, view_count> sync_is_depth_eye{};
 	for (uint32_t view = 0; view < view_count; ++view)
 	{
 		bool have_eye = view < current_blit_handles.size() and current_blit_handles[view] != nullptr;
-		sync_pose[view] = have_eye ? pose[view] : mask_pose[view];
-		sync_fov[view] = have_eye ? fov[view] : mask_fov[view];
+		bool have_depth_eye = sync_depth_handle != nullptr and
+		        depth_eye_valid(sync_depth_handle->view_info.pose[view], sync_depth_handle->view_info.fov[view]);
+		if (have_depth_eye)
+		{
+			sync_is_depth_eye[view] = true;
+			sync_pose[view] = sync_depth_handle->view_info.pose[view];
+			if (video_unshift)
+			{
+				auto & [iq, ip] = *video_unshift;
+				glm::quat q(sync_pose[view].orientation.w,
+				            sync_pose[view].orientation.x,
+				            sync_pose[view].orientation.y,
+				            sync_pose[view].orientation.z);
+				glm::vec3 p(sync_pose[view].position.x, sync_pose[view].position.y, sync_pose[view].position.z);
+				glm::quat rq = iq * q;
+				glm::vec3 rp = iq * p + ip;
+				sync_pose[view].orientation = {rq.x, rq.y, rq.z, rq.w};
+				sync_pose[view].position = {rp.x, rp.y, rp.z};
+			}
+			sync_fov[view] = sync_depth_handle->view_info.fov[view];
+		}
+		else
+		{
+			sync_pose[view] = have_eye ? pose[view] : mask_pose[view];
+			sync_fov[view] = have_eye ? fov[view] : mask_fov[view];
+		}
 	}
 
 	// Eye velocity history for the depth time-bias test slider: finite
@@ -1564,19 +1646,23 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Marker tracking runs every frame: solved frames feed the
 		// record phase below (cutouts, gizmos) and the status UI.
 		// Sync timebase: the mask alpha composites with server video, so
-		// mask-raster transforms ride the server display time
-		// (one common warp). Tracking/filtering itself stays live.
+		// mask-raster transforms ride the reference-eye display time
+		// (depth when the mask chain is depth-eyed, else the first paired
+		// color eye). Tracking/filtering itself stays live.
 		// Eye-0 time: both eyes share frame_index on the common path;
 		// fallback scans for the first paired eye below.
 		XrTime sync_display_time = frame_state.predictedDisplayTime;
-		for (const auto & h: current_blit_handles)
-		{
-			if (h)
+		if (sync_is_depth_eye[0] and sync_depth_handle)
+			sync_display_time = sync_depth_handle->view_info.display_time;
+		else
+			for (const auto & h: current_blit_handles)
 			{
-				sync_display_time = h->view_info.display_time;
-				break;
+				if (h)
+				{
+					sync_display_time = h->view_info.display_time;
+					break;
+				}
 			}
-		}
 		update_fiducial_passthrough(frame_state.predictedDisplayTime, sync_display_time);
 
 		// Hidden state, computed once per frame and shared by the nomask
