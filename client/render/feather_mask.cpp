@@ -1804,7 +1804,7 @@ bool feather_mask_renderer::ensure_hidden_field(vk::Extent2D extent)
 	                .arrayLayers = 2,
 	                .samples = vk::SampleCountFlagBits::e1,
 	                .tiling = vk::ImageTiling::eOptimal,
-	                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled,
+	                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment,
 	                .sharingMode = vk::SharingMode::eExclusive,
 	                .initialLayout = vk::ImageLayout::eUndefined,
 	        },

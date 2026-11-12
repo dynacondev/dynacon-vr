@@ -50,8 +50,8 @@ union_merge_renderer::union_merge_renderer(vk::raii::Device & device, vk::raii::
 
 std::shared_ptr<vk::raii::PipelineCache> union_merge_renderer::pipeline_cache(vk::raii::Device & device)
 {
-	// Same process-wide object the feather mask and dots renderers
-	// share (one entry per VkDevice).
+	// Same process-wide object shared with the feather mask renderer
+	// (one entry per VkDevice).
 	return feather_mask_renderer::pipeline_cache(device);
 }
 
