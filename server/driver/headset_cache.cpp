@@ -82,11 +82,24 @@ from_headset::settings_changed settings_from_json(const nlohmann::json & json)
 	settings.bitrate_bps = json.at("bitrate_bps");
 	settings.mirror_gamepad = json.at("mirror_gamepad");
 	settings.enabled_body_parts = json.at("enabled_body_parts");
-	// optional: caches written before overrides existed lack these keys
-	if (auto it = json.find("cpu_level_override"); it != json.end())
-		settings.cpu_level_override = it->get<int8_t>();
-	if (auto it = json.find("gpu_level_override"); it != json.end())
-		settings.gpu_level_override = it->get<int8_t>();
+	// optional, tolerant: caches written before overrides existed lack
+	// these keys, and a hand-edited out-of-range value must not discard
+	// the whole cached spec (early-start seed).
+	auto load_level = [](const nlohmann::json & json, const char * key, int8_t & out) {
+		auto it = json.find(key);
+		if (it == json.end() or not it->is_number_integer())
+			return;
+		try
+		{
+			long long level = it->get<long long>();
+			if (level >= -1 and level <= 6)
+				out = int8_t(level);
+		}
+		catch (const std::exception &)
+		{}
+	};
+	load_level(json, "cpu_level_override", settings.cpu_level_override);
+	load_level(json, "gpu_level_override", settings.gpu_level_override);
 	return settings;
 }
 

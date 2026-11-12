@@ -196,7 +196,9 @@ The headset needs wireless ADB reachable from the PC (paired once with
 addresses the headset at its control-connection IP as `<ip>:5555`. Set
 `target` to use an explicit `adb -s` selector (e.g. a USB serial).
 Overrides are cleared when the session ends; a headset reboot also
-clears them (debug properties are not persistent).
+clears them (debug properties are not persistent). If the server itself
+is killed ungracefully, pins stay until the next reboot — re-run or
+reboot to reset.
 
 ### Example
 ```json

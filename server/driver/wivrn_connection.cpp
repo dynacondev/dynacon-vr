@@ -96,7 +96,10 @@ void wivrn::wivrn_connection::init(std::stop_token stop_token, std::function<voi
 	}
 
 	// Stash the numeric peer IP for ADB target derivation; failure here
-	// is non-fatal (target selection falls back to config/single device).
+	// is non-fatal (target selection falls back to config). Clear first:
+	// reset() reuses this object, so a failed lookup must not pin the
+	// previous headset's IP.
+	peer_host_.clear();
 	char peer_host[NI_MAXHOST] = {};
 	if (getnameinfo((sockaddr *)&client_address, len, peer_host, sizeof(peer_host), nullptr, 0, NI_NUMERICHOST) == 0)
 		peer_host_ = peer_host;

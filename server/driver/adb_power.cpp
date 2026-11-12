@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdio>
 #include <csignal>
+#include <string_view>
 #include <cstring>
 #include <poll.h>
 #include <sys/types.h>
@@ -61,10 +62,18 @@ std::string adb_power_control::target_for_peer_host(const std::string & host)
 {
 	if (host.empty())
 		return {};
+	// Dual-stack listener: IPv4 peers arrive as ::ffff:a.b.c.d, which adb
+	// will not accept bracketed. Unwrap to the dotted quad first.
+	std::string ip = host;
+	constexpr std::string_view mapped = "::ffff:";
+	if (ip.size() > mapped.size() and ip.compare(0, mapped.size(), mapped) == 0 and
+	    ip.find(':', mapped.size()) == std::string::npos)
+		ip.erase(0, mapped.size());
 	// IPv6 literal: bracket for `adb connect [addr]:port`
-	if (host.find(':') != std::string::npos and host.front() != '[')
-		return "[" + host + "]:5555";
-	return host + ":5555";
+	// (getnameinfo never emits brackets, the check is defensive).
+	if (ip.find(':') != std::string::npos and ip.front() != '[')
+		return "[" + ip + "]:5555";
+	return ip + ":5555";
 }
 
 static int clamp_level(int level, const char * name)
@@ -77,21 +86,20 @@ static int clamp_level(int level, const char * name)
 	return level;
 }
 
-void adb_power_control::note_reconnected(std::string target, bool auto_connect)
+void adb_power_control::note_reconnected(std::string target)
 {
 	std::lock_guard lock(mutex);
-	bool target_changed = target != target_ or auto_connect != auto_connect_;
 	target_ = std::move(target);
-	auto_connect_ = auto_connect;
-	connected_ = false;
-	// A reconnect often follows a headset reboot, which wipes debug props:
-	// forget pushed state so the current wants are re-pushed. All-Auto
-	// with an unchanged target stays silent (nothing to push).
-	if (target_changed or want_cpu_ != level_auto or want_gpu_ != level_auto or
-	    applied_cpu_ != level_auto or applied_gpu_ != level_auto)
+	// The transport was replaced, often by a reboot, which wipes debug
+	// props: forget pushed state so the current wants are re-pushed (the
+	// previous device keeps its pins if it is no longer reachable).
+	// Empty target or all-Auto stays silent: nothing to push or clear.
+	bool need = want_cpu_ != level_auto or want_gpu_ != level_auto or applied_cpu_ != level_auto or applied_gpu_ != level_auto;
+	applied_cpu_ = applied_gpu_ = level_auto;
+	applied_target_ = target_;
+	connected_.store(false);
+	if (not target_.empty() and need)
 	{
-		applied_cpu_ = applied_gpu_ = level_auto;
-		applied_target_.clear();
 		dirty = true;
 		cv.notify_all();
 	}
@@ -121,7 +129,7 @@ void adb_power_control::clear()
 	}
 	cv.notify_all();
 	// Drain the queue synchronously so teardown never leaves a stale pin:
-	// bounded by two command timeouts in the worst case.
+	// bounded by the command timeouts in the worst case.
 	while (true)
 	{
 		std::unique_lock lock(mutex);
@@ -143,32 +151,30 @@ void adb_power_control::worker_main(std::stop_token stop)
 		int cpu = want_cpu_;
 		int gpu = want_gpu_;
 		std::string target = target_;
-		bool auto_connect = auto_connect_;
 		adb_power_config config = config_;
 		lock.unlock();
 
-		apply_now(target, cpu, gpu, auto_connect, config);
+		apply_now(target, cpu, gpu, config);
 
 		lock.lock();
 		// A newer request may have landed mid-apply: only go clean when
 		// the queue still matches what was just pushed.
-		if (want_cpu_ == cpu and want_gpu_ == gpu and target_ == target and auto_connect_ == auto_connect)
+		if (want_cpu_ == cpu and want_gpu_ == gpu and target_ == target)
 			dirty = false;
 	}
 }
 
-void adb_power_control::apply_now(const std::string & target, int cpu, int gpu, bool auto_connect, const adb_power_config & config)
+void adb_power_control::apply_now(const std::string & target, int cpu, int gpu, const adb_power_config & config)
 {
 	if (not config.enabled)
 		return;
 
 	if (target.empty())
 	{
-		U_LOG_W("ADB clock override requested but no headset target is known (set adb.target or use wireless ADB); levels follow the app's own hints");
-		std::lock_guard lock(mutex);
-		applied_target_ = target;
-		applied_cpu_ = cpu;
-		applied_gpu_ = gpu;
+		// No addressable headset (e.g. headless boot before the first
+		// connection): nothing pushed, state untouched so a later target
+		// re-pushes. Debug, not warning: this resolves on connect.
+		U_LOG_D("ADB clock override has no target yet; levels follow the app's own hints until a headset connects");
 		return;
 	}
 
@@ -179,25 +185,31 @@ void adb_power_control::apply_now(const std::string & target, int cpu, int gpu, 
 			// New target (connect or session change): re-push everything.
 			applied_cpu_ = applied_gpu_ = level_auto;
 			applied_target_ = target;
-			connected_ = false;
+			connected_.store(false);
 		}
 	}
 
-	if (auto_connect and not connected_)
+	// Nothing to push and nothing pinned: skip the connect too.
+	{
+		std::lock_guard lock(mutex);
+		if (cpu == level_auto and gpu == level_auto and applied_cpu_ == level_auto and applied_gpu_ == level_auto)
+			return;
+	}
+
+	// Best-effort connect for every target form (IP, hostname, USB
+	// serial): a failure only logs at debug, the setprop below decides.
+	// Idempotent when already connected.
+	if (not connected_.load())
 	{
 		std::string output;
-		if (run_adb({"connect", target}, output))
+		if (run_adb(config.binary, config.timeout_s, {"connect", target}, output))
 		{
 			U_LOG_I("ADB connected to %s", target.c_str());
-			connected_ = true;
+			connected_.store(true);
 		}
 		else
 		{
-			U_LOG_W("ADB connect to %s failed; is wireless debugging enabled and paired on the headset? "
-			        "Levels follow the app's own hints until then. Output: %s",
-			        target.c_str(),
-			        output.c_str());
-			return;
+			U_LOG_D("ADB connect to %s failed (continuing to setprop anyway): %s", target.c_str(), output.c_str());
 		}
 	}
 
@@ -216,7 +228,7 @@ void adb_power_control::apply_now(const std::string & target, int cpu, int gpu, 
 		// Empty value clears the override back to the app's own hint.
 		std::string value = level == level_auto ? "" : std::to_string(level);
 		std::string output;
-		if (run_adb({"-s", target, "shell", "setprop", property, value}, output))
+		if (run_adb(config.binary, config.timeout_s, {"-s", target, "shell", "setprop", property, value}, output))
 		{
 			if (level == level_auto)
 				U_LOG_I("ADB clock override cleared: %s on %s (headset decides again)", property, target.c_str());
@@ -246,7 +258,7 @@ void adb_power_control::apply_now(const std::string & target, int cpu, int gpu, 
 	}
 }
 
-bool adb_power_control::run_adb(const std::vector<std::string> & args, std::string & output)
+bool adb_power_control::run_adb(const std::string & binary, int timeout_s, const std::vector<std::string> & args, std::string & output)
 {
 	output.clear();
 
@@ -260,7 +272,7 @@ bool adb_power_control::run_adb(const std::vector<std::string> & args, std::stri
 		storage.emplace_back("flatpak-spawn");
 		storage.emplace_back("--host");
 	}
-	storage.push_back(config_.binary);
+	storage.push_back(binary);
 	storage.insert(storage.end(), args.begin(), args.end());
 
 	int pipefd[2] = {-1, -1};
@@ -305,7 +317,7 @@ bool adb_power_control::run_adb(const std::vector<std::string> & args, std::stri
 	// Parent: drain the pipe until EOF or timeout, then reap.
 	close(pipefd[1]);
 
-	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, config_.timeout_s));
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(std::max(1, timeout_s));
 	bool timed_out = false;
 	{
 		char buf[1024];
@@ -319,6 +331,7 @@ bool adb_power_control::run_adb(const std::vector<std::string> & args, std::stri
 			{
 				if (errno == EINTR)
 					continue;
+				timed_out = true; // treat poll errors like a timeout: kill and reap below
 				break;
 			}
 			if (r == 0)
@@ -333,7 +346,10 @@ bool adb_power_control::run_adb(const std::vector<std::string> & args, std::stri
 					output.resize(4096);
 			}
 			else
-				break; // POLLERR/POLLNVAL
+			{
+				timed_out = true; // POLLERR/POLLNVAL: kill and reap below
+				break;
+			}
 		}
 		timed_out = std::chrono::steady_clock::now() >= deadline;
 	}
@@ -341,11 +357,15 @@ bool adb_power_control::run_adb(const std::vector<std::string> & args, std::stri
 
 	if (timed_out)
 	{
-		kill(-pid, SIGKILL); // whole process group (see setpgrp above)
+		// Group kill first (children of adb, if any), then the leader
+	// itself: if the child had not reached setpgrp() yet, no group
+	// exists and the group kill misses (ESRCH).
+	kill(-pid, SIGKILL); // whole process group (see setpgrp above)
+	kill(pid, SIGKILL);
 		int status = 0;
 		while (waitpid(pid, &status, 0) < 0 and errno == EINTR)
 			;
-		U_LOG_W("ADB clock override failed: adb command timed out after %ds and was killed", std::max(1, config_.timeout_s));
+		U_LOG_W("ADB clock override failed: adb command timed out after %ds and was killed", std::max(1, timeout_s));
 		return false;
 	}
 

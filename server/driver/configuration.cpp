@@ -820,10 +820,20 @@ configuration::configuration()
 				}
 				if (auto jt = it->find("timeout-s"); jt != it->end())
 				{
-					if (jt->is_number_integer() and jt->get<int>() > 0)
-						adb.timeout_s = jt->get<int>();
+					// get<int>() would throw out_of_range on huge values
+					// and abort parsing of all later keys: narrow safely.
+					int64_t timeout = -1;
+					try
+					{
+						if (jt->is_number_integer())
+							timeout = jt->get<int64_t>();
+					}
+					catch (const std::exception &)
+					{}
+					if (timeout >= 1 and timeout <= 3600)
+						adb.timeout_s = int(timeout);
 					else
-						U_LOG_W("adb.timeout-s must be a positive integer, ignoring");
+						U_LOG_W("adb.timeout-s must be an integer 1..3600, ignoring");
 				}
 			}
 		}

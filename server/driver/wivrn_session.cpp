@@ -162,7 +162,10 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 
 	// Server-side ADB clock override, re-resolved on every (re)connect.
 	refresh_adb_target();
-	adb_power_.request(get_info().settings.cpu_level_override, get_info().settings.gpu_level_override);
+	// Headless early-start sessions have no peer yet: stay silent until
+	// the first real connection replays settings via reconnect().
+	if (connection->is_active())
+		adb_power_.request(get_info().settings.cpu_level_override, get_info().settings.gpu_level_override);
 
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 
@@ -1513,26 +1516,27 @@ void wivrn_session::refresh_adb_target()
 	// is set explicitly. Re-run on every (re)connect: the peer IP may
 	// change (DHCP), and a reconnect often follows a headset reboot which
 	// wipes debug props (note_reconnected forces a re-push of the wants).
+	// An explicit adb.target is used verbatim (bare IPv4 gains the
+	// wireless default port); otherwise the headset is addressed at its
+	// control-connection IP. Every non-empty target gets a best-effort
+	// "adb connect" first; USB serials simply fail that step and proceed
+	// to setprop (the device is already in "adb devices").
 	auto adb_conf = configuration().adb;
 	std::string target = adb_conf.target;
-	bool auto_connect = false;
 	if (target.empty())
 	{
 		target = adb_power_control::target_for_peer_host(connection->peer_host());
-		auto_connect = not target.empty();
 	}
-	else
+	else if (target.find(':') == std::string::npos)
 	{
-		// Bare IPv4 = wireless ADB default port; anything else (USB
-		// serial, host:port, [ipv6]:port) passes through to `adb -s`.
-		bool numeric = not target.empty();
+		// Bare IPv4 (or hostname): wireless ADB default port.
+		bool numeric = true;
 		for (char c: target)
 			numeric = numeric and (std::isdigit((unsigned char)c) or c == '.');
 		if (numeric)
 			target += ":5555";
-		auto_connect = target.find('.') != std::string::npos or target.find(':') != std::string::npos;
 	}
-	adb_power_.note_reconnected(std::move(target), auto_connect);
+	adb_power_.note_reconnected(std::move(target));
 }
 
 void wivrn_session::reconnect(std::stop_token stop, bool first)
@@ -1621,11 +1625,14 @@ void wivrn_session::reconnect(std::stop_token stop, bool first)
 			// update headset info
 
 			headset_info.settings = info.settings;
-			(*this)(headset_info.settings);
 
-			// New transport: refresh the ADB target (peer IP may have
-			// changed) and re-push the wants (a reboot wipes debug props).
+			// New transport before replaying settings: refresh the ADB
+			// target (peer IP may have changed) and re-push the wants
+			// (a reboot wipes debug props). Must precede the settings
+			// handler so the worker never pushes to the stale target.
 			refresh_adb_target();
+
+			(*this)(headset_info.settings);
 
 			headset_info.language = info.language;
 			headset_info.country = info.country;

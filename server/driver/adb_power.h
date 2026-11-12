@@ -19,6 +19,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -37,8 +38,6 @@ struct adb_power_config
 	bool enabled = true;
 	// adb binary; under flatpak this runs as `flatpak-spawn --host <binary>`
 	std::string binary = "adb";
-	// explicit `adb -s` selector, empty = derived from the peer IP (see note_reconnected)
-	std::string target;
 	// per-command timeout, seconds
 	int timeout_s = 5;
 };
@@ -69,9 +68,11 @@ public:
 
 	// (Re)bind to a headset address. The transport may have been replaced
 	// (reconnect, often after a headset reboot which wipes debug props):
-	// pushed state is forgotten so the current wants are re-pushed.
-	// Empty target disables override attempts (logged).
-	void note_reconnected(std::string target, bool auto_connect);
+	// pushed state is forgotten so the current wants are re-pushed to the
+	// new target. The previous device keeps any pins if it is no longer
+	// reachable (best effort: clearing it could stall on timeouts).
+	// Empty target records nothing and stays silent until a target appears.
+	void note_reconnected(std::string target);
 
 	// Request levels; out-of-range values become Auto with a warning.
 	// Only keys that differ from the last-applied state are sent; keys
@@ -84,11 +85,13 @@ public:
 
 private:
 	void worker_main(std::stop_token stop);
-	void apply_now(const std::string & target, int cpu, int gpu, bool auto_connect, const adb_power_config & config);
+	// config snapshot drives binary/timeout so a re-read config applies
+	// to commands already queued.
+	void apply_now(const std::string & target, int cpu, int gpu, const adb_power_config & config);
 
 	// Run one adb command, capturing output. Returns true on exit 0;
 	// all command failures are logged here.
-	bool run_adb(const std::vector<std::string> & args, std::string & output);
+	bool run_adb(const std::string & binary, int timeout_s, const std::vector<std::string> & args, std::string & output);
 
 	adb_power_config config_;
 	std::mutex mutex;
@@ -97,7 +100,6 @@ private:
 	bool dirty = false;
 
 	std::string target_;
-	bool auto_connect_ = false;
 	int want_cpu_ = level_auto;
 	int want_gpu_ = level_auto;
 
@@ -105,7 +107,8 @@ private:
 	std::string applied_target_;
 	int applied_cpu_ = level_auto;
 	int applied_gpu_ = level_auto;
-	bool connected_ = false;
+	// accessed from the worker only, except reset in note_reconnected
+	std::atomic<bool> connected_{false};
 };
 
 } // namespace wivrn
