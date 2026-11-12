@@ -134,13 +134,13 @@ struct configuration
 		// Proximity reveal radius in meters (3d-passthrough-hidden
 		// only): the cutout shows only where the mesh sits
 		// inside this distance of the head (hard near-field edge).
-		// Default 0.25, clamped to >= 0. Applied live.
-		float proximity_radius_m = 0.25f;
+		// Default 0.3, clamped to >= 0. Applied live.
+		float proximity_radius_m = 0.3f;
 		// Hand proximity reveal radius in meters (3d-passthrough-hidden
 		// only): same gate measured from each palm (hand tracking) or
-		// controller grip pose as fallback. Default 0.15, clamped to
+		// controller grip pose as fallback. Default 0.2, clamped to
 		// >= 0. Applied live.
-		float hand_proximity_radius_m = 0.15f;
+		float hand_proximity_radius_m = 0.2f;
 	};
 	std::vector<passthrough_object> passthrough_objects;
 

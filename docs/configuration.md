@@ -488,13 +488,13 @@ Each `passthrough` entry has:
   Composited by lifting the flat union's mask floor, so no extra layers
   or swapchains: exiting saturates the existing flat feed to fullscreen.
 - `proximity-radius`: near-field reveal radius in meters
-  (`3d-passthrough-hidden` only, default `0.25`, clamped to `>= 0`,
+  (`3d-passthrough-hidden` only, default `0.30`, clamped to `>= 0`,
   applied live). The cutout shows only where the mesh sits
   inside this distance of the head — or inside the body column
   (same radius, 2 m down from the head center) — (hard edge);
   `0` reveals nothing.
 - `hand-proximity-radius`: same gate measured from each hand in meters
-  (`3d-passthrough-hidden` only, default `0.15`, clamped to `>= 0`,
+  (`3d-passthrough-hidden` only, default `0.20`, clamped to `>= 0`,
   applied live). Uses palm tracking when valid, else the controller
   grip pose.
 

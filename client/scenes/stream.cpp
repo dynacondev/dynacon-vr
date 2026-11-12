@@ -2952,7 +2952,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							};
 							// Live radii per object (clamped, fail-closed at 0).
 							auto hidden_radii = [&](const std::string & mesh) {
-								float head_r = 0.25f, hand_r = 0.15f;
+								float head_r = 0.3f, hand_r = 0.2f;
 								auto soit = passthrough_objects.find(mesh);
 								if (soit != passthrough_objects.end())
 								{

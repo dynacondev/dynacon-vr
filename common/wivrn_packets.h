@@ -1078,12 +1078,12 @@ struct passthrough_object
 	float transition_distance_m = 0.3f;
 	// Proximity reveal radius in meters (3d-passthrough-hidden only):
 	// the cutout shows only where the mesh sits inside this
-	// distance of the head (hard near-field edge). Default 0.25.
-	float proximity_radius_m = 0.25f;
+	// distance of the head (hard near-field edge). Default 0.3.
+	float proximity_radius_m = 0.3f;
 	// Hand proximity reveal radius in meters (3d-passthrough-hidden
 	// only): same gate measured from each palm (hand tracking) or
-	// controller grip pose as fallback. Default 0.15.
-	float hand_proximity_radius_m = 0.15f;
+	// controller grip pose as fallback. Default 0.2.
+	float hand_proximity_radius_m = 0.2f;
 };
 
 // Origin alignment (headset-side): re-base outgoing tracking so the
