@@ -45,14 +45,15 @@ constexpr float spawn_radius = 1.0f;   // random position within this distance o
 // leash at cruise speed; the containment bias is a tendency, not a wall
 constexpr float cruise_lo = 0.30f;   // per-plane constant cruise speed range (m/s)
 constexpr float cruise_hi = 0.45f;
-constexpr float comfort_r = 0.6f;    // bias starts past this distance from the anchor (m)
-constexpr float leash_r = 1.0f;      // bias reaches full strength here (m)
+constexpr float comfort_r = 0.3f;    // bias starts past this distance from the anchor (m)
+constexpr float leash_r = 0.5f;      // bias reaches full strength here (m)
 constexpr float bias_gain = 2.0f;    // steering gain toward the anchor
 constexpr float bias_max_rate = 0.8f; // bias steering cap (rad/s): loops (1.2+) overrule it locally
-constexpr float rate_smooth = 3.0f;  // maneuver target blending rate (1/s)
+constexpr float pitch_max_rate = 0.35f; // climb/dive cap (rad/s); loops are exempt
+constexpr float rate_smooth = 3.0f;  // pitch/yaw target blending rate (1/s); roll snaps (visual only)
 constexpr float bank_coord_gain = 0.6f; // coordinated bank per yaw rate
 constexpr float bank_max = 1.0f;     // bank clamp (radians)
-constexpr float bank_relax = 2.0f;    // bank return rate toward coordinated value (1/s)
+constexpr float bank_relax = 5.0f;    // bank return rate toward coordinated value (1/s): tracks, not chases
 // Fixed det=+1 basis flips the apparent bank sense vs the old mirrored
 // frame: positive bank about +dir lifts the inside wing (leans OUT), so
 // the coordinated default is -1. Flip only if planes lean out of turns.
@@ -254,27 +255,38 @@ void kiosk_planes::pick_maneuver(plane & f)
 			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.1f, 0.3f)(rng_);
 			f.pitch_tgt = coin() * std::uniform_real_distribution<float>(0.f, 0.15f)(rng_);
 			f.roll_tgt = 0.f;
+			f.roll_free = false;
+			f.loop_maneuver = false;
 			f.man_t = std::uniform_real_distribution<double>(2., 4.)(rng_);
 			break;
 		case 1: // banked turn (bank emerges from yaw via the coordination below)
 			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.6f, 1.2f)(rng_);
 			f.pitch_tgt = coin() * std::uniform_real_distribution<float>(0.f, 0.2f)(rng_);
 			f.roll_tgt = 0.f;
+			f.roll_free = false;
+			f.loop_maneuver = false;
 			f.man_t = std::uniform_real_distribution<double>(1.5, 3.)(rng_);
 			break;
 		case 2: // loop: sustained pitch for exactly one revolution
 			f.yaw_tgt = 0.f;
 			f.pitch_tgt = coin() * std::uniform_real_distribution<float>(1.2f, 1.8f)(rng_);
 			f.roll_tgt = 0.f;
+			f.roll_free = false;
+			f.loop_maneuver = true;
 			f.man_t = 2. * std::numbers::pi / std::abs(f.pitch_tgt);
 			break;
 		case 3: // barrel roll: one full revolution with a hint of yaw
 			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.1f, 0.3f)(rng_);
 			f.pitch_tgt = 0.f;
 			f.roll_tgt = coin() * float(2. * std::numbers::pi / std::uniform_real_distribution<double>(1.2, 2.)(rng_));
+			f.roll_free = true;
+			f.loop_maneuver = false;
 			f.man_t = 2. * std::numbers::pi / std::abs(f.roll_tgt);
 			break;
 	}
+	// roll is purely visual: snap it so a decaying rate can't keep spinning
+	// the bank after a roll ends. Pitch/yaw stay smoothed (path must stay C1).
+	f.roll_rate = f.roll_tgt;
 }
 
 void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active)
@@ -354,7 +366,8 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		const float blend = std::min(1.f, float(dt * rate_smooth));
 		f.pitch_rate += (f.pitch_tgt - f.pitch_rate) * blend;
 		f.yaw_rate += (f.yaw_tgt - f.yaw_rate) * blend;
-		f.roll_rate += (f.roll_tgt - f.roll_rate) * blend;
+		// roll_rate is snapped on maneuver pick (visual only); no smoothing,
+		// so a decayed rate can't drag extra spin past a roll's end.
 
 		// moth-to-light: steer toward the live anchor, stronger the further
 		// past comfort. Capped well below loop pitch rates so figures can
@@ -376,6 +389,10 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		}
 		float yaw = f.yaw_rate + yaw_bias;
 		float pitch = f.pitch_rate + pitch_bias;
+		// model planes don't rocket: cap climb/dive authority everywhere
+		// except loops, which need the full pitch rate for the figure.
+		if (not f.loop_maneuver)
+			pitch = std::clamp(pitch, -pitch_max_rate, pitch_max_rate);
 
 		// Flight frame uses right = up×dir throughout. The intuitive dir×up
 		// order mirrors the orientation basis below to det=-1, and quat_cast
@@ -398,10 +415,14 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 		// rolls integrate; everything relaxes toward the coordinated bank
 		// for the current yaw rate. Wrap first: a finished roll is 2pi,
 		// which is 0 — relaxing unwrapped would spin all the way back.
+		// bank tracks the applied (post-clamp, post-bias) yaw — that is 1/R at
+		// constant speed, i.e. corner-radius-driven — fast enough to read as
+		// linked, not chasing. Rolls own the bank outright: no pull mid-roll.
 		float bank_tgt = std::clamp(yaw * bank_coord_gain, -bank_max, bank_max);
 		f.bank += f.roll_rate * float(dt);
 		f.bank = std::atan2(std::sin(f.bank), std::cos(f.bank));
-		f.bank += (bank_tgt - f.bank) * std::min(1.f, float(dt * bank_relax));
+		if (not f.roll_free)
+			f.bank += (bank_tgt - f.bank) * std::min(1.f, float(dt * bank_relax));
 
 		node->position = f.pos;
 		// Orientation basis, same convention as the flight frame: columns
