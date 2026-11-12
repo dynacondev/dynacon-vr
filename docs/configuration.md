@@ -80,7 +80,7 @@ Creates a hardware encoder for left eye and transparency, and a software encoder
 
 A list may also have 3 entries (left, right, alpha): the virtual depth
 stream then uses default selection (same backend as configured, H.265
-preferred when the headset supports it).
+Main10 required; disabled with a warning when the headset or GPU lacks it).
 
 ### `device`, only for vaapi
 Default value: unset

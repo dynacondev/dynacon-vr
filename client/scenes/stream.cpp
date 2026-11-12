@@ -1894,7 +1894,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					float n = shared_depth.near_z;
 					float f = shared_depth.far_z;
 					float a = 0, b = 0;
-					// Same infinite-far convention as volume_raster.frag:
+					// Same infinite-far convention as volume_raster_mv.frag:
 					// !(f > n) or huge f means D = 1 - n/d.
 					if (n > 1e-6f and (!(f > n) or f > 1e9f))
 					{
@@ -2039,7 +2039,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (any_behind or not any_px)
 						{
 							// Behind-camera corners poison the divide (or no
-							// corner projected): cover the eye fullscreen.
+							// corner reprojected): cover the eye fullscreen.
 							x0 = 0;
 							y0 = 0;
 							x1 = (float)extents[view].width;
@@ -2160,10 +2160,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Claim groups + sync member soups (upload on hash change).
 				// Groups are keyed by feather-px; record order is
 				// feather-ascending.
-				std::set<float> live_b;
+				std::set<float> live;
 				// Pre-warmed (map-known, not necessarily placed) feathers.
 				// Kept by the stale-erase below alongside live_groups, but
-				// kept OUT of live_b: it drives record order and
+				// kept OUT of live: it drives record order and
 				// the debug-cutout fallback, which must reflect placed
 				// objects only.
 				std::set<float> prewarmed_keys;
@@ -2197,7 +2197,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						device.waitIdle();
 						pg.swapchain = xr::swapchain(instance, session, device, swapchain.format(), pgw, pgh, 1, view_count);
 						pg.renderer->reset_targets();
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px, {} images)", pgw, pgh, pf, pg.swapchain.image_count());
+						spdlog::info("Feather mask swapchain: {}x{} (feather {}px, {} images)", pgw, pgh, pf, pg.swapchain.image_count());
 					}
 					pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh}, ptier != 0);
 				}
@@ -2207,7 +2207,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					if ((ost.def.type != "3d-passthrough" and not is_depth_vol) or not ost.soup_ready or not ost.fused.placed)
 						continue;
 					float f = ost.def.feather_px;
-					live_b.insert(f);
+					live.insert(f);
 					auto & g = mask_groups[f];
 					g.feather_px = f;
 					if (not g.renderer)
@@ -2224,7 +2224,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Reversed objects (negatives) cut every group:
 				// appended after all positives (the renderer
 				// resolves positives first, then depth-tested MIN cuts).
-				std::vector<float> live_groups(live_b.begin(), live_b.end());
+				std::vector<float> live_groups(live.begin(), live.end());
 				for (auto & [oid, ost]: passthrough_objects)
 				{
 					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
@@ -2254,7 +2254,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// fullscreen and the passthrough effects demo claim it
 				// the same way. Empty draws (clear-only record); the
 				// submit-time bias lifts it.
-				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough();
+				bool need_debug = (live.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough();
 				if (need_debug)
 				{
 					auto & g = debug_group;
@@ -2274,7 +2274,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						std::string order;
 						for (auto f: live_groups)
 							order += std::to_string(f) + " ";
-						spdlog::info("Fiducial mask groups order: {}", order);
+						spdlog::info("Feather mask groups order: {}", order);
 					}
 				}
 				// Drop stale groups + stale member meshes. Use-then-advance:
@@ -2347,7 +2347,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						device.waitIdle();
 						g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), gw, gh, 1, view_count);
 						g.renderer->reset_targets();
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
+						spdlog::info("Feather mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
 					}
 					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh}, tier != 0);
 					std::vector<feather_mask_renderer::instance_draw> draws;
@@ -2513,7 +2513,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
 						{
 							g.last_draws_log = instance.now();
-							spdlog::info("Fiducial mask draws lost (feather {}px)", f);
+							spdlog::info("Feather mask draws lost (feather {}px)", f);
 						}
 						g.had_draws = false;
 						continue;
@@ -2541,12 +2541,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (not g.wait_warned)
 						{
 							g.wait_warned = true;
-							spdlog::warn("Fiducial mask image wait timed out, skipping group (feather {}px)", f);
+							spdlog::warn("Feather mask image wait timed out, skipping group (feather {}px)", f);
 						}
 						continue;
 					}
 					g.wait_warned = false;
-					g.acquired = true;
 					g.active = true;
 					g.extent = {(int32_t)gw, (int32_t)gh};
 					feather_mask_renderer::mask_stage_cpu mstats{};
@@ -2566,9 +2565,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
 							// Virtual depth (shared by the volume reveal and
-							// the VR occlusion): strict pairing resolved
-							// above, null when the color frame had no depth
-							// warp. Near/far ride the sensor frustum so both
+							// the VR occlusion): tolerant (±1) pairing
+							// resolved above, null when the color frame had
+							// no depth warp. Near/far ride the sensor frustum so both
 							// D canvases agree. Eye extent comes from the
 							// stream description and sizes the high-res VR
 							// canvases (the sensor path stays at 320px).
@@ -2596,10 +2595,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					catch (std::exception & e)
 					{
-						spdlog::warn("Fiducial mask record failed: {} (feather {}px)", e.what(), f);
+						spdlog::warn("Feather mask record failed: {} (feather {}px)", e.what(), f);
 						g.swapchain.release();
 						acquired_groups.pop_back();
-						g.acquired = false;
 						g.active = false;
 						g.image_index = -1;
 					}
@@ -2689,7 +2687,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// the depth/effects debug fullscreen) it also runs with
 				// empty cutouts (clear-only): the promoted carrier lifted
 				// to the uniform floor at submit.
-				if ((live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough())
+				if ((live.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough())
 				{
 					auto & g = debug_group;
 					if (g.extent.width != mw or g.extent.height != mh)
@@ -2719,7 +2717,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					else
 					{
 						g.wait_warned = false;
-						g.acquired = true;
 						g.active = true;
 						acquired_groups.push_back(&g);
 						feather_mask_renderer::mask_stage_cpu mstats{};
@@ -2736,7 +2733,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							spdlog::warn("Debug mask record failed: {}", e.what());
 							g.swapchain.release();
 							acquired_groups.erase(std::remove(acquired_groups.begin(), acquired_groups.end(), &g), acquired_groups.end());
-							g.acquired = false;
 							g.active = false;
 							g.image_index = -1;
 							cutouts_punched = false;
@@ -3017,7 +3013,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								else
 								{
 									g.wait_warned = false;
-									g.acquired = true;
 									g.active = true;
 									g.extent = {(int32_t)hmw, (int32_t)hmh};
 									feather_mask_renderer::hidden_cpu hstats{};
@@ -3046,7 +3041,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										spdlog::warn("Hidden mask record failed: {}", e.what());
 										g.swapchain.release();
 										acquired_groups.pop_back();
-										g.acquired = false;
 										g.active = false;
 										g.image_index = -1;
 										// Fail the frame: the command buffer
@@ -3122,7 +3116,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						bool merge_slot_safe = device.waitForFences(*mask_fence, VK_FALSE, 0) == vk::Result::eSuccess;
 					if (not merge_slot_safe)
 					{
-						// Coverage loss (the whole union incl. hidden
+						// Coverage loss (the whole merged set incl. hidden
 						// sits out): error, 1s-throttled — must stay
 						// visible in adb.
 						static XrTime last_merge_slot_log = 0;
@@ -3136,7 +3130,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (merge_eyes_match and merge_slot_safe)
 						{
 							// False refuses the WHOLE merge below (the merge drops
-							// this frame, loudly — never submit a partial union:
+							// this frame, loudly — never submit a partial merged set:
 							// skipping coverage under-reveals.
 							auto push_merge_input = [&](mask_group & g, std::vector<union_merge_renderer::input> & out) {
 								if (g.image_index < 0 or (size_t)g.image_index >= g.swapchain.image_count())
@@ -3161,14 +3155,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								return true;
 							};
 							std::vector<union_merge_renderer::input> merge_inputs;
-							size_t merge_b_count = 0;
+							size_t merge_count = 0;
 							bool merge_ok = true;
 							// Hidden first: past the cap, the safety-critical input
 							// (over-reveal theorem) is the last dropped, never the
 							// first. (Max is commutative, so order changes nothing else.)
 							if (hidden_group.active)
 							{
-								++merge_b_count;
+								++merge_count;
 								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(hidden_group, merge_inputs))
 									merge_ok = false;
 							}
@@ -3179,7 +3173,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									break;
 								if (not g.active)
 									continue;
-								++merge_b_count;
+								++merge_count;
 								// Cap: documented max_inputs (8). Extras are counted,
 								// dropped with an error below, never a fallback path —
 								// >8 contributors under-reveals by construction, so the
@@ -3189,11 +3183,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 							if (merge_ok and debug_group.active)
 							{
-								++merge_b_count;
+								++merge_count;
 								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(debug_group, merge_inputs))
 									merge_ok = false;
 							}
-							if (merge_b_count > union_merge_renderer::max_inputs)
+							if (merge_count > union_merge_renderer::max_inputs)
 							{
 								static XrTime last_merge_cap_log = 0;
 								XrTime merge_now = instance.now();
@@ -3201,8 +3195,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								{
 									last_merge_cap_log = merge_now;
 									spdlog::error("Union merge input cap exceeded: {} contributors, merging first {} and DROPPING {} (no fallback; raise union_merge_renderer::max_inputs + matching srcN bindings in union_merge_mv.frag.glsl)",
-									              merge_b_count, union_merge_renderer::max_inputs,
-									              merge_b_count - union_merge_renderer::max_inputs);
+									              merge_count, union_merge_renderer::max_inputs,
+									              merge_count - union_merge_renderer::max_inputs);
 								}
 							}
 							if (merge_ok and not merge_inputs.empty())
@@ -3211,7 +3205,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								try
 								{
 									if (not merge_renderer)
-										merge_renderer = std::make_unique<union_merge_renderer>(device, physical_device);
+										merge_renderer = std::make_unique<union_merge_renderer>(device);
 									merge_renderer->ensure(instance, session, swapchain.format(), mw, mh);
 									merge_idx = merge_renderer->acquire();
 									if (merge_idx >= 0)
@@ -3315,7 +3309,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				for (auto * g: acquired_groups)
 				{
-					g->acquired = false;
 					g->image_index = -1;
 					g->swapchain.release();
 				}
@@ -3542,7 +3535,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if (debug_corrected)
 			{
 				// Orange fused-corrected boxes: each configured marker
-				// re-projected from its fiducial's smoothed pose with the
+				// reprojected from its fiducial's smoothed pose with the
 				// authored offset (the inverse of the vote path). Green
 				// raw vs orange corrected shows disagreement at a glance.
 				for (const auto & f: fid_map->fiducials)
@@ -3746,7 +3739,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// reference the swapchains in the layers below.
 		for (auto * g: acquired_groups)
 		{
-			g->acquired = false;
 			g->image_index = -1;
 			g->swapchain.release();
 		}
@@ -3805,7 +3797,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		if (mask_frame)
 		{
-			// Single-union compositing: every mask contributor is
+			// Single merged-set compositing: every mask contributor is
 			// MAX-merged into one alpha layer (submitted once with
 			// REPLACE, color preserved), which the flat camera layer
 			// consumes (camera x alpha + video x (1 - alpha)). Video
@@ -3813,8 +3805,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// then flat, then debug/GUI.
 			//
 			// This branch has no window groups yet (no objects, no blur):
-			// the union holds only the debug cutout group. Debug
-			// cutouts punch the union, so the flat feed must stay
+			// the merged set holds only the debug cutout group. Debug
+			// cutouts punch the merged set, so the flat feed must stay
 			// submitted.
 			bool need_flat = cutouts_punched;
 			for (auto & [oid, ost]: passthrough_objects)
@@ -3834,21 +3826,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// while actually submitting (P1 — a placed-but-gated hidden
 			// object reveals nothing, so it must not pin the flat layer
 			// and its compositor cost).
-			if (hidden_group.active)
-				need_flat = true;
-			if (cutouts_punched)
-				need_flat = true;
-			size_t b_active = 0;
+			size_t active_count = 0;
 			for (auto & [feather_key, g]: mask_groups)
 			{
 				(void)feather_key;
 				if (g.active)
-					++b_active;
+					++active_count;
 			}
 			if (debug_group.active)
-				++b_active;
+				++active_count;
 			if (hidden_group.active)
-				++b_active;
+			{
+				++active_count;
+				need_flat = true;
+			}
 			// Boundary veil (fresh values: update_fiducial_passthrough ran
 			// just above): lift the flat mask's floor by (1 - s) through
 			// colorScaleBias on the merged mask, applied once (max()
@@ -3882,8 +3873,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// opaque flat is by design and unaffected.
 			bool merge_covering = merge_this_frame and merge_image >= 0;
 			bool submit_flat = (need_flat or ((boundary_veil or full_passthrough_demo) and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
-			        (veil_hard_out or (b_active > 0 and merge_covering));
-			if (b_active > 0 and not veil_hard_out and not merge_covering)
+			        (veil_hard_out or (active_count > 0 and merge_covering));
+			if (active_count > 0 and not veil_hard_out and not merge_covering)
 			{
 				// Coverage loss (the merge dropped this frame): error,
 				// 1s-throttled — must stay visible in adb.
@@ -3892,7 +3883,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (merge_cover_now - last_merge_cover_log > 1'000'000'000LL)
 				{
 					last_merge_cover_log = merge_cover_now;
-					spdlog::error("Union merge dropped with {} contributors active, flat sits out (no alpha to consume)", b_active);
+					spdlog::error("Union merge dropped with {} contributors active, flat sits out (no alpha to consume)", active_count);
 				}
 			}
 			// Forensic submit decisions (change-triggered): whether the
@@ -3910,7 +3901,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					spdlog::info("Camera submit: {} (need_flat={} groups={} H={} cutouts={} depth_full={} effects_full={})",
 					             submit_flat ? "flat" : "video-only",
 					             need_flat,
-					             b_active,
+					             active_count,
 					             hidden_on ? "on" : "off",
 					             cutouts_punched,
 					             depth_full,
@@ -4213,7 +4204,7 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
 	// Same for the merge (one fullscreen pipeline): first
 	// revealing frames must only rasterize, not driver-compile.
-	union_merge_renderer::warm_pipelines(device, physical_device, swapchain.format());
+	union_merge_renderer::warm_pipelines(device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()

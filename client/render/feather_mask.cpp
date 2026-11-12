@@ -51,27 +51,17 @@ struct blur_push
 	float pad = 0;
 };
 
-// Silhouette raster push block. Mirrors mask.vert/frag.glsl PushConstants:
-// mvp plus the first-acquisition fade opacity. The blur chain is linear in
-// alpha, so one raster-alpha scale fades interior and feather band alike.
-struct raster_push
-{
-	glm::mat4 mvp;
-	float opacity = 1;
-};
-static_assert(sizeof(raster_push) == 68);
-
-// Multiview hidden push block. Mirrors mask_mv.vert.glsl: per-eye mvp
-// selected by gl_ViewIndex. 132B exceeds the 128-byte Vulkan minimum —
-// Adreno 740 (Quest 3) provides 256B; ensure_hidden throws loudly
-// below when the device reports less).
-struct hidden_mv_push
+// Silhouette raster push block. Mirrors mask_mv.vert/frag.glsl: per-eye
+// mvp selected by gl_ViewIndex. 132B exceeds the 128-byte Vulkan minimum —
+// Adreno 740 (Quest 3) provides 256B; the ctor and ensure_hidden throw
+// loudly below when the device reports less.
+struct silhouette_mv_push
 {
 	std::array<glm::mat4, 2> mvp;
 	float opacity = 1;
 };
-static_assert(sizeof(hidden_mv_push) == 132);
-static_assert(sizeof(hidden_mv_push) <= 256);
+static_assert(sizeof(silhouette_mv_push) == 132);
+static_assert(sizeof(silhouette_mv_push) <= 256);
 
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
@@ -84,11 +74,6 @@ struct erode_push
 	float pad = 0;
 };
 static_assert(sizeof(erode_push) == 24);
-
-// Rotation-reprojection UBO mirror (fragment only): per-eye homography
-// as 6 vec4 columns. std140 vec4 arrays are 16-byte strided on both
-// sides, so the C++ mirror packs identically (96 bytes, asserted below
-// next to the upload).
 
 // Erosion radius selector for internal-only feathering: the blur support
 // reaches ~2*spread past the silhouette (spread is defined in blur-input
@@ -178,22 +163,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
         format(format_),
         pipe_cache(pipeline_cache(device_))
 {
-	auto vert = load_shader(device, "mask.vert");
-	auto frag = load_shader(device, "mask.frag");
-
-	vk::PipelineShaderStageCreateInfo stages[2] = {
-	        {
-	                .stage = vk::ShaderStageFlagBits::eVertex,
-	                .module = **vert,
-	                .pName = "main",
-	        },
-	        {
-	                .stage = vk::ShaderStageFlagBits::eFragment,
-	                .module = **frag,
-	                .pName = "main",
-	        },
-	};
-
 	vk::VertexInputBindingDescription binding{
 	        .binding = 0,
 	        .stride = sizeof(XrVector3f),
@@ -248,91 +217,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .pDynamicStates = dynamics,
 	};
 
-	vk::PushConstantRange push_range{
-	        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
-	        .offset = 0,
-	        .size = sizeof(raster_push),
-	};
-	vk::PipelineLayoutCreateInfo layout_info{
-	        .pushConstantRangeCount = 1,
-	        .pPushConstantRanges = &push_range,
-	};
-	pipeline_layout = vk::raii::PipelineLayout(device, layout_info);
-
-	vk::AttachmentDescription attachment{
-	        .format = format,
-	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eClear,
-	        .storeOp = vk::AttachmentStoreOp::eStore,
-	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::AttachmentReference color_ref{
-	        .attachment = 0,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::SubpassDescription subpass{
-	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-	        .colorAttachmentCount = 1,
-	        .pColorAttachments = &color_ref,
-	};
-	vk::RenderPassCreateInfo renderpass_info{
-	        .attachmentCount = 1,
-	        .pAttachments = &attachment,
-	        .subpassCount = 1,
-	        .pSubpasses = &subpass,
-	};
-	renderpass = vk::raii::RenderPass(device, renderpass_info);
-
-	// Cutout pass: same shape as the raster pass but LOAD, so the
-	// finished (blurred) swapchain image can be re-begun and stamped.
-	// Framebuffer-compatible with both passes above by construction.
-	vk::AttachmentDescription cutout_attachment{
-	        .format = format,
-	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eLoad,
-	        .storeOp = vk::AttachmentStoreOp::eStore,
-	        .initialLayout = vk::ImageLayout::eColorAttachmentOptimal,
-	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::AttachmentReference cutout_ref{
-	        .attachment = 0,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::SubpassDescription cutout_subpass{
-	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-	        .colorAttachmentCount = 1,
-	        .pColorAttachments = &cutout_ref,
-	};
-	vk::RenderPassCreateInfo cutout_rp_info{
-	        .attachmentCount = 1,
-	        .pAttachments = &cutout_attachment,
-	        .subpassCount = 1,
-	        .pSubpasses = &cutout_subpass,
-	};
-	cutout_renderpass = vk::raii::RenderPass(device, cutout_rp_info);
-
-	vk::GraphicsPipelineCreateInfo pipeline_info{
-	        .stageCount = 2,
-	        .pStages = stages,
-	        .pVertexInputState = &vertex_input,
-	        .pInputAssemblyState = &input_assembly,
-	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &rasterization,
-	        .pMultisampleState = &multisample,
-	        .pColorBlendState = &blend,
-	        .pDynamicState = &dynamic,
-	        .layout = *pipeline_layout,
-	        .renderPass = *renderpass,
-	};
-	pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), pipeline_info);
-
-	// Depth-tested raster variants are multiview-only now (depth_renderpass_mv
-	// + raster_r8_depth_renderpass_mv below); the per-eye depth paths were
-	// retired with the silhouette MV conversion.
-
 	// Same vertex input/assembly/viewport/rasterization/multisample/
-	// dynamic state as the plain raster pipes (reused locals); only blend
+	// dynamic state throughout (reused locals); only blend
 	// and depth-stencil state vary (consumed by the MV variants below).
 	vk::PipelineColorBlendAttachmentState min_attachment{
 	        .blendEnable = VK_TRUE,
@@ -363,19 +249,19 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .depthCompareOp = vk::CompareOp::eGreater,
 	};
 
-	// Multiview twins of the raster path (one draw broadcasts to both
-	// eyes): same CLEAR/STORE/OPTIMAL attachments as the per-eye passes
-	// above plus viewMask=both. Uses mask_mv.vert/frag (plain
-	// gl_ViewIndex indexing, no mat3/ternary) with the 132B MVP-pair
-	// push (hidden_mv_push shape); layout is dedicated here so the
-	// raster MV pipes never depend on the lazy hidden init.
-	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(hidden_mv_push))
+	// Multiview raster path (one draw broadcasts to both eyes):
+	// CLEAR/STORE/OPTIMAL attachments plus viewMask=both. Uses
+	// mask_mv.vert/frag (plain gl_ViewIndex indexing, no mat3/ternary)
+	// with the 132B MVP-pair push (silhouette_mv_push shape); layout is
+	// dedicated here so the raster MV pipes never depend on the lazy
+	// hidden init.
+	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(silhouette_mv_push))
 		throw std::runtime_error("feather silhouette multiview needs 132B push constants");
 	{
 		vk::PushConstantRange mv_push_range{
 		        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
 		        .offset = 0,
-		        .size = sizeof(hidden_mv_push),
+		        .size = sizeof(silhouette_mv_push),
 		};
 		vk::PipelineLayoutCreateInfo mv_layout_info{
 		        .pushConstantRangeCount = 1,
@@ -914,15 +800,15 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 
 	vk::DescriptorPoolSize pool_size{
 	        .type = vk::DescriptorType::eCombinedImageSampler,
-	        .descriptorCount = 14,
+	        .descriptorCount = 9,
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
-	        .maxSets = 14,
+	        .maxSets = 9,
 	        .poolSizeCount = 1,
 	        .pPoolSizes = &pool_size,
 	};
 	descriptor_pool = vk::raii::DescriptorPool(device, pool_info);
-	for (int i = 0; i < 14; ++i)
+	for (int i = 0; i < 9; ++i)
 	{
 		vk::DescriptorSetAllocateInfo set_alloc_info{
 		        .descriptorPool = *descriptor_pool,
@@ -1215,9 +1101,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .dynamicStateCount = 2,
 		        .pDynamicStates = compare_dynamics,
 		};
-		// Single compare pipeline: the shader has no variants (no spec
-		// constants, no debug modes) — one remap path, selected by
-		// construction.
 		vk::GraphicsPipelineCreateInfo compare_pipeline_info{
 			        .stageCount = 2,
 			        .pStages = compare_stages,
@@ -1236,7 +1119,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// Virtual depth SBS -> sensor-D canvas: fullscreen _mv conversion
 	// (meters->D with the volume near/far), so the compare stays in D
 	// space with untouched push constants. Renders into
-	// volume_virt.blur_fb_mv... under its own CLEAR R16 MV pass (the
+	// volume_virt_fb_mv under its own CLEAR R16 MV pass (the
 	// compare pass is R8: format-incompatible). One draw per volume
 	// group, only when paired.
 	{
@@ -1520,10 +1403,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		vr_min_rgb8_pipeline = make_min_pipe(volume_max_rgb8_renderpass);
 	}
 	// VR-occlusion compare: fullscreen _mv eye-space flatten (object R16
-	// nearest + virtual D canvas). Renders into volume_bin.blur_fb_mv
-	// under the shared R8 MV CLEAR pass (sequential with the volume
-	// compare: VR first, volume overwrites after). No push constants:
-	// both inputs are already D, no reprojection.
+	// nearest + virtual D canvas). Renders into vr_bin.blur_fb_mv under
+	// the shared R8 MV CLEAR pass. No push constants: both inputs are
+	// already D, no reprojection.
 	{
 		auto vr_compare_frag = load_shader(device, "vr_occlude_compare_mv.frag");
 		vk::PipelineShaderStageCreateInfo vr_compare_stages[2] = {
@@ -1761,7 +1643,7 @@ vk::ImageView feather_mask_renderer::output_depth_array_view(vk::Extent2D extent
 	auto it = output_depth.find(key);
 	if (it == output_depth.end())
 	{
-		spdlog::info("Fiducial mask depth target: {}x{}", extent.width, extent.height);
+		spdlog::info("Feather mask depth target: {}x{}", extent.width, extent.height);
 		it = output_depth.emplace(key, make_depth_entry(extent)).first;
 	}
 	if (*it->second.view_array == VK_NULL_HANDLE)
@@ -1836,11 +1718,11 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 
 	if (not hidden_ready)
 	{
-		// Multiview hidden pushes (132B MVP pair) exceed the 128-byte
+		// Multiview silhouette pushes (132B MVP pair) exceed the 128-byte
 		// Vulkan minimum: Adreno 740 (Quest 3) provides 256B. Throw loudly
 		// here — not silently on device — when unsupported (see the
-		// hidden_mv_push note by raster_push).
-		if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(hidden_mv_push))
+		// silhouette_mv_push note above the ctor).
+		if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(silhouette_mv_push))
 			throw std::runtime_error("hidden multiview needs 132B push constants");
 		hidden_ready = true;
 		// Unit-sphere verts (shared proximity-depth generator).
@@ -1942,8 +1824,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 
 		// Multiview twins of the mask modules (mask_mv.vert/frag, 132B
 		// silhouette_mv_layout): same raster state as the tier-0 raster plus
-		// the proximity depth test. The shared 68B raster_push layout is
-		// untouched (cutout punch keeps it).
+		// the proximity depth test.
 		auto hvert = load_shader(device, "mask_mv.vert");
 		auto hfrag = load_shader(device, "mask_mv.frag");
 		// Empty fragment: the sphere pipe is depth-only (no color
@@ -2021,7 +1902,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		        .depthCompareOp = vk::CompareOp::eLess,
 		};
 		// Reuse the ctor-built silhouette MV layout (identical 132B
-		// hidden_mv_push range): one layout for all MV mask pipes.
+		// silhouette_mv_push range): one layout for all MV mask pipes.
 		hidden_sphere_pipe = vk::raii::Pipeline(device, *pipe_cache,
 		                                        vk::GraphicsPipelineCreateInfo{
 		                                                .stageCount = 2,
@@ -2239,10 +2120,9 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		out = vk::Rect2D{.offset = {ax0, ay0}, .extent = {(uint32_t)(ax1 - ax0), (uint32_t)(ay1 - ay0)}};
 		return true;
 	};
-	// Both-eyes union of a silhouette draw.s per-eye pixel boxes (same
+	// Both-eyes union of a silhouette draw's per-eye pixel boxes (same
 	// full-res bounds scaled into the mask extent +1px pad, clamped).
-	// NDC->pixel convention unchanged from the per-eye path. Skip only
-	// when both eyes degenerate.
+	// Skip only when both eyes degenerate.
 	auto draw_union = [&](const hidden_draw & d, vk::Rect2D & out) {
 		bool got = false;
 		int32_t ax0 = 0, ay0 = 0, ax1 = 0, ay1 = 0;
@@ -2298,8 +2178,8 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		if (not sphere_union(s, scissor))
 			continue;
 		cmd.setScissor(0, scissor);
-		cmd.pushConstants<hidden_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-		                                 hidden_mv_push{.mvp = {{s[0], s[1]}}, .opacity = 1});
+		cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+		                                 silhouette_mv_push{.mvp = {{s[0], s[1]}}, .opacity = 1});
 		cmd.draw(hidden_sphere_vert_count, 1, 0, 0);
 	}
 	cmd.endRenderPass();
@@ -2330,15 +2210,14 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 	// multiview begin over the layers=2 framebuffer. Per-draw scissor is
 	// the both-eyes union (submitted full-rect image: renderArea stays
 	// full, correctness).
-	vk::ClearValue hidden_clears[2]{};
-	hidden_clears[0].color.float32.fill(0);
-	hidden_clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0}; // dead by LOAD, ignored
+	vk::ClearValue hidden_clear{};
+	hidden_clear.color.float32.fill(0);
 	vk::RenderPassBeginInfo color_begin{
 	        .renderPass = *hidden_color_rp,
 	        .framebuffer = *tgt.framebuffer,
 	        .renderArea = {.offset = {0, 0}, .extent = extent},
-	        .clearValueCount = 2,
-	        .pClearValues = hidden_clears,
+	        .clearValueCount = 1,
+	        .pClearValues = &hidden_clear,
 	};
 	cmd.beginRenderPass(color_begin, vk::SubpassContents::eInline);
 	cmd.setViewport(0, full_vp);
@@ -2354,8 +2233,8 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		cmd.setScissor(0, scissor);
 		cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
 		cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-		cmd.pushConstants<hidden_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-		                                 hidden_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity});
+		cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+		                                 silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity});
 		cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
 		++local.draws;
 	}
@@ -2398,7 +2277,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			target->depth_image.clear();
 			target->depth_memory.clear();
 		}
-		spdlog::info("Fiducial mask blur targets: skipped (tier-0 direct raster) {}x{}", extent.width, extent.height);
+		spdlog::info("Feather mask blur targets: skipped (tier-0 direct raster) {}x{}", extent.width, extent.height);
 		return;
 	}
 	// A/B intermediates at half mask resolution (the mask extent is
@@ -2440,7 +2319,11 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 		target->memory = vk::raii::DeviceMemory(device, alloc_info);
 		target->image.bindMemory(*target->memory, 0);
 		// Multiview sampling + render target: array view over both
-		// layers, one layers=2 framebuffer under the multiview R8 pass.
+		// layers, plus one layers=2 framebuffer per begun pass for the
+		// raster source only (A). Target B is triple scratch: written via
+		// the shared triple FB and sampled via its view_array, never
+		// begun on its own, so it keeps no framebuffers (null FBs are
+		// reset/cleared like the rest, never begun).
 		target->view_array = vk::raii::ImageView(device,
 		        vk::ImageViewCreateInfo{
 		                .image = *target->image,
@@ -2455,24 +2338,27 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 		                },
 		        });
 		vk::ImageView raw_array = *target->view_array;
-		target->blur_fb_mv = vk::raii::Framebuffer(device,
-		        vk::FramebufferCreateInfo{
-		                .renderPass = *blur_r8_renderpass_mv,
-		                .attachmentCount = 1,
-		                .pAttachments = &raw_array,
-		                .width = half_targets.width,
-		                .height = half_targets.height,
-		                .layers = 2,
-		        });
-		target->raster_fb_mv = vk::raii::Framebuffer(device,
-		        vk::FramebufferCreateInfo{
-		                .renderPass = *raster_r8_renderpass_mv,
-		                .attachmentCount = 1,
-		                .pAttachments = &raw_array,
-		                .width = half_targets.width,
-		                .height = half_targets.height,
-		                .layers = 2,
-		        });
+		if (target == &target_a)
+		{
+			target->blur_fb_mv = vk::raii::Framebuffer(device,
+			        vk::FramebufferCreateInfo{
+			                .renderPass = *blur_r8_renderpass_mv,
+			                .attachmentCount = 1,
+			                .pAttachments = &raw_array,
+			                .width = half_targets.width,
+			                .height = half_targets.height,
+			                .layers = 2,
+			        });
+			target->raster_fb_mv = vk::raii::Framebuffer(device,
+			        vk::FramebufferCreateInfo{
+			                .renderPass = *raster_r8_renderpass_mv,
+			                .attachmentCount = 1,
+			                .pAttachments = &raw_array,
+			                .width = half_targets.width,
+			                .height = half_targets.height,
+			                .layers = 2,
+			        });
+		}
 		if (needs_depth)
 		{
 			// Depth-tested seed-raster companion: D16 image + array views
@@ -2508,8 +2394,10 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 		}
 	}
 	// Downsample/blur levels at half, quarter and eighth mask resolution
-	// (exact halving: the mask extent is 64-quantized upstream). One set of
-	// framebuffers each (blur render pass throughout); A/B above keep both.
+	// (exact halving: the mask extent is 64-quantized upstream). Only the
+	// down levels keep framebuffers (seed raster + downsample begins);
+	// the eblur workspaces are triple scratch (view_array/image only),
+	// like target B above.
 	for (int li = 0; li < 3; ++li)
 	{
 		vk::Extent2D le = level_extent(extent, li + 1);
@@ -2558,24 +2446,27 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			                },
 			        });
 			vk::ImageView raw_array = *target->view_array;
-			target->blur_fb_mv = vk::raii::Framebuffer(device,
-			        vk::FramebufferCreateInfo{
-			                .renderPass = *blur_r8_renderpass_mv,
-			                .attachmentCount = 1,
-			                .pAttachments = &raw_array,
-			                .width = le.width,
-			                .height = le.height,
-			                .layers = 2,
-			        });
-			target->raster_fb_mv = vk::raii::Framebuffer(device,
-			        vk::FramebufferCreateInfo{
-			                .renderPass = *raster_r8_renderpass_mv,
-			                .attachmentCount = 1,
-			                .pAttachments = &raw_array,
-			                .width = le.width,
-			                .height = le.height,
-			                .layers = 2,
-			        });
+			if (target == &down_targets[li])
+			{
+				target->blur_fb_mv = vk::raii::Framebuffer(device,
+				        vk::FramebufferCreateInfo{
+				                .renderPass = *blur_r8_renderpass_mv,
+				                .attachmentCount = 1,
+				                .pAttachments = &raw_array,
+				                .width = le.width,
+				                .height = le.height,
+				                .layers = 2,
+				        });
+				target->raster_fb_mv = vk::raii::Framebuffer(device,
+				        vk::FramebufferCreateInfo{
+				                .renderPass = *raster_r8_renderpass_mv,
+				                .attachmentCount = 1,
+				                .pAttachments = &raw_array,
+				                .width = le.width,
+				                .height = le.height,
+				                .layers = 2,
+				        });
+			}
 			if (needs_depth)
 			{
 				// Seed raster runs on down_targets[seed-1].raster_fb_mv;
@@ -2612,7 +2503,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			}
 		}
 	}
-	spdlog::info("Fiducial mask blur targets: {}x{} (A/B at half, levels below)", extent.width, extent.height);
+	spdlog::info("Feather mask blur targets: {}x{} (A/B at half, levels below)", extent.width, extent.height);
 }
 
 void feather_mask_renderer::ensure_volume_targets()
@@ -2763,13 +2654,8 @@ void feather_mask_renderer::ensure_volume_targets()
 	                .layers = 2,
 	        });
 
-	// Nearest-D canvas (R16 object depth for the VR-occlusion compare)
-	// lives with the high-res VR targets in ensure_vr_targets below
-	// (depth resolution, not 320px): far (1.0) clear, MIN blend,
-	// cull-nothing (see vr_raster_pipeline_mv). Not built here.
-
 	volume_targets_ready = true;
-	spdlog::info("Fiducial mask depth-volume targets: {}x{}", ve.width, ve.height);
+	spdlog::info("Feather mask depth-volume targets: {}x{}", ve.width, ve.height);
 }
 
 void feather_mask_renderer::ensure_vr_targets(vk::Extent2D eye)
@@ -2879,7 +2765,7 @@ void feather_mask_renderer::ensure_vr_targets(vk::Extent2D eye)
 
 	vr_extent = eye;
 	vr_targets_ready = true;
-	spdlog::info("Fiducial mask VR-occlusion targets: {}x{}", eye.width, eye.height);
+	spdlog::info("Feather mask VR-occlusion targets: {}x{}", eye.width, eye.height);
 }
 
 void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh)
@@ -2978,6 +2864,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	              volume->virt_eye_extent.height > 0;
 	float box_frac = 1;
 	float vr_box_frac = 1;
+	float volume_box_frac = 1;
 	size_t n_draws = 0;
 	int tier_out = -1;
 	bool has_reversed = std::ranges::any_of(draws, [](const instance_draw & d) { return d.reverse; });
@@ -2985,7 +2872,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// Reversed-only raster is a provable no-op (MIN against clear 0 writes
 	// 0), so clear-only and let the cutout punch below run if armed. Depth
 	// engages exactly when a reversed draw exists; positive-only calls
-	// keep the legacy passes bit-identically.
+	// rasterize as usual.
 	auto fill_stats = [&] {
 		if (cpu_stats)
 		{
@@ -3005,6 +2892,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cpu_stats->draws = n_draws;
 			cpu_stats->box_frac = box_frac;
 			cpu_stats->vr_box_frac = vr_box_frac;
+			cpu_stats->volume_box_frac = volume_box_frac;
 		}
 	};
 
@@ -3023,8 +2911,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// Same-queue read-after-write between passes. Standalone passes
 	// end OPTIMAL (UBWC on); the merged triple stays GENERAL across
 	// subpasses (cross-subpass sampling).
-	// Full-image range: the multiview chain reads both layers together,
-	// so per-eye narrowing no longer applies (one barrier replaces two).
+	// Full-image range: the multiview chain reads both layers together
+	// (one barrier).
 	auto transfer_barrier = [&](vk::Image img, vk::ImageLayout old_layout, vk::ImageLayout new_layout,
 	                            vk::AccessFlags src_access, vk::AccessFlags dst_access,
 	                            vk::PipelineStageFlags src_stage, vk::PipelineStageFlags dst_stage) {
@@ -3112,73 +3000,16 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			device.waitIdle();
 			targets.erase(it);
 		}
-		// NOTE: views below are named locals, not &* temporaries: the
+		// NOTE: the view below is a named local, not an &* temporary: the
 		// framebuffer create-info stores the pointer, so the VkImageView
 		// must outlive the vk::raii::Framebuffer constructor call.
 		// (&* on a vk::raii handle takes the address of a returned
 		// temporary: freed stack read as an image view, GPU fault, silent
 		// fence hang. That exact bug froze the first mask frame.)
-		std::array<vk::raii::ImageView, 2> views{{
-		        [&] {
-			        vk::ImageViewCreateInfo view_info{
-			                .image = image,
-			                .viewType = vk::ImageViewType::e2D,
-			                .format = format,
-			                .subresourceRange = {
-			                        .aspectMask = vk::ImageAspectFlagBits::eColor,
-			                        .baseMipLevel = 0,
-			                        .levelCount = 1,
-			                        .baseArrayLayer = 0,
-			                        .layerCount = 1,
-			                },
-			        };
-			        return vk::raii::ImageView(device, view_info);
-		        }(),
-		        [&] {
-			        vk::ImageViewCreateInfo view_info{
-			                .image = image,
-			                .viewType = vk::ImageViewType::e2D,
-			                .format = format,
-			                .subresourceRange = {
-			                        .aspectMask = vk::ImageAspectFlagBits::eColor,
-			                        .baseMipLevel = 0,
-			                        .levelCount = 1,
-			                        .baseArrayLayer = 1,
-			                        .layerCount = 1,
-			                },
-			        };
-			        return vk::raii::ImageView(device, view_info);
-		        }(),
-		}};
-		vk::ImageView raw_view_0 = *views[0];
-		vk::ImageView raw_view_1 = *views[1];
-		std::array<vk::raii::Framebuffer, 2> framebuffers{{
-		        [&] {
-			        vk::FramebufferCreateInfo fb_info{
-			                .renderPass = *renderpass,
-			                .attachmentCount = 1,
-			                .pAttachments = &raw_view_0,
-			                .width = out_extent.width,
-			                .height = out_extent.height,
-			                .layers = 1,
-			        };
-			        return vk::raii::Framebuffer(device, fb_info);
-		        }(),
-		        [&] {
-			        vk::FramebufferCreateInfo fb_info{
-			                .renderPass = *renderpass,
-			                .attachmentCount = 1,
-			                .pAttachments = &raw_view_1,
-			                .width = out_extent.width,
-			                .height = out_extent.height,
-			                .layers = 1,
-			        };
-			        return vk::raii::Framebuffer(device, fb_info);
-		        }(),
-		}};
-		// Multiview V-upscale target: array view over both layers plus
-		// one layers=2 framebuffer under blur_renderpass_mv. Per-eye
-		// framebuffers above stay for the cutout punch only.
+		// Multiview submit target: array view over both layers plus
+		// one layers=2 framebuffer under blur_renderpass_mv. All mask
+		// output (raster, V upscale, VR/volume merges, cutout punch)
+		// is multiview: no per-eye framebuffers remain.
 		vk::raii::ImageView mv_array_view(device,
 		        vk::ImageViewCreateInfo{
 		                .image = image,
@@ -3223,7 +3054,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        });
 			has_depth = true;
 		}
-		it = targets.emplace(image, frame_targets(out_extent, std::move(views), std::move(framebuffers), has_depth, std::move(mv_array_view), std::move(mv_framebuffer))).first;
+		it = targets.emplace(image, frame_targets(out_extent, has_depth, std::move(mv_array_view), std::move(mv_framebuffer))).first;
 		if (has_reversed)
 			it->second.depth_framebuffer_mv = std::move(depth_framebuffer_mv);
 	}
@@ -3254,7 +3085,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 	// Multiview silhouette raster: one draw broadcasts to both layers via
 	// mask_mv.vert (gl_ViewIndex selects the MVP). Same polarity passes as
-	// above, same clears; halves begins (2 per-eye -> 1) and pipe binds.
+	// the depth path, same clears; one begin and one pipe bind per pass.
 	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth) {
 		std::array<vk::ClearValue, 2> clears{};
 		clears[0].color.float32.fill(0);
@@ -3282,8 +3113,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
 				cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
 				float v = d.reverse ? 1.f - d.opacity : d.opacity;
-				cmd.pushConstants<hidden_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-				                                  hidden_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = v});
+				cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+				                                  silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = v});
 				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
 				++n_draws;
 			}
@@ -3302,7 +3133,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// Bypass: clear-only pass, transparent mask, full stack hot.
 		// Also covers reversed-only calls (a provable no-op: MIN against
 		// clear 0 writes 0); the cutout punch below still runs if armed.
-		// Single multiview clear (was 2 per-eye begins).
+		// Single multiview clear.
 		vk::RenderPassBeginInfo begin_info{
 		        .renderPass = *renderpass_mv,
 		        .framebuffer = *it->second.framebuffer_mv,
@@ -3353,6 +3184,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			spread = f / 48.f;
 		}
 		else if (tier == 4)
+			// Same quarter-res blur level as tier 2 (blur_level 2 either
+			// way), hence the same divisor.
 			spread = f / 48.f;
 		else if (tier == 8)
 		{
@@ -3551,7 +3384,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				vk::ClearValue vclear{};
 				const float far1[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 				std::memcpy(vclear.color.float32, far1, sizeof(far1));
-				// Single multiview raster (was 2 per-eye begins).
+				// Single multiview raster.
 				vk::RenderPassBeginInfo begin_vr{
 				        .renderPass = *volume_raster_renderpass_mv,
 				        .framebuffer = *vr_depth.raster_fb_mv,
@@ -3637,8 +3470,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// smoothing here would bleed keep back up at the rim the
 				// dilation just cut; feathering is the seed chain's job
 				// (erode/blur below at feather > 0, nothing at 0).
-				// Renderpass loadOp is DONT_CARE, so outside the box is
-				// stale — but the box covers total downstream support by
+				// Renderpass loadOp is LOAD, so outside the box is
+				// preserved — but the box covers total downstream support by
 				// construction (margin + rounding), and the box-scissored
 				// merge below never writes outside it. Opposite polarity
 				// to the volume path: the compare above ran fullscreen so
@@ -3675,8 +3508,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(seed_ext);
 				cmd.setScissor(0, merge_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, seed_is_rgb8 ? *vr_min_rgb8_pipeline : *vr_min_r8_pipeline);
-				update_source(*vr_bin.view_array, 7);
-				std::array<vk::DescriptorSet, 1> min_sets{*descriptor_sets[7]};
+				update_source(*vr_bin.view_array, 6);
+				std::array<vk::DescriptorSet, 1> min_sets{*descriptor_sets[6]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, min_sets, no_offsets);
 				// Spread 0: plain bilinear upscale under MIN, no blur.
 				blur_push min_push{{1.f / ve.width, 1.f / ve.height}, {0, 1}, 0, 0};
@@ -3719,7 +3552,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				}
 				vk::ClearValue vclear{};
 				vclear.color.float32.fill(0);
-				// Single multiview raster (was 2 per-eye begins).
+				// Single multiview raster.
 				vk::RenderPassBeginInfo begin_vol{
 				        .renderPass = *volume_raster_renderpass_mv,
 				        .framebuffer = *volume_depth.raster_fb_mv,
@@ -3797,7 +3630,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					},
 					{
 					        // Paired: virtual D canvas. Unpaired: the
-					        // volume canvas again (min(v,v) = legacy).
+					        // volume canvas again (min(v,v) = sensor-only).
 					        .dstSet = *compare_set,
 					        .dstBinding = 2,
 					        .descriptorCount = 1,
@@ -3891,9 +3724,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				// Viewport stays full (surviving pixels keep correct UVs) and
 				// degenerate boxes fall back to fullscreen, never broken.
 				vk::Rect2D merge_box = pass_scissor(seed_ext);
-				if (cpu_stats)
-				        cpu_stats->volume_box_frac = (float)merge_box.extent.width * (float)merge_box.extent.height /
-				                                     ((float)seed_ext.width * (float)seed_ext.height);
+				volume_box_frac = (float)merge_box.extent.width * (float)merge_box.extent.height /
+				                  ((float)seed_ext.width * (float)seed_ext.height);
 				vk::RenderPassBeginInfo begin_max{
 					        .renderPass = seed_is_rgb8 ? *volume_max_rgb8_renderpass : *volume_max_r8_renderpass,
 					        .framebuffer = seed_fb,
@@ -3904,9 +3736,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(seed_ext);
 				cmd.setScissor(0, merge_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, seed_is_rgb8 ? *volume_max_rgb8_pipeline : *volume_max_r8_pipeline);
-				// V-blur folded into the upscale: same taps as the deleted
-				// standalone V pass (source texel 1/320, V direction), executed
-				// while upscaling under the existing MAX blend. Separable with
+				// V-blur folded into the upscale (source texel 1/320, V
+				// direction) under the existing MAX blend; separable with
 				// the H pass above by linearity.
 				update_source(*volume_smooth.view_array, 1);
 				std::array<vk::DescriptorSet, 1> max_sets{*descriptor_sets[1]};
@@ -3941,7 +3772,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// erode H/V, blur H, V upscale. Same pushes and clears; the _mv
 		// fragment twins read each view's layer via gl_ViewIndex, so no
 		// per-eye state exists past the raster. One descriptor set per
-		// pass (the eye-0 indices), each written once per frame.
+		// pass, each written once per frame.
 		blur_push base{
 		        .texel = {1.f / half_extent.width, 1.f / half_extent.height},
 		        .spread = spread,
@@ -3978,17 +3809,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		cmd.setScissor(0, pass_scissor(half_extent));
 		{
 			section_clock erode_clk(&ms_erode);
-			update_source(*target_a.view_array, 10, true, vk::ImageLayout::eGeneral);
+			update_source(*target_a.view_array, 7, true, vk::ImageLayout::eGeneral);
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *triple_erode_0);
-			std::array<vk::DescriptorSet, 1> sets_e0{*descriptor_sets[10]};
+			std::array<vk::DescriptorSet, 1> sets_e0{*descriptor_sets[7]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_e0, no_offsets);
 			erode_push epush_h{{1.f / half_extent.width, 1.f / half_extent.height}, {1, 0}, (float)erode, 0};
 			cmd.pushConstants<erode_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, epush_h);
 			cmd.draw(3, 1, 0, 0);
 			cmd.nextSubpass(vk::SubpassContents::eInline);
-			update_source(*target_b.view_array, 12, true, vk::ImageLayout::eGeneral);
+			update_source(*target_b.view_array, 8, true, vk::ImageLayout::eGeneral);
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *triple_erode_1);
-			std::array<vk::DescriptorSet, 1> sets_e1{*descriptor_sets[12]};
+			std::array<vk::DescriptorSet, 1> sets_e1{*descriptor_sets[8]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_e1, no_offsets);
 			erode_push epush_v{{1.f / half_extent.width, 1.f / half_extent.height}, {0, 1}, (float)erode, 0};
 			cmd.pushConstants<erode_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, epush_v);
@@ -4077,7 +3908,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			{
 				blur_target & dst = down_targets[l - 1];
 				vk::Extent2D de = level_extent(extent, l);
-				update_source(down_src, 4 + (l - 1) * 2);
+				update_source(down_src, l + 2);
 				make_writable(*dst.image);
 				vk::RenderPassBeginInfo begin_down{
 				        .renderPass = *blur_r8_renderpass_mv,
@@ -4090,7 +3921,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(de);
 				cmd.setScissor(0, pass_scissor(de));
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *downsample_pipeline_mv);
-				std::array<vk::DescriptorSet, 1> sets_d{*descriptor_sets[4 + (l - 1) * 2]};
+				std::array<vk::DescriptorSet, 1> sets_d{*descriptor_sets[l + 2]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_d, no_offsets);
 				blur_push push{};
 				push.texel[0] = 1.f / down_src_extent.width;
@@ -4128,17 +3959,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.setScissor(0, pass_scissor(te));
 			{
 				section_clock erode_clk(&ms_erode);
-				update_source(*h_src.view_array, 10, true, vk::ImageLayout::eGeneral);
+				update_source(*h_src.view_array, 7, true, vk::ImageLayout::eGeneral);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *triple_erode_0);
-				std::array<vk::DescriptorSet, 1> sets_e0{*descriptor_sets[10]};
+				std::array<vk::DescriptorSet, 1> sets_e0{*descriptor_sets[7]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_e0, no_offsets);
 				erode_push epush_h{{1.f / te.width, 1.f / te.height}, {1, 0}, (float)erode, 0};
 				cmd.pushConstants<erode_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, epush_h);
 				cmd.draw(3, 1, 0, 0);
 				cmd.nextSubpass(vk::SubpassContents::eInline);
-				update_source(*eblur.view_array, 12, true, vk::ImageLayout::eGeneral);
+				update_source(*eblur.view_array, 8, true, vk::ImageLayout::eGeneral);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *triple_erode_1);
-				std::array<vk::DescriptorSet, 1> sets_e1{*descriptor_sets[12]};
+				std::array<vk::DescriptorSet, 1> sets_e1{*descriptor_sets[8]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_e1, no_offsets);
 				erode_push epush_v{{1.f / te.width, 1.f / te.height}, {0, 1}, (float)erode, 0};
 				cmd.pushConstants<erode_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, epush_v);
@@ -4182,10 +4013,13 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	}
 
 	// Marker window cutouts: crisp post-blur punch. Re-begins the finished
-	// swapchain framebuffers with the LOAD pass and stamps each quad at
-	// FULL alpha (mask 1 = reality window): holes show passthrough, not
-	// game. No blur pass touches them, so edges stay pixel-exact. Debug
-	// only; rasterize=false (bypass) skips them with the silhouettes.
+	// swapchain framebuffer (multiview LOAD: framebuffer-compatible with
+	// the CLEAR passes above) and stamps each quad at FULL alpha (mask 1
+	// = reality window): holes show passthrough, not game. No blur pass
+	// touches them, so edges stay pixel-exact. One draw per quad
+	// broadcasts to both layers via the silhouette MV pipe (opacity 1:
+	// blend-off overwrite, identical to the retired per-eye punch).
+	// Debug only; rasterize=false (bypass) skips them with the silhouettes.
 	if (not cutouts.empty() and rasterize)
 	{
 		// Execution barrier: the V upscale (or tier-0 raster) above wrote
@@ -4232,25 +4066,22 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			std::memcpy((char *)cutout_verts.map() + qi * sizeof(glm::vec3) * 6, cutouts[qi].data(), sizeof(glm::vec3) * 6);
 		// House idiom (cf. gpu_buffer): unmap flushes host writes for GPU read.
 		cutout_verts.unmap();
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
-		cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
-		section_clock punch_clk(&ms_punch);
-		for (size_t qi = 0; qi < cutouts.size(); ++qi)
-		{
-			const auto & quad = cutouts[qi];
+		// Both-eyes union of one quad's pixel bounds (same NDC mapping
+		// the viewport itself uses, so alignment is exact by
+		// construction): fullscreen LOAD/STORE traffic for a small debug
+		// rect would cost a full image round-trip per group. Any corner
+		// behind the camera falls back to fullscreen for that quad.
+		// Bounds track the submitted (output) size, like the viewport
+		// below: NDC maps consistently at any size. False only when the
+		// quad is degenerate in both eyes (nothing to punch).
+		auto quad_union = [&](const std::array<glm::vec3, 6> & quad, vk::Rect2D & out) {
+			bool got = false;
+			int32_t ax0 = 0, ay0 = 0, ax1 = 0, ay1 = 0;
 			for (int eye = 0; eye < 2; ++eye)
 			{
-				// Tighten to the quad's pixel bounds (same NDC mapping the
-				// viewport itself uses, so alignment is exact by
-				// construction): fullscreen LOAD/STORE traffic for a small
-				// debug rect would cost a full image round-trip per group.
-				// Any corner behind the camera falls back to fullscreen.
-				// Bounds track the submitted (output) size, like the
-				// viewport below: NDC maps consistently at any size.
-				vk::Rect2D area{{0, 0}, out_extent};
-				bool behind = false;
 				float minx = (float)out_extent.width, miny = (float)out_extent.height;
 				float maxx = 0, maxy = 0;
+				bool behind = false;
 				for (const auto & v: quad)
 				{
 					glm::vec4 c = cutout_mvp[eye] * glm::vec4(v, 1);
@@ -4266,31 +4097,96 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					maxx = std::max(maxx, px);
 					maxy = std::max(maxy, py);
 				}
-				if (not behind)
+				if (behind)
 				{
-					int32_t x0 = std::clamp<int32_t>((int32_t)std::floor(minx) - 1, 0, (int32_t)out_extent.width);
-					int32_t y0 = std::clamp<int32_t>((int32_t)std::floor(miny) - 1, 0, (int32_t)out_extent.height);
-					int32_t x1 = std::clamp<int32_t>((int32_t)std::ceil(maxx) + 1, 0, (int32_t)out_extent.width);
-					int32_t y1 = std::clamp<int32_t>((int32_t)std::ceil(maxy) + 1, 0, (int32_t)out_extent.height);
-					if (x1 <= x0 or y1 <= y0)
-						continue;
-					area = {{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+					out = vk::Rect2D{{0, 0}, out_extent};
+					return true;
 				}
-				vk::RenderPassBeginInfo begin_cut{
-				        .renderPass = *cutout_renderpass,
-				        .framebuffer = *it->second.framebuffers[eye],
-				        .renderArea = area,
-				        .clearValueCount = 0,
-				};
-				cmd.beginRenderPass(begin_cut, vk::SubpassContents::eInline);
-				set_full_viewport(out_extent);
-				cmd.setScissor(0, area);
-				cmd.pushConstants<raster_push>(*pipeline_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-				                               raster_push{.mvp = cutout_mvp[eye], .opacity = 1});
-				cmd.draw(6, 1, (uint32_t)(qi * 6), 0);
-				cmd.endRenderPass();
+				int32_t x0 = std::clamp<int32_t>((int32_t)std::floor(minx) - 1, 0, (int32_t)out_extent.width);
+				int32_t y0 = std::clamp<int32_t>((int32_t)std::floor(miny) - 1, 0, (int32_t)out_extent.height);
+				int32_t x1 = std::clamp<int32_t>((int32_t)std::ceil(maxx) + 1, 0, (int32_t)out_extent.width);
+				int32_t y1 = std::clamp<int32_t>((int32_t)std::ceil(maxy) + 1, 0, (int32_t)out_extent.height);
+				if (x1 <= x0 or y1 <= y0)
+					continue;
+				if (not got)
+				{
+					ax0 = x0;
+					ay0 = y0;
+					ax1 = x1;
+					ay1 = y1;
+					got = true;
+				}
+				else
+				{
+					ax0 = std::min(ax0, x0);
+					ay0 = std::min(ay0, y0);
+					ax1 = std::max(ax1, x1);
+					ay1 = std::max(ay1, y1);
+				}
 			}
+			if (not got)
+				return false;
+			out = vk::Rect2D{{ax0, ay0}, {(uint32_t)(ax1 - ax0), (uint32_t)(ay1 - ay0)}};
+			return true;
+		};
+		// renderArea must cover every draw below: union of all quad
+		// boxes (fullscreen when any quad falls back or all degenerate —
+		// over-wide just costs area, never correctness).
+		vk::Rect2D cut_area{{0, 0}, out_extent};
+		{
+			bool got = false;
+			int32_t ax0 = 0, ay0 = 0, ax1 = 0, ay1 = 0;
+			for (const auto & quad: cutouts)
+			{
+				vk::Rect2D box;
+				if (not quad_union(quad, box))
+					continue;
+				if (box.extent.width == out_extent.width and box.extent.height == out_extent.height)
+				{
+					got = false;
+					break;
+				}
+				if (not got)
+				{
+					ax0 = box.offset.x;
+					ay0 = box.offset.y;
+					ax1 = box.offset.x + (int32_t)box.extent.width;
+					ay1 = box.offset.y + (int32_t)box.extent.height;
+					got = true;
+				}
+				else
+				{
+					ax0 = std::min(ax0, box.offset.x);
+					ay0 = std::min(ay0, box.offset.y);
+					ax1 = std::max(ax1, box.offset.x + (int32_t)box.extent.width);
+					ay1 = std::max(ay1, box.offset.y + (int32_t)box.extent.height);
+				}
+			}
+			if (got)
+				cut_area = vk::Rect2D{{ax0, ay0}, {(uint32_t)(ax1 - ax0), (uint32_t)(ay1 - ay0)}};
 		}
+		vk::RenderPassBeginInfo begin_cut{
+		        .renderPass = *volume_max_rgb8_renderpass,
+		        .framebuffer = *it->second.framebuffer_mv,
+		        .renderArea = cut_area,
+		        .clearValueCount = 0,
+		};
+		cmd.beginRenderPass(begin_cut, vk::SubpassContents::eInline);
+		set_full_viewport(out_extent);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline_mv);
+		cmd.bindVertexBuffers(0, (vk::Buffer)cutout_verts, (vk::DeviceSize)0);
+		cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+		                                      silhouette_mv_push{.mvp = {{cutout_mvp[0], cutout_mvp[1]}}, .opacity = 1});
+		section_clock punch_clk(&ms_punch);
+		for (size_t qi = 0; qi < cutouts.size(); ++qi)
+		{
+			vk::Rect2D area;
+			if (not quad_union(cutouts[qi], area))
+				continue;
+			cmd.setScissor(0, area);
+			cmd.draw(6, 1, (uint32_t)(qi * 6), 0);
+		}
+		cmd.endRenderPass();
 	}
 
 	// All mask passes recorded (barrier below is submit bookkeeping, not

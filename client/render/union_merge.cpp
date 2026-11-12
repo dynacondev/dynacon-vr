@@ -42,9 +42,8 @@ struct push
 static_assert(sizeof(push) == 4);
 } // namespace
 
-union_merge_renderer::union_merge_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device) :
-        device(&device),
-        physical_device(&physical_device)
+union_merge_renderer::union_merge_renderer(vk::raii::Device & device) :
+        device(&device)
 {
 }
 
@@ -55,11 +54,11 @@ std::shared_ptr<vk::raii::PipelineCache> union_merge_renderer::pipeline_cache(vk
 	return feather_mask_renderer::pipeline_cache(device);
 }
 
-void union_merge_renderer::warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format)
+void union_merge_renderer::warm_pipelines(vk::raii::Device & device, vk::Format format)
 {
 	// Throwaway renderer: its pipeline compile populates the shared
 	// cache above, so the first real merge pays ~nothing.
-	union_merge_renderer warm(device, physical_device);
+	union_merge_renderer warm(device);
 	warm.init_pipelines(format);
 }
 
@@ -141,7 +140,8 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 {
 	pipe_cache = pipeline_cache(*device);
 	// 8 static sampler2DArray bindings, fragment-only (no vertex
-	// input, no push constants — the reduction is count-independent).
+	// input, 4B FRAG-only count push — the reduction is
+	// count-independent apart from the early-out).
 	vk::DescriptorSetLayoutBinding bindings[max_inputs];
 	for (uint32_t i = 0; i < max_inputs; ++i)
 	{

@@ -18,10 +18,12 @@
 
 #version 450
 
-// Multiview twin of volume_raster.frag.glsl: identical encode, push
-// block widened to the MVP pair so the VERT/FRAG blocks agree
-// byte-for-byte (see mask_mv.frag precedent — a mismatched FRAG block
-// would read mvp[1] as near_z). Fragment reads only near_z/far_z.
+// Multiview volume raster fragment: furthest-point encode of the
+// back-face eye distance as sensor-compatible D in [0,1] (same
+// near/far, same infinite-far branch as the runtime D16). Push block
+// widened to the MVP pair so the VERT/FRAG blocks agree byte-for-byte
+// (see mask_mv.frag precedent — a mismatched FRAG block would read
+// mvp[1] as near_z). Fragment reads only near_z/far_z.
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp[2];

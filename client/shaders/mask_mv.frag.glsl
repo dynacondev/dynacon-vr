@@ -18,11 +18,11 @@
 
 #version 450
 
-// Multiview twin of mask.frag.glsl: identical flat silhouette (opacity
+// Multiview silhouette fragment: flat silhouette (opacity
 // replicated to all channels), push block widened to the multiview pair
-// so the shared 132B layout reads opacity at the right offset (a legacy
-// mask.frag here would read mvp[1][0][0] as alpha — orientation-dependent
-// garbage through the DST_ALPHA blend).
+// so the shared 132B layout reads opacity at the right offset (a
+// mismatched single-MVP block here would read mvp[1][0][0] as alpha —
+// orientation-dependent garbage through the DST_ALPHA blend).
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp[2];

@@ -860,8 +860,11 @@ struct video_stream_description
 	// the client never hardcodes it. Wire convention: row 0 = scene top,
 	// left eye in x[0..depth_width/2), 10-bit 2mm/LSB luma clamped
 	// at 2.040m (code 1020); 1021+ decodes as far (lossy guard).
-	uint16_t depth_width = 640;
-	uint16_t depth_height = 320;
+	// Overwritten on connect from the encoder settings (half stream
+	// resolution per eye); 0 = not yet advertised. No legacy default:
+	// the client sizes its idle decoder from the connect-time describe.
+	uint16_t depth_width = 0;
+	uint16_t depth_height = 0;
 	float frame_rate;
 	float refresh_rate;
 

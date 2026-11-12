@@ -1040,6 +1040,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	for (auto & encoder: encoders)
 	{
+		if (not encoder)
+			continue; // depth backend skipped when settings[3] disabled
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
 		if (encoder->stream_idx == 3)
@@ -1116,6 +1118,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	for (auto & encoder: encoders)
 	{
+		if (not encoder)
+			continue; // depth backend skipped when settings[3] disabled
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
 		auto count_present = [&](video_encoder::present_outcome outcome) {
@@ -1289,6 +1293,8 @@ void compositor::encoder_work(std::stop_token tok)
 		// still clears below in all cases.
 		for (auto & encoder: encoders)
 		{
+			if (not encoder)
+				continue; // depth backend skipped when settings[3] disabled
 			// Depth (stream 3) encodes from its own staging image, only
 			// when this frame was packed (has_depth doubles as
 			// "present was attempted": the encode consumes the
@@ -1377,9 +1383,17 @@ compositor::compositor(wivrn_session & session) :
                 vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
                 cached_reprojection_switches().source_reverse_z),
         packer(vk),
-        depth_reprojection_enabled(cached_reprojection_switches().enabled),
-        depth_images{make_depth_images(vk, settings[3])}
+        depth_reprojection_enabled(cached_reprojection_switches().enabled)
+        // depth_images left default-constructed (empty) here and filled
+        // below only when settings[3].enabled: no Vulkan depth staging
+        // when the depth stream is disabled. All depth paths are guarded
+        // by settings[3].enabled; advertisement uses settings[3]
+        // width/height only, so idle sizing still works.
 {
+	// Depth staging (stream 3) only when enabled: skip the Vulkan image
+	// allocation entirely when the depth stream is disabled.
+	if (settings[3].enabled)
+		depth_images = make_depth_images(vk, settings[3]);
 	// Per-slot frame context (see TODO.md): one pool+buffer+query pool
 	// per compositor image, so the commit for images[slot] only ever resets
 	// and records its own slot while the other slot may still execute.
@@ -1454,8 +1468,19 @@ compositor::compositor(wivrn_session & session) :
 		throw std::runtime_error("comp_swapchain_shared_init failed");
 
 	print_encoders(settings);
-	for (auto [i, settings]: std::ranges::enumerate_view(settings))
-		encoders[i] = video_encoder::create(vk, settings, i);
+	for (auto [i, s]: std::ranges::enumerate_view(settings))
+	{
+		// Skip the depth backend when disabled: no encoder instance,
+		// encoders[3] stays nullptr. print_encoders above still marks
+		// it (disabled) from settings, and the bitrate-zero reclaim in
+		// get_encoder_settings is untouched.
+		if (i == 3 and not this->settings[3].enabled)
+		{
+			encoders[i] = nullptr;
+			continue;
+		}
+		encoders[i] = video_encoder::create(vk, s, i);
+	}
 	send_video_stream_description();
 
 	u_var_add_root(this, "Compositor", false);
@@ -1510,7 +1535,11 @@ xrt_system_compositor_info compositor::sys_info() const
 void compositor::set_bitrate(uint32_t bitrate)
 {
 	for (auto & encoder: encoders)
+	{
+		if (not encoder)
+			continue; // depth backend skipped when disabled
 		encoder->set_bitrate(bitrate);
+	}
 }
 
 void compositor::set_framerate(float hz)
@@ -1520,7 +1549,11 @@ void compositor::set_framerate(float hz)
 	U_LOG_IFL_D(log_level, "Framerate change from %.0f to %.0f", frame_rate.load(), hz);
 	pacer.set_frame_duration(U_TIME_1S_IN_NS / hz);
 	for (auto & encoder: encoders)
+	{
+		if (not encoder)
+			continue; // depth backend skipped when disabled
 		encoder->set_framerate(hz);
+	}
 }
 
 void compositor::update_tracking(const from_headset::tracking & tracking)
@@ -1536,15 +1569,19 @@ void compositor::update_foveation_center_override(const from_headset::override_f
 void compositor::resume()
 {
 	for (auto & encoder: encoders)
+	{
+		if (not encoder)
+			continue; // depth backend skipped when disabled
 		encoder->reset();
+	}
 	send_video_stream_description();
 }
 
 void compositor::on_feedback(const from_headset::feedback & feedback, const clock_offset & o)
 {
 	uint8_t stream = feedback.stream_index;
-	if (stream >= encoders.size())
-		return;
+	if (stream >= encoders.size() or not encoders[stream])
+		return; // disabled depth stream has no backend
 	encoders[stream]->on_feedback(feedback);
 	if (not o)
 		return;

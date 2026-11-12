@@ -74,7 +74,7 @@ void main()
 	                         texture(object_tex, base - vec3(texel.x, 0.0, 0.0)).r),
 	                     min(texture(object_tex, base + vec3(0.0, texel.y, 0.0)).r,
 	                         texture(object_tex, base - vec3(0.0, texel.y, 0.0)).r));
-	const float q = 0.25 / float(textureSize(object_tex, 0).x);
+	vec2 q = 0.25 / vec2(textureSize(object_tex, 0));
 	float keep = 0.0;
 	for (int i = 0; i < 4; ++i)
 	{

@@ -20,7 +20,7 @@
 
 #extension GL_EXT_multiview : require
 
-// Multiview twin of mask.vert.glsl: identical transform, per-eye MVP
+// Multiview silhouette vertex shader: per-eye MVP
 // selected by gl_ViewIndex. One draw broadcasts to both layers, halving
 // the hidden renderpass begins (8 per-eye to 4 multiview). Plain integer
 // indexing only (see AGENTS.md: no mat3/ternary on this driver path).

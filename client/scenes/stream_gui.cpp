@@ -1396,10 +1396,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	auto gui_submit_t0 = std::chrono::steady_clock::now();
 	auto layers = imgui_ctx->end_frame();
 
-	// Menu quads use depth testing (the triangle-mesh projected layer
-	// that used to ghost them is gone: flat-only sessions keep full
-	// menu depth-testing unconditionally).
-	constexpr bool menu_depth = true;
+	// Menu quads use depth testing.
 
 	// Display controllers and handle recentering
 	if (interactable)
@@ -1467,7 +1464,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		             world_to_window);
 
 		// Add the layer with the controllers
-		if (composition_layer_depth_test_supported and menu_depth)
+		if (composition_layer_depth_test_supported)
 		{
 			render_world(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 			             world_space,
@@ -1484,7 +1481,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	for (auto [_, layer]: layers)
 	{
 		add_quad_layer(layer.layerFlags, layer.space, layer.eyeVisibility, layer.subImage, layer.pose, layer.size);
-		if (composition_layer_depth_test_supported and menu_depth)
+		if (composition_layer_depth_test_supported)
 			set_depth_test(true, XR_COMPARE_OP_LESS_FB);
 
 		else if (alpha < 1 and composition_layer_color_scale_bias_supported)
@@ -1499,10 +1496,10 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 		             views,
 		             width,
 		             height,
-		             composition_layer_depth_test_supported and menu_depth,
-		             (composition_layer_depth_test_supported and menu_depth) ? layer_rays : layer_controllers | layer_rays,
+		             composition_layer_depth_test_supported,
+		             composition_layer_depth_test_supported ? layer_rays : layer_controllers | layer_rays,
 		             {});
-		if (composition_layer_depth_test_supported and menu_depth)
+		if (composition_layer_depth_test_supported)
 			set_depth_test(true, XR_COMPARE_OP_LESS_FB);
 	}
 	gui_submit_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gui_submit_t0).count();

@@ -151,7 +151,8 @@ public:
 		double punch_ms = 0;  // marker-window cutout punch
 		double total_ms = 0;  // whole record() body, incl. target setup
 		int tier = -1;        // selected tier, -1 = bypass/clear-only/empty
-		size_t draws = 0;     // silhouette drawIndexed calls (one per MV broadcast)
+		size_t draws = 0;   // drawIndexed calls: silhouettes (one per MV
+		                      // broadcast) plus VR-occlusion and volume draws
 		float box_frac = 1;   // scissor-box area fraction (0-1) at working
 		                      // res; 1 = fullscreen fallback. Diagnostic for
 		                      // cull effectiveness (log only, no plot).
@@ -270,8 +271,7 @@ public:
 	// (shared logic untouched): RP1 rasters the proximity spheres into a
 	// depth field, RP2 rasters the silhouettes with a depth test against
 	// it, so only in-radius fragments write mask. Quarter-res working +
-	// submit; tier-0 direct raster (no blur/erode/volume/VR ever —
-	// bubbles never engage here).
+	// submit; tier-0 direct raster (no blur/erode/volume/VR ever).
 	// spheres: one MVP pair per proximity volume (model =
 	// translate(center) * scale(radius)), stream-built so this stays
 	// timebase-free. Safety theorem baked in: LESS accumulates the
@@ -284,7 +284,8 @@ public:
 	// (re)created from the same quarter-res in the scene prewarm).
 	// One draw per silhouette: which uploaded mesh, per-eye transforms,
 	// opacity, and the full-res pixel bounds per eye (scaled to the mask
-	// extent for a per-draw scissor — the only tri-raster with one).
+	// extent for a per-draw scissor — two MV passes total here: spheres
+	// plus silhouettes, each one draw per item).
 	struct hidden_draw
 	{
 		std::string mesh;
@@ -348,14 +349,6 @@ private:
 	                                                                vk::BufferUsageFlags usage,
 	                                                                vk::MemoryPropertyFlags properties);
 
-	vk::raii::RenderPass renderpass{nullptr};
-	vk::raii::PipelineLayout pipeline_layout{nullptr};
-	vk::raii::Pipeline pipeline{nullptr};
-
-	// Multiview twins of the raster path (mask_mv.vert/frag, 132B
-	// push): one draw broadcasts to both layers. Same CLEAR/STORE
-	// OPTIMAL shape as the per-eye passes above; framebuffer-compatible
-	// with the V-upscale MV framebuffers for the non-depth path.
 	vk::raii::RenderPass renderpass_mv{nullptr};
 	vk::raii::RenderPass depth_renderpass_mv{nullptr};
 	vk::raii::RenderPass raster_r8_renderpass_mv{nullptr};
@@ -368,15 +361,11 @@ private:
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
 
-	// R8 variants of the raster path are multiview-only now
-	// (raster_r8_renderpass_mv below); the per-eye R8/depth R8 paths
-	// were retired with the silhouette MV conversion.
-
-	// LOAD variant of the raster pass for the marker window cutout: same
-	// single-attachment shape (framebuffer-compatible with the above), so
-	// the finished blurred image can be re-begun and stamped with a crisp
-	// full-alpha quad no blur pass touches.
-	vk::raii::RenderPass cutout_renderpass{nullptr};
+	// All raster paths are multiview now (silhouette, hidden, cutout);
+	// no per-eye raster renderpasses or pipelines remain. The marker
+	// cutout re-begins the submit framebuffer_mv under
+	// volume_max_rgb8_renderpass (LOAD twin of the V-upscale pass) with
+	// pipeline_mv at opacity 1.
 
 	// Separable Gaussian blur (fullscreen triangle, sampled input).
 	// Two format variants: R8 for the intermediates, RGBA8 for the V
@@ -403,31 +392,27 @@ private:
 	// Separable box-min erosion for internal-only feathering at any
 	// width: two 1D min passes (H then V, radius = ceil bleed) compose an
 	// exact (2r+1)^2 box. Same fullscreen vertex shader/layout as blur
-	// (24-byte push) and R8 standalone shape as the downsample pass, so
-	// it records into any single-attachment R8 MV framebuffer (A/B
-	// raster_fb_mv, eblur raster_fb_mv) with no new renderpasses.
-	// Triple-subpass pipes (subpass index is baked in: erode runs in
-	// subpasses 0/1, blur-H in 2). Shared by both triple renderpasses.
+	// (24-byte push). Erode runs only in triple subpasses 0/1 (blur-H in
+	// 2, subpass index baked in); one pipe set shared by both triple use
+	// sites (tier-1 [A,B] and tiered [h,eblur]).
 	vk::raii::Pipeline triple_erode_0{nullptr};
 	vk::raii::Pipeline triple_erode_1{nullptr};
 	vk::raii::Pipeline triple_blur_h{nullptr};
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
-	// One set per (pass, eye): descriptor updates are host-side writes
+	// One set per pass: descriptor updates are host-side writes
 	// that complete before submit, so every draw would otherwise read the
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
-	// Index: 0 = blur-H, 1 = upscale merges (blur-V source, volume MAX —
-	// triple never touches it), 2 = blur-V upscale; 3 = volume
-	// presmooth-H (must NOT be 0, which the triple blur-H overwrites);
-	// 4,6,8 = downsample levels 1..3; 7 = VR MIN-merge upscale (split
-	// from 1: the VR chain samples a different high-res image than the
-	// volume chain in the same command buffer). 5 retired (was VR
-	// presmooth, removed: smoothing reintroduced the rim).
-	// 10 = erode-H, 12 = erode-V.
+	// Index: 0 = blur-H, 1 = upscale merges (volume MAX — triple never
+	// touches it), 2 = blur-V upscale; 3 = volume presmooth-H (must NOT
+	// be 0, which the triple blur-H overwrites); 4,5 = downsample levels
+	// 2,3; 6 = VR MIN-merge upscale (split from 1: the VR chain samples
+	// a different high-res image than the volume chain in the same
+	// command buffer). 7 = erode-H, 8 = erode-V.
 	// One set per pass (not
-	// per eye): the multiview passes sample the array view, so eye-1
-	// slots stay unused. Erosion needs two sets because its H and V
+	// per eye): the multiview passes sample the array view, so no
+	// per-eye slots exist. Erosion needs two sets because its H and V
 	// passes sample different images in the same command buffer (one
 	// host-side write per set per frame, like the rest).
 	std::vector<vk::raii::DescriptorSet> descriptor_sets;
@@ -494,7 +479,7 @@ private:
 	static constexpr uint32_t volume_size = 320;
 	static constexpr vk::Format volume_depth_format = vk::Format::eR16Unorm;
 	// Presmooth radius (blur-spread units = texels at 320): stairs
-	// smaller than ~2x this vanish into a stable gradient. 4 -> ~8px.
+	// smaller than ~2x this (~3px at 320) vanish into a stable gradient.
 	static constexpr float volume_smooth_spread = 1.4f;
 	// Multiview volume/VR raster (volume_mv.vert, 136B MVP-pair push):
 	// one draw broadcasts to both layers. Same CLEAR/STORE/OPTIMAL R16
@@ -544,8 +529,9 @@ private:
 	// virtual D canvas). Eye-space virt < object, no sensor remap, no
 	// push constants (both inputs are already D). Renders into
 	// vr_bin.blur_fb_mv under the shared R8 MV CLEAR pass (the volume
-	// compare uses the separate 320px volume_bin), then presmooths +
-	// MIN-merges below.
+	// compare uses the separate 320px volume_bin), then MIN-merges
+	// straight into the seed (spread-0 upscale, no presmooth: smoothing
+	// would bleed keep back up at the dilated rim).
 	vk::raii::DescriptorSetLayout vr_compare_set_layout{nullptr};
 	vk::raii::PipelineLayout vr_compare_pipe_layout{nullptr};
 	vk::raii::DescriptorPool vr_compare_pool{nullptr};
@@ -602,7 +588,8 @@ private:
 	// (volume_virt_fb_mv) under volume_virt_renderpass (CLEAR R16 MV).
 	vk::raii::Framebuffer volume_virt_fb_mv{nullptr};
 	blur_target volume_bin; // R8 coverage canvas (320, 2 layers):
-	// compare output, presmoothed in place before the merge upscale
+	// compare output, H-presmoothed out-of-place into volume_smooth
+	// before the merge upscale
 	blur_target volume_smooth; // R8 presmooth workspace (320, 2 layers):
 	// H destination, read directly by the merge upscale (V folded in)
 	bool volume_targets_ready = false;
@@ -656,7 +643,7 @@ private:
 
 	// Hidden proximity path (record_hidden): own renderpasses (sphere
 	// depth-only + color-with-depth-LOAD), own pipelines (sphere fill +
-	// silhouette-with-proximity-test, same mask.vert/mask.frag modules),
+	// silhouette-with-proximity-test, same mask_mv.vert/mask_mv.frag modules),
 	// own unit-sphere verts. Created lazily on first record_hidden.
 	vk::raii::RenderPass hidden_sphere_rp{nullptr};
 	vk::raii::RenderPass hidden_color_rp{nullptr};
@@ -689,16 +676,16 @@ private:
 	void ensure_hidden(vk::Image image, vk::Extent2D extent);
 	bool hidden_ready = false; // lazy RPs/pipes/sphere verts (first record_hidden)
 
-	// Framebuffers + views per swapchain image (images cycle; entries for
+	// Framebuffer + view per swapchain image (images cycle; entries for
 	// retired swapchains are dropped via reset_targets()).
 	struct frame_targets
 	{
 		vk::Extent2D extent;
-		std::array<vk::raii::ImageView, 2> views;
-		std::array<vk::raii::Framebuffer, 2> framebuffers;
-		// Multiview V-upscale target: array view + layers=2
-		// framebuffer under blur_renderpass_mv. Per-eye framebuffers
-		// above stay (cutout punch only; raster is multiview now).
+		// Multiview submit target: array view (both layers) + layers=2
+		// framebuffer under blur_renderpass_mv. All output is multiview
+		// (raster, V upscale, VR/volume merges, cutout punch — the
+		// cutout re-begins this framebuffer under
+		// volume_max_rgb8_renderpass).
 		vk::raii::ImageView view_array{nullptr};
 		vk::raii::Framebuffer framebuffer_mv{nullptr};
 		// Depth-tested raster companion for tier-0 direct raster (color +
@@ -708,14 +695,10 @@ private:
 		vk::raii::Framebuffer depth_framebuffer_mv{nullptr};
 		bool has_depth = false;
 		frame_targets(vk::Extent2D extent_,
-		              std::array<vk::raii::ImageView, 2> views_,
-		              std::array<vk::raii::Framebuffer, 2> framebuffers_,
 		              bool has_depth_,
 		              vk::raii::ImageView view_array_ = nullptr,
 		              vk::raii::Framebuffer framebuffer_mv_ = nullptr) :
 		        extent(extent_),
-		        views(std::move(views_)),
-		        framebuffers(std::move(framebuffers_)),
 		        view_array(std::move(view_array_)),
 		        framebuffer_mv(std::move(framebuffer_mv_)),
 		        has_depth(has_depth_)

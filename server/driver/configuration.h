@@ -106,9 +106,8 @@ struct configuration
 		// runtime depth map resolves inside the model volume (depth-tested
 		// volume, feathered like a normal window). "3d-passthrough-hidden"
 		// reveals the flat feed where the model sits inside the proximity
-		// radius around the head (hard-edged near-field cutout on its own
-		// mask layer, reversed cuts never apply), plus a dot overlay in
-		// the config color over the revealed feed.
+		// radius around the head (hard-edged near-field cutout merged into
+		// the single merged submit layer; reversed cuts never apply).
 		// Unknown types are skipped with a warning (forward-compat).
 		std::string type = "3d-passthrough";
 		std::string id;

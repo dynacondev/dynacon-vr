@@ -84,13 +84,13 @@ public:
 		vk::ImageView view_array;
 	};
 
-	explicit union_merge_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
+	explicit union_merge_renderer(vk::raii::Device & device);
 
 	// Shared driver pipeline cache (one per device, same object the
 	// feather mask renderer uses). Render-thread only.
 	static std::shared_ptr<vk::raii::PipelineCache> pipeline_cache(vk::raii::Device & device);
 	// Throwaway compile so the first real merge pays ~nothing.
-	static void warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format);
+	static void warm_pipelines(vk::raii::Device & device, vk::Format format);
 
 	// (Re)create swapchain + targets + pipeline for format/size
 	// (full mask working res). waitIdle inside on rebuild; no-op
@@ -131,7 +131,6 @@ private:
 	void init_pipelines(vk::Format format);
 
 	vk::raii::Device * device = nullptr;
-	vk::raii::PhysicalDevice * physical_device = nullptr;
 	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};

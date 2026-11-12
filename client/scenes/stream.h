@@ -77,8 +77,9 @@ public:
 
 private:
 	static const size_t view_count = 2;
-	// left, right, alpha, virtual depth SBS (stream 3, strict frame_idx
-	// pairing with color, null when the color frame had no depth warp)
+	// left, right, alpha, virtual depth SBS (stream 3, tolerant (±1)
+	// frame_idx pairing with color, null when the color frame had no
+	// depth warp)
 	static const size_t decoder_count = view_count + 2;
 	static const uint8_t depth_stream_index = 3;
 
@@ -724,7 +725,6 @@ private:
 		// Dedicated member swapchain (explicit acquire/release pairing,
 		// never the shared pool).
 		xr::swapchain swapchain;
-		bool acquired = false;
 		bool wait_warned = false; // image-wait timeout already reported
 		XrExtent2Di extent{0, 0}; // submitted size (tier-selected)
 		bool active = false; // submitting this frame
@@ -763,8 +763,9 @@ private:
 	// its own swapchain, never feathered, never cut by reversed draws
 	// (hidden always wins). Merged like every other input at submit.
 	// Render thread only.
-	// NOTE: hidden_group.feather_px intentionally untouched
-	// (stale default): the hidden record passes tier/behavior literals.
+	// NOTE: hidden_group.feather_px (and debug_group.feather_px)
+	// intentionally untouched (stale defaults): the hidden record and
+	// the debug record pass tier/behavior literals.
 	mask_group hidden_group;
 	// Merge (single submitted alpha layer for the flat feed):
 	// MAX-combines every active contributor (feather groups +

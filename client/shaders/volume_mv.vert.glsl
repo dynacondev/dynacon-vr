@@ -20,13 +20,13 @@
 
 #extension GL_EXT_multiview : require
 
-// Multiview twin of volume.vert.glsl: identical transform, per-eye MVP
-// selected by gl_ViewIndex. One draw broadcasts to both layers, halving
+// Multiview volume vertex shader: per-eye MVP selected by
+// gl_ViewIndex. One draw broadcasts to both layers, halving
 // the volume/VR raster begins. Plain integer indexing only (see
 // AGENTS.md: no mat3/ternary on this driver path). The fragment stage
-// reads only near_z/far_z, so the push mirrors volume_push with an
-// MVP pair (136B — same >128B note as the hidden/silhouette MV pushes;
-// Adreno 740 provides 256B).
+// reads only near_z/far_z; the push carries an MVP pair (136B — same
+// >128B note as the hidden/silhouette MV pushes; Adreno 740
+// provides 256B).
 layout(location = 0) in vec3 pos;
 
 layout(push_constant) uniform PushConstants
