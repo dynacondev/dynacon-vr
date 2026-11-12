@@ -424,18 +424,20 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 
 		// moth-to-light: steer toward the live anchor, stronger the further
 		// past comfort. Capped well below loop pitch rates so figures can
-		// range out; a tendency, never a wall. Loops stay planar: in-plane
-		// (pitch) correction only, no out-of-plane yaw.
+		// range out; a tendency, never a wall. Fully suppressed mid-loop:
+		// the accumulator below counts only maneuver rates, so any bias
+		// during the figure would over-rotate past 2pi (ending backwards
+		// with a frame flip on exit). A planar loop is position-neutral
+		// anyway, so the leash loses nothing by standing down.
 		float yaw_bias = 0.f, pitch_bias = 0.f;
 		glm::vec3 to_anchor = anchor_pos - f.pos;
 		float dist = glm::length(to_anchor);
-		if (dist > comfort_r && dist > 1e-4f)
+		if (not f.loop_maneuver && dist > comfort_r && dist > 1e-4f)
 		{
 			glm::vec3 want = to_anchor / dist;
 			glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
 			float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
-			if (not f.loop_maneuver)
-				yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w;
+			yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w;
 			pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w;
 		}
 		float yaw = f.yaw_rate + yaw_bias;
