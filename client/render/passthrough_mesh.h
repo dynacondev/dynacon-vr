@@ -45,4 +45,11 @@ triangle_soup flatten_gltf(const std::filesystem::path & path);
 // wall from any viewpoint). One shared generator, expanded with
 // per-frame MVPs by the hidden mask record.
 std::vector<XrVector3f> unit_sphere_positions();
+
+// Unit-cylinder positions for the proximity depth field (non-indexed
+// triangles, outward-CCW winding like the sphere above). Radius 1,
+// y in [-1,1] (inscribed in the unit cube, so the same cube-corner
+// scissor stays a conservative superset): the record scales it to
+// (r, depth/2, r) around the body column center.
+std::vector<XrVector3f> unit_cylinder_positions();
 } // namespace passthrough_mesh

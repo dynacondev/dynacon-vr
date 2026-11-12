@@ -450,6 +450,8 @@ Each `passthrough` entry has:
   triangles budget). Both eyes fade together from a single per-frame
   headset distance. `"3d-passthrough-hidden"` reveals the flat feed
   where the model sits inside the proximity radius around the head
+  or inside a body column of the same radius hanging 2 m down from
+  the head center
   (hard-edged near-field cutout merged into the single merged submit layer;
   front faces only, so hidden meshes read best as **closed volumes** like boundary
   meshes): reversed cuts never apply to it (safety: hidden always wins),
@@ -488,7 +490,9 @@ Each `passthrough` entry has:
 - `proximity-radius`: near-field reveal radius in meters
   (`3d-passthrough-hidden` only, default `0.25`, clamped to `>= 0`,
   applied live). The cutout shows only where the mesh sits
-  inside this distance of the head (hard edge); `0` reveals nothing.
+  inside this distance of the head — or inside the body column
+  (same radius, 2 m down from the head center) — (hard edge);
+  `0` reveals nothing.
 - `hand-proximity-radius`: same gate measured from each hand in meters
   (`3d-passthrough-hidden` only, default `0.15`, clamped to `>= 0`,
   applied live). Uses palm tracking when valid, else the controller

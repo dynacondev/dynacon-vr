@@ -18,7 +18,7 @@
 
 #version 450
 
-// Empty fragment for the hidden proximity sphere pipe: depth-only
+// Empty fragment for the hidden proximity pipe: depth-only
 // (no color attachment, color writes off).
 void main()
 {

@@ -650,7 +650,7 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		// transition_distance_m excluded (live-applied by the boundary
 		// fade).
 		// proximity_radius_m/hand_proximity_radius_m excluded as well
-		// (live-applied by the near-field reveal: sphere MVPs rebuild
+		// (live-applied by the near-field reveal: proximity MVPs rebuild
 		// every frame).
 	}
 	map_key += 'L';

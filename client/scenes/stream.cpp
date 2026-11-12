@@ -2777,11 +2777,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// soon as the soup is ready, even unplaced.
 							if (not g.renderer)
 								g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
-							// Hidden sphere field, warmed here (ahead of the
+							// Hidden proximity field, warmed here (ahead of the
 							// mask record below which renders into it): same
 							// hidden_known prewarm as the mask swapchain, same
 							// quarter-res extent. A rebuild recreates the views
-							// the mask builds its sphere framebuffer against,
+							// the mask builds its proximity framebuffer against,
 							// so drop those first.
 							if (mask_frame and g.renderer and
 							    g.renderer->ensure_hidden_field({(uint32_t)hmw, (uint32_t)hmh}))
@@ -2864,20 +2864,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// shared margin floors off the quarter-res mask
 							// working size (conservative superset either way).
 							build_hidden_silhouettes(hmw, hmh);
-							// Proximity spheres (v1: head + hands — further
+							// Proximity field (head sphere + body column + hands — further
 							// trackers slot in as more entries later): head
 							// center = midpoint of the sync eye positions,
 							// same timebase as server_mvp by construction
 							// (NOT the fiducial head_pos, which runs on
-							// predicted timebase).
+							// predicted timebase). The body column hangs
+							// hidden_body_depth_m down from the head center
+							// in world -Y with the head radius, so leaning
+							// the torso into a volume reveals it without the
+							// head or hands being near.
 							// One head entry per placed hidden object, each
 							// with its own live proximity-radius, plus one
 							// entry per tracked palm/grip with the same
 							// object's hand-proximity-radius:
 							// the min-accumulating field unions them (inside
 							// ANY = over-reveal, the safe direction).
+							constexpr float hidden_body_depth_m = 2.f;
 							proximity_spheres.clear();
 							proximity_spheres.reserve(hidden_silhouettes.size() * 3);
+							proximity_cylinders.clear();
+							proximity_cylinders.reserve(hidden_silhouettes.size());
 							// Shared GUI pair (see hidden_wants_hands): the GUI leaves
 							// them alive while a hidden map is live; created here when
 							// it never ran (no GUI open). Positions are never culled
@@ -2925,6 +2932,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									sm[view] = server_mvp[view] * sphere_model;
 								proximity_spheres.push_back(sm);
 							};
+							// Body column: unit cylinder (radius 1, y in
+							// [-1,1]) scaled to (r, depth/2, r) around the
+							// head-center-minus-half-depth point, so it spans
+							// head center down hidden_body_depth_m in world
+							// -Y with the head radius.
+							auto push_cylinder = [&](glm::vec3 c, float r) {
+								if (r <= 0)
+									return; // degenerate: field stays cleared, fail-closed
+								glm::vec3 cc(c.x, c.y - hidden_body_depth_m * 0.5f, c.z);
+								glm::mat4 cyl_model =
+								        glm::translate(glm::mat4(1), cc) *
+								        glm::scale(glm::mat4(1),
+								                   glm::vec3(r, hidden_body_depth_m * 0.5f, r));
+								std::array<glm::mat4, 2> cm;
+								for (uint32_t view = 0; view < view_count; ++view)
+									cm[view] = server_mvp[view] * cyl_model;
+								proximity_cylinders.push_back(cm);
+							};
 							// Live radii per object (clamped, fail-closed at 0).
 							auto hidden_radii = [&](const std::string & mesh) {
 								float head_r = 0.25f, hand_r = 0.15f;
@@ -2942,11 +2967,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							glm::vec3 center((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f,
 							                 (p0.z + p1.z) * 0.5f);
 							// P0 CPU pre-gate: drop silhouettes fully outside every
-							// sphere (head + palms) before any acquire/record.
+							// proximity shape (head sphere + body column + palms)
+							// before any acquire/record.
 							// Sphere-vs-world-AABB; test radii padded 2cm against
 							// edge flicker (the GPU field keeps the exact radii).
 							// Unknown bounds pass conservatively. Survivors feed the
-							// mask draws and the sphere MVPs below, so
+							// mask draws and the proximity MVPs below, so
 							// a closed gate costs ~zero GPU and no layers.
 							hidden_silhouettes.erase(
 								std::remove_if(hidden_silhouettes.begin(), hidden_silhouettes.end(),
@@ -2963,7 +2989,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											float dz = std::max({s.world_min.z - c.z, 0.f, c.z - s.world_max.z});
 											return dx * dx + dy * dy + dz * dz > rr * rr;
 										};
+										// Body column vs world AABB: vertical
+										// segment [c.y - depth, c.y] with the
+										// head radius. Same 2cm pad; over-reveal
+										// stays the safe direction.
+										auto outside_cylinder = [&](glm::vec3 c, float r) {
+											if (r <= 0)
+												return true;
+											float rr = r + 0.02f;
+											float dx = std::max({s.world_min.x - c.x, 0.f, c.x - s.world_max.x});
+											float dz = std::max({s.world_min.z - c.z, 0.f, c.z - s.world_max.z});
+											float top = c.y, bottom = c.y - hidden_body_depth_m;
+											float dy = 0.f;
+											if (s.world_min.y > top)
+												dy = s.world_min.y - top;
+											else if (s.world_max.y < bottom)
+												dy = bottom - s.world_max.y;
+											return dx * dx + dy * dy + dz * dz > rr * rr;
+										};
 										return outside(center, head_r) and
+											outside_cylinder(center, head_r) and
 											(not palm_l or outside(*palm_l, hand_r)) and
 											(not palm_r or outside(*palm_r, hand_r));
 									}),
@@ -2972,6 +3017,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							{
 								auto [head_r, hand_r] = hidden_radii(s.mesh);
 								push_sphere(center, head_r);
+								push_cylinder(center, head_r);
 								if (palm_l)
 									push_sphere(*palm_l, hand_r);
 								if (palm_r)
@@ -3020,7 +3066,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									{
 										// Quarter-res proximity reveal (dedicated
 										// hidden path beside feather record):
-										// sphere field first, silhouettes kept
+										// proximity field first, silhouettes kept
 										// only where nearer (hard near-field
 										// edge — v1 flips the overlay from
 										// always-on to proximity-gated).
@@ -3029,12 +3075,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										        vk::Extent2D{(uint32_t)extents[0].width, (uint32_t)extents[0].height},
 										        vk::Extent2D{(uint32_t)extents[1].width, (uint32_t)extents[1].height},
 										};
-										// Feather-owned sphere field (P4): ensured in the
+										// Feather-owned proximity field (P4): ensured in the
 										// prewarm above under the same
 										// hidden_known+mask_frame conditions, same
 										// quarter-res, so it is live here.
 										g.renderer->record_hidden(rec_cmd, g.swapchain.image(mask_index), hex,
-										                          hidden_mask_draws, proximity_spheres, &hstats, full_ext);
+										                          hidden_mask_draws, proximity_spheres, proximity_cylinders, &hstats, full_ext);
 									}
 									catch (std::exception & e)
 									{

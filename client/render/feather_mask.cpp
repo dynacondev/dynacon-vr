@@ -1665,7 +1665,7 @@ vk::ImageView feather_mask_renderer::output_depth_array_view(vk::Extent2D extent
 	return *it->second.view_array;
 }
 
-// Feather-owned hidden sphere field (P4: one sphere raster per frame).
+// Feather-owned hidden proximity field (P4: one proximity raster per frame).
 // (Re)created here in the waitIdle'd scene prewarm on extent change;
 // the mask record below renders into it.
 bool feather_mask_renderer::ensure_hidden_field(vk::Extent2D extent)
@@ -1708,7 +1708,7 @@ bool feather_mask_renderer::ensure_hidden_field(vk::Extent2D extent)
 	        },
 	});
 	hidden_sphere_extent_ = extent;
-	spdlog::info("Hidden sphere field: {}x{}", extent.width, extent.height);
+	spdlog::info("Hidden proximity field: {}x{}", extent.width, extent.height);
 	return true;
 }
 
@@ -1742,6 +1742,23 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		};
 		std::memcpy(hidden_sphere_verts_.map(), sphere.data(), sphere.size() * sizeof(XrVector3f));
 		hidden_sphere_verts_.unmap();
+		// Unit-cylinder verts (body column, same depth-only pipe).
+		auto cylinder = passthrough_mesh::unit_cylinder_positions();
+		hidden_cylinder_vert_count = (uint32_t)cylinder.size();
+		hidden_cylinder_verts_ = buffer_allocation{
+		        device,
+		        vk::BufferCreateInfo{
+		                .size = cylinder.size() * sizeof(XrVector3f),
+		                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "hidden proximity cylinder",
+		};
+		std::memcpy(hidden_cylinder_verts_.map(), cylinder.data(), cylinder.size() * sizeof(XrVector3f));
+		hidden_cylinder_verts_.unmap();
 
 		// Sphere depth-only RP: CLEAR near (1.0) / STORE, ends in the
 		// attachment layout for the silhouette pass below.
@@ -1778,7 +1795,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		                                                          .pSubpasses = &sphere_sub,
 		                                                  });
 		// Silhouette RP: color CLEAR/STORE/OPTIMAL (submitted image, nothing
-		// app-side re-reads it — keeps UBWC live) + sphere depth LOAD
+		// app-side re-reads it — keeps UBWC live) + proximity depth LOAD
 		// (written by the pass above), DONT_CARE store.
 		vk::AttachmentDescription hidden_atts[2] = {
 		        vk::AttachmentDescription{
@@ -1827,7 +1844,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		// the proximity depth test.
 		auto hvert = load_shader(device, "mask_mv.vert");
 		auto hfrag = load_shader(device, "mask_mv.frag");
-		// Empty fragment: the sphere pipe is depth-only (no color
+		// Empty fragment: the proximity pipe is depth-only (no color
 		// attachment, color writes off).
 		auto hempty = load_shader(device, "empty.frag");
 		vk::PipelineShaderStageCreateInfo hstages[2] = {
@@ -1854,7 +1871,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		                .pName = "main",
 		        },
 		};
-		// vec3 positions, shared by mesh verts and sphere verts.
+		// vec3 positions, shared by mesh verts and proximity verts.
 		vk::VertexInputBindingDescription hbinding{
 		        .binding = 0,
 		        .stride = sizeof(float) * 3,
@@ -1964,11 +1981,11 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		hidden_frame_targets tgt;
 		tgt.extent = extent;
 		// One multiview target: array color view (both layers) + layers=2
-		// framebuffers; one draw broadcasts to both eyes. The sphere
-		// framebuffer bakes the feather-owned sphere field ARRAY view
+		// framebuffers; one draw broadcasts to both eyes. The proximity
+		// framebuffer bakes the feather-owned proximity field ARRAY view
 		// (see ensure_hidden_field); reset_targets() on field rebuild.
 		// Extent agreement is the scene's job — one quarter-res for
-		// mask and sphere field.
+		// mask and proximity field.
 		vk::ImageViewCreateInfo iv_info{
 		        .image = image,
 		        .viewType = vk::ImageViewType::e2DArray,
@@ -2012,6 +2029,7 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
                                           vk::Extent2D extent,
                                           const std::vector<hidden_draw> & draws,
                                           const std::vector<std::array<glm::mat4, 2>> & spheres,
+                                          const std::vector<std::array<glm::mat4, 2>> & cylinders,
                                           hidden_cpu * cpu_stats,
                                           const std::array<vk::Extent2D, 2> & full_extents)
 {
@@ -2038,13 +2056,16 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 	        .maxDepth = 1,
 	};
 	vk::Rect2D full_sc{.offset = {0, 0}, .extent = extent};
-	// Both-eyes union of the containing-cube boxes for a sphere MVP pair.
-	// Per eye: rigorous superset while every corner is in front (+2px pad,
-	// float-domain clamp — see the UB note below); any corner at/behind
-	// the camera forces fullscreen for that eye (the eye-inside case always
-	// has one; a clipped box there would under-reveal, fail-unsafe).
+	// Both-eyes union of the containing-cube boxes for a proximity MVP
+	// pair (unit sphere or unit cylinder — both are inscribed in
+	// [-1,1]^3, so the cube corners stay a rigorous superset either
+	// way). Per eye: rigorous superset while every corner is in front
+	// (+2px pad, float-domain clamp — see the UB note below); any corner
+	// at/behind the camera forces fullscreen for that eye (the eye-inside
+	// case always has one; a clipped box there would under-reveal,
+	// fail-unsafe).
 	// Returns false only when both eyes degenerate (fully off-screen).
-	auto sphere_union = [&](const std::array<glm::mat4, 2> & s, vk::Rect2D & out) {
+	auto field_union = [&](const std::array<glm::mat4, 2> & s, vk::Rect2D & out) {
 		bool got = false;
 		int32_t ax0 = 0, ay0 = 0, ax1 = 0, ay1 = 0;
 		for (int eye = 0; eye < 2; ++eye)
@@ -2157,8 +2178,8 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		out = vk::Rect2D{.offset = {ax0, ay0}, .extent = {(uint32_t)(ax1 - ax0), (uint32_t)(ay1 - ay0)}};
 		return true;
 	};
-	// RP1: proximity field (sphere exits, LESS over a near-clear). One
-	// multiview begin over the layers=2 framebuffer.
+	// RP1: proximity field (sphere/cylinder exits, LESS over a
+	// near-clear). One multiview begin over the layers=2 framebuffer.
 	vk::ClearValue sphere_clear{};
 	sphere_clear.depthStencil = vk::ClearDepthStencilValue{1.f, 0};
 	vk::RenderPassBeginInfo sphere_begin{
@@ -2175,16 +2196,28 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 	for (const auto & s: spheres)
 	{
 		vk::Rect2D scissor;
-		if (not sphere_union(s, scissor))
+		if (not field_union(s, scissor))
 			continue;
 		cmd.setScissor(0, scissor);
 		cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                                 silhouette_mv_push{.mvp = {{s[0], s[1]}}, .opacity = 1});
 		cmd.draw(hidden_sphere_vert_count, 1, 0, 0);
 	}
+	// Body columns: same pipe/push, cylinder verts (same vec3 layout).
+	cmd.bindVertexBuffers(0, (vk::Buffer)hidden_cylinder_verts_, (vk::DeviceSize)0);
+	for (const auto & c: cylinders)
+	{
+		vk::Rect2D scissor;
+		if (not field_union(c, scissor))
+			continue;
+		cmd.setScissor(0, scissor);
+		cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+		                                 silhouette_mv_push{.mvp = {{c[0], c[1]}}, .opacity = 1});
+		cmd.draw(hidden_cylinder_vert_count, 1, 0, 0);
+	}
 	cmd.endRenderPass();
 
-	// Sphere depth → silhouette test hazard (same attachment layout
+	// Proximity depth → silhouette test hazard (same attachment layout
 	// throughout, write then read).
 	vk::ImageMemoryBarrier sph_bar{
 	        .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
@@ -2205,7 +2238,7 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
 	                    vk::PipelineStageFlagBits::eEarlyFragmentTests, {}, {}, {}, sph_bar);
 
-	// RP2: silhouettes, kept only where nearer than the sphere exit
+	// RP2: silhouettes, kept only where nearer than the proximity exit
 	// (GREATER, no depth write). Hard near-field edge by design. One
 	// multiview begin over the layers=2 framebuffer. Per-draw scissor is
 	// the both-eyes union (submitted full-rect image: renderArea stays

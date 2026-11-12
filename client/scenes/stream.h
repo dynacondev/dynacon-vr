@@ -794,11 +794,12 @@ private:
 	};
 	std::vector<hidden_silhouette_draw> hidden_silhouettes;
 	std::vector<feather_mask_renderer::hidden_draw> hidden_mask_draws;
-	// Per-frame proximity spheres (model already placed): rebuilt when
-	// the mask phase builds draws below; the mask record renders them
-	// into the feather-owned sphere field. Capacity survives clear().
-	// Render thread only.
+	// Per-frame proximity spheres + body cylinders (model already
+	// placed): rebuilt when the mask phase builds draws below; the mask
+	// record renders them into the feather-owned proximity field.
+	// Capacity survives clear(). Render thread only.
 	std::vector<std::array<glm::mat4, 2>> proximity_spheres;
+	std::vector<std::array<glm::mat4, 2>> proximity_cylinders;
 	// The proximity palms borrow the GUI hand trackers (shared handles,
 	// per-frame positions — never culled): set from hidden_known at
 	// frame top so the GUI pair survives its interactability reset

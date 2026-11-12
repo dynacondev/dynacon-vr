@@ -268,24 +268,27 @@ public:
 	// Hidden proximity record (3d-passthrough-hidden): hard-edged
 	// near-field reveal, submit-merged into the single merged layer.
 	// Dedicated path beside record()
-	// (shared logic untouched): RP1 rasters the proximity spheres into a
+	// (shared logic untouched): RP1 rasters the proximity shapes
+	// (spheres + body cylinders) into a
 	// depth field, RP2 rasters the silhouettes with a depth test against
 	// it, so only in-radius fragments write mask. Quarter-res working +
 	// submit; tier-0 direct raster (no blur/erode/volume/VR ever).
-	// spheres: one MVP pair per proximity volume (model =
-	// translate(center) * scale(radius)), stream-built so this stays
-	// timebase-free. Safety theorem baked in: LESS accumulates the
-	// furthest sphere exit (max distance), so coverage can only
-	// OVER-reveal (front-of-sphere imprecision, accepted); GREATER here
+	// spheres/cylinders: one MVP pair per proximity volume (model =
+	// translate(center) * scale(radius) for spheres, translate(column
+	// center) * scale(r, depth/2, r) for the head-hung body columns),
+	// stream-built so this stays timebase-free. Safety theorem baked
+	// in: LESS accumulates the furthest proximity exit (max distance),
+	// OVER-reveal (front-of-shape imprecision, accepted); GREATER here
 	// would under-reveal (unsafe miss) and is forbidden.
-	// The sphere field is a feather-owned D16 2-layer image (one sphere
+	// The proximity field is a feather-owned D16 2-layer image (one
 	// raster per frame): RP1 renders into it, RP2 tests the silhouettes
 	// against it. Extent always equals the mask working extent (both
 	// (re)created from the same quarter-res in the scene prewarm).
 	// One draw per silhouette: which uploaded mesh, per-eye transforms,
 	// opacity, and the full-res pixel bounds per eye (scaled to the mask
-	// extent for a per-draw scissor — two MV passes total here: spheres
-	// plus silhouettes, each one draw per item).
+	// extent for a per-draw scissor — two MV begins total here: the
+	// proximity field (spheres plus body cylinders) then the silhouettes,
+	// one draw per item each).
 	struct hidden_draw
 	{
 		std::string mesh;
@@ -298,7 +301,7 @@ public:
 		double raster_ms = 0;
 		int draws = 0;
 	};
-	// Ensure the hidden sphere field image for an extent (idempotent,
+	// Ensure the hidden proximity field image for an extent (idempotent,
 	// change-gated). Public so the scene can create it in the prewarm
 	// (ahead of the mask record that renders into it); waitIdle inside
 	// on rebuild. Returns true when (re)created: the sphere
@@ -311,6 +314,7 @@ public:
 	                   vk::Extent2D extent,
 	                   const std::vector<hidden_draw> & draws,
 	                   const std::vector<std::array<glm::mat4, 2>> & spheres,
+	                   const std::vector<std::array<glm::mat4, 2>> & cylinders,
 	                   hidden_cpu * cpu_stats,
 	                   const std::array<vk::Extent2D, 2> & full_extents);
 
@@ -642,9 +646,9 @@ private:
 	buffer_allocation cutout_verts;
 
 	// Hidden proximity path (record_hidden): own renderpasses (sphere
-	// depth-only + color-with-depth-LOAD), own pipelines (sphere fill +
+	// depth-only + color-with-depth-LOAD), own pipelines (proximity fill +
 	// silhouette-with-proximity-test, same mask_mv.vert/mask_mv.frag modules),
-	// own unit-sphere verts. Created lazily on first record_hidden.
+	// own unit-sphere + unit-cylinder verts. Created lazily on first record_hidden.
 	vk::raii::RenderPass hidden_sphere_rp{nullptr};
 	vk::raii::RenderPass hidden_color_rp{nullptr};
 	vk::raii::Pipeline hidden_sphere_pipe{nullptr};
@@ -653,8 +657,12 @@ private:
 	// pipes too — identical 132B range, one layout for all MV mask pipes).
 	buffer_allocation hidden_sphere_verts_;
 	uint32_t hidden_sphere_vert_count = 0;
-	// Feather-owned hidden sphere field (D16 2-layer image + array view
-	// the sphere framebuffer below bakes against; P4: one sphere raster
+	// Body-column twin of the sphere verts: closed unit cylinder
+	// (radius 1, y in [-1,1]), drawn with the same depth-only pipe.
+	buffer_allocation hidden_cylinder_verts_;
+	uint32_t hidden_cylinder_vert_count = 0;
+	// Feather-owned hidden proximity field (D16 2-layer image + array view
+	// the proximity framebuffer below bakes against; P4: one proximity raster
 	// per frame). (Re)created by ensure_hidden_field (waitIdle'd scene
 	// prewarm); reset_targets() on rebuild. output_depth_array_view is
 	// declared with output_depth below.
@@ -662,7 +670,7 @@ private:
 	vk::raii::ImageView hidden_sphere_view_array_{nullptr};
 	vk::Extent2D hidden_sphere_extent_{0, 0};
 	// Per-swapchain-image multiview framebuffers for the two hidden
-	// passes (color + sphere-depth, layers=2 each); dropped by
+	// passes (color + proximity-depth, layers=2 each); dropped by
 	// reset_targets() with the rest (swapchain recreate = waitIdle'd
 	// upstream).
 	struct hidden_frame_targets
@@ -674,7 +682,7 @@ private:
 	};
 	std::unordered_map<VkImage, hidden_frame_targets> hidden_targets;
 	void ensure_hidden(vk::Image image, vk::Extent2D extent);
-	bool hidden_ready = false; // lazy RPs/pipes/sphere verts (first record_hidden)
+	bool hidden_ready = false; // lazy RPs/pipes/proximity verts (first record_hidden)
 
 	// Framebuffer + view per swapchain image (images cycle; entries for
 	// retired swapchains are dropped via reset_targets()).
