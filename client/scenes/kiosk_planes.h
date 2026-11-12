@@ -75,7 +75,10 @@ private:
 		float pitch_tgt = 0.f, yaw_tgt = 0.f, roll_tgt = 0.f; // maneuver targets (rad/s)
 		bool roll_free = false; // roll maneuver: relax suppressed, roll owns the bank
 		bool loop_maneuver = false; // loop: exempt from the climb/dive rate clamp
-		double man_t = 0.; // time left in the current maneuver (seconds)
+		double man_t = 0.; // time left in the current maneuver (seconds; backstop for figures)
+		double man_dur = 1.; // expected maneuver duration (envelope runs on this)
+		double man_age = 0.; // elapsed time in the current maneuver (seconds)
+		double man_angle = 0.; // accumulated figure angle (loops/rolls terminate at 2pi)
 		XrTime prev_now = 0; // dt clock (0 = uninitialized)
 	};
 

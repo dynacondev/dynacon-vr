@@ -261,7 +261,7 @@ void kiosk_planes::pick_maneuver(plane & f)
 			f.roll_tgt = 0.f;
 			f.roll_free = false;
 			f.loop_maneuver = false;
-			f.man_t = std::uniform_real_distribution<double>(2., 4.)(rng_);
+			f.man_t = f.man_dur = std::uniform_real_distribution<double>(2., 4.)(rng_);
 			break;
 		case 1: // banked turn (bank emerges from yaw via the coordination below)
 			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.6f, 1.2f)(rng_);
@@ -269,15 +269,17 @@ void kiosk_planes::pick_maneuver(plane & f)
 			f.roll_tgt = 0.f;
 			f.roll_free = false;
 			f.loop_maneuver = false;
-			f.man_t = std::uniform_real_distribution<double>(1.5, 3.)(rng_);
+			f.man_t = f.man_dur = std::uniform_real_distribution<double>(1.5, 3.)(rng_);
 			break;
-		case 2: // loop: sustained pitch for exactly one revolution
+		case 2: // loop: sustained pitch for exactly one revolution, always
+		        // nose-up (inside loop only — never bunt/dive into it)
 			f.yaw_tgt = 0.f;
-			f.pitch_tgt = coin() * std::uniform_real_distribution<float>(1.2f, 1.8f)(rng_);
+			f.pitch_tgt = std::uniform_real_distribution<float>(1.2f, 1.8f)(rng_);
 			f.roll_tgt = 0.f;
 			f.roll_free = false;
 			f.loop_maneuver = true;
-			f.man_t = 2. * std::numbers::pi / std::abs(f.pitch_tgt);
+			f.man_dur = 2. * std::numbers::pi / f.pitch_tgt;
+			f.man_t = 1.5 * f.man_dur; // backstop; the 2pi angle below terminates first
 			break;
 		case 3: // barrel roll: one full revolution with a hint of yaw
 			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.1f, 0.3f)(rng_);
@@ -285,12 +287,12 @@ void kiosk_planes::pick_maneuver(plane & f)
 			f.roll_tgt = coin() * float(2. * std::numbers::pi / std::uniform_real_distribution<double>(1.2, 2.)(rng_));
 			f.roll_free = true;
 			f.loop_maneuver = false;
-			f.man_t = 2. * std::numbers::pi / std::abs(f.roll_tgt);
+			f.man_dur = 2. * std::numbers::pi / std::abs(f.roll_tgt);
+			f.man_t = 1.5 * f.man_dur; // backstop; the 2pi angle below terminates first
 			break;
 	}
-	// roll is purely visual: snap it so a decaying rate can't keep spinning
-	// the bank after a roll ends. Pitch/yaw stay smoothed (path must stay C1).
-	f.roll_rate = f.roll_tgt;
+	f.man_age = 0.;
+	f.man_angle = 0.;
 }
 
 void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active)
@@ -364,14 +366,42 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			continue;
 
 		f.man_t -= dt;
+		f.man_age += dt;
+		// figures terminate on completed angle (exact 2pi regardless of the
+		// envelope below); time-based maneuvers terminate on the clock, and
+		// the backstop catches a figure that somehow stalls short.
 		if (f.man_t <= 0.)
 			pick_maneuver(f);
+		else if ((f.loop_maneuver || f.roll_free) && f.man_angle >= 2. * std::numbers::pi - 0.2)
+			pick_maneuver(f);
 
+		// maneuver envelope: smoothstep in and out of the targets so figures
+		// join through near-zero curvature with continuous derivatives — no
+		// straight-to-curve jump at either end. Ramps clamp to a fraction of
+		// short figures. Figures ramps out by angle (a timed exit would
+		// stall the rate before the 2pi closes); time-based maneuvers ramp
+		// out by the clock. The bias stays outside the envelope (smooth).
+		double ramp = std::min(0.7, 0.35 * f.man_dur);
+		float env_in = float(smoothstep(0., ramp, f.man_age));
+		float env_out;
+		double nominal_rate = 0.;
+		if (f.loop_maneuver)
+			nominal_rate = std::abs(f.pitch_tgt);
+		else if (f.roll_free)
+			nominal_rate = std::abs(f.roll_tgt);
+		if (nominal_rate > 0.)
+			env_out = 1.f - float(smoothstep(2. * std::numbers::pi - nominal_rate * ramp, 2. * std::numbers::pi, f.man_angle));
+		else
+			env_out = 1.f - float(smoothstep(f.man_dur - ramp, f.man_dur, f.man_age));
+		float env = env_in * env_out;
 		const float blend = std::min(1.f, float(dt * rate_smooth));
-		f.pitch_rate += (f.pitch_tgt - f.pitch_rate) * blend;
-		f.yaw_rate += (f.yaw_tgt - f.yaw_rate) * blend;
-		// roll_rate is snapped on maneuver pick (visual only); no smoothing,
-		// so a decayed rate can't drag extra spin past a roll's end.
+		f.pitch_rate += (f.pitch_tgt * env - f.pitch_rate) * blend;
+		f.yaw_rate += (f.yaw_tgt * env - f.yaw_rate) * blend;
+		f.roll_rate = f.roll_tgt * env; // visual only: envelope spins rolls up/down, no snap
+		if (f.loop_maneuver)
+			f.man_angle += f.pitch_rate * float(dt);
+		else if (f.roll_free)
+			f.man_angle += std::abs(f.roll_rate) * float(dt);
 
 		// Flight frame, rebuilt every frame from the current dir: right =
 		// up×dir throughout (the intuitive dir×up order mirrors the
