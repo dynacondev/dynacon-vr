@@ -3080,7 +3080,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Merge: MAX-combine every active contributor
 				// (hidden first, then feather groups in map order, then
 				// debug) into ONE full-res image, submitted once with
-				// color ADDITIVE + alpha REPLACE below.
+				// REPLACE below.
 				// merge_this_frame is evaluated HERE (contributor activity
 				// time) and read back at submit — never recomputed there, so
 				// record and submit cannot disagree. The GPU bracket

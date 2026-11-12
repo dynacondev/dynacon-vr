@@ -24,8 +24,7 @@
 // hidden group used to submit its own UNPREMULTIPLIED_ALPHA layer and
 // union them with REPLACE-then-ADD dst-alpha blending. This pass
 // MAX-combines every active contributor into a single full-res image
-// (any-mask-reveals-wins), submitted once with color ADDITIVE + alpha
-// REPLACE.
+// (any-mask-reveals-wins), submitted once with REPLACE.
 // The hidden dots overlay rides along as a 9th sidecar input (not
 // counted in max_inputs): premultiplied dot RGB holed out of the
 // merged alpha, so the flat layer passes dots through where the
@@ -150,8 +149,7 @@ private:
 	// Single-attachment multiview renderpass (CLEAR/STORE/OPTIMAL:
 	// submitted image, keeps UBWC live like the feather groups) + MAX pipeline
 	// (fullscreen triangle, no vertex input, no blending — one write
-	// wins; the submit-time ADDITIVE color + REPLACE alpha preserves
-	// video and carries the dots glow).
+	// wins, the submit-time REPLACE builds the dst-alpha union).
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
 	// 9 static sampler2DArray bindings (see the shader): linear +
