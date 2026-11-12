@@ -190,7 +190,7 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 	was_active_ = active;
 
 	size_t slot = 0;
-	for (auto & f: flights_)
+	for (auto & f: planes_)
 	{
 		auto * node = scene_.world.try_get<components::node>(f.root);
 		if (not node)
