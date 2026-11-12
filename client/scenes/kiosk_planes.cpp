@@ -71,7 +71,7 @@ constexpr double trail_sample_dt = 1. / 30.;
 constexpr double trail_max_age = trail_points * trail_sample_dt;
 constexpr float trail_width_head = 0.02f;  // ribbon half-width at the engine (m)
 constexpr float trail_width_tail = 0.055f; // ... at the faded end
-constexpr float trail_alpha_max = 0.15f;
+constexpr float trail_alpha_max = 0.1425f; // 5% under the original 0.15
 constexpr float trail_gap = 0.05f; // emitter hangs behind the tail along the flight direction
 
 struct trail_vertex
@@ -186,7 +186,10 @@ kiosk_planes::kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_
 									if (src->name == "Material")
 										m.staging.base_color_factor = glm::vec4(body_tint, 1.f);
 									m.blend_enable = true;
-									m.depth_write_enable = false;
+									// NOTE: depth_write stays enabled (opaque-style depth):
+									// disabling it here made the models render X-ray
+									// once the flag started being honored. Fades still
+									// blend correctly via premultiplied alpha.
 								});
 								f.materials.push_back(it->second);
 								f.base_colors.push_back(it->second->staging.base_color_factor);
@@ -420,6 +423,13 @@ void kiosk_planes::pick_maneuver(plane & f)
 			f.loop_maneuver = true;
 			f.man_dur = 2. * std::numbers::pi / f.pitch_tgt;
 			f.man_t = 2.0 * f.man_dur; // backstop only; the angle test below terminates first
+			// planar entry: kill any yaw carryover (and the leash pull) so
+			// the figure starts in-plane. A decaying yaw would tilt the
+			// loop, and the exit frame would then snap to the tilted plane.
+			// The stop-then-pull-up reads as a deliberate entry, and the
+			// envelope eases the pitch in from here.
+			f.yaw_rate = 0.f;
+			f.bias_w = 0.f;
 			break;
 		case 3: // barrel roll: one full revolution with a hint of yaw
 			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.1f, 0.3f)(rng_);
