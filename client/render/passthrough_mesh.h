@@ -40,9 +40,9 @@ struct triangle_soup
 // points/lines are skipped. Throws std::exception on parse errors.
 triangle_soup flatten_gltf(const std::filesystem::path & path);
 
-// Unit-sphere positions for the proximity depth fields (non-indexed
+// Unit-sphere positions for the proximity depth field (non-indexed
 // triangles, outward-CCW winding so cull-front keeps the inside/exit
-// wall from any viewpoint). One shared generator: the dots renderer and
-// the hidden mask path both expand it with per-frame MVPs.
+// wall from any viewpoint). One shared generator, expanded with
+// per-frame MVPs by the hidden mask record.
 std::vector<XrVector3f> unit_sphere_positions();
 } // namespace passthrough_mesh

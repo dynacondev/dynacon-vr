@@ -53,3 +53,18 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
 - Push-size trap (caught by audit pre-commit, would have shipped silent garbage): with a shared push range, the VERT-declared block and the FRAG-declared block must agree byte-for-byte — pairing `mask_mv.vert` (opacity @128) with legacy `mask.frag` (opacity @64) passes pipeline creation and validation silently while the fragment reads `mvp[1][0][0]` as alpha (≈1 often, orientation-dependent reveal). Hence `mask_mv.frag` exists as a separate twin; never mix MV vert with legacy frag across a shared layout.
 - 160B pushes (mask 132B, dots 176B) exceed the 128B Vulkan minimum: Adreno 740 provides 256B; both renderers throw loudly at init when the device reports less (no silent fallback — no 128B stereo-MVP encoding exists; fallback would be a dynamic-UBO redesign). In-tree precedent routes MV matrices via UBOs (`lit.vert.glsl`); push was chosen here for per-draw simplicity.
 - Submitted color finals are COLOR_ATTACHMENT_OPTIMAL on the hidden paths only (mask + dots; nothing app-side re-reads those images). Feather GENERAL lifecycle deliberately untouched (cutout re-begin, seed_layout, make_readable olds, submit barrier — ~25 entangled sites; its own follow-up, biggest prize is the plain full-res mask). If the Quest runtime objects to OPTIMAL at submit, revert is 2 lines (`hidden_color_rp`, dots color RP) — failure would be loud (missing layers), not silent.
+
+## Hidden dots overlay removed (trial, Nov 2026)
+
+- The dots overlay system is stripped client-side: hidden reveal is the
+  hard-edged proximity cutout only (mask RP1 spheres + RP2 silhouettes,
+  merged, flat consumes). Removed: hidden_dots renderer + shaders,
+  dot-lattice baking (feather set_mesh is soup-only), dots record/submit
+  wiring in stream.cpp. The sphere field image moved from the deleted
+  dots renderer into feather (ensure_hidden_field, waitIdled prewarm).
+- Fold-into-merge was tried first and reverted: single-layer additive
+  (ONE,ONE color) washes dots out over bright video (no true over
+  without a video tap); binary hole-punch was discussed but not shipped.
+- Kept for protocol compat (accepted but ignored): server dot-pitch /
+  dot-color config + packet fields, map_key exclusions. Docs mark them
+  REMOVED (trial).

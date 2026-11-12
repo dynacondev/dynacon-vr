@@ -62,8 +62,8 @@ struct raster_push
 static_assert(sizeof(raster_push) == 68);
 
 // Multiview hidden push block. Mirrors mask_mv.vert.glsl: per-eye mvp
-// selected by gl_ViewIndex. 132B — same >128B note as the dots push in
-// hidden_dots.cpp (Adreno 740 provides 256B; ensure_hidden throws loudly
+// selected by gl_ViewIndex. 132B exceeds the 128-byte Vulkan minimum —
+// Adreno 740 (Quest 3) provides 256B; ensure_hidden throws loudly
 // below when the device reports less).
 struct hidden_mv_push
 {
@@ -1646,7 +1646,7 @@ std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_
 	return {std::move(buffer), std::move(memory)};
 }
 
-void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup, float dot_pitch_m)
+void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
 {
 	if (soup.indices.empty() or soup.vertices.empty())
 	{
@@ -1658,93 +1658,10 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	// old buffers before replacing them.
 	device.waitIdle();
 
-	// Billboard dot lattice for the hidden overlay: per-triangle
-	// dominant-axis lattice points snapped exactly onto the face plane
-	// (pitch in object-space units). Static per (mesh, pitch): placement
-	// rides the draw MVP, so no per-frame CPU work. Dots on shared edges
-	// may emit from both faces (identical overlapping dots, harmless).
-	struct dot_point
-	{
-		glm::vec3 center;
-		glm::vec3 normal;
-	};
-	std::vector<dot_point> dots;
-	if (dot_pitch_m > 0)
-	{
-		float pitch = dot_pitch_m;
-		size_t tris = soup.indices.size() / 3;
-		dots.reserve(tris);
-		// Input-driven budget (pitch floor 1cm, unbounded mesh area):
-		// over budget the partial lattice is worse than none (a
-		// half-dotted mesh misleads), so drop the whole bake with a
-		// warn. The mask cutout is unaffected.
-		constexpr size_t dot_budget = 262144; // 256k dots = 6MB @24B
-		bool over_budget = false;
-		for (size_t t = 0; t < tris and not over_budget; ++t)
-		{
-			glm::vec3 v[3];
-			for (int k = 0; k < 3; ++k)
-			{
-				const auto & sv = soup.vertices[soup.indices[3 * t + k]];
-				v[k] = glm::vec3(sv.x, sv.y, sv.z);
-			}
-			glm::vec3 n = glm::cross(v[1] - v[0], v[2] - v[0]);
-			float a2 = glm::length(n);
-			if (a2 <= 1e-12f)
-				continue;
-			n /= a2;
-			glm::vec3 an = glm::abs(n);
-			int d = an.x > an.y ? (an.x > an.z ? 0 : 2) : (an.y > an.z ? 1 : 2);
-			int u = (d + 1) % 3, w = (d + 2) % 3;
-			float minu = std::min({v[0][u], v[1][u], v[2][u]}) / pitch;
-			float maxu = std::max({v[0][u], v[1][u], v[2][u]}) / pitch;
-			float minv = std::min({v[0][w], v[1][w], v[2][w]}) / pitch;
-			float maxv = std::max({v[0][w], v[1][w], v[2][w]}) / pitch;
-			float au = v[0][u], av = v[0][w];
-			float bu = v[1][u], bv = v[1][w];
-			float cu = v[2][u], cv = v[2][w];
-			for (long iu = (long)std::floor(minu); iu <= (long)std::ceil(maxu); ++iu)
-			{
-				for (long iv = (long)std::floor(minv); iv <= (long)std::ceil(maxv); ++iv)
-				{
-					float xu = (float)iu * pitch, xv = (float)iv * pitch;
-					// Half-edge inclusion (edges inclusive on both sides:
-					// shared-edge duplicates overlap identically).
-					float e0 = (bu - au) * (xv - av) - (bv - av) * (xu - au);
-					float e1 = (cu - bu) * (xv - bv) - (cv - bv) * (xu - bu);
-					float e2 = (au - cu) * (xv - cv) - (av - cv) * (xu - cu);
-					if (not ((e0 >= 0 and e1 >= 0 and e2 >= 0) or (e0 <= 0 and e1 <= 0 and e2 <= 0)))
-						continue;
-					// Snap onto the face plane via the dominant axis.
-					float xd = (glm::dot(n, v[0]) - n[u] * xu - n[w] * xv) / n[d];
-					glm::vec3 center{0};
-					center[d] = xd;
-					center[u] = xu;
-					center[w] = xv;
-					dots.push_back({center, n});
-					if (dots.size() > dot_budget)
-					{
-						dots.clear();
-						over_budget = true;
-						spdlog::warn("Hidden dot lattice over budget (>{} dots) for '{}' at pitch {}m: skipping dots (mask cutout unaffected)",
-						             dot_budget, key, pitch);
-					}
-				}
-			}
-		}
-		if (not over_budget and dots.empty() and tris > 0)
-		{
-			// Non-degenerate mesh, no dots: pitch dwarfs the mesh (or an
-			// all-sliver soup) — the region reveals with no annotation.
-			spdlog::warn("Hidden dot lattice empty for '{}' at pitch {}m: object reveals unannotated", key, pitch);
-		}
-	}
-
 	mesh_buffers & mesh = meshes[key];
 	vk::DeviceSize vertex_bytes = soup.vertices.size() * sizeof(XrVector3f);
 	vk::DeviceSize index_bytes = soup.indices.size() * sizeof(uint32_t);
-	vk::DeviceSize dot_bytes = dots.size() * sizeof(dot_point);
-	vk::DeviceSize total = vertex_bytes + index_bytes + dot_bytes;
+	vk::DeviceSize total = vertex_bytes + index_bytes;
 
 	if (mesh.staging_size < total)
 	{
@@ -1757,8 +1674,6 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	void * mapped = mesh.staging_memory.mapMemory(0, total);
 	std::memcpy(mapped, soup.vertices.data(), vertex_bytes);
 	std::memcpy((char *)mapped + vertex_bytes, soup.indices.data(), index_bytes);
-	if (dot_bytes > 0)
-		std::memcpy((char *)mapped + vertex_bytes + index_bytes, dots.data(), dot_bytes);
 	mesh.staging_memory.unmapMemory();
 
 	std::tie(mesh.vertex_buffer, mesh.vertex_memory) = make_buffer(
@@ -1769,22 +1684,8 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        index_bytes,
 	        vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst,
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
-	if (dot_bytes > 0)
-	{
-		std::tie(mesh.dot_buffer, mesh.dot_memory) = make_buffer(
-		        dot_bytes,
-		        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
-		        vk::MemoryPropertyFlagBits::eDeviceLocal);
-	}
-	else
-	{
-		mesh.dot_buffer = nullptr;
-		mesh.dot_memory = nullptr;
-	}
-
-	mesh.pending_upload = {vertex_bytes, index_bytes, dot_bytes};
+	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
-	mesh.dot_count = (uint32_t)dots.size();
 	// Model-space bounds for the stream-side frustum skip (upload-time
 	// only; per-frame tests transform the 8 corners by the draw MVP).
 	glm::vec3 lo{soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z};
@@ -1804,31 +1705,6 @@ std::optional<std::pair<glm::vec3, glm::vec3>> feather_mask_renderer::mesh_bound
 	if (it == meshes.end())
 		return std::nullopt;
 	return std::make_pair(it->second.aabb_min, it->second.aabb_max);
-}
-
-std::optional<feather_mask_renderer::borrowed_mesh> feather_mask_renderer::borrowed_mesh_buffers(const std::string & key) const
-{
-	auto it = meshes.find(key);
-	if (it == meshes.end() or it->second.pending_upload)
-		return std::nullopt;
-	return borrowed_mesh{
-	        (vk::Buffer)*it->second.vertex_buffer,
-	        (vk::Buffer)*it->second.index_buffer,
-	        it->second.index_count,
-	};
-}
-
-std::optional<feather_mask_renderer::borrowed_dots> feather_mask_renderer::borrowed_dot_buffers(const std::string & key) const
-{
-	auto it = meshes.find(key);
-	if (it == meshes.end() or it->second.pending_upload)
-		return std::nullopt;
-	if (it->second.dot_count == 0)
-		return borrowed_dots{vk::Buffer{}, 0};
-	return borrowed_dots{
-	        (vk::Buffer)*it->second.dot_buffer,
-	        it->second.dot_count,
-	};
 }
 
 void feather_mask_renderer::remove_mesh(const std::string & key)
@@ -1907,8 +1783,56 @@ vk::ImageView feather_mask_renderer::output_depth_array_view(vk::Extent2D extent
 	return *it->second.view_array;
 }
 
-void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, const hidden_sphere_field & field)
-{	assert(field.extent.width == extent.width and field.extent.height == extent.height);
+// Feather-owned hidden sphere field (P4: one sphere raster per frame).
+// (Re)created here in the waitIdle'd scene prewarm on extent change;
+// the mask record below renders into it.
+bool feather_mask_renderer::ensure_hidden_field(vk::Extent2D extent)
+{
+	if (hidden_sphere_extent_.width == extent.width and hidden_sphere_extent_.height == extent.height and
+	    hidden_sphere_extent_.width != 0)
+		return false;
+	// Rare path (first hidden frame, video resize): nothing outstanding
+	// (acquire + release pair within one frame, always paired below).
+	device.waitIdle();
+	hidden_sphere_depth_ = image_allocation{
+	        device,
+	        vk::ImageCreateInfo{
+	                .imageType = vk::ImageType::e2D,
+	                .format = depth_format,
+	                .extent = {extent.width, extent.height, 1},
+	                .mipLevels = 1,
+	                .arrayLayers = 2,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .tiling = vk::ImageTiling::eOptimal,
+	                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	        },
+	        VmaAllocationCreateInfo{
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	        },
+	        "hidden proximity sphere depth",
+	};
+	hidden_sphere_view_array_ = vk::raii::ImageView(device, vk::ImageViewCreateInfo{
+	        .image = (VkImage)hidden_sphere_depth_,
+	        .viewType = vk::ImageViewType::e2DArray,
+	        .format = depth_format,
+	        .subresourceRange = {
+	                .aspectMask = vk::ImageAspectFlagBits::eDepth,
+	                .baseMipLevel = 0,
+	                .levelCount = 1,
+	                .baseArrayLayer = 0,
+	                .layerCount = 2,
+	        },
+	});
+	hidden_sphere_extent_ = extent;
+	spdlog::info("Hidden sphere field: {}x{}", extent.width, extent.height);
+	return true;
+}
+
+void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
+{
+	assert(hidden_sphere_extent_.width == extent.width and hidden_sphere_extent_.height == extent.height);
 
 	if (not hidden_ready)
 	{
@@ -1919,7 +1843,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(hidden_mv_push))
 			throw std::runtime_error("hidden multiview needs 132B push constants");
 		hidden_ready = true;
-		// Unit-sphere verts (shared generator with the dots renderer).
+		// Unit-sphere verts (shared proximity-depth generator).
 		auto sphere = passthrough_mesh::unit_sphere_positions();
 		hidden_sphere_vert_count = (uint32_t)sphere.size();
 		hidden_sphere_verts_ = buffer_allocation{
@@ -2022,7 +1946,9 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		// untouched (cutout punch keeps it).
 		auto hvert = load_shader(device, "mask_mv.vert");
 		auto hfrag = load_shader(device, "mask_mv.frag");
-		auto hempty = load_shader(device, "hidden_dotfill.frag");
+		// Empty fragment: the sphere pipe is depth-only (no color
+		// attachment, color writes off).
+		auto hempty = load_shader(device, "empty.frag");
 		vk::PipelineShaderStageCreateInfo hstages[2] = {
 		        {
 		                .stage = vk::ShaderStageFlagBits::eVertex,
@@ -2158,10 +2084,10 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		tgt.extent = extent;
 		// One multiview target: array color view (both layers) + layers=2
 		// framebuffers; one draw broadcasts to both eyes. The sphere
-		// framebuffer bakes the dots-owned borrowed ARRAY view, so the
-		// scene must reset_targets() before the dots renderer dies or
-		// rebuilds (see hidden_sphere_field). Extent agreement is the
-		// scene's job — one quarter-res for mask, field and dots.
+		// framebuffer bakes the feather-owned sphere field ARRAY view
+		// (see ensure_hidden_field); reset_targets() on field rebuild.
+		// Extent agreement is the scene's job — one quarter-res for
+		// mask and sphere field.
 		vk::ImageViewCreateInfo iv_info{
 		        .image = image,
 		        .viewType = vk::ImageViewType::e2DArray,
@@ -2176,7 +2102,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent, 
 		};
 		tgt.view_array = vk::raii::ImageView(device, iv_info);
 		vk::ImageView color_view = *tgt.view_array;
-		vk::ImageView sphere_view = field.view_array;
+		vk::ImageView sphere_view = *hidden_sphere_view_array_;
 		vk::ImageView color_atts[2] = {color_view, sphere_view};
 		vk::FramebufferCreateInfo color_fb{
 		        .renderPass = *hidden_color_rp,
@@ -2206,17 +2132,16 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
                                           const std::vector<hidden_draw> & draws,
                                           const std::vector<std::array<glm::mat4, 2>> & spheres,
                                           hidden_cpu * cpu_stats,
-                                          const std::array<vk::Extent2D, 2> & full_extents,
-                                          const hidden_sphere_field & field)
+                                          const std::array<vk::Extent2D, 2> & full_extents)
 {
 	hidden_cpu local{};
 	section_clock raster_clk(&local.raster_ms);
 
 	for (auto & [key, mesh]: meshes)
 		flush_upload(cmd, mesh);
-	ensure_hidden(image, extent, field);
+	ensure_hidden(image, extent);
 	auto & tgt = hidden_targets[image];
-	VkImage sphere_image = field.image;
+	VkImage sphere_image = (VkImage)hidden_sphere_depth_;
 
 	// Multiview: one draw broadcasts to both layers (viewMask=both) — the
 	// two per-eye passes collapse into two begins total. Push carries both
@@ -2435,29 +2360,6 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		++local.draws;
 	}
 	cmd.endRenderPass();
-
-	// Shared-field handoff (P4): the dots color pass samples the sphere
-	// image later in this command buffer. Same-queue write→read needs an
-	// explicit transition — the barrier above only covered write→RP2
-	// attachment-read. Harmless when dots sits out (image simply unused).
-	vk::ImageMemoryBarrier sph_read{
-	        .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
-	        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-	        .oldLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
-	        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	        .image = sphere_image,
-	        .subresourceRange = {
-	                .aspectMask = vk::ImageAspectFlagBits::eDepth,
-	                .baseMipLevel = 0,
-	                .levelCount = 1,
-	                .baseArrayLayer = 0,
-	                .layerCount = 2,
-	        },
-	};
-	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
-	                    vk::PipelineStageFlagBits::eFragmentShader, {}, {}, {}, sph_read);
 
 	if (cpu_stats)
 		*cpu_stats = local;
@@ -2984,7 +2886,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 {
 	if (not mesh.pending_upload)
 		return;
-	auto [vertex_bytes, index_bytes, dot_bytes] = *mesh.pending_upload;
+	auto [vertex_bytes, index_bytes] = *mesh.pending_upload;
 	mesh.pending_upload.reset();
 
 	vk::BufferCopy vertex_copy{
@@ -2999,15 +2901,6 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	        .size = index_bytes,
 	};
 	cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
-	if (dot_bytes > 0)
-	{
-		vk::BufferCopy dot_copy{
-		        .srcOffset = vertex_bytes + index_bytes,
-		        .dstOffset = 0,
-		        .size = dot_bytes,
-		};
-		cmd.copyBuffer(*mesh.staging_buffer, *mesh.dot_buffer, dot_copy);
-	}
 
 	std::vector<vk::BufferMemoryBarrier> barriers = {
 	        vk::BufferMemoryBarrier{
@@ -3029,20 +2922,6 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	                .size = index_bytes,
 	        },
 	};
-	// Only when a dot copy ran above (same CB order as the borrower
-	// below): a null dot buffer means count 0, never bound.
-	if (dot_bytes > 0)
-	{
-		barriers.push_back(vk::BufferMemoryBarrier{
-		        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-		        .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
-		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .buffer = *mesh.dot_buffer,
-		        .offset = 0,
-		        .size = dot_bytes,
-		});
-	}
 	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                    vk::PipelineStageFlagBits::eVertexInput,
 	                    {},

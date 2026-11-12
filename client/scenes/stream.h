@@ -28,7 +28,6 @@
 #include "render/debug_lines.h"
 #include "render/depth_overlay.h"
 #include "render/feather_mask.h"
-#include "render/hidden_dots.h"
 #include "render/imgui_impl.h"
 #include "render/passthrough_mesh.h"
 #include "render/union_merge.h"
@@ -761,13 +760,6 @@ private:
 	std::unique_ptr<union_merge_renderer> merge_renderer;
 	int merge_image = -1;
 	bool merge_this_frame = false;
-	// Dot overlay over the revealed camera feed: fixed world-size dots in
-	// the config color, front faces only, sampled-depth occlusion (no
-	// depth attachment in the dots pass). Own swapchain, submitted after
-	// the flat layer, before gizmos. -1 = inactive.
-	std::unique_ptr<hidden_dots_renderer> hidden_dots;
-	int hidden_dots_image = -1;
-	bool hidden_dots_active = false;
 	// Per-frame hidden working buffers (filled by the shared silhouette
 	// build in the mask phase; capacity survives clear()). Render thread
 	// only.
@@ -776,8 +768,6 @@ private:
 		std::string mesh;
 		std::array<glm::mat4, 2> mvp;
 		std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
-		glm::vec3 color{0};
-		float pitch = 0.1f;
 		// World-space mesh AABB for the CPU proximity pre-gate (P0):
 		// silhouettes fully outside every sphere are dropped before any
 		// acquire/record. bounds_known=false (upload pending) keeps the
@@ -787,16 +777,10 @@ private:
 	};
 	std::vector<hidden_silhouette_draw> hidden_silhouettes;
 	std::vector<feather_mask_renderer::hidden_draw> hidden_mask_draws;
-	std::vector<hidden_dots_renderer::instance_draw> hidden_dots_draws;
-	// Baked dot pitch per hidden mesh (the lattice rides the upload, so a
-	// pitch edit must re-upload): compared as floats alongside the soup
-	// hash, no per-frame string formatting. Kept in step with
-	// hidden_group.mesh_hashes at the three sites below.
-	std::map<std::string, float> hidden_dot_pitch;
 	// Per-frame proximity spheres (model already placed): rebuilt when
 	// the mask phase builds draws below; the mask record renders them
-	// into the dots-owned shared field, the dots record only samples.
-	// Capacity survives clear(). Render thread only.
+	// into the feather-owned sphere field. Capacity survives clear().
+	// Render thread only.
 	std::vector<std::array<glm::mat4, 2>> proximity_spheres;
 	// The proximity palms borrow the GUI hand trackers (shared handles,
 	// per-frame positions — never culled): set from hidden_known at

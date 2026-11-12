@@ -647,9 +647,9 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		map_key += ';';
 		map_key += std::to_string(o.feather_px);
 		map_key += ';';
-		// dot_color/dot_pitch_m excluded: live-applied (dot color +
-		// pitch), edits must not reset tracking. transition_distance_m
-		// excluded too (live-applied by the boundary fade).
+		// dot_color/dot_pitch_m excluded (dots overlay removed; fields
+		// ignored client-side) as is transition_distance_m
+		// (live-applied by the boundary fade).
 		// proximity_radius_m/hand_proximity_radius_m excluded as well
 		// (live-applied by the near-field reveal: sphere MVPs rebuild
 		// every frame).

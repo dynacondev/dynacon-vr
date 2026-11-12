@@ -78,44 +78,13 @@ public:
 
 	// (Re)upload one object's mesh buffers under its key. Synchronous
 	// (device idle on replace); call when idle, e.g. on map change, not
-	// per frame. Empty soup erases the entry. dot_pitch_m > 0 also bakes
-	// the hidden billboard dot lattice (object-space centers + face
-	// normals for this pitch) into an extra buffer, uploaded and gated
-	// with the mesh; 0 skips it (non-hidden meshes). dot_pitch_m is in
-	// OBJECT units: callers pass world_pitch / model_scale so the world
-	// spacing matches the configured pitch at any model scale.
-	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup, float dot_pitch_m = 0);
+	// per frame. Empty soup erases the entry.
+	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
 	void remove_mesh(const std::string & key);
 	// Model-space AABB for frustum skip (nullopt = unknown key: keep the
 	// draw). Computed once at upload; the draws filter in stream.cpp
 	// consults it before acquire, so fully-culled groups cost nothing.
 	std::optional<std::pair<glm::vec3, glm::vec3>> mesh_bounds(const std::string & key) const;
-
-	// Borrowed GPU mesh buffers for the dots overlay (binds these for its
-	// own silhouette raster; feather keeps owning upload + eviction).
-	// Nullopt when unknown OR an upload is still pending (no flush ran
-	// ahead of this borrow — e.g. empty mask draws or a skipped mask
-	// record). On flush frames the copy + barrier precede the borrower in
-	// the same command buffer, so it binds fresh data immediately.
-	struct borrowed_mesh
-	{
-		vk::Buffer vertex_buffer;
-		vk::Buffer index_buffer;
-		uint32_t index_count;
-	};
-	std::optional<borrowed_mesh> borrowed_mesh_buffers(const std::string & key) const;
-
-	// Borrowed billboard dot instances for the dots overlay (per-dot
-	// object-space center + face normal, baked at upload for the pitch
-	// passed to set_mesh). Same pending-upload gate as the mesh buffers
-	// above: nullopt when unknown, pending, or baked with dot_pitch 0.
-	// Count 0 (degenerate lattice) also means skip the draw.
-	struct borrowed_dots
-	{
-		vk::Buffer buffer;
-		uint32_t count;
-	};
-	std::optional<borrowed_dots> borrowed_dot_buffers(const std::string & key) const;
 
 	// Borrowed submitted-image array view (both layers) for the
 	// merge pass: the just-recorded image's multiview color
@@ -301,31 +270,18 @@ public:
 	// (shared logic untouched): RP1 rasters the proximity spheres into a
 	// depth field, RP2 rasters the silhouettes with a depth test against
 	// it, so only in-radius fragments write mask. Quarter-res working +
-	// submit (alert-grade, like the dots layer); tier-0 direct raster
-	// (no blur/erode/volume/VR ever — bubbles never engage here).
+	// submit; tier-0 direct raster (no blur/erode/volume/VR ever —
+	// bubbles never engage here).
 	// spheres: one MVP pair per proximity volume (model =
 	// translate(center) * scale(radius)), stream-built so this stays
 	// timebase-free. Safety theorem baked in: LESS accumulates the
 	// furthest sphere exit (max distance), so coverage can only
 	// OVER-reveal (front-of-sphere imprecision, accepted); GREATER here
 	// would under-reveal (unsafe miss) and is forbidden.
-	// The sphere field is the dots-owned shared image (P4: one raster
-	// per frame, not two): RP1 renders into field.view_array at
-	// field.extent, RP2 tests against it, then the record transitions
-	// the image to shader-readable for the dots color pass later in
-	// the same command buffer. Extent MUST equal the quarter-res
-	// working extent (the scene sizes mask, field and dots from one
-	// quarter-res); mismatched views
-	// would misalign the gate. Borrowed-framebuffer discipline: the
-	// framebuffers built here reference the dots-owned views, so the
-	// scene must reset_targets() before the dots renderer dies or
-	// rebuilds.
-	struct hidden_sphere_field
-	{
-		VkImage image = VK_NULL_HANDLE; // shared D16 2-layer field
-		vk::Extent2D extent{0, 0}; // must equal the mask extent below
-		vk::ImageView view_array{}; // both layers (mask builds its MV FB against this)
-	};
+	// The sphere field is a feather-owned D16 2-layer image (one sphere
+	// raster per frame): RP1 renders into it, RP2 tests the silhouettes
+	// against it. Extent always equals the mask working extent (both
+	// (re)created from the same quarter-res in the scene prewarm).
 	// One draw per silhouette: which uploaded mesh, per-eye transforms,
 	// opacity, and the full-res pixel bounds per eye (scaled to the mask
 	// extent for a per-draw scissor — the only tri-raster with one).
@@ -341,14 +297,21 @@ public:
 		double raster_ms = 0;
 		int draws = 0;
 	};
+	// Ensure the hidden sphere field image for an extent (idempotent,
+	// change-gated). Public so the scene can create it in the prewarm
+	// (ahead of the mask record that renders into it); waitIdle inside
+	// on rebuild. Returns true when (re)created: the sphere
+	// framebuffers built in ensure_hidden bake the new views, so the
+	// scene must reset_targets() on rebuild.
+	bool ensure_hidden_field(vk::Extent2D extent);
+
 	void record_hidden(vk::raii::CommandBuffer & cmd,
 	                   vk::Image image,
 	                   vk::Extent2D extent,
 	                   const std::vector<hidden_draw> & draws,
 	                   const std::vector<std::array<glm::mat4, 2>> & spheres,
 	                   hidden_cpu * cpu_stats,
-	                   const std::array<vk::Extent2D, 2> & full_extents,
-	                   const hidden_sphere_field & field);
+	                   const std::array<vk::Extent2D, 2> & full_extents);
 
 	bool has_mesh() const
 	{
@@ -672,11 +635,6 @@ private:
 		vk::raii::Buffer index_buffer{nullptr};
 		vk::raii::DeviceMemory index_memory{nullptr};
 		uint32_t index_count = 0;
-		// Baked billboard dots (hidden overlay): per-dot center + face
-		// normal, uploaded with the mesh above when set_mesh got a pitch.
-		vk::raii::Buffer dot_buffer{nullptr};
-		vk::raii::DeviceMemory dot_memory{nullptr};
-		uint32_t dot_count = 0;
 		vk::raii::Buffer staging_buffer{nullptr};
 		vk::raii::DeviceMemory staging_memory{nullptr};
 		vk::DeviceSize staging_size = 0;
@@ -684,7 +642,6 @@ private:
 		{
 			vk::DeviceSize vertex_bytes = 0;
 			vk::DeviceSize index_bytes = 0;
-			vk::DeviceSize dot_bytes = 0;
 		};
 		std::optional<upload_sizes> pending_upload;
 		glm::vec3 aabb_min{0}, aabb_max{0};
@@ -709,8 +666,14 @@ private:
 	// pipes too — identical 132B range, one layout for all MV mask pipes).
 	buffer_allocation hidden_sphere_verts_;
 	uint32_t hidden_sphere_vert_count = 0;
-	// (The sphere depth images moved to the dots renderer — P4 shared
-	// field. output_depth_array_view is declared with output_depth below.)
+	// Feather-owned hidden sphere field (D16 2-layer image + array view
+	// the sphere framebuffer below bakes against; P4: one sphere raster
+	// per frame). (Re)created by ensure_hidden_field (waitIdle'd scene
+	// prewarm); reset_targets() on rebuild. output_depth_array_view is
+	// declared with output_depth below.
+	image_allocation hidden_sphere_depth_;
+	vk::raii::ImageView hidden_sphere_view_array_{nullptr};
+	vk::Extent2D hidden_sphere_extent_{0, 0};
 	// Per-swapchain-image multiview framebuffers for the two hidden
 	// passes (color + sphere-depth, layers=2 each); dropped by
 	// reset_targets() with the rest (swapchain recreate = waitIdle'd
@@ -723,7 +686,7 @@ private:
 		vk::raii::Framebuffer sphere_framebuffer{nullptr}; // sphere MV, layers=2
 	};
 	std::unordered_map<VkImage, hidden_frame_targets> hidden_targets;
-	void ensure_hidden(vk::Image image, vk::Extent2D extent, const hidden_sphere_field & field);
+	void ensure_hidden(vk::Image image, vk::Extent2D extent);
 	bool hidden_ready = false; // lazy RPs/pipes/sphere verts (first record_hidden)
 
 	// Framebuffers + views per swapchain image (images cycle; entries for

@@ -450,9 +450,8 @@ Each `passthrough` entry has:
   triangles budget). Both eyes fade together from a single per-frame
   headset distance. `"3d-passthrough-hidden"` reveals the flat feed
   where the model sits inside the proximity radius around the head
-  (hard-edged near-field cutout merged into the single merged submit layer, plus a
-  dot overlay in `dot-color` over the revealed feed (front faces
-  only, so hidden meshes read best as **closed volumes** like boundary
+  (hard-edged near-field cutout merged into the single merged submit layer;
+  front faces only, so hidden meshes read best as **closed volumes** like boundary
   meshes): reversed cuts never apply to it (safety: hidden always wins),
   and it needs `model-path` like boundary zones.
 - `id`: stable identifier (required, must be unique); `tag`:
@@ -486,17 +485,12 @@ Each `passthrough` entry has:
   (symmetric smoothstep, 0.5 at the surface); `0` is a hard step.
   Composited by lifting the flat union's mask floor, so no extra layers
   or swapchains: exiting saturates the existing flat feed to fullscreen.
-- `dot-pitch`: hidden dot pitch in meters
-  (`3d-passthrough-hidden` only, default `0.05`, clamped to
-  `[0.01, 1]`, applied live). Fixed world-size dots wrapping the mesh
-  faces; all hidden objects share one merge input, so the pitch is per-object
-  at draw time.
-- `dot-color`: hidden dot color as a `"#RRGGBB"` hex string
-  (`3d-passthrough-hidden` only, default red `#FF291A`, applied
-  live). Tints the dot overlay (per-object color at draw time).
+- `dot-pitch` / `dot-color`: REMOVED (trial). The hidden dot overlay
+  no longer exists, so these fields are accepted but ignored; the
+  reveal is the hard-edged proximity cutout only.
 - `proximity-radius`: near-field reveal radius in meters
   (`3d-passthrough-hidden` only, default `0.25`, clamped to `>= 0`,
-  applied live). The cutout and dots show only where the mesh sits
+  applied live). The cutout shows only where the mesh sits
   inside this distance of the head (hard edge); `0` reveals nothing.
 - `hand-proximity-radius`: same gate measured from each hand in meters
   (`3d-passthrough-hidden` only, default `0.15`, clamped to `>= 0`,

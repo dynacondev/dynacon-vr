@@ -18,7 +18,9 @@
 
 #version 450
 
-// Depth-fill fragment: nothing to shade (color writes off, depth only).
+// Empty fragment for depth-only pipes (no color attachment, color
+// writes off, depth only). Shared by the hidden proximity sphere
+// raster; the dots overlay that previously shared it is removed.
 void main()
 {
 }

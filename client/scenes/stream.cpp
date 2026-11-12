@@ -1533,7 +1533,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		update_fiducial_passthrough(frame_state.predictedDisplayTime, sync_display_time);
 
 		// Hidden state, computed once per frame and shared by the nomask
-		// gate, mask record, dots record and submit below (one scan, not
+		// gate and mask record below (one scan, not
 		// five). Working buffers live on the scene (members, capacity
 		// survives clear()); the silhouette build in the mask phase fills
 		// them (see below).
@@ -1561,7 +1561,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// shared silhouette build in the mask phase; capacity survives).
 		hidden_silhouettes.clear();
 		hidden_mask_draws.clear();
-		hidden_dots_draws.clear();
 		hidden_silhouettes.reserve(passthrough_objects.size());
 
 		// Hidden objects need the mask path (alpha blend): without it they
@@ -1824,13 +1823,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// outputs, so no cross-submit semaphore is needed: the
 		// compositor joins via swapchain release (gated on the mask
 		// fence below).
-		// One hidden-silhouette build per frame, shared by the hidden mask
-		// draw list and the dots draw list + scissor: model/MVP/visibility
+		// One hidden-silhouette build per frame, feeding the hidden mask
+		// draw list + scissor: model/MVP/visibility
 		// computed once instead of per consumer. 1px margin per eye floored
 		// by the mask working size: a superset of the old mask margin for
 		// every eye, so the mask may keep a ≤1px sliver it previously
-		// skipped — visually identical, exact for dots.
-		// Full-res pixel bounds per eye ride along for the dots scissor
+		// skipped — visually identical.
+		// Full-res pixel bounds per eye ride along for the mask scissor
 		// (any behind-camera corner → fullscreen that eye).
 		auto build_hidden_silhouettes = [&](int mask_w, int mask_h) {
 			hidden_silhouettes.clear();
@@ -1943,8 +1942,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				if (not visible)
 					continue;
-				s.color = glm::vec3(ost.def.dot_color[0], ost.def.dot_color[1], ost.def.dot_color[2]);
-				s.pitch = std::max(0.01f, ost.def.dot_pitch_m);
 				hidden_silhouettes.push_back(std::move(s));
 			}
 		};
@@ -2598,8 +2595,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// swapchain from the feather groups (tier 0 direct raster, no
 				// blur chain, no cutouts); reversed draws are never appended,
 				// so hidden always wins for safety.
-				// Steady full-opacity cutout; the dot overlay below annotates
-				// the revealed feed.
+				// Steady full-opacity cutout of the revealed feed.
 				auto record_hidden_mask = [&]() {
 					auto & g = hidden_group;
 					// Quarter-res working + submit (alert-grade layers):
@@ -2607,13 +2603,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// chain ever — tier comes from feather_px = 0, not
 					// resolution), the compositor upscales the
 					// quarter-rect (binary alpha: edge carries a ~1-texel
-					// upscale ramp; the quarter-res dots still annotate
-					// precisely). Reuses the tiered-quarter qw/qh size.
+					// upscale ramp). Reuses the tiered-quarter qw/qh size.
 					int hmw = qw;
 					int hmh = qh;
 					{
 						// State hoisted per frame above (shared with the
-						// nomask gate, dots record and submit).
+						// nomask gate and mask submit).
 						if (hidden_known)
 						{
 							// Pre-warm (map-known, not necessarily placed):
@@ -2623,20 +2618,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// soon as the soup is ready, even unplaced.
 							if (not g.renderer)
 								g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
-							// Dots renderer + shared sphere field, warmed here (ahead
-							// of the mask record below which renders into it): same
-							// hidden_known prewarm as the mask swapchain. Sized from
-							// the same quarter-res so the shared field extent agrees
-							// exactly (dots halves its args: 2x in = 1x out). A
-							// rebuild recreates the sphere views the mask builds
-							// framebuffers against, so drop those first.
-							if (mask_frame)
-							{
-								if (not hidden_dots)
-									hidden_dots = std::make_unique<hidden_dots_renderer>(device, physical_device);
-								if (hidden_dots->ensure(instance, session, swapchain.format(), hmw * 2, hmh * 2) and g.renderer)
-									g.renderer->reset_targets();
-							}
+							// Hidden sphere field, warmed here (ahead of the
+							// mask record below which renders into it): same
+							// hidden_known prewarm as the mask swapchain, same
+							// quarter-res extent. A rebuild recreates the views
+							// the mask builds its sphere framebuffer against,
+							// so drop those first.
+							if (mask_frame and g.renderer and
+							    g.renderer->ensure_hidden_field({(uint32_t)hmw, (uint32_t)hmh}))
+								g.renderer->reset_targets();
 							if (not g.swapchain or g.swapchain.width() != hmw or g.swapchain.height() != hmh)
 							{
 								// Rare path (first frame, video resize): nothing
@@ -2653,38 +2643,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								if (ost.def.type != "3d-passthrough-hidden")
 									continue;
 								bool member = ost.soup_ready;
-								// The baked dot lattice rides the upload, so a
-								// pitch edit must re-upload (dot-pitch is
-								// otherwise live-applied, excluded from the
-								// map fingerprint). Two-field compare (hash +
-								// pitch float, exact: same clamped source) —
-								// no per-frame string formatting.
-								// Scale-corrected: the lattice bakes in
-								// object units but dot-pitch is world
-								// meters, so divide by the model scale (max
-								// axis: never denser than configured under
-								// non-uniform scale). Without this a 0.1x
-								// model bakes a 10x over-dense lattice and
-								// the radius knob reads 10x off.
-								float dot_pitch_world = std::max(0.01f, ost.def.dot_pitch_m);
-								float model_scale = std::max({std::abs(ost.fused.world_scale.x),
-								                              std::abs(ost.fused.world_scale.y),
-								                              std::abs(ost.fused.world_scale.z), 1e-6f});
-								float dot_pitch = dot_pitch_world / model_scale;
-								auto mhit = g.mesh_hashes.find(oid);
-								auto phit = hidden_dot_pitch.find(oid);
-								if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash or
-								                phit == hidden_dot_pitch.end() or phit->second != dot_pitch))
-								{
-									g.renderer->set_mesh(oid, ost.soup, dot_pitch);
-									g.mesh_hashes[oid] = ost.soup_hash;
-									hidden_dot_pitch[oid] = dot_pitch;
-								}
+								// Upload on soup change (hash compare, no per-frame
+								// string formatting).
+									auto mhit = g.mesh_hashes.find(oid);
+									if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash))
+									{
+										g.renderer->set_mesh(oid, ost.soup);
+										g.mesh_hashes[oid] = ost.soup_hash;
+									}
 								else if (not member and mhit != g.mesh_hashes.end())
 								{
 									g.renderer->remove_mesh(oid);
 									g.mesh_hashes.erase(mhit);
-									hidden_dot_pitch.erase(oid);
 								}
 							}
 							// Hash-side eviction (mirrors the feather groups): oids
@@ -2698,19 +2668,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								        oit->second.soup_ready;
 								if (member)
 								{
-									float want_world = std::max(0.01f, oit->second.def.dot_pitch_m);
-									float want_scale = std::max({std::abs(oit->second.fused.world_scale.x),
-									                             std::abs(oit->second.fused.world_scale.y),
-									                             std::abs(oit->second.fused.world_scale.z), 1e-6f});
-									float dot_pitch = want_world / want_scale;
-									auto phit = hidden_dot_pitch.find(hit->first);
-									member = hit->second == oit->second.soup_hash and
-									        phit != hidden_dot_pitch.end() and phit->second == dot_pitch;
+									member = hit->second == oit->second.soup_hash;
 								}
 								if (not member)
 								{
 									g.renderer->remove_mesh(hit->first);
-									hidden_dot_pitch.erase(hit->first);
 									hit = g.mesh_hashes.erase(hit);
 								}
 								else
@@ -2725,17 +2687,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								for (auto & [key, _]: g.mesh_hashes)
 									g.renderer->remove_mesh(key);
 								g.mesh_hashes.clear();
-								hidden_dot_pitch.clear();
 								// Map no longer carries hidden objects: drop
-								// the dots renderer too (swapchain + shared
-								// sphere field), not just the meshes. The mask
-								// framebuffers reference the dots-owned sphere
-								// views, so they must die first (reset_targets)
-								// — views die with the dots renderer. Recreated
-								// on demand under hidden_known below; nothing
-								// is submitted while inactive.
+								// the cached targets (they reference retired
+								// images). Recreated on demand under
+								// hidden_known below; nothing is submitted
+								// while inactive.
 								g.renderer->reset_targets();
-								hidden_dots.reset();
 							}
 						}
 						// Without the mask path nothing can display: skip the
@@ -2743,11 +2700,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// above already warned). Uploads/prewarm still ran.
 						else if (mask_frame)
 						{
-							// Silhouettes built once above (shared with the
-							// dots below): map straight to mask draws. The
+							// Silhouettes built once above: map straight to
+							// mask draws. The
 							// shared margin floors off the quarter-res mask
-							// working size (conservative superset either way;
-							// the dots scissor reads the px bounds exactly).
+							// working size (conservative superset either way).
 							build_hidden_silhouettes(hmw, hmh);
 							// Proximity spheres (v1: head + hands — further
 							// trackers slot in as more entries later): head
@@ -2831,7 +2787,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// Sphere-vs-world-AABB; test radii padded 2cm against
 							// edge flicker (the GPU field keeps the exact radii).
 							// Unknown bounds pass conservatively. Survivors feed the
-							// mask draws, the dots draws and the sphere MVPs below, so
+							// mask draws and the sphere MVPs below, so
 							// a closed gate costs ~zero GPU and no layers.
 							hidden_silhouettes.erase(
 								std::remove_if(hidden_silhouettes.begin(), hidden_silhouettes.end(),
@@ -2915,17 +2871,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										        vk::Extent2D{(uint32_t)extents[0].width, (uint32_t)extents[0].height},
 										        vk::Extent2D{(uint32_t)extents[1].width, (uint32_t)extents[1].height},
 										};
-										// Shared sphere field (P4): dots-ensured in the prewarm
-										// above under the same hidden_known+mask_frame conditions,
-										// same quarter-res, so the image/views are live here.
-										feather_mask_renderer::hidden_sphere_field sphere_field{
-											.image = hidden_dots->sphere_image(),
-											.extent = hex,
-											.view_array = hidden_dots->sphere_view_array(),
-										};
+										// Feather-owned sphere field (P4): ensured in the
+										// prewarm above under the same
+										// hidden_known+mask_frame conditions, same
+										// quarter-res, so it is live here.
 										g.renderer->record_hidden(rec_cmd, g.swapchain.image(mask_index), hex,
-										                          hidden_mask_draws, proximity_spheres, &hstats, full_ext,
-										                          sphere_field);
+										                          hidden_mask_draws, proximity_spheres, &hstats, full_ext);
 									}
 									catch (std::exception & e)
 									{
@@ -2952,131 +2903,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				};
 				record_hidden_mask();
-				// Hidden dot overlay, recorded in the mask phase (async-safe:
-				// acquire happens here ahead of the video wait; every path
-				// below pairs it — record-throw, wait-timeout, submit, and
-				// the video-stall drain). Server eye timebase MVPs come from
-				// the shared silhouette build above (no recompute); mesh
-				// buffers are borrowed from the feather hidden renderer,
-				// whose upload flush ran in the mask record above in
-				// submission order (pending uploads report nullopt and show
-				// next frame).
-				hidden_dots_image = -1;
-				hidden_dots_active = false;
-				if (mask_frame)
-				{
-					// Map-known state hoisted per frame above (shared with
-					// the mask record): prewarm while known so visible
-					// frames only rasterize.
-					// Dots renderer + shared field are warmed in the mask prewarm
-					// above (same hidden_known gate). Fresh-field rule: dots only
-					// records when the mask recorded this frame (hidden_group.active)
-					// — otherwise the shared image holds last frame's field.
-					if (not hidden_silhouettes.empty() and hidden_dots and hidden_group.renderer and hidden_group.active)
-					{
-						auto dots_t0 = std::chrono::steady_clock::now();
-						vk::Extent2D dext{(uint32_t)hidden_dots->swapchain().width(),
-						                  (uint32_t)hidden_dots->swapchain().height()};
-						hidden_dots_draws.reserve(hidden_silhouettes.size());
-						// proj[1][1] per eye, once (not per draw): only this
-						// element is ever read below.
-						float dots_proj11[2] = {scene::projection_matrix(sync_fov[0])[1][1],
-						                        scene::projection_matrix(sync_fov[1])[1][1]};
-						for (auto & s: hidden_silhouettes)
-						{
-							auto bb = hidden_group.renderer->borrowed_dot_buffers(s.mesh);
-							if (not bb or bb->count == 0)
-								continue;
-							// Mesh triangles for the depth prepass (same
-							// pending-upload gate: prepass copies precede in
-							// the same command buffer).
-							auto mb = hidden_group.renderer->borrowed_mesh_buffers(s.mesh);
-							if (not mb or mb->index_count == 0)
-								continue;
-							hidden_dots_renderer::instance_draw d;
-							d.mvp = s.mvp;
-							d.color = s.color;
-							d.pitch = s.pitch;
-							d.dot_buffer = bb->buffer;
-							d.dot_count = bb->count;
-							d.vertex_buffer = mb->vertex_buffer;
-							d.index_buffer = mb->index_buffer;
-							d.index_count = mb->index_count;
-							for (uint32_t view = 0; view < 2; ++view)
-								d.view_params[view] = glm::vec3((float)dext.width, (float)dext.height,
-								                                dots_proj11[view]);
-							// Scissor: shared full-res pixel bounds scaled
-							// into the quarter-res dots extent (+1px pad).
-							for (uint32_t view = 0; view < 2; ++view)
-							{
-								float sx = (float)dext.width / (float)extents[view].width;
-								float sy = (float)dext.height / (float)extents[view].height;
-								int32_t x0 = (int32_t)std::max(0.f, s.px[view][0] * sx - 1.f);
-								int32_t y0 = (int32_t)std::max(0.f, s.px[view][1] * sy - 1.f);
-								int32_t x1 = (int32_t)std::min((float)dext.width, s.px[view][2] * sx + 1.f);
-								int32_t y1 = (int32_t)std::min((float)dext.height, s.px[view][3] * sy + 1.f);
-								d.scissor[view] = vk::Rect2D{.offset = {x0, y0},
-								                             .extent = {(uint32_t)std::max(x1 - x0, 0),
-								                                        (uint32_t)std::max(y1 - y0, 0)}};
-							}
-							hidden_dots_draws.push_back(d);
-						}
-						// Zero-area union skip: all-degenerate rects mean no
-						// content (far/subpixel) — skip acquire/record/layer
-						// entirely rather than presenting an empty frame.
-						bool dots_empty = true;
-						for (auto & d: hidden_dots_draws)
-						{
-							for (uint32_t view = 0; view < 2; ++view)
-							{
-								if (d.scissor[view].extent.width > 0 and d.scissor[view].extent.height > 0)
-								{
-									dots_empty = false;
-									break;
-								}
-							}
-							if (not dots_empty)
-								break;
-						}
-						// Inline-fallback slot safety: the renderer-owned
-						// depth_ image is single, so when the previous
-						// frame's async mask CB is still in flight (fence
-						// busy at frame top → this record runs inline),
-						// re-recording would CLEAR/sample over its live
-						// reads. Re-poll here, post video-wait: the fence
-						// often completed by now (then dots still draw);
-						// if still busy, sit out one spike frame.
-						bool dots_slot_safe =
-						        device.waitForFences(*mask_fence, VK_FALSE, 0) == vk::Result::eSuccess;
-						if (not hidden_dots_draws.empty() and not dots_empty and dots_slot_safe)
-						{
-							int idx = hidden_dots->acquire();
-							if (idx >= 0)
-							{
-								std::array<vk::Extent2D, 2> dots_ext{dext, dext};
-								try
-								{
-									if (hidden_dots->record(rec_cmd, (size_t)idx, dots_ext, hidden_dots_draws))
-									{
-										hidden_dots_image = idx;
-										hidden_dots_active = true;
-									}
-									else
-										hidden_dots->release();
-								}
-								catch (std::exception & e)
-								{
-									spdlog::warn("Hidden dots record failed: {}", e.what());
-									hidden_dots->release();
-									// Fail the frame, not a poisoned CB (see
-									// the hidden mask catch above).
-									throw;
-								}
-							}
-						}
-						mask_gizmo_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - dots_t0).count();
-					}
-				}
 				// Merge: MAX-combine every active contributor
 				// (hidden first, then feather groups in map order, then
 				// debug) into ONE full-res image, submitted once with
@@ -3115,14 +2941,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					if (not merge_hard_out)
 					{
 						// Multiview broadcasts one draw to both layers: both
-						// eyes must share the extent (dots precedent) — a
+						// eyes must share the extent — a
 						// mismatch would silently misalign one eye, so the
 						// merge sits out loudly instead (assert for debug).
 						assert(extents[0].width == extents[1].width and extents[0].height == extents[1].height);
 						bool merge_eyes_match = extents[0].width == extents[1].width and extents[0].height == extents[1].height;
 						if (not merge_eyes_match)
 							spdlog::error("Union merge eye-extent mismatch, dropping merge this frame");
-						// Slot safety (dots precedent): the merge descriptor set
+						// Slot safety: the merge descriptor set
 						// is rewritten per record. When the previous async mask
 						// command buffer is still in flight (inline fallback while
 						// it flies), its reads are still live — sit out one spike
@@ -3331,14 +3157,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					g->swapchain.release();
 				}
 				acquired_groups.clear();
-				// Dots acquisition (mask phase runs ahead of the video
-				// wait): same pairing, released here on the stall path.
-				if (hidden_dots_image >= 0 and hidden_dots)
-				{
-					hidden_dots->release();
-					hidden_dots_image = -1;
-					hidden_dots_active = false;
-				}
 				// Merge acquisition: same pairing (the merge
 				// records in the mask phase, ahead of the video wait).
 				if (merge_image >= 0 and merge_renderer)
@@ -3853,7 +3671,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// while actually submitting (P1 — a placed-but-gated hidden
 			// object reveals nothing, so it must not pin the flat layer
 			// and its compositor cost).
-			if (hidden_group.active or hidden_dots_active)
+			if (hidden_group.active)
 				need_flat = true;
 			if (cutouts_punched)
 				need_flat = true;
@@ -3921,7 +3739,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				static bool last_submit_flat = true;
 				static bool last_hidden = false;
-				bool hidden_on = hidden_group.active or hidden_dots_active;
+				bool hidden_on = hidden_group.active;
 				if (submit_flat != last_submit_flat or hidden_on != last_hidden)
 				{
 					last_submit_flat = submit_flat;
@@ -3995,7 +3813,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
 				}
 				// Paired with the acquire in the record phase above:
-				// release after submit, like the dots acquisition.
+				// release after submit.
 				merge_renderer->release();
 				merge_image = -1;
 				merge_this_frame = false;
@@ -4008,42 +3826,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (not veil_hard_out)
 					set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 			}
-		}
-
-		// Hidden dot overlay: ONE transparent projection layer over the
-		// revealed camera feed (server eye timebase, like the masks),
-		// below gizmos and GUI quads. Same discipline as the debug lines:
-		// standard alpha blend, no FB extensions.
-		if (hidden_dots_active and hidden_dots_image >= 0 and hidden_dots)
-		{
-			// Quarter-res image rect: the runtime stretches it over the FOV.
-			XrExtent2Di dots_rect{(int32_t)hidden_dots->swapchain().width(),
-			                       (int32_t)hidden_dots->swapchain().height()};
-			std::array<XrCompositionLayerProjectionView, view_count> dots_views;
-			for (uint32_t view = 0; view < view_count; ++view)
-			{
-				dots_views[view] = {
-				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-				        .pose = sync_pose[view],
-				        .fov = sync_fov[view],
-				        .subImage = {
-				                .swapchain = hidden_dots->swapchain(),
-				                .imageRect = {
-				                        .offset = {0, 0},
-				                        .extent = dots_rect,
-				                },
-				                .imageArrayIndex = view,
-				        },
-				};
-			}
-			add_projection_layer(XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-			                     application::space(xr::spaces::world),
-			                     dots_views);
-			// Paired with the acquire in the record phase above: the
-			// compositor takes the last released image; release after submit.
-			hidden_dots->release();
-			hidden_dots_active = false;
-			hidden_dots_image = -1;
 		}
 
 		// Debug gizmo layer: ONE transparent projection layer for all debug
@@ -4266,9 +4048,6 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	// anyway).
 	mask_pipe_cache = feather_mask_renderer::pipeline_cache(device);
 	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
-	// Same for the hidden dots (one trivial pipeline): first-visible
-	// hidden frames must only rasterize.
-	hidden_dots_renderer::warm_pipelines(device, physical_device, swapchain.format());
 	// Same for the merge (one fullscreen pipeline): first
 	// revealing frames must only rasterize, not driver-compile.
 	union_merge_renderer::warm_pipelines(device, physical_device, swapchain.format());
