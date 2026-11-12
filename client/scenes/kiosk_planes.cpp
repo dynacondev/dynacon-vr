@@ -22,6 +22,7 @@
 #include "scene.h"
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <functional>
 #include <glm/geometric.hpp>
@@ -40,6 +41,18 @@ constexpr float model_scale = 0.00675f; // ~0.13m wingspan
 constexpr double fade_in = 1.2;
 constexpr double spawn_interval = 1.0; // plane i spawns at activation + i * this
 constexpr float spawn_radius = 1.0f;   // random position within this distance of the overlay
+// curvature-integrator flight tuning: modest rates keep the fleet inside the
+// leash at cruise speed; the containment bias is a tendency, not a wall
+constexpr float cruise_lo = 0.30f;   // per-plane constant cruise speed range (m/s)
+constexpr float cruise_hi = 0.45f;
+constexpr float comfort_r = 0.6f;    // bias starts past this distance from the anchor (m)
+constexpr float leash_r = 1.0f;      // bias reaches full strength here (m)
+constexpr float bias_gain = 2.0f;    // steering gain toward the anchor
+constexpr float bias_max_rate = 0.8f; // bias steering cap (rad/s): loops (1.2+) overrule it locally
+constexpr float rate_smooth = 3.0f;  // maneuver target blending rate (1/s)
+constexpr float bank_coord_gain = 0.6f; // coordinated bank per yaw rate
+constexpr float bank_max = 1.0f;     // bank clamp (radians)
+constexpr float bank_relax = 2.0f;    // bank return rate toward coordinated value (1/s)
 
 double smoothstep(double e0, double e1, double x)
 {
@@ -176,7 +189,20 @@ void kiosk_planes::spawn_at(plane & f, const glm::vec3 & anchor_pos)
 	node->position = pos;
 	// level random heading; model nose points along +Z
 	std::uniform_real_distribution<float> yaw_dist(0.f, 2.f * std::numbers::pi_v<float>);
-	node->orientation = glm::angleAxis(yaw_dist(rng_), glm::vec3(0.f, 1.f, 0.f));
+	float yaw0 = yaw_dist(rng_);
+	node->orientation = glm::angleAxis(yaw0, glm::vec3(0.f, 1.f, 0.f));
+	// flight state: level cruise on the spawn heading, maneuver picked on
+	// the first integrated frame (man_t = 0)
+	f.pos = pos;
+	// match the spawn orientation above: identity nose +Z rotated by yaw0
+	f.dir = glm::vec3(std::sin(yaw0), 0.f, std::cos(yaw0));
+	f.right = glm::vec3(1.f, 0.f, 0.f);
+	f.speed = std::uniform_real_distribution<float>(cruise_lo, cruise_hi)(rng_);
+	f.bank = 0.f;
+	f.pitch_rate = f.yaw_rate = f.roll_rate = 0.f;
+	f.pitch_tgt = f.yaw_tgt = f.roll_tgt = 0.f;
+	f.man_t = 0.;
+	f.prev_now = 0;
 	// fresh livery every spawn: construction-time draws could hide a color
 	// all session. The spawn is invisible (pre-fade), so the swap never pops.
 	// Logcat records the pick for on-device color forensics.
@@ -208,6 +234,44 @@ void kiosk_planes::apply_livery(plane & f)
 	spdlog::info("kiosk_planes: spawn livery {}", p.name);
 }
 
+void kiosk_planes::pick_maneuver(plane & f)
+{
+	// maneuvers are just rate targets for the shared integrator: cruise is
+	// near-zero curvature, a turn is sustained yaw (bank follows), a loop is
+	// a full 2pi of pitch, a roll is a full 2pi of roll with a breath of yaw.
+	// Durations complete the figure exactly, then a new target is drawn.
+	static const std::array<double, 4> weights{5.0, 3.0, 1.0, 1.0};
+	auto coin = [&] { return std::uniform_real_distribution<float>(0.f, 1.f)(rng_) < 0.5f ? -1.f : 1.f; };
+	switch (std::discrete_distribution<int>(weights.begin(), weights.end())(rng_))
+	{
+		case 0: // cruise
+		default:
+			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.1f, 0.3f)(rng_);
+			f.pitch_tgt = coin() * std::uniform_real_distribution<float>(0.f, 0.15f)(rng_);
+			f.roll_tgt = 0.f;
+			f.man_t = std::uniform_real_distribution<double>(2., 4.)(rng_);
+			break;
+		case 1: // banked turn (bank emerges from yaw via the coordination below)
+			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.6f, 1.2f)(rng_);
+			f.pitch_tgt = coin() * std::uniform_real_distribution<float>(0.f, 0.2f)(rng_);
+			f.roll_tgt = 0.f;
+			f.man_t = std::uniform_real_distribution<double>(1.5, 3.)(rng_);
+			break;
+		case 2: // loop: sustained pitch for exactly one revolution
+			f.yaw_tgt = 0.f;
+			f.pitch_tgt = coin() * std::uniform_real_distribution<float>(1.2f, 1.8f)(rng_);
+			f.roll_tgt = 0.f;
+			f.man_t = 2. * std::numbers::pi / std::abs(f.pitch_tgt);
+			break;
+		case 3: // barrel roll: one full revolution with a hint of yaw
+			f.yaw_tgt = coin() * std::uniform_real_distribution<float>(0.1f, 0.3f)(rng_);
+			f.pitch_tgt = 0.f;
+			f.roll_tgt = coin() * float(2. * std::numbers::pi / std::uniform_real_distribution<double>(1.2, 2.)(rng_));
+			f.man_t = 2. * std::numbers::pi / std::abs(f.roll_tgt);
+			break;
+	}
+}
+
 void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active)
 {
 	(void)anchor_orient; // placement is position-only; heading is random
@@ -227,24 +291,19 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 	}
 	was_active_ = active;
 
-	size_t slot = 0;
-	for (auto & f: planes_)
+	for (size_t slot = 0; slot < planes_.size(); ++slot)
 	{
+		plane & f = planes_[slot];
 		auto * node = scene_.world.try_get<components::node>(f.root);
 		if (not node)
-		{
-			++slot;
 			continue;
-		}
 		if (not active)
 		{
 			node->visible = false;
-			++slot;
 			continue;
 		}
 
 		XrTime due = activated_t0_ + XrDuration(slot * spawn_interval * 1e9);
-		++slot;
 		if (now < due)
 		{
 			node->visible = false;
@@ -273,6 +332,70 @@ void kiosk_planes::update(XrTime now, const glm::vec3 & anchor_pos, const glm::q
 			std::memcpy(material->buffer->map(), &material->staging, sizeof(material->staging));
 			material->buffer->unmap();
 		}
+
+		// curvature-integrator flight: advance the frozen spawn state along
+		// the current maneuver targets, biased weakly home on overshoot
+		double dt = 0.;
+		if (f.prev_now != 0)
+			dt = std::clamp(double(now - f.prev_now) * 1e-9, 0., 0.05);
+		f.prev_now = now;
+		if (dt <= 0.)
+			continue;
+
+		f.man_t -= dt;
+		if (f.man_t <= 0.)
+			pick_maneuver(f);
+
+		const float blend = std::min(1.f, float(dt * rate_smooth));
+		f.pitch_rate += (f.pitch_tgt - f.pitch_rate) * blend;
+		f.yaw_rate += (f.yaw_tgt - f.yaw_rate) * blend;
+		f.roll_rate += (f.roll_tgt - f.roll_rate) * blend;
+
+		// moth-to-light: steer toward the live anchor, stronger the further
+		// past comfort. Capped well below loop pitch rates so figures can
+		// range out; a tendency, never a wall.
+		float yaw_bias = 0.f, pitch_bias = 0.f;
+		glm::vec3 to_anchor = anchor_pos - f.pos;
+		float dist = glm::length(to_anchor);
+		if (dist > comfort_r && dist > 1e-4f)
+		{
+			glm::vec3 want = to_anchor / dist;
+			glm::vec3 r = f.right;
+			if (std::abs(f.dir.y) < 0.98f)
+				r = glm::normalize(glm::cross(f.dir, glm::vec3{0.f, 1.f, 0.f}));
+			glm::vec3 u = glm::cross(r, f.dir);
+			glm::vec3 corr = want - f.dir * glm::dot(want, f.dir);
+			float w = std::min(1.f, (dist - comfort_r) / (leash_r - comfort_r));
+			yaw_bias = std::clamp(bias_gain * glm::dot(corr, r), -bias_max_rate, bias_max_rate) * w;
+			pitch_bias = std::clamp(bias_gain * glm::dot(corr, u), -bias_max_rate, bias_max_rate) * w;
+		}
+		float yaw = f.yaw_rate + yaw_bias;
+		float pitch = f.pitch_rate + pitch_bias;
+
+		// re-orthogonalized lateral axis (loops go vertical; keep the cache
+		// valid without letting it drift)
+		if (std::abs(f.dir.y) < 0.98f)
+		{
+			f.right = glm::normalize(glm::cross(f.dir, glm::vec3{0.f, 1.f, 0.f}));
+			f.right = glm::normalize(f.right - f.dir * glm::dot(f.right, f.dir));
+		}
+		glm::vec3 up0 = glm::cross(f.right, f.dir);
+		f.dir = glm::normalize(f.dir + (f.right * yaw + up0 * pitch) * float(dt));
+		f.pos += f.dir * f.speed * float(dt);
+
+		// rolls integrate; everything relaxes toward the coordinated bank
+		// for the current yaw rate. Wrap first: a finished roll is 2pi,
+		// which is 0 — relaxing unwrapped would spin all the way back.
+		float bank_tgt = std::clamp(yaw * bank_coord_gain, -bank_max, bank_max);
+		f.bank += f.roll_rate * float(dt);
+		f.bank = std::atan2(std::sin(f.bank), std::cos(f.bank));
+		f.bank += (bank_tgt - f.bank) * std::min(1.f, float(dt * bank_relax));
+
+		node->position = f.pos;
+		// basis verified on device: right=+X, up=+Y, nose=+Z maps onto dir,
+		// so positive bank (with positive yaw) leans into the turn
+		glm::quat orient = glm::quat_cast(glm::mat3(f.right, glm::cross(f.right, f.dir), f.dir));
+		node->orientation = glm::angleAxis(f.bank, f.dir) * orient;
 	}
 }
 

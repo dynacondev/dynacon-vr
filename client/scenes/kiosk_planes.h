@@ -34,18 +34,22 @@ namespace wivrn
 {
 
 // Small fleet of model planes for the kiosk waiting overlays, shared by the
-// lobby and stream scenes. Clean slate: no pathing. Planes spawn one by one
-// at random positions within 1m of the overlay panel, fade in, then stay
-// put forever (eternal: no flight paths, no fade-outs, no respawns). Create once
-// the scene world exists (on_focused), update every frame the overlay may
-// show, destroy with the scene (planes hold entities in the scene registry).
+// lobby and stream scenes. Planes spawn one by one at random positions
+// within 1m of the overlay panel, fade in, then fly forever under a
+// curvature integrator: maneuvers (cruise/turn/loop/roll) are just rate
+// targets, banking emerges from turn rate, and a weak containment bias pulls
+// the fleet back toward the live anchor moth-to-light style (positions stay
+// world-frozen, nothing translates with the panel). Create once the scene
+// world exists (on_focused), update every frame the overlay may show,
+// destroy with the scene (planes hold entities in the scene registry).
 class kiosk_planes
 {
 public:
 	kiosk_planes(::scene & scene, uint32_t layer_mask);
 
-	// anchor is the overlay panel pose sampled this frame; used for spawn
-	// placement only (positions freeze once spawned). Inactive planes are
+	// anchor is the overlay panel pose sampled this frame: spawn placement
+	// uses it once (positions freeze once spawned), and the containment bias
+	// steers toward its live position every frame. Inactive planes are
 	// hidden; re-showing replays the one-by-one spawn-in.
 	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active);
 
@@ -60,6 +64,17 @@ private:
 		std::vector<glm::vec3> base_emissives;
 		XrTime spawn_t0 = 0; // scheduled spawn moment (fade clock starts here)
 		bool spawned = false; // position assigned, never un-spawned while active
+		// curvature-integrator flight state (world space; the live anchor
+		// only steers via the containment bias, never translates the plane)
+		glm::vec3 pos{0.f};
+		glm::vec3 dir{0.f, 0.f, -1.f}; // unit flight direction
+		glm::vec3 right{1.f, 0.f, 0.f}; // cached lateral axis (rebuilt unless near-vertical)
+		float speed = 0.35f; // constant cruise (m/s)
+		float bank = 0.f; // smoothed visual bank (radians, wrapped to [-pi, pi])
+		float pitch_rate = 0.f, yaw_rate = 0.f, roll_rate = 0.f; // smoothed rates (rad/s)
+		float pitch_tgt = 0.f, yaw_tgt = 0.f, roll_tgt = 0.f; // maneuver targets (rad/s)
+		double man_t = 0.; // time left in the current maneuver (seconds)
+		XrTime prev_now = 0; // dt clock (0 = uninitialized)
 	};
 
 	::scene & scene_;
@@ -75,6 +90,7 @@ private:
 
 	void spawn_at(plane & f, const glm::vec3 & anchor_pos);
 	void apply_livery(plane & f);
+	void pick_maneuver(plane & f);
 };
 
 } // namespace wivrn
