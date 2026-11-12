@@ -578,63 +578,6 @@ configuration::configuration()
 						}
 					}
 				}
-				if (item.contains("dot-pitch"))
-				{
-					if (not is_hidden)
-						U_LOG_W("passthrough object \"%s\": dot-pitch is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
-					else if (not item["dot-pitch"].is_number())
-						U_LOG_W("passthrough object \"%s\": dot-pitch must be a number of meters, ignoring", o.id.c_str());
-					else
-					{
-						o.dot_pitch_m = item["dot-pitch"];
-						if (o.dot_pitch_m < 0.01f)
-						{
-							U_LOG_W("passthrough object \"%s\": dot-pitch too small, clamping to 0.01", o.id.c_str());
-							o.dot_pitch_m = 0.01f;
-						}
-						else if (o.dot_pitch_m > 1.0f)
-						{
-							U_LOG_W("passthrough object \"%s\": dot-pitch too large, clamping to 1", o.id.c_str());
-							o.dot_pitch_m = 1.0f;
-						}
-					}
-				}
-				if (item.contains("dot-color"))
-				{
-					if (not is_hidden)
-						U_LOG_W("passthrough object \"%s\": dot-color is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
-					else if (not item["dot-color"].is_string())
-						U_LOG_W("passthrough object \"%s\": dot-color must be a \"#RRGGBB\" hex string, ignoring", o.id.c_str());
-					else
-					{
-						const std::string hex = item["dot-color"];
-						auto nibble = [](char c) -> int {
-							if (c >= '0' and c <= '9')
-								return c - '0';
-							if (c >= 'a' and c <= 'f')
-								return c - 'a' + 10;
-							if (c >= 'A' and c <= 'F')
-								return c - 'A' + 10;
-							return -1;
-						};
-						std::string digits = hex;
-						if (not digits.empty() and digits[0] == '#')
-							digits.erase(digits.begin());
-						bool ok = digits.size() == 6;
-						int rgb[3] = {0, 0, 0};
-						for (int i = 0; ok and i < 3; ++i)
-						{
-							int hi = nibble(digits[2 * i]);
-							int lo = nibble(digits[2 * i + 1]);
-							ok = hi >= 0 and lo >= 0;
-							rgb[i] = hi * 16 + lo;
-						}
-						if (not ok)
-							U_LOG_W("passthrough object \"%s\": invalid dot-color \"%s\", expected \"#RRGGBB\", ignoring", o.id.c_str(), hex.c_str());
-						else
-							o.dot_color = {rgb[0] / 255.f, rgb[1] / 255.f, rgb[2] / 255.f};
-					}
-				}
 				if (item.contains("proximity-radius"))
 				{
 					if (not is_hidden)

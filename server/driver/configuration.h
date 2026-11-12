@@ -132,18 +132,8 @@ struct configuration
 		// surface (symmetric smoothstep, 0.5 at the surface). 0 = hard
 		// step at the surface. Ignored for other types (warned).
 		float transition_distance_m = 0.3f;
-		// Hidden dot pitch in meters (3d-passthrough-hidden only): fixed
-		// world-size dots wrapping the mesh (default 0.05, clamped to
-		// [0.01, 1]). Ignored for other types (warned).
-		float dot_pitch_m = 0.05f;
-		// Hidden-object dot color as RGB 0..1, parsed from a
-		// "#RRGGBB" hex string as-authored (no colorspace conversion;
-		// default #FF291A red). Tints the dot overlay (per-object
-		// color at draw time). Applied live. Ignored for other types
-		// (warned).
-		std::array<float, 3> dot_color = {1.0f, 0.16f, 0.10f};
 		// Proximity reveal radius in meters (3d-passthrough-hidden
-		// only): the cutout and dots show only where the mesh sits
+		// only): the cutout shows only where the mesh sits
 		// inside this distance of the head (hard near-field edge).
 		// Default 0.25, clamped to >= 0. Applied live.
 		float proximity_radius_m = 0.25f;

@@ -1044,11 +1044,10 @@ struct passthrough_object
 	// volumes. "3d-depth-passthrough" reveals the flat feed where the
 	// runtime depth map resolves inside the model volume (depth-tested
 	// volume, feathered like a normal window). "3d-passthrough-hidden"
-	// renders the model as a hard-edged always-on passthrough cutout on
-	// its own mask layer (reversed cuts never apply), plus a dot-grid
-	// overlay in the config color over the revealed feed. Unknown types
-	// are skipped
-	// client-side (forward-compat).
+	// reveals the flat feed where the model sits inside the proximity
+	// radius around the head (hard-edged near-field cutout, merged into
+	// the single merged submit layer; reversed cuts never apply).
+	// Unknown types are skipped client-side (forward-compat).
 	std::string type = "3d-passthrough";
 	std::string id;
 	std::string tag;
@@ -1074,16 +1073,8 @@ struct passthrough_object
 	// symmetric smoothstep over +/- this distance around the mesh
 	// surface (0.5 at the surface); 0 = hard step. Default 0.3.
 	float transition_distance_m = 0.3f;
-	// Hidden dot pitch in meters (3d-passthrough-hidden only): fixed
-	// world-size dots wrapping the mesh. Default 0.05.
-	float dot_pitch_m = 0.05f;
-	// Hidden-object dot color as RGB 0..1, parsed server-side
-	// from a "#RRGGBB" hex string as-authored (no colorspace conversion).
-	// Tints the dot overlay (per-object color at draw time). Applied
-	// live. Default #FF291A red.
-	std::array<float, 3> dot_color = {1.0f, 0.16f, 0.10f};
 	// Proximity reveal radius in meters (3d-passthrough-hidden only):
-	// the cutout and dots show only where the mesh sits inside this
+	// the cutout shows only where the mesh sits inside this
 	// distance of the head (hard near-field edge). Default 0.25.
 	float proximity_radius_m = 0.25f;
 	// Hand proximity reveal radius in meters (3d-passthrough-hidden

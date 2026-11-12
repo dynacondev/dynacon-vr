@@ -38,6 +38,7 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   3. When display disagrees with proven-oscillating logs, suspect the compositor channel, not the math: gate one variable per device round-trip with a throttled forensic log.
 
 ## Hidden passthrough idle discipline: CPU pre-gate, activity-pinned flat, one sphere field
+> HISTORICAL (dots overlay removed Nov 2026): rules 2-4 name the deleted dots layer / borrowed views. Rule 1 (CPU pre-gate) still applies.
 
 - Proximity used to be evaluated only on the GPU (mask depth test, dots frag discards), so idle frames (object placed but out of range) paid full acquire/record/submit: 2 swapchain acquires, ~7 half-res passes incl. the sphere field rasterized TWICE (mask RP1 + dots Pass1b), 3 submitted layers (hidden mask, dots, flat pinned by placement).
 - Rules:
@@ -48,6 +49,7 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   5. Hands: every `locate()` is a full 26-joint IPC (no peek API) — cost is per call, not per handle. Proximity borrows the GUI pair (no dedicated trackers); `hidden_wants_hands` shields the pair from the GUI interactability reset while a hidden map is live.
 
 ## Hidden multiview + submit-layout notes (Quest 3 validation pending)
+> HISTORICAL (dots overlay removed Nov 2026): dots passes/shaders/push notes below describe the deleted system. Mask MV rules still apply.
 
 - Hidden path runs 4 multiview passes (viewMask=both, one draw broadcasts to both layers) instead of 8 per-eye: mask RP1+RP2 (`feather_mask.cpp` `record_hidden`), dots prepass+color (`hidden_dots.cpp` `record`). New shader twins (`mask_mv.vert/frag`, `hidden_dotfill_mv.vert`, `hidden_dots_mv.vert/frag`): plain `gl_ViewIndex` indexing only. Scissors are both-eyes unions (skip iff both degenerate); submitted color passes keep full renderArea/CLEAR; dots prepass renderArea is the content union (sampled only at dot centers).
 - Push-size trap (caught by audit pre-commit, would have shipped silent garbage): with a shared push range, the VERT-declared block and the FRAG-declared block must agree byte-for-byte — pairing `mask_mv.vert` (opacity @128) with legacy `mask.frag` (opacity @64) passes pipeline creation and validation silently while the fragment reads `mvp[1][0][0]` as alpha (≈1 often, orientation-dependent reveal). Hence `mask_mv.frag` exists as a separate twin; never mix MV vert with legacy frag across a shared layout.
@@ -65,6 +67,5 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
 - Fold-into-merge was tried first and reverted: single-layer additive
   (ONE,ONE color) washes dots out over bright video (no true over
   without a video tap); binary hole-punch was discussed but not shipped.
-- Kept for protocol compat (accepted but ignored): server dot-pitch /
-  dot-color config + packet fields, map_key exclusions. Docs mark them
-  REMOVED (trial).
+- Config + packet fields removed too (server dot-pitch/dot-color,
+  packet members, session fill, docs): dev branch, no compat shims.

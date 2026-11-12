@@ -485,9 +485,6 @@ Each `passthrough` entry has:
   (symmetric smoothstep, 0.5 at the surface); `0` is a hard step.
   Composited by lifting the flat union's mask floor, so no extra layers
   or swapchains: exiting saturates the existing flat feed to fullscreen.
-- `dot-pitch` / `dot-color`: REMOVED (trial). The hidden dot overlay
-  no longer exists, so these fields are accepted but ignored; the
-  reveal is the hard-edged proximity cutout only.
 - `proximity-radius`: near-field reveal radius in meters
   (`3d-passthrough-hidden` only, default `0.25`, clamped to `>= 0`,
   applied live). The cutout shows only where the mesh sits

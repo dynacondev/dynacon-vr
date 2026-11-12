@@ -573,8 +573,6 @@ void wivrn_session::send_fiducial_map()
 		        .scale = entry.scale,
 		        .feather_px = entry.feather_px,
 		        .transition_distance_m = entry.transition_distance_m,
-		        .dot_pitch_m = entry.dot_pitch_m,
-		        .dot_color = entry.dot_color,
 		        .proximity_radius_m = entry.proximity_radius_m,
 		        .hand_proximity_radius_m = entry.hand_proximity_radius_m,
 		};
