@@ -763,8 +763,9 @@ private:
 	bool merge_this_frame = false;
 	// Dot overlay over the revealed camera feed: fixed world-size dots in
 	// the config color, front faces only, sampled-depth occlusion (no
-	// depth attachment in the dots pass). Own swapchain, submitted after
-	// the flat layer, before gizmos. -1 = inactive.
+	// depth attachment in the dots pass). Own swapchain, folded into
+	// the merge image (no separate layer); hidden_dots_active means
+	// "dots merged this frame". -1 = inactive.
 	std::unique_ptr<hidden_dots_renderer> hidden_dots;
 	int hidden_dots_image = -1;
 	bool hidden_dots_active = false;

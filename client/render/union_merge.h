@@ -25,6 +25,10 @@
 // union them with REPLACE-then-ADD dst-alpha blending. This pass
 // MAX-combines every active contributor into a single full-res image
 // (any-mask-reveals-wins), submitted once with REPLACE.
+// The hidden dots overlay rides along as a 9th sidecar input (not
+// counted in max_inputs): premultiplied dot RGB holed out of the
+// merged alpha, so the flat layer passes dots through where the
+// camera would otherwise cover them. One layer total instead of two.
 //
 // MAX preserves the safety theorems: hidden-wins-reversed (hidden only
 // adds coverage) and over-reveal (max >= every input). It differs from
@@ -35,9 +39,10 @@
 // the caller drops extras with a loud log (no fallback submit path —
 // >8 contributors means a config the merge was never sized for, and
 // dropping coverage under-reveals, so the error must stay visible).
-// Typical configs carry 1-3.
+// Typical configs carry 1-3. The dots sidecar is separate (binding 8)
+// and never consumes a mask slot.
 //
-// 4B FRAG-only count push (uniform early-out over the static taps:
+// 8B FRAG-only count + use_dots push (uniform early-out over the static taps:
 // unused slots still re-bind an active input's view, but taps past
 // the count never execute, so cost scales with real inputs; vert
 // declares nothing, so no VERT|FRAG mismatch trap), no derivatives,
@@ -66,10 +71,11 @@ public:
 	// Hard input cap (see above): more contributors than this are
 	// dropped by the caller with an error, never merged, never
 	// submitted on a fallback path. Typical configs carry 1-3.
-	// 8 is the static sampler-binding count in
+	// 8 is the static mask-binding count in
 	// union_merge_mv.frag.glsl (src0..src7, no descriptor indexing
 	// per the Adreno rule): raising max_inputs requires adding
 	// matching srcN shader bindings + layout slots in lockstep.
+	// Binding 8 is the dots sidecar (outside max_inputs).
 	static constexpr uint32_t max_inputs = 8;
 
 	// One merge input: a just-recorded contributor image plus its
@@ -114,13 +120,18 @@ public:
 	// acquired image (one fullscreen multiview draw, full extent).
 	// inputs must hold 1..max_inputs entries with valid borrowed
 	// views; empty or oversized returns false without recording
-	// (caller releases the acquisition to keep pairing). The
+	// (caller releases the acquisition to keep pairing). dots is an
+	// optional sidecar (borrowed dots image + array view, same-frame
+	// use only, never cached): null = masks only. A non-null dots
+	// with a null view refuses the whole merge (never a partial
+	// union). The
 	// descriptor set is rewritten per call (contributor images cycle
 	// independently); two sets ping-pong by call parity so an
 	// inline-fallback record never rewrites the set a still-flight
 	// async command buffer reads.
 	bool record(vk::raii::CommandBuffer & cmd, size_t image_index,
-	            vk::Extent2D extent, std::span<const input> inputs);
+	            vk::Extent2D extent, std::span<const input> inputs,
+	            const input * dots = nullptr);
 
 	xr::swapchain & swapchain()
 	{
@@ -141,8 +152,9 @@ private:
 	// wins, the submit-time REPLACE builds the dst-alpha union).
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
-	// 8 static sampler2DArray bindings (see the shader): linear +
+	// 9 static sampler2DArray bindings (see the shader): linear +
 	// ClampToEdge, the bilinear tap is the half/quarter upscale.
+	// Bindings 0..7 are mask inputs, binding 8 is the dots sidecar.
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	// Ping-pong pair (see record()): rewritten per call, never while

@@ -35,7 +35,7 @@ layout(location = 0) out vec4 out_color;
 // old saturating-ADD union only in overlap bands (0.6+0.6 saturated
 // to 1.0, MAX gives 0.6) — the double-count was a bug, not a feature.
 //
-// 8 STATIC bindings (not a sampler array): no descriptor-indexing
+// 8 STATIC mask bindings (not a sampler array): no descriptor-indexing
 // extension, no dynamic indexing for Adreno to miscompile, no
 // per-fragment early-out (loop-free, derivatives stay uniform).
 // Unused slots bind an already-active input's view again (same view
@@ -43,8 +43,13 @@ layout(location = 0) out vec4 out_color;
 // taps past the active inputs (uniform control flow — skipped
 // texture() calls never execute — so cost scales with real inputs,
 // not with the 8 slots).
-// RGB is zero: downstream the REPLACE blend preserves dst color and
-// the veil bias touches alpha only, so mask RGB is ignored.
+// RGB is zero for pure masks: downstream the ADDITIVE color blend
+// preserves dst color and the veil bias touches alpha only, so mask
+// RGB is ignored. The dots sidecar (src8) is the only non-zero RGB
+// source: premultiplied dot color (rgb·coverage) holed out of alpha
+// below, so the flat layer passes dots through where the camera
+// would otherwise cover them (hole-punch: keys off dots alpha,
+// never luminance).
 layout(set = 0, binding = 0) uniform sampler2DArray src0;
 layout(set = 0, binding = 1) uniform sampler2DArray src1;
 layout(set = 0, binding = 2) uniform sampler2DArray src2;
@@ -53,14 +58,20 @@ layout(set = 0, binding = 4) uniform sampler2DArray src4;
 layout(set = 0, binding = 5) uniform sampler2DArray src5;
 layout(set = 0, binding = 6) uniform sampler2DArray src6;
 layout(set = 0, binding = 7) uniform sampler2DArray src7;
+// Dots sidecar (quarter-res dots image, linear upscale like the
+// half/quarter feather inputs): premultiplied RGB + coverage alpha.
+// Bound to a valid view always (input 0 re-bound when inactive);
+// sampled only when use_dots is set (uniform branch).
+layout(set = 0, binding = 8) uniform sampler2DArray src8;
 
-// Active input count (1..8), pushed per draw. Uniform across the
-// draw, so the branches below are uniform control flow: skipped
-// taps never execute (no derivatives in this shader, nothing to
-// diverge). Static indexing throughout — Adreno-safe.
+// Active mask input count (1..8) + dots present flag, pushed per draw.
+// Uniform across the draw, so the branches below are uniform control
+// flow: skipped taps never execute (no derivatives in this shader,
+// nothing to diverge). Static indexing throughout — Adreno-safe.
 layout(push_constant) uniform Push
 {
 	int count;
+	int use_dots;
 }
 pc;
 
@@ -82,5 +93,13 @@ void main()
 		a = max(a, texture(src6, buv).a);
 	if (pc.count > 7)
 		a = max(a, texture(src7, buv).a);
-	out_color = vec4(0.0, 0.0, 0.0, a);
+	vec3 dots_rgb = vec3(0.0);
+	float dots_a = 0.0;
+	if (pc.use_dots != 0)
+	{
+		vec4 dots = texture(src8, buv);
+		dots_rgb = dots.rgb * dots.a;
+		dots_a = dots.a;
+	}
+	out_color = vec4(dots_rgb, a * (1.0 - dots_a));
 }

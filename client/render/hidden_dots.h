@@ -33,9 +33,11 @@
 // half-chopped by geometry. Trivial circle fragment with a 1px AA band
 // and coverage fade at distance.
 //
-// Composited as ONE transparent projection layer (standard alpha blend,
-// above the flat passthrough, below gizmos/GUI) so the maxLayerCount
-// discipline holds. Own swapchain, no depth. Render thread only.
+// Composited through the union-merge layer (not its own layer): the
+// merged mask image carries premultiplied dot RGB holed out of its
+// alpha, so the flat passthrough passes dots through where the
+// camera would otherwise cover them. Own swapchain, no depth. Render
+// thread only.
 
 #include <array>
 #include <cstddef>
@@ -109,6 +111,17 @@ public:
 	{
 		return (bool)swapchain_;
 	}
+
+	// Borrowed submitted-image array view (both layers) for the
+	// merge pass: the just-recorded image's multiview color view,
+	// sampled (not rendered) by the merge. Built for every recorded
+	// image alongside the framebuffers, so any image recorded this
+	// frame has one. Null when unknown (retired image or never
+	// recorded): the caller must skip the input loudly, never
+	// silently. Same borrowed lifetime as the mesh buffers above
+	// (dies with ensure() rebuilds — merge uses it same-frame only,
+	// so no reset coupling needed).
+	vk::ImageView submitted_view_array(vk::Image image) const;
 
 	// Acquire + wait (100ms); -1 on timeout (pairing-safe: the untouched
 	// acquisition is released inside, skip the frame).
