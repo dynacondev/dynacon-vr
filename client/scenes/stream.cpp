@@ -479,7 +479,10 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	        self->device,
 	        vk::QueryPoolCreateInfo{
 	                .queryType = vk::QueryType::eTimestamp,
-	                .queryCount = 3,
+	                // q0 start, q1 after first group, q2 end, q3/q4
+	                // merge bracket (stamped unconditionally,
+	                // zero span when the merge sits out).
+	                .queryCount = 5,
 	        });
 
 	// Volume GPU brackets (raster/virt/compare/merge boundaries, 5 queries).
@@ -778,15 +781,94 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, scenes::stream::deco
 				result[i] = *min;
 			}
 		}
+		// Forensics for the stereo-divergence hypothesis: the fallback
+		// above pairs each eye independently, so left/right can display
+		// different frame_idx (depth below can only match left). Log the
+		// selected index + display-time delta per color eye every time.
+		{
+			std::string sel;
+			for (size_t i = 0; i < color_count; ++i)
+			{
+				if (result[i])
+				{
+					auto d_ms = (double)(result[i]->view_info.display_time - display_time) * 1e-6;
+					sel += fmt::format(" s{}={}({:+.1f}ms)", i, result[i]->feedback.frame_index, d_ms);
+				}
+				else
+					sel += fmt::format(" s{}=-", i);
+			}
+			bool divergent = color_count > 1 and result[0] and result[1] and
+			        result[0]->feedback.frame_index != result[1]->feedback.frame_index;
+			spdlog::warn("Common-frame fallback selected:{} divergent={}", sel, divergent);
+		}
 	}
-	// Virtual depth (stream 3) never joins the common-frame intersection:
-	// strict frame_idx pairing with the selected color frame, else null
-	// (the volume compare skips the virtual term for that frame). No
-	// hold-last: stale virtual depth occludes wrong pixels. Note the
-	// fallback path above pairs per-decoder nearest, so depth follows
-	// the left eye there (warn path only, same strict rule otherwise).
-	if (result[0])
-		result[depth_stream_index] = decoders[depth_stream_index].frame(result[0]->feedback.frame_index);
+	// Virtual depth (stream 3) pairs with the selected color frame by
+	// frame_idx, tolerating ±1 (exact first, then nearest, ties to the
+	// older): depth trails (or, on a color stall, leads) color by a frame
+	// when either stream jitters, and strict equality turned that into a
+	// dropped VR cut. Index-based, never time-based: depth N is registered
+	// to color N's eye, and nearest index keeps the pair registered. The
+	// scan covers the decoder's own 3-slot window, so skew is bounded and
+	// no ancient frame can ever pair (no hold-last). Gated on
+	// depth_expected (a straight server frame must never pair a
+	// neighboring warped frame's depth) and on the decoder being live.
+	// Left-anchored: depth follows result[0], as before.
+	if (result[0] and result[0]->view_info.depth_expected and decoders[depth_stream_index].decoder)
+	{
+		uint64_t target = result[0]->feedback.frame_index;
+		if (auto exact = decoders[depth_stream_index].frame(target))
+			result[depth_stream_index] = std::move(exact);
+		else
+		{
+			int64_t best_ad = 2; // sentinel: any |d|<=1 wins
+			int64_t best_d = 0;
+			std::shared_ptr<shard_accumulator::blit_handle> best;
+			for (const auto & h: decoders[depth_stream_index].latest_frames)
+			{
+				if (not h)
+					continue;
+				int64_t d = (int64_t)h->feedback.frame_index - (int64_t)target;
+				int64_t ad = d < 0 ? -d : d;
+				if (ad > 1)
+					continue;
+				if (ad < best_ad or (ad == best_ad and d < best_d))
+				{
+					best_ad = ad;
+					best_d = d;
+					best = h;
+				}
+			}
+			result[depth_stream_index] = std::move(best);
+		}
+	}
+	// Forensics for the color-without-depth hypothesis: expected (server
+	// packed depth for this frame_idx) but even tolerant (±1) pairing
+	// found none.
+	// Throttled 1s: isolated single-frame misses each log, sustained
+	// outages don't spam. The depth decoder window is dumped so wire
+	// loss (frame never arrived) reads apart from pairing miss (frame
+	// arrived but outside the 3-slot window / display-time pick).
+	if (result[0] and not result[depth_stream_index] and result[0]->view_info.depth_expected)
+	{
+		XrTime now = instance.now();
+		if (now - depth_miss_last_log > 1'000'000'000LL)
+		{
+			depth_miss_last_log = now;
+			std::string dwin;
+			for (const auto & frame: decoders[depth_stream_index].latest_frames)
+			{
+				if (frame)
+					dwin += " " + std::to_string(frame->feedback.frame_index);
+				else
+					dwin += " -";
+			}
+			uint64_t left_idx = result[0]->feedback.frame_index;
+			uint64_t right_idx = result[1] ? result[1]->feedback.frame_index : UINT64_MAX;
+			spdlog::warn("Virt depth expected-but-missing: color L={} R={} depth window:{}, display_dt_L={:+.1f}ms", left_idx,
+			             result[1] ? std::to_string(right_idx) : std::string("-"),
+			             dwin, (double)(result[0]->view_info.display_time - display_time) * 1e-6);
+		}
+	}
 	return result;
 }
 
@@ -1059,16 +1141,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// the render thread.
 	if (query_pool_filled)
 	{
-		// Only the five written queries (0..4): the pool is sized for
-		// the whole struct but the spare queries are never written,
-		// and waiting on an unwritten query blocks forever (black
-		// screen: the render thread stalls here after exactly one
-		// frame).
+		// Only the written queries: the pool is sized for the whole
+		// struct but unwritten queries block forever (black screen:
+		// the render thread stalls here after exactly one frame).
 		// q4 (post-first-group) is written only on inline frames; on
 		// async frames the mask spans come from the mask pool below.
-		// Either way only written queries are read (never wait on an
-		// unwritten query).
-		uint32_t main_qcount = use_async_masks ? 4 : 5;
+		// q5/q6 (merge bracket) are written on inline mask
+		// frames only, unconditionally (zero span when the merge sits
+		// out). Non-mask runtimes never write them (the mask condition
+		// is a session constant: extension support + stereo), so the
+		// read range follows it. Either way only written queries are
+		// read (never wait on an unwritten query).
+		bool mask_path = composition_layer_alpha_blend_supported and view_count == 2; // same condition as mask_frame below
+		uint32_t main_qcount = use_async_masks ? 4 : (mask_path ? 7 : 5);
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
 		        main_qcount,
@@ -1087,12 +1172,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				last_gpu_timestamps.mask_gpu_time = (timestamps2[1] - timestamps2[3]) * period;
 				last_gpu_timestamps.mask_first_gpu_time = (timestamps2[4] - timestamps2[3]) * period;
 				last_gpu_timestamps.mask_rest_gpu_time = (timestamps2[1] - timestamps2[4]) * period;
+				// q5/q6 exist only on mask-path frames (see main_qcount
+				// above): never index past a 5-entry read on runtimes
+				// without the alpha-blend extension.
+				if (mask_path)
+					last_gpu_timestamps.merge_gpu_time = (timestamps2[6] - timestamps2[5]) * period;
 			}
 		}
 	}
 
 	// Mask-pool results (async path): q0 start, q1 after first group,
-	// q2 end. Read only when the last mask submission went async (else
+	// q2 end, q3/q4 merge bracket. Read only when the last mask submission went async (else
 	// the pool holds older data); not-ready carries like the main pool.
 	// Volume-pool results: raster/virt/compare/merge boundaries from the
 	// last volume group. Same poll discipline (no eWait, carry over),
@@ -1126,8 +1216,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	{
 		auto [mres, mtimestamps] = mask_query_pool.getResults<uint64_t>(
 		        0,
-		        3,
-		        3 * sizeof(uint64_t),
+		        5,
+		        5 * sizeof(uint64_t),
 		        sizeof(uint64_t),
 		        vk::QueryResultFlagBits::e64);
 
@@ -1137,6 +1227,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			last_gpu_timestamps.mask_gpu_time = (mtimestamps[2] - mtimestamps[0]) * period;
 			last_gpu_timestamps.mask_first_gpu_time = (mtimestamps[1] - mtimestamps[0]) * period;
 			last_gpu_timestamps.mask_rest_gpu_time = (mtimestamps[2] - mtimestamps[1]) * period;
+			last_gpu_timestamps.merge_gpu_time = (mtimestamps[4] - mtimestamps[3]) * period;
 		}
 	}
 
@@ -1173,9 +1264,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 	update_video_stall_status(video_starved and ever_received_video);
-	std::array<XrPosef, view_count> pose;
-	std::array<XrFovf, view_count> fov;
-	std::array<wivrn::to_headset::foveation_parameter, view_count> foveation;
+	std::array<XrPosef, view_count> pose{};
+	std::array<XrFovf, view_count> fov{};
+	std::array<wivrn::to_headset::foveation_parameter, view_count> foveation{};
 	bool use_alpha = false;
 
 	std::array<stream_defoveator::input, view_count> images;
@@ -1198,6 +1289,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		glm::quat iq = glm::conjugate(aq);
 		video_unshift.emplace(iq, iq * -ap);
 	}
+	// Origin-alignment counter-shift applied to any server-stamped pose
+	// before it is submitted into unshifted world space (video poses
+	// above, depth reference eye below — one helper so the two can never
+	// drift apart).
+	auto apply_unshift = [&](XrPosef p) {
+		if (not video_unshift)
+			return p;
+		auto & [iq, ip] = *video_unshift;
+		glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+		glm::vec3 v(p.position.x, p.position.y, p.position.z);
+		glm::quat rq = iq * q;
+		glm::vec3 rp = iq * v + ip;
+		p.orientation = {rq.x, rq.y, rq.z, rq.w};
+		p.position = {rp.x, rp.y, rp.z};
+		return p;
+	};
 	for (size_t i = 0; i < view_count + use_alpha; ++i)
 	{
 		auto & blit_handle = current_blit_handles[i];
@@ -1268,20 +1375,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		if (i < view_count)
 		{
 			foveation[i] = blit_handle->view_info.foveation[i];
-			pose[i] = blit_handle->view_info.pose[i];
-			if (video_unshift)
-			{
-				auto & [iq, ip] = *video_unshift;
-				glm::quat q(pose[i].orientation.w,
-				            pose[i].orientation.x,
-				            pose[i].orientation.y,
-				            pose[i].orientation.z);
-				glm::vec3 p(pose[i].position.x, pose[i].position.y, pose[i].position.z);
-				glm::quat rq = iq * q;
-				glm::vec3 rp = iq * p + ip;
-				pose[i].orientation = {rq.x, rq.y, rq.z, rq.w};
-				pose[i].position = {rp.x, rp.y, rp.z};
-			}
+			pose[i] = apply_unshift(blit_handle->view_info.pose[i]);
 			fov[i] = blit_handle->view_info.fov[i];
 			// colour image
 			images[i] = {
@@ -1381,13 +1475,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 	}
 
-	// Mask record/submit views: located live at predicted display time,
-	// not the video frame's pose. The video layer keeps its own pose (and
-	// its own runtime warp); masks warped from a stale video pose trail
-	// live geometry (projected instances) and live camera under head
-	// motion (black trailing edge). Each layer warps independently, so a
-	// fresher mask pose strictly reduces warp error. Falls back to the
-	// video pose when locating fails.
+	// Mask record/submit views: server eye timebase, not live predicted.
+	// The mask alpha composites with server video (and the VR-occlusion
+	// compare tests server virtual depth against the object raster), so
+	// raster + submit share one reference eye and the runtime warps each
+	// layer to display from its own submitted pose. The reference eye is
+	// the paired depth frame's eye whenever depth is paired (identical
+	// values on exact pairing) and the color eye otherwise — so the
+	// compare never mixes viewpoints while the video stays on the color
+	// eye it was rendered for. Live views stay live for GUI,
+	// gizmos and the depth debug viz (independent overlays).
+	// Falls back to the live pose when no server frame is paired.
 	std::array<XrPosef, view_count> mask_pose = pose;
 	std::array<XrFovf, view_count> mask_fov = fov;
 	// Located once per frame and reused by draw_gui below (same time +
@@ -1406,6 +1504,63 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 		}
 		live_views_for_gui = std::move(live_views);
+	}
+
+	// Sync eye for everything that composites with server video: the
+	// reference eye (depth frame's eye when depth is paired, else the
+	// video layer's own pose/fov, i.e. the eye the server rendered).
+	// Raster and virt must share parametrization for the compare, and
+	// raster-eye must equal submit-pose for the runtime warp — the union
+	// merge submits one layer with one pose, so both eyes switch together
+	// (never per-group), each falling back to color, then live,
+	// independently when the depth eye is unpaired or degenerate
+	// (partial pairing / teardown races). Divergent color eyes skip the
+	// switch outright: depth is left-anchored, so the right eye stays on
+	// its own color pose there. Static-world caveat: latest fused object
+	// poses and live vote positions reused here; moving boards would need
+	// a pose history.
+	auto depth_eye_valid = [](const XrPosef & p, const XrFovf & f) {
+		float n2 = p.orientation.w * p.orientation.w + p.orientation.x * p.orientation.x +
+		        p.orientation.y * p.orientation.y + p.orientation.z * p.orientation.z;
+		if (not (n2 > 0.5f and n2 < 2.0f))
+			return false;
+		if (not (std::isfinite(p.orientation.w) and std::isfinite(p.orientation.x) and std::isfinite(p.orientation.y) and
+		         std::isfinite(p.orientation.z) and std::isfinite(p.position.x) and std::isfinite(p.position.y) and
+		         std::isfinite(p.position.z)))
+			return false;
+		if (not (std::isfinite(f.angleLeft) and std::isfinite(f.angleRight) and std::isfinite(f.angleUp) and
+		         std::isfinite(f.angleDown)))
+			return false;
+		if (f.angleRight - f.angleLeft < 1e-4f or f.angleUp - f.angleDown < 1e-4f)
+			return false;
+		return true;
+	};
+	auto & sync_depth_handle = current_blit_handles[depth_stream_index];
+	// Divergent color eyes (fallback path picked different frame_idx per
+	// eye): the depth frame is anchored to the left eye, so a frame-wide
+	// switch would drive the right eye's raster/submit from an unrelated
+	// frame. Stay on per-eye color there, exactly as before.
+	bool color_divergent = current_blit_handles[0] != nullptr and current_blit_handles[1] != nullptr and
+	        current_blit_handles[0]->feedback.frame_index != current_blit_handles[1]->feedback.frame_index;
+	std::array<XrPosef, view_count> sync_pose{};
+	std::array<XrFovf, view_count> sync_fov{};
+	std::array<bool, view_count> sync_is_depth_eye{};
+	for (uint32_t view = 0; view < view_count; ++view)
+	{
+		bool have_eye = view < current_blit_handles.size() and current_blit_handles[view] != nullptr;
+		bool have_depth_eye = not color_divergent and sync_depth_handle != nullptr and
+		        depth_eye_valid(sync_depth_handle->view_info.pose[view], sync_depth_handle->view_info.fov[view]);
+		if (have_depth_eye)
+		{
+			sync_is_depth_eye[view] = true;
+			sync_pose[view] = apply_unshift(sync_depth_handle->view_info.pose[view]);
+			sync_fov[view] = sync_depth_handle->view_info.fov[view];
+		}
+		else
+		{
+			sync_pose[view] = have_eye ? pose[view] : mask_pose[view];
+			sync_fov[view] = have_eye ? fov[view] : mask_fov[view];
+		}
 	}
 
 	// Eye velocity history for the depth time-bias test slider: finite
@@ -1489,7 +1644,67 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		// Marker tracking runs every frame: solved frames feed the
 		// record phase below (cutouts, gizmos) and the status UI.
-		update_fiducial_passthrough(frame_state.predictedDisplayTime);
+		// Sync timebase: the mask alpha composites with server video, so
+		// mask-raster transforms ride the reference-eye display time
+		// (depth when the mask chain is depth-eyed, else the first paired
+		// color eye). Tracking/filtering itself stays live.
+		// Eye-0 time: both eyes share frame_index on the common path;
+		// fallback scans for the first paired eye below.
+		XrTime sync_display_time = frame_state.predictedDisplayTime;
+		if (sync_is_depth_eye[0] and sync_depth_handle)
+			sync_display_time = sync_depth_handle->view_info.display_time;
+		else
+			for (const auto & h: current_blit_handles)
+			{
+				if (h)
+				{
+					sync_display_time = h->view_info.display_time;
+					break;
+				}
+			}
+		update_fiducial_passthrough(frame_state.predictedDisplayTime, sync_display_time);
+
+		// Hidden state, computed once per frame and shared by the nomask
+		// gate and mask record below (one scan, not
+		// five). Working buffers live on the scene (members, capacity
+		// survives clear()); the silhouette build in the mask phase fills
+		// them (see below).
+		bool hidden_known = false; // map-known (placed or not)
+		bool hidden_placed = false; // placed + mesh ready
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			(void)oid;
+			if (ost.def.type != "3d-passthrough-hidden")
+				continue;
+			hidden_known = true;
+			if (ost.soup_ready and ost.fused.placed)
+			{
+				hidden_placed = true;
+				break;
+			}
+		}
+		// Shared hand trackers: while a hidden map is live the proximity
+		// palms borrow the GUI pair (created on demand below), so the
+		// GUI must not reset them on interactability loss. Map-level
+		// (not placed-level): steady across placement flaps, zero
+		// per-frame cost when unplaced (no locates run).
+		hidden_wants_hands = hidden_known;
+		// Per-frame hidden working buffers (declared here, filled by the
+		// shared silhouette build in the mask phase; capacity survives).
+		hidden_silhouettes.clear();
+		hidden_mask_draws.clear();
+		hidden_silhouettes.reserve(passthrough_objects.size());
+
+		// Hidden objects need the mask path (alpha blend): without it they
+		// stay unrevealed rather than flashing. One-shot log.
+		if (not mask_frame)
+		{
+			if (hidden_placed and not hidden_nomask_warned)
+			{
+				hidden_nomask_warned = true;
+				spdlog::warn("Hidden passthrough objects placed but the mask path is unavailable on this runtime, staying unrevealed");
+			}
+		}
 
 		// Depth-volume objects (3d-depth-passthrough) need the runtime
 		// depth feed this frame: placed + mesh ready, any feather. The
@@ -1540,6 +1755,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					env_depth->start();
 					auto acq_t0 = std::chrono::steady_clock::now();
+					// Live acquire: sensor pose rides predicted time; H
+					// absorbs the server-eye delta at compare time.
 					bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, shared_depth);
 					double acq_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - acq_t0).count();
 					if (need_volume_depth and mask_frame)
@@ -1566,7 +1783,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
 		volume_acquire_ms = volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = 0;
+		vr_raster_ms = vr_compare_ms = vr_merge_ms = 0;
 		volume_frame_virt_paired = false;
+		vr_frame_wanted = false;
+		vr_frame_virt_paired = false;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
@@ -1650,14 +1870,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					return glm::mat3(glm::vec3(P[0][0], P[0][1], P[0][3]), glm::vec3(P[1][0], P[1][1], P[1][3]),
 					                   glm::vec3(P[2][0], P[2][1], P[2][3]));
 				};
-				glm::mat3 Qe = Q_of(scene::projection_matrix(mask_fov[view]));
+				glm::mat3 Qe = Q_of(scene::projection_matrix(sync_fov[view]));
 				glm::mat3 Qd = Q_of(scene::projection_matrix(shared_depth.fov[view]));
 				if (std::abs(glm::determinant(Qe)) < 1e-9f or std::abs(glm::determinant(Qd)) < 1e-9f)
 				{
 					h_ok = false;
 					break;
 				}
-				glm::mat3 Rew = glm::mat3(scene::view_matrix(mask_pose[view]));
+				glm::mat3 Rew = glm::mat3(scene::view_matrix(sync_pose[view]));
 				glm::mat3 Rcw = glm::mat3(scene::view_matrix(depth_pose[view]));
 				glm::mat3 H = Suv * Qd * Rcw * glm::inverse(Rew) * glm::inverse(Qe) * E1;
 				for (int c = 0; c < 3; ++c)
@@ -1666,7 +1886,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// forward (qt.z) deliberately dropped here. a, b give
 				// 1/depth = a*D + b for the sensor D encoding.
 				{
-					const auto & pe = mask_pose[view].position;
+					const auto & pe = sync_pose[view].position;
 					const auto & pcap = depth_pose[view].position;
 					glm::vec3 dw(pe.x - pcap.x, pe.y - pcap.y, pe.z - pcap.z);
 					glm::vec3 tc = Rcw * dw;
@@ -1674,7 +1894,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					float n = shared_depth.near_z;
 					float f = shared_depth.far_z;
 					float a = 0, b = 0;
-					// Same infinite-far convention as volume_raster.frag:
+					// Same infinite-far convention as volume_raster_mv.frag:
 					// !(f > n) or huge f means D = 1 - n/d.
 					if (n > 1e-6f and (!(f > n) or f > 1e9f))
 					{
@@ -1717,12 +1937,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			volume_compare_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - remap_t0).count();
 		}
 
-		// View-only transforms for the mask record below. Live
-		// predicted views (mask_pose/mask_fov), not the video frame's
-		// pose: see the mask_pose block above.
+		// View-only transforms for the mask record below. Reference eye
+		// (sync_pose/sync_fov): the depth frame's eye when the mask chain
+		// is depth-eyed, else the video frame's pose — so the silhouette
+		// raster, VR/volume draws and cutout punch always share the eye
+		// the submitted mask layer is posed with (one warp per layer).
+		// world_mvp stays live for gizmos/debug viz (independent overlays).
 		std::array<glm::mat4, view_count> world_mvp;
 		for (uint32_t view = 0; view < view_count; ++view)
 			world_mvp[view] = scene::projection_matrix(mask_fov[view]) * scene::view_matrix(mask_pose[view]);
+		std::array<glm::mat4, view_count> server_mvp;
+		for (uint32_t view = 0; view < view_count; ++view)
+			server_mvp[view] = scene::projection_matrix(sync_fov[view]) * scene::view_matrix(sync_pose[view]);
 
 		// Mask record phase, factored to run at two points: async on
 		// its own command buffer ahead of the video wait (masks need
@@ -1732,7 +1958,129 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// outputs, so no cross-submit semaphore is needed: the
 		// compositor joins via swapchain release (gated on the mask
 		// fence below).
-		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit) {
+		// One hidden-silhouette build per frame, feeding the hidden mask
+		// draw list + scissor: model/MVP/visibility
+		// computed once instead of per consumer. 1px margin per eye floored
+		// by the mask working size: a superset of the old mask margin for
+		// every eye, so the mask may keep a ≤1px sliver it previously
+		// skipped — visually identical.
+		// Full-res pixel bounds per eye ride along for the mask scissor
+		// (any behind-camera corner → fullscreen that eye).
+		auto build_hidden_silhouettes = [&](int mask_w, int mask_h) {
+			hidden_silhouettes.clear();
+			auto * fr = hidden_group.renderer.get();
+			if (not fr)
+				return;
+			for (auto & [oid, ost]: passthrough_objects)
+			{
+				if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+					continue;
+				const auto & fu = ost.fused;
+				glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+				            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+				glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+				glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+				                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+				hidden_silhouette_draw s;
+				s.mesh = oid;
+				for (uint32_t view = 0; view < view_count; ++view)
+					s.mvp[view] = server_mvp[view] * model;
+				// Unknown bounds (sync above uploads before draws, so
+				// unexpected): keep the draw with a fullscreen scissor,
+				// then the frustum skip below (1px margin per eye, floored
+				// by the mask working size so the shared test stays a
+				// superset of the old mask margin even under asymmetric
+				// eyes).
+				for (uint32_t view = 0; view < 2; ++view)
+					s.px[view] = {0, 0, (float)extents[view].width, (float)extents[view].height};
+				bool visible = true;
+				if (auto bounds = fr->mesh_bounds(oid))
+				{
+					visible = false;
+					for (uint32_t view = 0; view < 2 and not visible; ++view)
+					{
+						float denom_w = std::min((float)mask_w, (float)extents[view].width);
+						float denom_h = std::min((float)mask_h, (float)extents[view].height);
+						bool any_front = false, any_behind = false, any_inside = false;
+						float x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+						bool any_px = false;
+						for (int corner = 0; corner < 8; ++corner)
+						{
+							glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+							               (corner & 2) ? bounds->second.y : bounds->first.y,
+							               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+							glm::vec4 c = s.mvp[view] * q4;
+							if (c.w <= 0)
+							{
+								any_behind = true;
+								continue;
+							}
+							any_front = true;
+							if (glm::abs(c.x) <= c.w * (1.f + 1.f / (denom_w * 0.5f)) and
+							    glm::abs(c.y) <= c.w * (1.f + 1.f / (denom_h * 0.5f)) and c.z >= 0 and c.z <= c.w)
+								any_inside = true;
+							float px = (c.x / c.w * 0.5f + 0.5f) * (float)extents[view].width;
+							float py = (c.y / c.w * 0.5f + 0.5f) * (float)extents[view].height;
+							if (not any_px)
+							{
+								x0 = x1 = px;
+								y0 = y1 = py;
+								any_px = true;
+							}
+							else
+							{
+								x0 = std::min(x0, px);
+								x1 = std::max(x1, px);
+								y0 = std::min(y0, py);
+								y1 = std::max(y1, py);
+							}
+						}
+						visible = any_front and (any_behind or any_inside);
+						if (any_behind or not any_px)
+						{
+							// Behind-camera corners poison the divide (or no
+							// corner reprojected): cover the eye fullscreen.
+							x0 = 0;
+							y0 = 0;
+							x1 = (float)extents[view].width;
+							y1 = (float)extents[view].height;
+						}
+						s.px[view] = {x0, y0, x1, y1};
+					}
+					// World-space AABB for the CPU proximity pre-gate
+					// (P0): model-space bounds through the model matrix
+					// (8 corners; the MVPs above already paid the
+					// expensive part). Unknown-bounds draws keep
+					// bounds_known=false and pass the gate conservatively.
+					glm::vec3 wmin(0), wmax(0);
+					for (int corner = 0; corner < 8; ++corner)
+					{
+						glm::vec4 q4((corner & 1) ? bounds->second.x : bounds->first.x,
+						               (corner & 2) ? bounds->second.y : bounds->first.y,
+						               (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+						glm::vec3 w = glm::vec3(model * q4);
+						if (corner == 0)
+						{
+							wmin = wmax = w;
+							continue;
+						}
+						wmin.x = std::min(wmin.x, w.x);
+						wmin.y = std::min(wmin.y, w.y);
+						wmin.z = std::min(wmin.z, w.z);
+						wmax.x = std::max(wmax.x, w.x);
+						wmax.y = std::max(wmax.y, w.y);
+						wmax.z = std::max(wmax.z, w.z);
+					}
+					s.world_min = wmin;
+					s.world_max = wmax;
+					s.bounds_known = true;
+				}
+				if (not visible)
+					continue;
+				hidden_silhouettes.push_back(std::move(s));
+			}
+		};
+		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit, uint32_t qmerge) {
 			// Volume sensor from the shared frame (acquired once above).
 			// Content age + index rate feed the Volume heartbeat: age is
 			// the deferred pose-correction signal, the index rate is the
@@ -1749,7 +2097,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					++volume_win_acquired;
 					if (shared_depth.capture_time != 0)
 					{
-						double age_ms = (frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6;
+						// Sync (server) eye timebase: age relative to the
+						// display time the raster actually targets.
+						double age_ms = (sync_display_time - shared_depth.capture_time) * 1e-6;
 						volume_last_age_ms = (float)age_ms;
 						volume_win_age_sum += age_ms;
 						volume_win_age_max = std::max(volume_win_age_max, age_ms);
@@ -1808,37 +2158,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// onto: the flat feed must stay submitted (see submit).
 				cutouts_punched = not cutouts.empty();
 				// Claim groups + sync member soups (upload on hash change).
-				// Groups are keyed (feather, union): A (true) drives the
-				// projected layer, B (false) the flat layer. Record order
-				// is A ascending, then B ascending (submit matches).
-				std::set<float> live_a, live_b;
-				// Pre-warmed (map-known, not necessarily placed) combos.
+				// Groups are keyed by feather-px; record order is
+				// feather-ascending.
+				std::set<float> live;
+				// Pre-warmed (map-known, not necessarily placed) feathers.
 				// Kept by the stale-erase below alongside live_groups, but
-				// kept OUT of live_a/live_b: those drive record order and
+				// kept OUT of live: it drives record order and
 				// the debug-cutout fallback, which must reflect placed
 				// objects only.
-				std::set<std::pair<float, bool>> prewarmed_keys;
+				std::set<float> prewarmed_keys;
 				// Pre-warm pass (first-visible-frame hitch fix): claim
-				// renderer + swapchain + intermediates for every (feather,
-				// union) combo in the map, before anything is placed or
-				// uploaded. Placement frames then only rasterize. Combos
+				// renderer + swapchain + intermediates for every feather
+				// value in the map, before anything is placed or
+				// uploaded. Placement frames then only rasterize. Feathers
 				// with nothing placed record no draws and stay inactive.
 				// Mirrors the storage blocks in the record loop (which
 				// become no-ops once pre-warmed).
 				for (auto & [oid, ost]: passthrough_objects)
 				{
-					// Depth volumes share their feather's flat group (they
-					// merge into its seed; surface projection never applies).
+					// Depth volumes share their feather's group (they
+					// merge into its seed).
 					bool pdepth = ost.def.type == "3d-depth-passthrough";
 					if (ost.def.type != "3d-passthrough" and not pdepth)
 						continue;
 					float pf = ost.def.feather_px;
-					bool pproj = surface_projected_effective(oid, ost);
-					prewarmed_keys.emplace(pf, pproj);
-					auto pkey = std::make_pair(pf, pproj);
-					auto & pg = mask_groups[pkey];
+					prewarmed_keys.emplace(pf);
+					auto & pg = mask_groups[pf];
 					pg.feather_px = pf;
-					pg.projected = pproj;
 					if (not pg.renderer)
 					{
 						pg.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
@@ -1851,9 +2197,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						device.waitIdle();
 						pg.swapchain = xr::swapchain(instance, session, device, swapchain.format(), pgw, pgh, 1, view_count);
 						pg.renderer->reset_targets();
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", pgw, pgh, pf, pproj ? "A" : "B", pg.swapchain.image_count());
+						spdlog::info("Feather mask swapchain: {}x{} (feather {}px, {} images)", pgw, pgh, pf, pg.swapchain.image_count());
 					}
-					pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+					pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh}, ptier != 0);
 				}
 				for (auto & [oid, ost]: passthrough_objects)
 				{
@@ -1861,12 +2207,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					if ((ost.def.type != "3d-passthrough" and not is_depth_vol) or not ost.soup_ready or not ost.fused.placed)
 						continue;
 					float f = ost.def.feather_px;
-					bool proj = surface_projected_effective(oid, ost);
-					(proj ? live_a : live_b).insert(f);
-					auto key = std::make_pair(f, proj);
-					auto & g = mask_groups[key];
+					live.insert(f);
+					auto & g = mask_groups[f];
 					g.feather_px = f;
-					g.projected = proj;
 					if (not g.renderer)
 					{
 						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
@@ -1878,14 +2221,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.mesh_hashes[oid] = ost.soup_hash;
 					}
 				}
-				// Reversed objects (negatives) cut every group of both
-				// unions: appended after all positives (the renderer
+				// Reversed objects (negatives) cut every group:
+				// appended after all positives (the renderer
 				// resolves positives first, then depth-tested MIN cuts).
-				std::vector<std::pair<float, bool>> live_groups;
-				for (float f: live_a)
-					live_groups.emplace_back(f, true);
-				for (float f: live_b)
-					live_groups.emplace_back(f, false);
+				std::vector<float> live_groups(live.begin(), live.end());
 				for (auto & [oid, ost]: passthrough_objects)
 				{
 					if (ost.def.type != "3d-passthrough-reversed" or not ost.soup_ready or not ost.fused.placed)
@@ -1906,16 +2245,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				// Debug-only cutout group (no objects): lets the marker
 				// window punch with a fiducials-only config. Claimed
-				// whenever cutouts exist but no B group does (real B groups
+				// whenever cutouts exist but no group does (real groups
 				// punch cutouts themselves, so no extra group then).
 				// Promoted to the boundary-veil carrier while the veil is
-				// active: claimed whenever veiled so a B canvas always
+				// active: claimed whenever veiled so a canvas always
 				// exists to lift to the uniform floor (boundary-only /
-				// projected-only / all-culled configs). The depth debug
+				// all-culled configs). The depth debug
 				// fullscreen and the passthrough effects demo claim it
 				// the same way. Empty draws (clear-only record); the
 				// submit-time bias lifts it.
-				bool need_debug = (live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough();
+				bool need_debug = (live.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough();
 				if (need_debug)
 				{
 					auto & g = debug_group;
@@ -1928,21 +2267,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// the per-group loop order below is load-bearing diagnostics.
 				// Logged on change only (config/map edits, anchor flapping).
 				{
-					static std::vector<std::pair<float, bool>> last_live_feathers;
+					static std::vector<float> last_live_feathers;
 					if (live_groups != last_live_feathers)
 					{
 						last_live_feathers = live_groups;
 						std::string order;
-						for (auto [f, proj]: live_groups)
-							order += std::to_string(f) + (proj ? "A " : "B ");
-						spdlog::info("Fiducial mask groups order: {}", order);
+						for (auto f: live_groups)
+							order += std::to_string(f) + " ";
+						spdlog::info("Feather mask groups order: {}", order);
 					}
 				}
 				// Drop stale groups + stale member meshes. Use-then-advance:
 				// touching git->second after ++git reads past end().
 				for (auto git = mask_groups.begin(); git != mask_groups.end();)
 				{
-					// Pre-warmed combos are kept like live ones (they become
+					// Pre-warmed feathers are kept like live ones (they become
 					// live on placement without re-creating storage).
 					if (std::ranges::find(live_groups, git->first) == live_groups.end() and
 					    prewarmed_keys.find(git->first) == prewarmed_keys.end())
@@ -1958,17 +2297,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						auto oit = passthrough_objects.find(hit->first);
 						// Reversed objects live in every group (no feather of
 						// their own): evict on removal/unready only, never on
-						// feather/union mismatch. Positives must match both
-						// feather and union: a flag flip evicts from the old
-						// union's group (remove_mesh) so no frame ever
-						// rasterizes the object in both unions (ghost).
+						// feather mismatch. Positives must match feather.
 						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
 						        oit->second.fused.placed and
 						        (oit->second.def.type == "3d-passthrough-reversed" or
 						         (oit->second.def.feather_px == g.feather_px and
-						          surface_projected_effective(oit->first, oit->second) == g.projected) or
-						         (oit->second.def.type == "3d-depth-passthrough" and
-						          oit->second.def.feather_px == g.feather_px and not g.projected));
+						          (oit->second.def.type == "3d-passthrough" or oit->second.def.type == "3d-depth-passthrough")));
 						if (not member)
 						{
 							g.renderer->remove_mesh(hit->first);
@@ -1979,10 +2313,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					++git;
 				}
-				// Record per group: draws from placed objects (union-scoped),
-				// full opacity. Cutouts punch union B only (flat): no geometry
-				// exists to map them onto, so A must never see them.
-				static const std::vector<std::array<glm::vec3, 6>> no_cutouts;
+				// Record per group: draws from placed objects,
+				// full opacity. Cutouts punch every group (all reveal
+				// the flat feed).
 				// Box-coverage diagnostics share one 5s window: the flag is
 				// latched before the loop so every group reports in the same
 				// frame (a per-group throttle starves all but the first).
@@ -1993,9 +2326,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					last_box_log = instance.now();
 					log_boxes = true;
 				}
-				for (auto [f, proj]: live_groups)
+				for (auto f: live_groups)
 				{
-					auto & g = mask_groups[{f, proj}];
+					auto & g = mask_groups[f];
 					// Eager setup: member swapchain + intermediates ready
 					// before first draws, so first-visible frames pay
 					// record+submit only. Tier-0 groups keep a full-res
@@ -2014,9 +2347,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						device.waitIdle();
 						g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), gw, gh, 1, view_count);
 						g.renderer->reset_targets();
-						spdlog::info("Fiducial mask swapchain: {}x{} (feather {}px union {}, {} images)", gw, gh, f, proj ? "A" : "B", g.swapchain.image_count());
+						spdlog::info("Feather mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
 					}
-					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
+					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh}, tier != 0);
 					std::vector<feather_mask_renderer::instance_draw> draws;
 					// Frustum skip: drop draws fully outside both eyes (the
 					// empty-draws path below then skips acquire/record for
@@ -2072,7 +2405,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
 						std::array<glm::mat4, 2> mvp;
 						for (uint32_t view = 0; view < view_count; ++view)
-							mvp[view] = world_mvp[view] * model;
+							mvp[view] = server_mvp[view] * model;
 						constexpr float op = 1;
 						if (not draw_visible(oid, mvp))
 							return;
@@ -2080,17 +2413,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					};
 					for (auto & [oid, ost]: passthrough_objects)
 					{
-						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed or ost.def.feather_px != f or
-						    surface_projected_effective(oid, ost) != proj)
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed or ost.def.feather_px != f)
 							continue;
 						append_draw(oid, ost, false, draws);
 					}
-					// Depth volumes for this feather's flat group: same
+					// Depth volumes for this feather's group: same
 					// eye-space MVPs, no reversed polarity (the renderer
 					// MAXes them over the cuts instead of cutting).
 					std::vector<feather_mask_renderer::instance_draw> volume_draws;
 					bool any_volume = false;
-					if (have_volume_sensor and not proj)
+					if (have_volume_sensor)
 					{
 						for (auto & [oid, ost]: passthrough_objects)
 						{
@@ -2101,8 +2433,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						any_volume = not volume_draws.empty();
 					}
-					// Reversed objects (negatives) cut every group of both
-					// unions: appended after all positives (the renderer
+					// Reversed objects (negatives) cut every group:
+					// appended after all positives (the renderer
 					// resolves positives first, then depth-tested MIN cuts).
 					// Same mvp/frustum path, full cut strength.
 					for (auto & [oid, ost]: passthrough_objects)
@@ -2113,9 +2445,65 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					// Reversed-only draws rasterize to a provable no-op, so a
 					// group with no positive draws is skipped exactly like an
-					// empty one.
+					// empty one. VR occlusion needs positives + paired
+					// virtual depth (resolved below); it rides the same
+					// positives, so no extra culling pass.
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					if ((draws.empty() or not any_positive) and not any_volume)
+					// Tolerant virtual-depth pairing (shared by the volume
+					// reveal and the VR occlusion): null when the color
+					// frame had no depth warp.
+					bool virt_paired = false;
+					vk::ImageView virt_view = nullptr;
+					vk::Sampler virt_sampler = nullptr;
+					if (auto & dh = current_blit_handles[depth_stream_index])
+					{
+						// Decoder teardown races the hot path: a non-null
+						// handle with a torn-down decoder must not crash.
+						if (auto & dec = decoders[depth_stream_index].decoder)
+						{
+							virt_view = dh->image_view;
+							virt_sampler = dec->sampler();
+							virt_paired = true;
+						}
+					}
+					std::vector<feather_mask_renderer::instance_draw> vr_draws;
+					bool any_vr = false;
+					if (virt_paired and any_positive)
+					{
+						for (const auto & d: draws)
+						{
+							if (!d.reverse)
+								vr_draws.push_back(d);
+						}
+						any_vr = not vr_draws.empty();
+					}
+					// Forensics for the VR-flicker hypothesis: window positives
+					// exist (a 3d-passthrough cutout wants the VR cut) but
+					// strict depth pairing failed (exact and ±1 neighbor
+					// both absent), so the mask stays 1
+					// (passthrough) where VR should have won. Throttled 1s;
+					// the common_frame depth-miss line carries the
+					// frame_idx/window detail, this one marks the visible
+					// consequence (cut skipped) with the feather group.
+					if (any_positive and not virt_paired)
+					{
+						vr_frame_wanted = true;
+						bool expected = current_blit_handles[0] and current_blit_handles[0]->view_info.depth_expected;
+						if (expected)
+						{
+							XrTime now = instance.now();
+							if (now - vr_cut_skip_last_log > 1'000'000'000LL)
+							{
+								vr_cut_skip_last_log = now;
+								uint64_t cidx = current_blit_handles[0] ? current_blit_handles[0]->feedback.frame_index : UINT64_MAX;
+								spdlog::warn("VR cut skipped (depth expected-but-missing): color frame {} feather {}px draws {}", cidx, f,
+								             draws.size());
+							}
+						}
+					}
+					else if (any_vr)
+						vr_frame_wanted = true;
+					if ((draws.empty() or not any_positive) and not any_volume and not any_vr)
 					{
 						g.active = false;
 						// Mesh-pipeline edge forensics: draws present ->
@@ -2125,13 +2513,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
 						{
 							g.last_draws_log = instance.now();
-							spdlog::info("Fiducial mask draws lost (feather {}px union {})", f, proj ? "A" : "B");
+							spdlog::info("Feather mask draws lost (feather {}px)", f);
 						}
 						g.had_draws = false;
 						continue;
 					}
 					g.had_draws = true;
 					int mask_index = g.swapchain.acquire();
+					g.image_index = mask_index;
 					// (wait clocked below: mask image waits are silent
 					// below timeout and sit inside the cpu measurement)
 					// Paired from acquisition: the group joins the release
@@ -2148,54 +2537,69 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.swapchain.release();
 						acquired_groups.pop_back();
 						g.active = false;
+						g.image_index = -1;
 						if (not g.wait_warned)
 						{
 							g.wait_warned = true;
-							spdlog::warn("Fiducial mask image wait timed out, skipping group (feather {}px union {})", f, proj ? "A" : "B");
+							spdlog::warn("Feather mask image wait timed out, skipping group (feather {}px)", f);
 						}
 						continue;
 					}
 					g.wait_warned = false;
-					g.acquired = true;
 					g.active = true;
 					g.extent = {(int32_t)gw, (int32_t)gh};
 					feather_mask_renderer::mask_stage_cpu mstats{};
-					bool vol_virt_paired = false;
 					try
 					{
 						feather_mask_renderer::volume_input vol_in;
-						if (any_volume)
+						bool use_vol_in = any_volume or any_vr;
+						if (use_vol_in)
 						{
 							vol_in.draws = volume_draws;
 							vol_in.remap_cols = volume_remap;
 							vol_in.remap_corr = volume_remap_corr;
+							// May be null in VR-only groups (no sensor this
+							// frame): use_volume stays false there, so the
+							// view is never sampled.
 							vol_in.sensor_view = volume_sensor;
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
-							// Virtual depth: strict pairing already resolved
-							// in current_blit_handles[3] (null when the
-							// color frame had no depth warp).
-							if (auto & dh = current_blit_handles[depth_stream_index])
+							// Virtual depth (shared by the volume reveal and
+							// the VR occlusion): tolerant (±1) pairing
+							// resolved above, null when the color frame had
+							// no depth warp. Near/far ride the sensor frustum so both
+							// D canvases agree. Eye extent comes from the
+							// stream description and sizes the high-res VR
+							// canvases (the sensor path stays at 320px).
+							if (virt_paired)
 							{
-								vol_in.virt_view = dh->image_view;
-								vol_in.virt_sampler = decoders[depth_stream_index].decoder->sampler();
+								vol_in.virt_view = virt_view;
+								vol_in.virt_sampler = virt_sampler;
 								vol_in.virt_valid = true;
-								vol_virt_paired = true;
+								if (video_stream_description and video_stream_description->depth_width >= 2)
+								{
+									vol_in.virt_eye_extent = {
+									        uint32_t(video_stream_description->depth_width / 2),
+									        uint32_t(video_stream_description->depth_height),
+									};
+								}
 							}
-							if (*volume_query_pool)
+							if (any_vr)
+								vol_in.vr_draws = vr_draws;
+							if (any_volume and *volume_query_pool)
 								vol_in.timestamp_pool = *volume_query_pool;
 						}
 						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						                   true, f, proj ? no_cutouts : cutouts, world_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
-						                   any_volume ? &vol_in : nullptr);
+						                   true, f, cutouts, server_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
+						                   use_vol_in ? &vol_in : nullptr);
 					}
 					catch (std::exception & e)
 					{
-						spdlog::warn("Fiducial mask record failed: {} (feather {}px union {})", e.what(), f, proj ? "A" : "B");
+						spdlog::warn("Feather mask record failed: {} (feather {}px)", e.what(), f);
 						g.swapchain.release();
 						acquired_groups.pop_back();
-						g.acquired = false;
 						g.active = false;
+						g.image_index = -1;
 					}
 					// Cutout punch (debug-only) folds into raster.
 					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
@@ -2205,8 +2609,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					volume_virt_ms += mstats.volume_virt_ms;
 					volume_compare_ms += mstats.volume_compare_ms;
 					volume_merge_ms += mstats.volume_merge_ms;
-					if (any_volume and vol_virt_paired)
+					vr_raster_ms += mstats.vr_raster_ms;
+					vr_compare_ms += mstats.vr_compare_ms;
+					vr_merge_ms += mstats.vr_merge_ms;
+					if (virt_paired and (any_volume or any_vr))
 						volume_frame_virt_paired = true;
+					if (any_vr and virt_paired)
+						vr_frame_virt_paired = true;
 					mask_draws += (int)mstats.draws;
 					if (any_volume)
 					{
@@ -2222,9 +2631,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// Depth-vs-eye pose divergence at record time: the
 						// time-difference the future delay compensation
 						// must absorb (eye 0; both eyes share the warp).
+						// Measured against the sync (server) eye the raster
+						// actually used.
 						{
 							const auto & dp = shared_depth.pose[0];
-							const auto & mp = mask_pose[0];
+							const auto & mp = sync_pose[0];
 							float ex = dp.position.x - mp.position.x;
 							float ey = dp.position.y - mp.position.y;
 							float ez = dp.position.z - mp.position.z;
@@ -2249,8 +2660,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// flag above; tier-0 has no scissored passes to report).
 					if (log_boxes and mstats.tier > 0)
 					{
-						spdlog::info("MaskBox: feather {}px union {} box {:.0f}% tier {} draws {}",
-						             f, proj ? "A" : "B", mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
+						if (any_vr)
+							spdlog::info("MaskBox: feather {}px box {:.0f}% tier {} draws {} vrbox {:.0f}%",
+							             f, mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws,
+							             mstats.vr_box_frac * 100.f);
+						else
+							spdlog::info("MaskBox: feather {}px box {:.0f}% tier {} draws {}",
+							             f, mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
 					}
 					if (not mask_split_written)
 					{
@@ -2271,7 +2687,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// the depth/effects debug fullscreen) it also runs with
 				// empty cutouts (clear-only): the promoted carrier lifted
 				// to the uniform floor at submit.
-				if ((live_b.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough())
+				if ((live.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough())
 				{
 					auto & g = debug_group;
 					if (g.extent.width != mw or g.extent.height != mh)
@@ -2285,10 +2701,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.renderer->reset_targets();
 					}
 					int mask_index = g.swapchain.acquire();
+					g.image_index = mask_index;
 					if (not g.swapchain.wait(100'000'000))
 					{
 						g.swapchain.release();
 						g.active = false;
+						g.image_index = -1;
 						cutouts_punched = false;
 						if (not g.wait_warned)
 						{
@@ -2299,7 +2717,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					else
 					{
 						g.wait_warned = false;
-						g.acquired = true;
 						g.active = true;
 						acquired_groups.push_back(&g);
 						feather_mask_renderer::mask_stage_cpu mstats{};
@@ -2309,15 +2726,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// punch needs no blur intermediates.
 							vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
 							g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, {}, true, 0,
-							                   cutouts, world_mvp, &mstats, mex);
+							                   cutouts, server_mvp, &mstats, mex);
 						}
 						catch (std::exception & e)
 						{
 							spdlog::warn("Debug mask record failed: {}", e.what());
 							g.swapchain.release();
 							acquired_groups.erase(std::remove(acquired_groups.begin(), acquired_groups.end(), &g), acquired_groups.end());
-							g.acquired = false;
 							g.active = false;
+							g.image_index = -1;
 							cutouts_punched = false;
 						}
 						mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
@@ -2331,6 +2748,552 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				else
 					debug_group.active = false;
+				// Hidden objects (3d-passthrough-hidden): dedicated hard-edged
+				// mask merged into the single submit layer below.
+				// Separate renderer +
+				// swapchain from the feather groups (tier 0 direct raster, no
+				// blur chain, no cutouts); reversed draws are never appended,
+				// so hidden always wins for safety.
+				// Steady full-opacity cutout of the revealed feed.
+				auto record_hidden_mask = [&]() {
+					auto & g = hidden_group;
+					// Quarter-res working + submit (alert-grade layers):
+					// tier-0 stays a hard-edged direct raster (no blur
+					// chain ever — tier comes from feather_px = 0, not
+					// resolution), the compositor upscales the
+					// quarter-rect (binary alpha: edge carries a ~1-texel
+					// upscale ramp). Reuses the tiered-quarter qw/qh size.
+					int hmw = qw;
+					int hmh = qh;
+					{
+						// State hoisted per frame above (shared with the
+						// nomask gate and mask submit).
+						if (hidden_known)
+						{
+							// Pre-warm (map-known, not necessarily placed):
+							// renderer + swapchain ready before first
+							// placement so visible frames only rasterize,
+							// mirroring the feather groups. Meshes upload as
+							// soon as the soup is ready, even unplaced.
+							if (not g.renderer)
+								g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+							// Hidden proximity field, warmed here (ahead of the
+							// mask record below which renders into it): same
+							// hidden_known prewarm as the mask swapchain, same
+							// quarter-res extent. A rebuild recreates the views
+							// the mask builds its proximity framebuffer against,
+							// so drop those first.
+							if (mask_frame and g.renderer and
+							    g.renderer->ensure_hidden_field({(uint32_t)hmw, (uint32_t)hmh}))
+								g.renderer->reset_targets();
+							if (not g.swapchain or g.swapchain.width() != hmw or g.swapchain.height() != hmh)
+							{
+								// Rare path (first frame, video resize): nothing
+								// outstanding (previous images released last
+								// frame), mirroring the feather groups.
+								device.waitIdle();
+								g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), hmw, hmh, 1, view_count);
+								g.renderer->reset_targets();
+								g.extent = {(int32_t)hmw, (int32_t)hmh};
+								spdlog::info("Hidden mask swapchain: {}x{} ({} images)", hmw, hmh, g.swapchain.image_count());
+							}
+							for (auto & [oid, ost]: passthrough_objects)
+							{
+								if (ost.def.type != "3d-passthrough-hidden")
+									continue;
+								bool member = ost.soup_ready;
+								// Upload on soup change (hash compare, no per-frame
+								// string formatting).
+									auto mhit = g.mesh_hashes.find(oid);
+									if (member and (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash))
+									{
+										g.renderer->set_mesh(oid, ost.soup);
+										g.mesh_hashes[oid] = ost.soup_hash;
+									}
+								else if (not member and mhit != g.mesh_hashes.end())
+								{
+									g.renderer->remove_mesh(oid);
+									g.mesh_hashes.erase(mhit);
+								}
+							}
+							// Hash-side eviction (mirrors the feather groups): oids
+							// deleted or retyped away from hidden are never
+							// visited above, so sweep them here.
+							for (auto hit = g.mesh_hashes.begin(); hit != g.mesh_hashes.end();)
+							{
+								auto oit = passthrough_objects.find(hit->first);
+								bool member = oit != passthrough_objects.end() and
+								        oit->second.def.type == "3d-passthrough-hidden" and
+								        oit->second.soup_ready;
+								if (member)
+								{
+									member = hit->second == oit->second.soup_hash;
+								}
+								if (not member)
+								{
+									g.renderer->remove_mesh(hit->first);
+									hit = g.mesh_hashes.erase(hit);
+								}
+								else
+									++hit;
+							}
+						}
+						if (not hidden_placed)
+						{
+							g.active = false;
+							if (not hidden_known and g.renderer)
+							{
+								for (auto & [key, _]: g.mesh_hashes)
+									g.renderer->remove_mesh(key);
+								g.mesh_hashes.clear();
+								// Map no longer carries hidden objects: drop
+								// the cached targets (they reference retired
+								// images). Recreated on demand under
+								// hidden_known below; nothing is submitted
+								// while inactive.
+								g.renderer->reset_targets();
+							}
+						}
+						// Without the mask path nothing can display: skip the
+						// build, the locates and the record (the nomask gate
+						// above already warned). Uploads/prewarm still ran.
+						else if (mask_frame)
+						{
+							// Silhouettes built once above: map straight to
+							// mask draws. The
+							// shared margin floors off the quarter-res mask
+							// working size (conservative superset either way).
+							build_hidden_silhouettes(hmw, hmh);
+							// Proximity field (head sphere + body column + hands — further
+							// trackers slot in as more entries later): head
+							// center = midpoint of the sync eye positions,
+							// same timebase as server_mvp by construction
+							// (NOT the fiducial head_pos, which runs on
+							// predicted timebase). The body column hangs
+							// hidden_body_depth_m down from the head center
+							// in world -Y with the head radius, so leaning
+							// the torso into a volume reveals it without the
+							// head or hands being near.
+							// One head entry per placed hidden object, each
+							// with its own live proximity-radius, plus one
+							// entry per tracked palm/grip with the same
+							// object's hand-proximity-radius:
+							// the min-accumulating field unions them (inside
+							// ANY = over-reveal, the safe direction).
+							constexpr float hidden_body_depth_m = 2.f;
+							proximity_spheres.clear();
+							proximity_spheres.reserve(hidden_silhouettes.size() * 3);
+							proximity_cylinders.clear();
+							proximity_cylinders.reserve(hidden_silhouettes.size());
+							// Shared GUI pair (see hidden_wants_hands): the GUI leaves
+							// them alive while a hidden map is live; created here when
+							// it never ran (no GUI open). Positions are never culled
+							// — the P0 gate below only skips GPU work.
+							if (system.hand_tracking_supported())
+							{
+								if (not left_hand)
+									left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
+								if (not right_hand)
+									right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+							}
+							XrSpace prox_space = application::space(xr::spaces::world);
+							// Palm preferred, controller grip fallback, per
+							// side. Fail-closed: an untracked side contributes
+							// no sphere (the head sphere always remains).
+							auto hand_pos = [&](std::optional<xr::hand_tracker> & tracker,
+							                    xr::spaces grip) -> std::optional<glm::vec3> {
+								if (tracker)
+								{
+									if (auto located = tracker->locate(prox_space, sync_display_time))
+									{
+										const auto & palm = located->joints[XR_HAND_JOINT_PALM_EXT].first;
+										if (palm.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+										{
+											return glm::vec3(palm.pose.position.x, palm.pose.position.y,
+											                 palm.pose.position.z);
+										}
+									}
+								}
+								if (auto grip_pos = application::locate_controller(application::space(grip),
+								                                                   prox_space, sync_display_time))
+									return grip_pos->first;
+								return std::nullopt;
+							};
+							std::optional<glm::vec3> palm_l = hand_pos(left_hand, xr::spaces::grip_left);
+							std::optional<glm::vec3> palm_r = hand_pos(right_hand, xr::spaces::grip_right);
+							auto push_sphere = [&](glm::vec3 c, float r) {
+								if (r <= 0)
+									return; // degenerate: field stays cleared, fail-closed
+								glm::mat4 sphere_model =
+								        glm::translate(glm::mat4(1), c) *
+								        glm::scale(glm::mat4(1), glm::vec3(r));
+								std::array<glm::mat4, 2> sm;
+								for (uint32_t view = 0; view < view_count; ++view)
+									sm[view] = server_mvp[view] * sphere_model;
+								proximity_spheres.push_back(sm);
+							};
+							// Body column: unit cylinder (radius 1, y in
+							// [-1,1]) scaled to (r, depth/2, r) around the
+							// head-center-minus-half-depth point, so it spans
+							// head center down hidden_body_depth_m in world
+							// -Y with the head radius.
+							auto push_cylinder = [&](glm::vec3 c, float r) {
+								if (r <= 0)
+									return; // degenerate: field stays cleared, fail-closed
+								glm::vec3 cc(c.x, c.y - hidden_body_depth_m * 0.5f, c.z);
+								glm::mat4 cyl_model =
+								        glm::translate(glm::mat4(1), cc) *
+								        glm::scale(glm::mat4(1),
+								                   glm::vec3(r, hidden_body_depth_m * 0.5f, r));
+								std::array<glm::mat4, 2> cm;
+								for (uint32_t view = 0; view < view_count; ++view)
+									cm[view] = server_mvp[view] * cyl_model;
+								proximity_cylinders.push_back(cm);
+							};
+							// Live radii per object (clamped, fail-closed at 0).
+							auto hidden_radii = [&](const std::string & mesh) {
+								float head_r = 0.3f, hand_r = 0.2f;
+								auto soit = passthrough_objects.find(mesh);
+								if (soit != passthrough_objects.end())
+								{
+									head_r = std::max(0.f, soit->second.def.proximity_radius_m);
+									hand_r = std::max(0.f, soit->second.def.hand_proximity_radius_m);
+								}
+								return std::make_pair(head_r, hand_r);
+							};
+							// Head center = midpoint of the sync eye positions.
+							const auto & p0 = sync_pose[0].position;
+							const auto & p1 = sync_pose[1].position;
+							glm::vec3 center((p0.x + p1.x) * 0.5f, (p0.y + p1.y) * 0.5f,
+							                 (p0.z + p1.z) * 0.5f);
+							// P0 CPU pre-gate: drop silhouettes fully outside every
+							// proximity shape (head sphere + body column + palms)
+							// before any acquire/record.
+							// Sphere-vs-world-AABB; test radii padded 2cm against
+							// edge flicker (the GPU field keeps the exact radii).
+							// Unknown bounds pass conservatively. Survivors feed the
+							// mask draws and the proximity MVPs below, so
+							// a closed gate costs ~zero GPU and no layers.
+							hidden_silhouettes.erase(
+								std::remove_if(hidden_silhouettes.begin(), hidden_silhouettes.end(),
+									[&](const hidden_silhouette_draw & s) {
+										if (not s.bounds_known)
+											return false;
+										auto [head_r, hand_r] = hidden_radii(s.mesh);
+										auto outside = [&](glm::vec3 c, float r) {
+											if (r <= 0)
+												return true;
+											float rr = r + 0.02f;
+											float dx = std::max({s.world_min.x - c.x, 0.f, c.x - s.world_max.x});
+											float dy = std::max({s.world_min.y - c.y, 0.f, c.y - s.world_max.y});
+											float dz = std::max({s.world_min.z - c.z, 0.f, c.z - s.world_max.z});
+											return dx * dx + dy * dy + dz * dz > rr * rr;
+										};
+										// Body column vs world AABB: vertical
+										// segment [c.y - depth, c.y] with the
+										// head radius. Same 2cm pad; over-reveal
+										// stays the safe direction.
+										auto outside_cylinder = [&](glm::vec3 c, float r) {
+											if (r <= 0)
+												return true;
+											float rr = r + 0.02f;
+											float dx = std::max({s.world_min.x - c.x, 0.f, c.x - s.world_max.x});
+											float dz = std::max({s.world_min.z - c.z, 0.f, c.z - s.world_max.z});
+											float top = c.y, bottom = c.y - hidden_body_depth_m;
+											float dy = 0.f;
+											if (s.world_min.y > top)
+												dy = s.world_min.y - top;
+											else if (s.world_max.y < bottom)
+												dy = bottom - s.world_max.y;
+											return dx * dx + dy * dy + dz * dz > rr * rr;
+										};
+										return outside(center, head_r) and
+											outside_cylinder(center, head_r) and
+											(not palm_l or outside(*palm_l, hand_r)) and
+											(not palm_r or outside(*palm_r, hand_r));
+									}),
+								hidden_silhouettes.end());
+							for (auto & s: hidden_silhouettes)
+							{
+								auto [head_r, hand_r] = hidden_radii(s.mesh);
+								push_sphere(center, head_r);
+								push_cylinder(center, head_r);
+								if (palm_l)
+									push_sphere(*palm_l, hand_r);
+								if (palm_r)
+									push_sphere(*palm_r, hand_r);
+							}
+							hidden_mask_draws.reserve(hidden_silhouettes.size());
+							for (auto & s: hidden_silhouettes)
+								hidden_mask_draws.push_back({s.mesh, s.mvp, 1.f, s.px});
+							if (hidden_mask_draws.empty())
+							{
+								g.active = false;
+								if (g.had_draws and instance.now() - g.last_draws_log > 1'000'000'000LL)
+								{
+									g.last_draws_log = instance.now();
+									spdlog::info("Hidden mask draws lost");
+								}
+								g.had_draws = false;
+							}
+							else
+							{
+								g.had_draws = true;
+								int mask_index = g.swapchain.acquire();
+								g.image_index = mask_index;
+								// Paired from acquisition (mirrors the feather
+								// groups): the release list owns it from here.
+								acquired_groups.push_back(&g);
+								if (not g.swapchain.wait(100'000'000))
+								{
+									g.swapchain.release();
+									acquired_groups.pop_back();
+									g.active = false;
+									g.image_index = -1;
+									if (not g.wait_warned)
+									{
+										g.wait_warned = true;
+										spdlog::warn("Hidden mask image wait timed out, skipping frame");
+									}
+								}
+								else
+								{
+									g.wait_warned = false;
+									g.active = true;
+									g.extent = {(int32_t)hmw, (int32_t)hmh};
+									feather_mask_renderer::hidden_cpu hstats{};
+									try
+									{
+										// Quarter-res proximity reveal (dedicated
+										// hidden path beside feather record):
+										// proximity field first, silhouettes kept
+										// only where nearer (hard near-field
+										// edge — v1 flips the overlay from
+										// always-on to proximity-gated).
+										vk::Extent2D hex{(uint32_t)hmw, (uint32_t)hmh};
+										std::array<vk::Extent2D, 2> full_ext{
+										        vk::Extent2D{(uint32_t)extents[0].width, (uint32_t)extents[0].height},
+										        vk::Extent2D{(uint32_t)extents[1].width, (uint32_t)extents[1].height},
+										};
+										// Feather-owned proximity field (P4): ensured in the
+										// prewarm above under the same
+										// hidden_known+mask_frame conditions, same
+										// quarter-res, so it is live here.
+										g.renderer->record_hidden(rec_cmd, g.swapchain.image(mask_index), hex,
+										                          hidden_mask_draws, proximity_spheres, proximity_cylinders, &hstats, full_ext);
+									}
+									catch (std::exception & e)
+									{
+										spdlog::warn("Hidden mask record failed: {}", e.what());
+										g.swapchain.release();
+										acquired_groups.pop_back();
+										g.active = false;
+										g.image_index = -1;
+										// Fail the frame: the command buffer
+										// may be half-open (inside a render
+										// pass) — never submit it.
+										throw;
+									}
+									mask_raster_ms += hstats.raster_ms;
+									mask_draws += (int)hstats.draws;
+								}
+							}
+						}
+						else
+						{
+							g.active = false;
+						}
+					}
+				};
+				record_hidden_mask();
+				// Merge: MAX-combine every active contributor
+				// (hidden first, then feather groups in map order, then
+				// debug) into ONE full-res image, submitted once with
+				// REPLACE below.
+				// merge_this_frame is evaluated HERE (contributor activity
+				// time) and read back at submit — never recomputed there, so
+				// record and submit cannot disagree. The GPU bracket
+				// (qmerge/qmerge+1) is stamped unconditionally so the poll
+				// range never covers an unwritten query on either pool.
+				rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qmerge);
+				// Self-healing reset: a held image here is definitionally
+				// leaked (submit always consumes it), so release before
+				// overwriting rather than dropping the handle.
+				if (merge_image >= 0 and merge_renderer)
+				{
+					merge_renderer->release();
+					merge_image = -1;
+				}
+				merge_this_frame = false;
+				merge_image = -1;
+				{
+					// Hard-outside veil submits opaque flat with no masks at
+					// all (submit skips the merge): the merge sits
+					// out too, even with contributors active. Same
+					// formula as submit (mask_frame is true throughout
+					// this lambda).
+					bool merge_depth_full = depth_fullscreen_passthrough();
+					bool merge_effects_full = session.effects_fullscreen_passthrough();
+					bool merge_full_demo = merge_depth_full or merge_effects_full;
+					float merge_veil_s = std::clamp(boundary_s, 0.f, 1.f);
+					if (merge_full_demo)
+						merge_veil_s = 0;
+					bool merge_hard_out = ((boundary_veil or merge_full_demo) and merge_veil_s < 0.5f) and not composition_layer_color_scale_bias_supported;
+					if ((boundary_veil or merge_full_demo) and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
+						merge_hard_out = true;
+					if (not merge_hard_out)
+					{
+						// Multiview broadcasts one draw to both layers: both
+						// eyes must share the extent — a
+						// mismatch would silently misalign one eye, so the
+						// merge sits out loudly instead (assert for debug).
+						assert(extents[0].width == extents[1].width and extents[0].height == extents[1].height);
+						bool merge_eyes_match = extents[0].width == extents[1].width and extents[0].height == extents[1].height;
+						if (not merge_eyes_match)
+							spdlog::error("Union merge eye-extent mismatch, dropping merge this frame");
+						// Slot safety: the merge descriptor set
+						// is rewritten per record. When the previous async mask
+						// command buffer is still in flight (inline fallback while
+						// it flies), its reads are still live — sit out one spike
+						// frame rather than rewrite the set under it. (The
+						// ping-pong pair covers the single-frame case; this covers
+						// deeper stalls. On the async path the frame-top poll
+						// already proved the fence, so this passes.)
+						bool merge_slot_safe = device.waitForFences(*mask_fence, VK_FALSE, 0) == vk::Result::eSuccess;
+					if (not merge_slot_safe)
+					{
+						// Coverage loss (the whole merged set incl. hidden
+						// sits out): error, 1s-throttled — must stay
+						// visible in adb.
+						static XrTime last_merge_slot_log = 0;
+						XrTime merge_slot_now = instance.now();
+						if (merge_slot_now - last_merge_slot_log > 1'000'000'000LL)
+						{
+							last_merge_slot_log = merge_slot_now;
+							spdlog::error("Union merge slot-unsafe (prior mask command buffer in flight), merge sits out this frame");
+						}
+					}
+						if (merge_eyes_match and merge_slot_safe)
+						{
+							// False refuses the WHOLE merge below (the merge drops
+							// this frame, loudly — never submit a partial merged set:
+							// skipping coverage under-reveals.
+							auto push_merge_input = [&](mask_group & g, std::vector<union_merge_renderer::input> & out) {
+								if (g.image_index < 0 or (size_t)g.image_index >= g.swapchain.image_count())
+								{
+									// Defensive only (active groups always hold an
+									// acquisition): error, 1s-throttled — coverage loss
+									// must stay visible in adb.
+									static XrTime last_merge_input_log = 0;
+									XrTime merge_input_now = instance.now();
+									if (merge_input_now - last_merge_input_log > 1'000'000'000LL)
+									{
+										last_merge_input_log = merge_input_now;
+										spdlog::error("Union merge dropping group with no acquired image (active={}, index={})", g.active, g.image_index);
+									}
+									return false;
+								}
+								vk::Image img = g.swapchain.image((size_t)g.image_index);
+								out.push_back(union_merge_renderer::input{
+								        .image = img,
+								        .view_array = g.renderer->submitted_view_array(img),
+								});
+								return true;
+							};
+							std::vector<union_merge_renderer::input> merge_inputs;
+							size_t merge_count = 0;
+							bool merge_ok = true;
+							// Hidden first: past the cap, the safety-critical input
+							// (over-reveal theorem) is the last dropped, never the
+							// first. (Max is commutative, so order changes nothing else.)
+							if (hidden_group.active)
+							{
+								++merge_count;
+								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(hidden_group, merge_inputs))
+									merge_ok = false;
+							}
+							for (auto & [feather_key, g]: mask_groups)
+							{
+								(void)feather_key;
+								if (not merge_ok)
+									break;
+								if (not g.active)
+									continue;
+								++merge_count;
+								// Cap: documented max_inputs (8). Extras are counted,
+								// dropped with an error below, never a fallback path —
+								// >8 contributors under-reveals by construction, so the
+								// error must stay visible.
+								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(g, merge_inputs))
+									merge_ok = false;
+							}
+							if (merge_ok and debug_group.active)
+							{
+								++merge_count;
+								if (merge_inputs.size() < union_merge_renderer::max_inputs and not push_merge_input(debug_group, merge_inputs))
+									merge_ok = false;
+							}
+							if (merge_count > union_merge_renderer::max_inputs)
+							{
+								static XrTime last_merge_cap_log = 0;
+								XrTime merge_now = instance.now();
+								if (merge_now - last_merge_cap_log > 1'000'000'000LL)
+								{
+									last_merge_cap_log = merge_now;
+									spdlog::error("Union merge input cap exceeded: {} contributors, merging first {} and DROPPING {} (no fallback; raise union_merge_renderer::max_inputs + matching srcN bindings in union_merge_mv.frag.glsl)",
+									              merge_count, union_merge_renderer::max_inputs,
+									              merge_count - union_merge_renderer::max_inputs);
+								}
+							}
+							if (merge_ok and not merge_inputs.empty())
+							{
+								int merge_idx = -1;
+								try
+								{
+									if (not merge_renderer)
+										merge_renderer = std::make_unique<union_merge_renderer>(device);
+									merge_renderer->ensure(instance, session, swapchain.format(), mw, mh);
+									merge_idx = merge_renderer->acquire();
+									if (merge_idx >= 0)
+									{
+										vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
+										if (merge_renderer->record(rec_cmd, (size_t)merge_idx, merge_ext, merge_inputs))
+										{
+											merge_image = merge_idx;
+											merge_this_frame = true;
+											merge_idx = -1; // owned by the submit phase now
+										}
+										else
+										{
+											merge_renderer->release();
+											merge_idx = -1;
+										}
+									}
+								}
+								catch (std::exception & e)
+								{
+									// Internal-catch, never rethrow past acquired images (a
+									// throw out of the phase leaks in-flight acquisitions):
+									// the merge is dropped this frame, loudly
+									// (1s-throttled).
+									static XrTime last_merge_fail_log = 0;
+									XrTime merge_fail_now = instance.now();
+									if (merge_fail_now - last_merge_fail_log > 1'000'000'000LL)
+									{
+										last_merge_fail_log = merge_fail_now;
+										spdlog::error("Union merge record failed: {} (merge dropped this frame)", e.what());
+									}
+									if (merge_idx >= 0)
+									{
+										merge_renderer->release();
+										merge_idx = -1;
+									}
+								}
+							}
+						}
+					}
+				}
+				rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qmerge + 1);
 			}
 		};
 
@@ -2346,9 +3309,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_command_buffer.begin(vk::CommandBufferBeginInfo{
 			        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
 			});
-			mask_command_buffer.resetQueryPool(*mask_query_pool, 0, 3);
+			mask_command_buffer.resetQueryPool(*mask_query_pool, 0, 5);
 			mask_command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *mask_query_pool, 0);
-			record_masks_phase(mask_command_buffer, mask_query_pool, 1);
+			record_masks_phase(mask_command_buffer, mask_query_pool, 1, 3);
 			mask_command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *mask_query_pool, 2);
 			mask_command_buffer.end();
 			vk::SubmitInfo mask_submit_info;
@@ -2392,10 +3355,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				for (auto * g: acquired_groups)
 				{
-					g->acquired = false;
+					g->image_index = -1;
 					g->swapchain.release();
 				}
 				acquired_groups.clear();
+				// Merge acquisition: same pairing (the merge
+				// records in the mask phase, ahead of the video wait).
+				if (merge_image >= 0 and merge_renderer)
+				{
+					merge_renderer->release();
+					merge_image = -1;
+					merge_this_frame = false;
+				}
+			}
+			// Inline path: nothing is acquired yet here (masks record
+			// later, after the video wait), so the async-only block
+			// above suffices for the groups; the merge releases
+			// unconditionally anyway — one leaked image per timeout
+			// frame would drain its pool.
+			if (merge_image >= 0 and merge_renderer)
+			{
+				merge_renderer->release();
+				merge_image = -1;
+				merge_this_frame = false;
 			}
 			session.end_frame(frame_state.predictedDisplayTime, {});
 			return;
@@ -2599,7 +3581,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if (debug_corrected)
 			{
 				// Orange fused-corrected boxes: each configured marker
-				// re-projected from its fiducial's smoothed pose with the
+				// reprojected from its fiducial's smoothed pose with the
 				// authored offset (the inverse of the vote path). Green
 				// raw vs orange corrected shows disagreement at a glance.
 				for (const auto & f: fid_map->fiducials)
@@ -2729,7 +3711,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// else: status already set by the shared acquire site above
 		// (unsupported / unavailable / waiting).
 
-		// Debug mask record: the local debug group (union B) carries the
+		// Debug mask record: the local debug group carries the
 		// marker-window cutouts. No silhouette raster yet (no objects):
 		// clear + hard cutout punch at full alpha.
 		// GPU span point: closes the gizmo gap (q3-q2). On inline
@@ -2753,7 +3735,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					spdlog::info("Mask submit: inline fallback (mask fence busy)");
 				}
 			}
-			record_masks_phase(command_buffer, query_pool, 4);
+			record_masks_phase(command_buffer, query_pool, 4, 5);
 			mask_results_in_mask_pool = false;
 			volume_ts_async = false;
 		}
@@ -2803,7 +3785,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// reference the swapchains in the layers below.
 		for (auto * g: acquired_groups)
 		{
-			g->acquired = false;
+			g->image_index = -1;
 			g->swapchain.release();
 		}
 		acquired_groups.clear();
@@ -2819,14 +3801,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// passthrough underneath them.
 		bool want_debug_cutout = debug_overlays and debug_window_mm >= 0;
 		bool effects_full = session.effects_fullscreen_passthrough();
-		if (use_alpha or session.has_projected_passthrough_mesh() or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough() or effects_full)
+		if (use_alpha or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough() or effects_full)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();
 
 		// Mask path owns the display when the alpha-blend extension is
-		// present (stereo only, like the mask targets): video, then one
-		// union pass each (A projected, B flat), then debug/GUI. Without
+		// present (stereo only, like the mask targets): video, then the
+		// merged mask, then the flat camera layer, then debug/GUI. Without
 		// it, previous behavior is untouched (flat auto-submit), except the
 		// boundary veil hard switch forces passthrough when outside.
 		bool veil_hard_nomask = ((boundary_veil and boundary_s < 0.5f) or depth_fullscreen_passthrough() or effects_full) and not mask_frame;
@@ -2861,78 +3843,60 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		if (mask_frame)
 		{
-			// Split-union compositing: union A (projected content) drives
-			// the projected layer, union B (the rest) drives the flat
-			// layer, composited projected-below-flat so flat wins overlaps.
-			// Video (opaque) was already added above, then each union's
-			// masks, then the camera layers, then debug/GUI. The single
-			// dst-alpha channel carries one union at a time: the first mask
-			// of each union REPLACEs destination alpha (color preserved),
-			// the rest ADD (saturating union). B's REPLACE resets the alpha
-			// the projected layer consumed, so flat reads only B.
-			//
-			// EITHER/OR camera layers: co-submitting flat reconstruction and
-			// projected mapping breaks video compositing on current runtimes
-			// (video goes black; instantly reversible), so exactly one camera
-			// layer submits per frame.
+			// Single merged-set compositing: every mask contributor is
+			// MAX-merged into one alpha layer (submitted once with
+			// REPLACE, color preserved), which the flat camera layer
+			// consumes (camera x alpha + video x (1 - alpha)). Video
+			// (opaque) was already added above, then the merged mask,
+			// then flat, then debug/GUI.
 			//
 			// This branch has no window groups yet (no objects, no blur):
-			// union A is empty, union B holds only the debug cutout group.
-			// Debug cutouts punch union B only (no geometry to map onto),
-			// so the flat feed must stay submitted.
-			//
-			// With objects: union A holds the surface-projected windows
-			// (drives the projected layer), union B the rest (drives the
-			// flat layer). Flat wins whenever anything needs it:
-			// unprojected windows, debug cutouts (camera with no geometry
-			// to map it onto). Otherwise the projected layer alone carries
-			// every projected window.
+			// the merged set holds only the debug cutout group. Debug
+			// cutouts punch the merged set, so the flat feed must stay
+			// submitted.
 			bool need_flat = cutouts_punched;
 			for (auto & [oid, ost]: passthrough_objects)
 			{
 				if (not ost.soup_ready or not ost.fused.placed)
 					continue;
-				// Depth volumes reveal the flat feed wherever the sensor
-				// resolves inside the volume: flat must stay submitted.
-				if (ost.def.type == "3d-depth-passthrough")
-				{
-					need_flat = true;
-					break;
-				}
-				if (ost.def.type != "3d-passthrough")
-					continue;
-				if (not surface_projected_effective(oid, ost))
+				// Windows and depth volumes reveal the flat feed: flat
+				// must stay submitted.
+				if (ost.def.type == "3d-depth-passthrough" or ost.def.type == "3d-passthrough")
 				{
 					need_flat = true;
 					break;
 				}
 			}
-			if (cutouts_punched)
-				need_flat = true;
-			bool have_projected = session.has_projected_instances();
-			size_t a_active = 0, b_active = 0;
-			for (auto & [key, g]: mask_groups)
+			// Hidden objects reveal the flat feed (via the merged
+			// layer): only
+			// while actually submitting (P1 — a placed-but-gated hidden
+			// object reveals nothing, so it must not pin the flat layer
+			// and its compositor cost).
+			size_t active_count = 0;
+			for (auto & [feather_key, g]: mask_groups)
 			{
-				if (not g.active)
-					continue;
-				if (key.second)
-					++a_active;
-				else
-					++b_active;
+				(void)feather_key;
+				if (g.active)
+					++active_count;
 			}
 			if (debug_group.active)
-				++b_active;
+				++active_count;
+			if (hidden_group.active)
+			{
+				++active_count;
+				need_flat = true;
+			}
 			// Boundary veil (fresh values: update_fiducial_passthrough ran
-			// just above): lift the flat union's floor by (1 - s) through
-			// colorScaleBias on the B masks (first submitted B mask gets
-			// scale+lift, the rest scale-only: ADD would multi-add the lift).
+			// just above): lift the flat mask's floor by (1 - s) through
+			// colorScaleBias on the merged mask, applied once (max()
+			// and the lift commute, so one bias equals per-input bias).
 			// Skipped at full-inside so steady state stays bit-identical.
 			// Without colorScaleBias (or without the mask path) the veil
 			// degrades to a hard switch at s = 0.5 (opaque fullscreen flat
 			// when outside, no masks needed).
 			float veil_s = std::clamp(boundary_s, 0.f, 1.f);
 			// Depth debug fullscreen + effects demo fullscreen: full
-			// passthrough under the viz via the same B floor lift
+			// passthrough under the viz via the same floor lift
 			// (scale 0 + bias 1), no geometry.
 			bool depth_full = depth_fullscreen_passthrough();
 			bool effects_full_inner = session.effects_fullscreen_passthrough();
@@ -2947,144 +3911,120 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// colorScaleBias).
 			if ((boundary_veil or full_passthrough_demo) and not composition_layer_alpha_blend_supported and boundary_s < 0.5f)
 				veil_hard_out = true;
-			bool submit_projected = have_projected and a_active > 0;
+			// The flat feed needs the merge behind it: when the merge
+			// drops (push failure, slot sit-out, timeout) with
+			// contributors active, there is no alpha to consume, so
+			// flat must sit out too — otherwise it reads zero while
+			// burning its compositor cost. Veil-hard-out
+			// opaque flat is by design and unaffected.
+			bool merge_covering = merge_this_frame and merge_image >= 0;
 			bool submit_flat = (need_flat or ((boundary_veil or full_passthrough_demo) and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
-			        (b_active > 0 or veil_hard_out);
-			// Forensic submit decisions (change-triggered): which camera layer
-			// submits and why. Permanent: coexistence bugs read as wrong output
-			// with no error, so the decision itself must be in the log.
+			        (veil_hard_out or (active_count > 0 and merge_covering));
+			if (active_count > 0 and not veil_hard_out and not merge_covering)
+			{
+				// Coverage loss (the merge dropped this frame): error,
+				// 1s-throttled — must stay visible in adb.
+				static XrTime last_merge_cover_log = 0;
+				XrTime merge_cover_now = instance.now();
+				if (merge_cover_now - last_merge_cover_log > 1'000'000'000LL)
+				{
+					last_merge_cover_log = merge_cover_now;
+					spdlog::error("Union merge dropped with {} contributors active, flat sits out (no alpha to consume)", active_count);
+				}
+			}
+			// Forensic submit decisions (change-triggered): whether the
+			// flat camera layer submits and why. Permanent: coexistence
+			// bugs read as wrong output with no error, so the decision
+			// itself must be in the log.
 			{
 				static bool last_submit_flat = true;
-				static bool last_submit_projected = false;
-				if (submit_flat != last_submit_flat or submit_projected != last_submit_projected)
+				static bool last_hidden = false;
+				bool hidden_on = hidden_group.active;
+				if (submit_flat != last_submit_flat or hidden_on != last_hidden)
 				{
 					last_submit_flat = submit_flat;
-					last_submit_projected = submit_projected;
-					spdlog::info("Camera submit: {} (need_flat={} have_projected={} A_groups={} B_groups={} cutouts={} depth_full={} effects_full={})",
-					             (submit_flat and submit_projected) ? "projected+flat"
-					             : submit_flat                      ? "flat"
-					             : submit_projected                 ? "projected"
-					                                                : "video-only",
+					last_hidden = hidden_on;
+					spdlog::info("Camera submit: {} (need_flat={} groups={} H={} cutouts={} depth_full={} effects_full={})",
+					             submit_flat ? "flat" : "video-only",
 					             need_flat,
-					             have_projected,
-					             a_active,
-					             b_active,
+					             active_count,
+					             hidden_on ? "on" : "off",
 					             cutouts_punched,
 					             depth_full,
 					             effects_full_inner);
 				}
 			}
-			// One mask submit pass per union (A then B): each union's first
-			// active group REPLACEs, the rest ADD.
-			for (bool proj_union: {true, false})
+			// Opaque hard-outside flat needs no masks at all.
+			if (veil_hard_out)
 			{
-				// Opaque hard-outside flat needs no masks at all.
-				if (veil_hard_out and not proj_union)
-					continue;
-				bool first_group = true;
-				// Union A: window groups with projected=true (none yet).
-				for (auto & [key, g]: mask_groups)
+				// The record phase already sat the merge out under
+				// the same formula, so this is not expected to fire —
+				// but a leaked merge image drains its pool in
+				// pool-depth frames, so release defensively rather
+				// than reason about it.
+				if (merge_image >= 0 and merge_renderer)
 				{
-					if (key.second != proj_union)
-						continue;
-					if (not g.active)
-						continue;
-					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
-					for (uint32_t view = 0; view < view_count; ++view)
-					{
-						mask_views[view] = {
-						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-						        .pose = mask_pose[view],
-						        .fov = mask_fov[view],
-						        .subImage = {
-						                .swapchain = g.swapchain,
-						                .imageRect = {
-						                        .offset = {0, 0},
-						                        .extent = {g.extent.width, g.extent.height},
-						                },
-						                .imageArrayIndex = view,
-						        },
-						};
-					}
-					// imageIndex is implicit: the compositor uses the last
-					// released image, which record() acquired above.
-					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
-					                     application::space(xr::spaces::world),
-					                     mask_views);
-					if (first_group)
-						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-					else
-						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
-					if (veil_lift and not proj_union)
-					{
-						// Coverage·s + (1−s): window interiors stay ~1, empty
-						// areas lift to the uniform veil floor, feather bands
-						// interpolate. RGB untouched (ignored downstream anyway).
-						if (first_group)
-							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
-						else
-							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
-					}
-					first_group = false;
+					merge_renderer->release();
+					merge_image = -1;
+					merge_this_frame = false;
 				}
-				// Union B also carries the local debug cutout group.
-				if (not proj_union and debug_group.active)
+			}
+			// The merged mask: the record phase MAX-combined every
+			// active contributor (hidden, feather groups, debug — up
+			// to max_inputs, extras dropped with an error at record)
+			// into the merge target (merge_this_frame, evaluated once
+			// at record — never recomputed here). ONE layer, always
+			// REPLACE, veil bias once. The old per-group REPLACE/ADD
+			// chain is gone with the layers it cost (~10pp each on
+			// Quest 3).
+			if (not veil_hard_out and merge_this_frame and merge_image >= 0 and merge_renderer)
+			{
+				XrExtent2Di merge_rect{(int32_t)merge_renderer->swapchain().width(),
+				                        (int32_t)merge_renderer->swapchain().height()};
+				std::array<XrCompositionLayerProjectionView, view_count> mask_views;
+				for (uint32_t view = 0; view < view_count; ++view)
 				{
-					auto & g = debug_group;
-					std::array<XrCompositionLayerProjectionView, view_count> mask_views;
-					for (uint32_t view = 0; view < view_count; ++view)
-					{
-						mask_views[view] = {
-						        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-						        .pose = mask_pose[view],
-						        .fov = mask_fov[view],
-						        .subImage = {
-						                .swapchain = g.swapchain,
-						                .imageRect = {
-						                        .offset = {0, 0},
-						                        .extent = {g.extent.width, g.extent.height},
-						                },
-						                .imageArrayIndex = view,
-						        },
-						};
-					}
-					add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
-					                     application::space(xr::spaces::world),
-					                     mask_views);
-					if (first_group)
-						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-					else
-						set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB);
-					if (veil_lift and not proj_union)
-					{
-						if (first_group)
-							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
-						else
-							set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 0});
-					}
-					first_group = false;
+					mask_views[view] = {
+					        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
+					        .pose = sync_pose[view],
+					        .fov = sync_fov[view],
+					        .subImage = {
+					                .swapchain = merge_renderer->swapchain(),
+				                .imageRect = {
+					                        .offset = {0, 0},
+					                        .extent = merge_rect,
+				                        },
+				                .imageArrayIndex = view,
+				        },
+					};
 				}
-				// Each union's camera layer consumes its own alpha: A feeds
-				// projected, then B REPLACEs the alpha and feeds flat, so
-				// flat wins overlaps.
-				if (proj_union)
+				// imageIndex is implicit: the compositor uses the last
+				// released image, which the merge record acquired above.
+				add_projection_layer(XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT,
+				                     application::space(xr::spaces::world),
+				                     mask_views);
+				set_alpha_blend(XR_BLEND_FACTOR_ZERO_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
+				if (veil_lift)
 				{
-					if (submit_projected)
-					{
-						add_projected_passthrough_layer();
-						set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-					}
+					// Coverage·s + (1−s), once: max() and the lift
+					// commute (s ≥ 0), so lifting after the merge
+					// equals lifting every input before it. RGB
+					// untouched (ignored downstream anyway).
+					set_color_scale_bias({1, 1, 1, veil_s}, {0, 0, 0, 1 - veil_s});
 				}
-				else
-				{
-					if (submit_flat)
-					{
-						add_passthrough_layer();
-						// Hard-outside veil is opaque fullscreen: no blend.
-						if (not veil_hard_out)
-							set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
-					}
-				}
+				// Paired with the acquire in the record phase above:
+				// release after submit.
+				merge_renderer->release();
+				merge_image = -1;
+				merge_this_frame = false;
+			}
+			// The flat camera layer consumes the merged alpha.
+			if (submit_flat)
+			{
+				add_passthrough_layer();
+				// Hard-outside veil is opaque fullscreen: no blend.
+				if (not veil_hard_out)
+					set_alpha_blend(XR_BLEND_FACTOR_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_MINUS_DST_ALPHA_FB, XR_BLEND_FACTOR_ONE_FB, XR_BLEND_FACTOR_ZERO_FB);
 			}
 		}
 
@@ -3308,6 +4248,9 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	// anyway).
 	mask_pipe_cache = feather_mask_renderer::pipeline_cache(device);
 	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
+	// Same for the merge (one fullscreen pipeline): first
+	// revealing frames must only rasterize, not driver-compile.
+	union_merge_renderer::warm_pipelines(device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()

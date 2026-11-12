@@ -43,6 +43,10 @@ struct encoder_settings
 	std::map<std::string, std::string> options; // additional encoder-specific configuration
 	int bit_depth;
 	std::optional<std::string> device;
+	// Depth stream only: false when H.265 Main10 virtual depth is
+	// unavailable (headset or GPU). The encoder keeps benign fallback
+	// settings but is never fed; the client falls back to no-virtual.
+	bool enabled = true;
 };
 
 std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle &, wivrn_session &);

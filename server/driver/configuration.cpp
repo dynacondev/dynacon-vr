@@ -500,7 +500,8 @@ configuration::configuration()
 					o.type = item["type"];
 				bool is_boundary = o.type == "3d-boundary" or o.type == "3d-boundary-reversed";
 				bool is_depth = o.type == "3d-depth-passthrough";
-				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed" and not is_boundary and not is_depth)
+				bool is_hidden = o.type == "3d-passthrough-hidden";
+				if (o.type != "3d-passthrough" and o.type != "3d-passthrough-reversed" and not is_boundary and not is_depth and not is_hidden)
 				{
 					U_LOG_W("passthrough object \"%s\": unknown type \"%s\", skipping (not implemented yet)",
 					        item.value("id", o.type).c_str(), o.type.c_str());
@@ -540,7 +541,7 @@ configuration::configuration()
 				}
 				if (item.contains("model-path"))
 					o.model_path = item["model-path"];
-				if (o.model_path.empty() and is_boundary)
+				if (o.model_path.empty() and (is_boundary or is_hidden))
 				{
 					U_LOG_W("passthrough object \"%s\": %s needs model-path (a zone without geometry), skipping", o.id.c_str(), o.type.c_str());
 					continue;
@@ -558,17 +559,10 @@ configuration::configuration()
 				}
 				if (item.contains("feather-px"))
 				{
-					if (o.type == "3d-passthrough-reversed" or is_boundary)
+					if (o.type == "3d-passthrough-reversed" or is_boundary or is_hidden)
 						U_LOG_W("passthrough object \"%s\": feather-px is not accepted for %s, ignoring", o.id.c_str(), o.type.c_str());
 					else
 						o.feather_px = item["feather-px"];
-				}
-				if (item.contains("surface-projected"))
-				{
-					if (o.type == "3d-passthrough-reversed" or is_boundary or is_depth)
-						U_LOG_W("passthrough object \"%s\": surface-projected is not applicable to %s, ignoring", o.id.c_str(), o.type.c_str());
-					else
-						o.surface_projected = item["surface-projected"];
 				}
 				if (item.contains("transition-distance"))
 				{
@@ -581,6 +575,38 @@ configuration::configuration()
 						{
 							U_LOG_W("passthrough object \"%s\": negative transition-distance, clamping to 0", o.id.c_str());
 							o.transition_distance_m = 0;
+						}
+					}
+				}
+				if (item.contains("proximity-radius"))
+				{
+					if (not is_hidden)
+						U_LOG_W("passthrough object \"%s\": proximity-radius is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["proximity-radius"].is_number())
+						U_LOG_W("passthrough object \"%s\": proximity-radius must be a number of meters, ignoring", o.id.c_str());
+					else
+					{
+						o.proximity_radius_m = item["proximity-radius"];
+						if (o.proximity_radius_m < 0)
+						{
+							U_LOG_W("passthrough object \"%s\": negative proximity-radius, clamping to 0", o.id.c_str());
+							o.proximity_radius_m = 0;
+						}
+					}
+				}
+				if (item.contains("hand-proximity-radius"))
+				{
+					if (not is_hidden)
+						U_LOG_W("passthrough object \"%s\": hand-proximity-radius is only accepted for 3d-passthrough-hidden, ignoring", o.id.c_str());
+					else if (not item["hand-proximity-radius"].is_number())
+						U_LOG_W("passthrough object \"%s\": hand-proximity-radius must be a number of meters, ignoring", o.id.c_str());
+					else
+					{
+						o.hand_proximity_radius_m = item["hand-proximity-radius"];
+						if (o.hand_proximity_radius_m < 0)
+						{
+							U_LOG_W("passthrough object \"%s\": negative hand-proximity-radius, clamping to 0", o.id.c_str());
+							o.hand_proximity_radius_m = 0;
 						}
 					}
 				}

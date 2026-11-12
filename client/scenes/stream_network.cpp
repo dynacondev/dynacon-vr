@@ -206,6 +206,16 @@ void scenes::stream::operator()(to_headset::fiducial_map && map)
 				             label, obj.type, obj.model_hash.substr(0, 8), obj.model_size,
 				             (double)obj.transition_distance_m);
 		}
+		else if (obj.type == "3d-passthrough-hidden")
+		{
+			if (obj.model_hash.empty())
+				spdlog::info("Passthrough object \"{}\" ({}): no model", label, obj.type);
+			else
+				spdlog::info("Passthrough object \"{}\" ({}): model {} ({} bytes) reveal {:.2f}m hands {:.2f}m",
+				             label, obj.type, obj.model_hash.substr(0, 8), obj.model_size,
+				             (double)std::max(0.f, obj.proximity_radius_m),
+				             (double)std::max(0.f, obj.hand_proximity_radius_m));
+		}
 		else if (obj.model_hash.empty())
 			spdlog::info("Passthrough object \"{}\" ({}): no model", label, obj.type);
 		else

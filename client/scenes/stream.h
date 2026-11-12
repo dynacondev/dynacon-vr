@@ -30,6 +30,7 @@
 #include "render/feather_mask.h"
 #include "render/imgui_impl.h"
 #include "render/passthrough_mesh.h"
+#include "render/union_merge.h"
 #include "scene.h"
 #include "scenes/input_profile.h"
 #include "stream_defoveator.h"
@@ -76,8 +77,9 @@ public:
 
 private:
 	static const size_t view_count = 2;
-	// left, right, alpha, virtual depth SBS (stream 3, strict frame_idx
-	// pairing with color, null when the color frame had no depth warp)
+	// left, right, alpha, virtual depth SBS (stream 3, tolerant (±1)
+	// frame_idx pairing with color, null when the color frame had no
+	// depth warp)
 	static const size_t decoder_count = view_count + 2;
 	static const uint8_t depth_stream_index = 3;
 
@@ -124,7 +126,8 @@ private:
 	// compositor joins via swapchain release, so no semaphore is
 	// needed). Single slot: reused when its fence reads signaled,
 	// otherwise the frame falls back to inline recording. Results
-	// feed the mask spans (q0 start, q1 after first group, q2 end).
+	// feed the mask spans (q0 start, q1 after first group, q2 end,
+	// q3/q4 merge bracket).
 	vk::raii::Fence mask_fence = nullptr;
 	vk::raii::CommandBuffer mask_command_buffer = nullptr;
 	vk::raii::QueryPool mask_query_pool = nullptr;
@@ -373,14 +376,6 @@ private:
 		float boundary_opacity = 1;
 	};
 	std::map<std::string /*object id*/, passthrough_object_state> passthrough_objects;
-	// Live in-headset surface-projection overrides (Passthrough tab,
-	// session-scoped): presence wins over the map flag. Render thread
-	// only (GUI runs there too).
-	std::map<std::string /*object id*/, bool> projected_overrides;
-	// Object ids whose projected instance upload failed (runtime refused
-	// the mesh): skip retry so a persistent failure can't spam every
-	// frame. Cleared on map change with everything else.
-	std::set<std::string> projected_failed;
 
 	stream(std::string server_name, scene & parent_scene);
 
@@ -500,6 +495,7 @@ private:
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
 	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
 	double volume_raster_ms = 0, volume_virt_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
+	double vr_raster_ms = 0, vr_compare_ms = 0, vr_merge_ms = 0; // VR-occlusion chain CPU (eye-space virt<object MIN-cut)
 	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
 	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
 	// never read unwritten queries). volume_ts_async selects the fence
@@ -527,6 +523,22 @@ private:
 	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
 	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
 	uint64_t volume_win_virt_missing = 0; // color expected depth (view_info flag) but none paired
+	// VR-occlusion diagnostics (unconditional: unlike the Volume block
+	// above, VR cut candidates in 3d-passthrough windows count even when
+	// no 3d-depth-passthrough volume is placed). wanted = any feather
+	// group carried window positives this frame; paired/missing split
+	// that by tolerant (±1) depth pairing (missing only when depth_expected).
+	// Windowed + 5s heartbeat in accumulate_metrics ("VRoccl:" line).
+	bool vr_frame_wanted = false; // set by the mask record loop (any group, any_positive)
+	bool vr_frame_virt_paired = false; // set alongside volume_frame_virt_paired when any_vr ran
+	uint64_t vr_win_frames = 0, vr_win_paired = 0, vr_win_missing = 0;
+	XrTime vr_win_t0 = 0;
+	XrTime vr_last_log = 0;
+	// Throttles for the per-event pairing forensics in common_frame and
+	// the mask record loop (1s: isolated single-frame misses each log,
+	// sustained outages don't spam at 90Hz).
+	XrTime depth_miss_last_log = 0;
+	XrTime vr_cut_skip_last_log = 0;
 	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
@@ -583,6 +595,8 @@ private:
 		// the poll range is valid on group-less frames). Spans:
 		// frame = q1-q0, defoveate = q2-q0, gizmos = q3-q2,
 		// mask = q1-q3, mask first-group = q4-q3, mask rest = q1-q4.
+		// q5/q6 merge bracket (inline mask frames only;
+		// async frames stamp the same span in mask-pool q3/q4).
 		// TopOfPipe stamps don't drain prior fragment work, so a late
 		// producer inflates the *following* span — read spikes by
 		// span, not as exact per-pass costs.
@@ -595,6 +609,12 @@ private:
 		// (preemption/contention inflates both halves together).
 		float mask_first_gpu_time = 0;
 		float mask_rest_gpu_time = 0;
+		// Merge span: async = mask-pool q3/q4, inline =
+		// main-pool q5/q6. One fullscreen full-res pass. Stamped
+		// unconditionally (zero span when the merge sits out) so the
+		// poll range never covers an unwritten query. Read spikes by
+		// span (TopOfPipe caveat).
+		float merge_gpu_time = 0;
 	};
 
 	// Last successfully polled GPU timestamps: the query readback is a
@@ -625,6 +645,9 @@ private:
 		float volume_virt_ms = 0;
 		float volume_compare_ms = 0;
 		float volume_merge_ms = 0;
+		float vr_raster_ms = 0;
+		float vr_compare_ms = 0;
+		float vr_merge_ms = 0;
 		float volume_raster_gpu_ms = 0;
 		float volume_virt_gpu_ms = 0;
 		float volume_compare_gpu_ms = 0;
@@ -636,6 +659,7 @@ private:
 		float gizmo_gpu_ms = 0;
 		float mask_first_gpu_ms = 0;
 		float mask_rest_gpu_ms = 0;
+		float merge_gpu_ms = 0;
 		// Frame-phase waits (seconds): fence wait at frame top, GUI,
 		// and render_end submit (end_frame IPC). Names CPU stalls the
 		// section timers above can't see.
@@ -691,49 +715,40 @@ private:
 	float compact_cpu_time = 0;
 	float compact_gpu_time = 0;
 
-	// Mask stacks grouped by (feather-px, union): union A holds the
-	// surface-projected content (drives the projected layer), union B
-	// the rest (drives the flat layer). The single dst-alpha
-	// channel carries one union at a time: A is consumed by projected,
-	// then B REPLACEs the alpha (color preserved) and is consumed by
-	// flat, so flat wins overlaps. Render thread only.
+	// Mask stacks grouped by feather-px: every group reveals the flat
+	// feed through the single merged alpha layer below. Render thread
+	// only.
 	struct mask_group
 	{
 		float feather_px = 24;
-		// True = union A (projected), false = union B (flat).
-		bool projected = false;
 		std::unique_ptr<feather_mask_renderer> renderer;
 		// Dedicated member swapchain (explicit acquire/release pairing,
 		// never the shared pool).
 		xr::swapchain swapchain;
-		bool acquired = false;
 		bool wait_warned = false; // image-wait timeout already reported
 		XrExtent2Di extent{0, 0}; // submitted size (tier-selected)
 		bool active = false; // submitting this frame
+		// Acquired swapchain image this frame (-1 = none): lets the
+		// merge borrow the recorded image + its array view
+		// after the record loop. Set on acquire, cleared on
+		// wait-timeout / record-throw / release.
+		int image_index = -1;
 		bool had_draws = false; // draws present last frame (edge forensics)
 		XrTime last_draws_log = 0; // throttle for the edge log below
 		// Uploaded object soups by object id (hash compare avoids
 		// re-upload; renderer mirrors).
 		std::map<std::string, std::string> mesh_hashes;
 	};
-	// Mask stacks grouped by (feather-px, union): union A holds the
-	// surface-projected objects (drives the projected layer), union B
-	// the rest (drives the flat layer). Same feather value with mixed
-	// flags is two groups (two swapchains/blur stacks). The single
-	// dst-alpha channel carries one union at a time: A is consumed by
-	// projected, then B REPLACEs the alpha (color preserved) and is
-	// consumed by flat, so flat wins overlaps. Render thread only.
-	// Exact float equality groups identical parsed values; the bool
-	// splits projected (A) from flat (B). Iteration order is
-	// feather-ascending within each union; submit does one pass per
-	// union (A then B).
-	std::map<std::pair<float, bool>, mask_group> mask_groups;
-	// Local debug cutout group (union B): QR windows punched at full
+	// Mask stacks grouped by feather-px (exact float equality groups
+	// identical parsed values). Iteration order is feather-ascending.
+	// Every group feeds the merge below; nothing submits per-group.
+	std::map<float, mask_group> mask_groups;
+	// Local debug cutout group: QR windows punched at full
 	// alpha. Standalone member, not in the map: debug never keys off
-	// server feather values. Claimed while cutouts exist and no B group
-	// does (real B groups punch cutouts themselves), and promoted to the
-	// boundary-veil carrier while the veil is active with no B group to
-	// carry its floor (boundary-only / projected-only configs). Empty
+	// server feather values. Claimed while cutouts exist and no group
+	// does (real groups punch cutouts themselves), and promoted to the
+	// boundary-veil carrier while the veil is active with no group to
+	// carry its floor (boundary-only / all-culled configs). Empty
 	// draws (clear-only record), tier 0; the submit-time bias lifts the
 	// cleared image to a uniform floor.
 	mask_group debug_group;
@@ -742,12 +757,65 @@ private:
 	// feed must stay submitted). Read by the submit phase below.
 	bool cutouts_punched = false;
 
+	// Hidden passthrough objects (3d-passthrough-hidden): hard-edged cutout
+	// on a dedicated mask layer. The mask reuses the feather renderer at
+	// tier 0 (direct raster, no blur chain) but lives outside mask_groups:
+	// its own swapchain, never feathered, never cut by reversed draws
+	// (hidden always wins). Merged like every other input at submit.
+	// Render thread only.
+	// NOTE: hidden_group.feather_px (and debug_group.feather_px)
+	// intentionally untouched (stale defaults): the hidden record and
+	// the debug record pass tier/behavior literals.
+	mask_group hidden_group;
+	// Merge (single submitted alpha layer for the flat feed):
+	// MAX-combines every active contributor (feather groups +
+	// debug + hidden) into one full-res image, submitted once with
+	// REPLACE. merge_image is the acquired target (-1 = none);
+	// merge_this_frame is evaluated ONCE at record time (contributor
+	// activity, not submit_flat/cutouts_punched) and read back at
+	// submit, so record and submit cannot disagree. Render thread only.
+	std::unique_ptr<union_merge_renderer> merge_renderer;
+	int merge_image = -1;
+	bool merge_this_frame = false;
+	// Per-frame hidden working buffers (filled by the shared silhouette
+	// build in the mask phase; capacity survives clear()). Render thread
+	// only.
+	struct hidden_silhouette_draw
+	{
+		std::string mesh;
+		std::array<glm::mat4, 2> mvp;
+		std::array<std::array<float, 4>, 2> px; // full-res x0,y0,x1,y1 per eye
+		// World-space mesh AABB for the CPU proximity pre-gate (P0):
+		// silhouettes fully outside every sphere are dropped before any
+		// acquire/record. bounds_known=false (upload pending) keeps the
+		// draw conservatively.
+		glm::vec3 world_min{0}, world_max{0};
+		bool bounds_known = false;
+	};
+	std::vector<hidden_silhouette_draw> hidden_silhouettes;
+	std::vector<feather_mask_renderer::hidden_draw> hidden_mask_draws;
+	// Per-frame proximity spheres + body cylinders (model already
+	// placed): rebuilt when the mask phase builds draws below; the mask
+	// record renders them into the feather-owned proximity field.
+	// Capacity survives clear(). Render thread only.
+	std::vector<std::array<glm::mat4, 2>> proximity_spheres;
+	std::vector<std::array<glm::mat4, 2>> proximity_cylinders;
+	// The proximity palms borrow the GUI hand trackers (shared handles,
+	// per-frame positions — never culled): set from hidden_known at
+	// frame top so the GUI pair survives its interactability reset
+	// while a hidden map is live. No dedicated trackers (handle churn
+	// bought nothing: locate cost is per call, not per handle).
+	bool hidden_wants_hands = false;
+	// One-shot log when hidden objects exist but the runtime has no mask
+	// path (no alpha blend: hidden stays unrevealed, never flashes).
+	bool hidden_nomask_warned = false;
+
 	// Global boundary-veil state (3d-boundary(-reversed) zones):
 	// scene opacity from the headset distance to placed zone meshes
-	// (union: inside ANY normal AND outside ALL reversed; unplaced
+	// (verdict: inside ANY normal AND outside ALL reversed; unplaced
 	// zones ignored, fail-open to game). boundary_s = 1 means no
 	// effect (no zones, or fully inside). veil = s < ~1 with a placed
-	// zone: the submit lifts the flat union's floor by (1 - s).
+	// zone: the submit lifts the flat mask's floor by (1 - s).
 	// Render thread only; refreshed in update_fiducial_passthrough,
 	// consumed one frame stale by record/submit like the placements.
 	float boundary_s = 1;
@@ -759,7 +827,7 @@ private:
 	// solve latches, never reset on loss; cleared on map change). Empty
 	// target disables. Armed only when the target matches a fiducial id
 	// in the map. While waiting (armed && !locked) the veil is forced to
-	// fullscreen via the same B floor lift, no geometry involved. On lock
+	// fullscreen via the same floor lift, no geometry involved. On lock
 	// the veil fades to normal over passthrough-fade-time seconds
 	// (smoothstep, min-combined with boundary zones so zones still hold
 	// passthrough independently). Render thread only.
@@ -803,7 +871,7 @@ private:
 	bool debug_smoothed = true;  // twin tripod (smaller, cyan square) at the smoothed pose
 	float debug_opacity = 0.5f;  // overlay alpha, 0..1
 	// Marker window cutout, mm past the marker edge punched through
-	// the flat union's mask (-1 = disabled). Gated on the master toggle.
+	// the flat mask (-1 = disabled). Gated on the master toggle.
 	int debug_window_mm = 50;
 	size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts
 	std::unique_ptr<debug_lines_renderer> gizmo_lines;
@@ -819,9 +887,9 @@ private:
 	bool debug_depth_overlay = false; // master toggle (starts the provider)
 	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1
 	std::string depth_status;         // UI status line, refreshed per frame
-	// Fullscreen flat passthrough while depth debugging: the B floor
+	// Fullscreen flat passthrough while depth debugging: the mask floor
 	// lifts to full alpha under the viz (same lift as the boundary
-	// veil). True from the toggle frame (pre-probe optimistic) so the B
+	// veil). True from the toggle frame (pre-probe optimistic) so the
 	// canvas exists when the probe lands; runtimes without depth support
 	// drop out once probing reports unsupported.
 	bool depth_fullscreen_passthrough() const
@@ -858,8 +926,7 @@ private:
 	// user grant. Process-once; the result feeds the status-tab hint.
 	void request_spatial_permissions();
 	void sync_fiducial_trackers(const to_headset::fiducial_map & map);
-	void update_fiducial_passthrough(XrTime predicted_display_time);
-	bool surface_projected_effective(const std::string & oid, const passthrough_object_state & ost) const;
+	void update_fiducial_passthrough(XrTime predicted_display_time, XrTime sync_display_time);
 	// update_boundary_fade: per-frame scene opacity from placed boundary
 	// zones (head point in world space). Writes boundary_s/veil/any plus
 	// the per-object display state; render thread only.

@@ -204,10 +204,6 @@ protected:
 	// so the order becomes video, masks, passthrough.
 	void add_passthrough_layer();
 
-	// Append the surface-projected passthrough layer (Quest only) when a
-	// mesh is live. Dormant until set_projected_passthrough_mesh runs.
-	void add_projected_passthrough_layer();
-
 	void render_end();
 
 	virtual void on_unfocused();

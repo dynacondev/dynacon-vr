@@ -91,7 +91,7 @@ void main()
 	// k-guard) is per-sub: sharing center-k would reintroduce the
 	// discontinuity catch-22 at sub scale for the exact pixels this
 	// fixes.
-	const float q = 0.25 / 320.0;
+	const float q = 0.25 / float(textureSize(volume_tex, 0).x);
 	float inside = 0.0;
 	for (int i = 0; i < 4; ++i)
 	{

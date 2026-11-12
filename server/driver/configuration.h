@@ -97,15 +97,18 @@ struct configuration
 	struct passthrough_object
 	{
 		// Behavior type. "3d-passthrough" renders the model as a
-		// surface-projected passthrough cutout; "3d-passthrough-reversed"
+		// flat-feed passthrough cutout through the merged alpha layer; "3d-passthrough-reversed"
 		// reverse-cuts the model from every mask layer instead (game video
 		// shows through, depth-tested against covering windows). "3d-boundary"
 		// shows game video only inside the model volume (passthrough outside),
 		// "3d-boundary-reversed" inverts it. Boundary meshes must be closed
 		// volumes. "3d-depth-passthrough" reveals the flat feed where the
 		// runtime depth map resolves inside the model volume (depth-tested
-		// volume, feathered like a normal window). Unknown types are skipped
-		// with a warning (forward-compat).
+		// volume, feathered like a normal window). "3d-passthrough-hidden"
+		// reveals the flat feed where the model sits inside the proximity
+		// radius around the head (hard-edged near-field cutout merged into
+		// the single merged submit layer; reversed cuts never apply).
+		// Unknown types are skipped with a warning (forward-compat).
 		std::string type = "3d-passthrough";
 		std::string id;
 		std::string tag;
@@ -120,20 +123,24 @@ struct configuration
 		// Passthrough window feather width in screen pixels (render-only,
 		// applied live). Mask stacks group by this value so each object
 		// feathers independently. Not accepted for
-		// 3d-passthrough-reversed and 3d-boundary(-reversed)
-		// (warned + ignored).
+		// 3d-passthrough-reversed, 3d-boundary(-reversed) and
+		// 3d-passthrough-hidden (warned + ignored).
 		float feather_px = 24;
-		// Surface-projected mapping: the headset projects camera imagery
-		// onto this object's mesh instead of the flat reconstruction feed.
-		// Enabled by default; opt out per object with false (plus a live
-		// in-headset override). Ignored for 3d-passthrough-reversed and
-		// 3d-boundary(-reversed) (warned).
-		bool surface_projected = true;
 		// Boundary fade width in meters (3d-boundary(-reversed) only):
 		// the scene cross-fades over +/- this distance around the mesh
 		// surface (symmetric smoothstep, 0.5 at the surface). 0 = hard
 		// step at the surface. Ignored for other types (warned).
 		float transition_distance_m = 0.3f;
+		// Proximity reveal radius in meters (3d-passthrough-hidden
+		// only): the cutout shows only where the mesh sits
+		// inside this distance of the head (hard near-field edge).
+		// Default 0.3, clamped to >= 0. Applied live.
+		float proximity_radius_m = 0.3f;
+		// Hand proximity reveal radius in meters (3d-passthrough-hidden
+		// only): same gate measured from each palm (hand tracking) or
+		// controller grip pose as fallback. Default 0.2, clamped to
+		// >= 0. Applied live.
+		float hand_proximity_radius_m = 0.2f;
 	};
 	std::vector<passthrough_object> passthrough_objects;
 

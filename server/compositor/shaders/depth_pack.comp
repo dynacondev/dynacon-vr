@@ -21,8 +21,9 @@
  *
  * Reads the warp's target-view splat depth (R32Uint, DEPTH_SCALE-encoded
  * NDC, 0xffffffff sentinel = no splat) for both eyes at full render size
- * and packs a 640x320 side-by-side 8-bit image: left eye in x[0..320),
- * right eye in x[320..640).
+ * and packs a side-by-side 10-bit image: left eye in x[0..half),
+ * right eye in x[half..2*half), where half/height track half the stream
+ * resolution per eye (SBS width = full stream width).
  *
  * Resample happens FIRST in the encoded NDC/uint domain with MIN pooling
  * (foreground wins, order-independent): bilinear filtering of nonlinear
@@ -30,10 +31,14 @@
  * every silhouette. The sentinel is the max uint, so a plain min ignores
  * holes automatically; all-sentinel windows stay sentinel.
  *
- * Linearisation runs only at 320x320 (~102k px/eye, not ~4M): zt back to
- * eye meters via the dst frustum near/far (same math as depth_viz's
- * linearize_depth, mirrored here), then 1cm/LSB quantize. 255 is the
- * single far value: >=2.55m, sky (pinned 1.0 in splat), holes, sentinel.
+ * Linearisation runs only at depth resolution (~1M px/eye at 2K stream,
+ * not ~4M): zt back to eye meters via the dst frustum near/far (same
+ * math as depth_viz's linearize_depth, mirrored here), then 2mm/LSB
+ * quantize CLAMPED at 2.040m (code 1020): beyond-range content (sky
+ * pinned at 1.0, holes, sentinel) reads as a near wall, so VR occludes
+ * passthrough there instead of flagging far (which would let
+ * passthrough win over far VR). Codes 1021-1023 are a guard band for
+ * lossy overshoot; the client decodes them as far.
  *
  * Row convention: output row 0 = scene top (top-down on the wire, like
  * the foveated color streams and the client volume canvas). The warp
@@ -48,8 +53,10 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 layout(set = 0, binding = 0, r32ui) readonly uniform uimage2D splat_l;
 layout(set = 0, binding = 1, r32ui) readonly uniform uimage2D splat_r;
-// Y plane of the depth staging image, 2D view on layer 3 (SBS canvas).
-layout(set = 0, binding = 2, r8) writeonly uniform image2D dst_y;
+// Y plane of the depth staging image, 2D view on layer 3 (SBS canvas,
+// 10-bit in R16). Geometry derives from the actual image (never
+// hardcoded).
+layout(set = 0, binding = 2, r16) writeonly uniform image2D dst_y;
 
 layout(push_constant) uniform Push
 {
@@ -63,7 +70,13 @@ pc;
 
 #define DEPTH_SCALE 16777215.0
 #define DEPTH_SENTINEL 0xffffffffu
-#define CM_PER_UNIT 100.0
+#define LSB_PER_M 500.0
+#define DEPTH_MAX_CODE 1023u
+// Clamp: beyond-range VR reads as a near wall (occludes passthrough)
+// instead of flagging far. Codes above this are a guard band for lossy
+// overshoot, decoded as far client-side.
+#define DEPTH_CLAMP_CODE 1020u
+#define MAX_VIRT_M 2.040
 
 float linearize(float d, float n, float f)
 {
@@ -111,17 +124,17 @@ void main()
 	float virt_m;
 	if (best == DEPTH_SENTINEL)
 	{
-		virt_m = 1e9; // hole: clamps to 255 below
+		virt_m = MAX_VIRT_M; // hole: clamps to near-max, VR wins
 	}
 	else
 	{
 		float zt = float(best) / DEPTH_SCALE;
 		if (zt >= 1.0)
-			virt_m = 1e9; // sky pinned at far
+			virt_m = MAX_VIRT_M; // sky pinned at far: clamp, VR wins
 		else
-			virt_m = linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l);
+			virt_m = min(linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l), MAX_VIRT_M);
 	}
 
-	uint u8 = uint(clamp(virt_m * CM_PER_UNIT + 0.5, 0.0, 255.0));
-	imageStore(dst_y, out_xy, vec4(float(u8) / 255.0));
+	uint u10 = uint(clamp(virt_m * LSB_PER_M + 0.5, 0.0, float(DEPTH_CLAMP_CODE)));
+	imageStore(dst_y, out_xy, vec4(float(u10) / float(DEPTH_MAX_CODE)));
 }

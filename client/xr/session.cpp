@@ -177,7 +177,7 @@ void xr::session::end_frame(XrTime display_time, const std::vector<XrComposition
 	// the passthrough handle being active: the runtime refuses suppression
 	// (SUPPRESSION_NOT_ALLOWED) and forces visible when the app fully
 	// obscures reality (opaque video-only), so video-only must expect
-	// visible. Projected counts too: camera imagery is showing.
+	// visible.
 	bool passthrough_visible = (blend_mode == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND);
 	for (auto * l: layers)
 	{
@@ -489,53 +489,6 @@ void xr::session::disable_passthrough()
 	passthrough.emplace<std::monostate>();
 }
 
-bool xr::session::projected_passthrough_supported()
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		return fb->projected_mesh_supported();
-	return false;
-}
-
-void xr::session::set_projected_passthrough_mesh(
-        std::span<const XrVector3f> vertices,
-        std::span<const uint32_t> indices,
-        XrSpace base_space,
-        const XrPosef & pose,
-        const XrVector3f & scale)
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		fb->set_projected_mesh(vertices, indices, base_space, pose, scale);
-}
-
-void xr::session::clear_projected_passthrough_mesh()
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		fb->clear_projected_mesh();
-}
-
-bool xr::session::has_projected_passthrough_mesh()
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		return fb->has_projected_mesh();
-	return false;
-}
-
-void xr::session::update_projected_passthrough_transform(XrSpace base_space, XrTime time, const XrPosef & pose, const XrVector3f & scale)
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		fb->update_projected_transform(base_space, time, pose, scale);
-}
-
-XrCompositionLayerBaseHeader * xr::session::projected_passthrough_layer()
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-	{
-		if (fb->has_projected_mesh() or fb->has_projected_instances())
-			return fb->projected_layer_header();
-	}
-	return nullptr;
-}
-
 void xr::session::set_passthrough_boundary_enabled(bool enabled)
 {
 	passthrough_boundary_enabled = enabled;
@@ -596,51 +549,4 @@ void xr::session::set_performance_level(XrPerfSettingsDomainEXT domain, XrPerfSe
 {
 	if (xrPerfSettingsSetPerformanceLevelEXT)
 		xrPerfSettingsSetPerformanceLevelEXT(*this, domain, level);
-}
-
-void xr::session::set_projected_instance_mesh(const std::string & key,
-                                              std::span<const XrVector3f> vertices,
-                                              std::span<const uint32_t> indices,
-                                              XrSpace base_space,
-                                              const XrPosef & pose,
-                                              const XrVector3f & scale)
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		fb->set_projected_instance_mesh(key, vertices, indices, base_space, pose, scale);
-}
-
-void xr::session::remove_projected_instance(const std::string & key)
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		fb->remove_projected_instance(key);
-}
-
-void xr::session::clear_projected_instances()
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		fb->clear_projected_instances();
-}
-
-bool xr::session::has_projected_instance(const std::string & key)
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		return fb->has_projected_instance(key);
-	return false;
-}
-
-bool xr::session::has_projected_instances()
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		return fb->has_projected_instances();
-	return false;
-}
-
-void xr::session::update_projected_instance_transform(const std::string & key,
-                                                      XrSpace base_space,
-                                                      XrTime time,
-                                                      const XrPosef & pose,
-                                                      const XrVector3f & scale)
-{
-	if (auto * fb = std::get_if<xr::passthrough_fb>(&passthrough))
-		fb->update_projected_instance_transform(key, base_space, time, pose, scale);
 }

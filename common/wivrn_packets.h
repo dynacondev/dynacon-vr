@@ -848,17 +848,23 @@ struct video_stream_description
 {
 	// dimensions of the video stream per eye
 	// alpha is half resolution
-	// depth is a 640x320 side-by-side (left|right) 8-bit virtual-depth
-	// channel, 1cm/LSB, 255 = >=2.55m / unknown
+	// depth is a side-by-side (left|right) 10-bit virtual-depth
+	// channel at half stream resolution per eye, 2mm/LSB, clamped at
+	// 2.040m (code 1020) so beyond-range VR occludes passthrough;
+	// 1021+ is a lossy-overshoot guard band, decoded as far
 	uint16_t width;
 	uint16_t height;
 	std::array<video_codec, 4> codec; // left, right, alpha, depth
 	// Depth SBS dimensions (left|right halves); color width/height above
-	// are per-eye. Fixed 640x320 today, carried explicitly so the client
-	// never hardcodes it. Wire convention: row 0 = scene top, left eye in
-	// x[0..depth_width/2), 8-bit 1cm/LSB luma, 255 = >=2.55m / unknown.
-	uint16_t depth_width = 640;
-	uint16_t depth_height = 320;
+	// are per-eye. Half stream resolution per eye, carried explicitly so
+	// the client never hardcodes it. Wire convention: row 0 = scene top,
+	// left eye in x[0..depth_width/2), 10-bit 2mm/LSB luma clamped
+	// at 2.040m (code 1020); 1021+ decodes as far (lossy guard).
+	// Overwritten on connect from the encoder settings (half stream
+	// resolution per eye); 0 = not yet advertised. No legacy default:
+	// the client sizes its idle decoder from the connect-time describe.
+	uint16_t depth_width = 0;
+	uint16_t depth_height = 0;
 	float frame_rate;
 	float refresh_rate;
 
@@ -873,7 +879,7 @@ public:
 	// 0 left
 	// 1 right
 	// 2 alpha
-	// 3 virtual depth SBS (640x320 left|right, strict frame_idx pairing
+	// 3 virtual depth SBS (half-res left|right, strict frame_idx pairing
 	//   with color; absent when the color frame had no depth warp)
 	uint8_t stream_item_idx;
 	// Counter increased for each frame
@@ -1033,15 +1039,18 @@ struct fiducial_entry
 struct passthrough_object
 {
 	// Behavior type. "3d-passthrough" renders the model as a
-	// surface-projected passthrough cutout; "3d-passthrough-reversed"
+	// flat-feed passthrough cutout through the merged alpha layer; "3d-passthrough-reversed"
 	// reverse-cuts the model from every mask layer instead (game video
 	// shows through, depth-tested against covering windows). "3d-boundary"
 	// shows game video only inside the model volume (passthrough outside),
 	// "3d-boundary-reversed" inverts it. Boundary meshes must be closed
 	// volumes. "3d-depth-passthrough" reveals the flat feed where the
 	// runtime depth map resolves inside the model volume (depth-tested
-	// volume, feathered like a normal window). Unknown types are skipped
-	// client-side (forward-compat).
+	// volume, feathered like a normal window). "3d-passthrough-hidden"
+	// reveals the flat feed where the model sits inside the proximity
+	// radius around the head (hard-edged near-field cutout, merged into
+	// the single merged submit layer; reversed cuts never apply).
+	// Unknown types are skipped client-side (forward-compat).
 	std::string type = "3d-passthrough";
 	std::string id;
 	std::string tag;
@@ -1060,20 +1069,21 @@ struct passthrough_object
 	// Passthrough window feather width in screen pixels (alpha-gradient
 	// blend band around the mesh silhouette). Mask stacks group by this
 	// value so each object feathers independently. 0 disables feathering.
-	// Not accepted for 3d-passthrough-reversed and 3d-boundary(-reversed)
-	// (warned + ignored on the server).
+	// Not accepted for 3d-passthrough-reversed, 3d-boundary(-reversed)
+	// and 3d-passthrough-hidden (warned + ignored on the server).
 	float feather_px = 24;
-	// Surface-projected mapping: the headset projects camera imagery onto
-	// this object's mesh (geometry instance on the projected passthrough
-	// layer) instead of the flat reconstruction feed. Enabled by default;
-	// opt out per object with false (plus a live in-headset override).
-	// Ignored for 3d-passthrough-reversed and 3d-boundary(-reversed)
-	// (warned + ignored on the server).
-	bool surface_projected = true;
 	// Boundary fade width in meters (3d-boundary(-reversed) only):
 	// symmetric smoothstep over +/- this distance around the mesh
 	// surface (0.5 at the surface); 0 = hard step. Default 0.3.
 	float transition_distance_m = 0.3f;
+	// Proximity reveal radius in meters (3d-passthrough-hidden only):
+	// the cutout shows only where the mesh sits inside this
+	// distance of the head (hard near-field edge). Default 0.3.
+	float proximity_radius_m = 0.3f;
+	// Hand proximity reveal radius in meters (3d-passthrough-hidden
+	// only): same gate measured from each palm (hand tracking) or
+	// controller grip pose as fallback. Default 0.2.
+	float hand_proximity_radius_m = 0.2f;
 };
 
 // Origin alignment (headset-side): re-base outgoing tracking so the

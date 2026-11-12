@@ -18,19 +18,21 @@
 
 #version 450
 
-layout(location = 0) in vec3 pos;
-
+// Multiview silhouette fragment: flat silhouette (opacity
+// replicated to all channels), push block widened to the multiview pair
+// so the shared 132B layout reads opacity at the right offset (a
+// mismatched single-MVP block here would read mvp[1][0][0] as alpha —
+// orientation-dependent garbage through the DST_ALPHA blend).
 layout(push_constant) uniform PushConstants
 {
-	mat4 mvp;
-	// First-acquisition fade: global silhouette opacity, ramps 0 -> 1.
-	// Read by the fragment stage; the blur chain is linear in alpha so
-	// the whole window (interior and feather band) fades uniformly.
+	mat4 mvp[2];
 	float opacity;
 }
 pc;
 
+layout(location = 0) out vec4 out_color;
+
 void main()
 {
-	gl_Position = pc.mvp * vec4(pos, 1.0);
+	out_color = vec4(pc.opacity);
 }

@@ -19,6 +19,7 @@
 #include "passthrough_mesh.h"
 
 #include "utils/mapped_file.h"
+#include <cmath>
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
 #include <fastgltf/tools.hpp>
@@ -262,3 +263,76 @@ passthrough_mesh::triangle_soup passthrough_mesh::flatten_gltf(const std::filesy
 	spdlog::info("passthrough_mesh: {} -> {} vertices, {} triangles", path.string(), out.vertices.size(), out.indices.size() / 3);
 	return out;
 }
+
+namespace passthrough_mesh
+{
+// Latitude-longitude grid, 16x8 (256 tris incl. degenerate pole rows:
+// harmless, rasterizer culls zero-area). Quad (i,j): a=(i,j), b=(i,j+1),
+// d=(i+1,j), e=(i+1,j+1) with latitude increasing upward; tris (a,e,b) +
+// (a,d,e) wind outward-CCW (verified: equator quad gives +X normals).
+std::vector<XrVector3f> unit_sphere_positions()
+{
+	constexpr int rows = 8, cols = 16;
+	constexpr float pi = 3.14159265358979323846f;
+	std::vector<XrVector3f> out;
+	out.reserve((size_t)rows * cols * 6);
+	auto at = [&](int i, int j) {
+		float lat = -pi / 2.f + pi * (float)i / (float)rows;
+		float lon = 2.f * pi * (float)(j % cols) / (float)cols;
+		float cl = std::cos(lat);
+		return XrVector3f{cl * std::cos(lon), std::sin(lat), cl * std::sin(lon)};
+	};
+	for (int i = 0; i < rows; ++i)
+	{
+		for (int j = 0; j < cols; ++j)
+		{
+			XrVector3f a = at(i, j), b = at(i, j + 1), d = at(i + 1, j), e = at(i + 1, j + 1);
+			out.push_back(a);
+			out.push_back(e);
+			out.push_back(b);
+			out.push_back(a);
+			out.push_back(d);
+			out.push_back(e);
+		}
+	}
+	return out;
+}
+
+// Closed unit cylinder, radius 1, y in [-1,1]: 16-sided wall plus top
+// and bottom cap fans. Side quad (j,j+1): tris (b0,t0,t1) + (b0,t1,b1)
+// give +radial normals (spot-checked at lon 0); caps (C,t1,t0) top /
+// (C,b0,b1) bottom give +/-Y. All outward-CCW, matching the sphere
+// above so the same cull-front exit-wall pipe serves both.
+std::vector<XrVector3f> unit_cylinder_positions()
+{
+	constexpr int segs = 16;
+	constexpr float pi = 3.14159265358979323846f;
+	std::vector<XrVector3f> out;
+	out.reserve((size_t)segs * 12);
+	auto ring = [&](float y, int j) {
+		float lon = 2.f * pi * (float)(j % segs) / (float)segs;
+		return XrVector3f{std::cos(lon), y, std::sin(lon)};
+	};
+	for (int j = 0; j < segs; ++j)
+	{
+		XrVector3f b0 = ring(-1.f, j), b1 = ring(-1.f, j + 1);
+		XrVector3f t0 = ring(1.f, j), t1 = ring(1.f, j + 1);
+		// Wall (outward).
+		out.push_back(b0);
+		out.push_back(t0);
+		out.push_back(t1);
+		out.push_back(b0);
+		out.push_back(t1);
+		out.push_back(b1);
+		// Top cap (+Y): fan (C,t1,t0).
+		out.push_back(XrVector3f{0, 1, 0});
+		out.push_back(t1);
+		out.push_back(t0);
+		// Bottom cap (-Y): fan (C,b0,b1).
+		out.push_back(XrVector3f{0, -1, 0});
+		out.push_back(b0);
+		out.push_back(b1);
+	}
+	return out;
+}
+} // namespace passthrough_mesh

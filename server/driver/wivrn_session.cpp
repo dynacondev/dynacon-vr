@@ -572,8 +572,9 @@ void wivrn_session::send_fiducial_map()
 		        .orientation = entry.orientation,
 		        .scale = entry.scale,
 		        .feather_px = entry.feather_px,
-		        .surface_projected = entry.surface_projected,
 		        .transition_distance_m = entry.transition_distance_m,
+		        .proximity_radius_m = entry.proximity_radius_m,
+		        .hand_proximity_radius_m = entry.hand_proximity_radius_m,
 		};
 
 		// Display label: the tag, or the id when untagged.

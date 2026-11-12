@@ -54,10 +54,7 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
                                            .passthrough = id,
                                            .flags = 0,
                                            .purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB,
-                                   }),
-        inst(&inst),
-        sess(&s),
-        projected_supported(inst.has_extension(XR_FB_TRIANGLE_MESH_EXTENSION_NAME))
+                                   })
 {
 	xrPassthroughStartFB = inst.get_proc<PFN_xrPassthroughStartFB>("xrPassthroughStartFB");
 	xrPassthroughPauseFB = inst.get_proc<PFN_xrPassthroughPauseFB>("xrPassthroughPauseFB");
@@ -92,50 +89,8 @@ xr::passthrough_fb::passthrough_fb(instance & inst, session & s) :
 	        .layerHandle = passthrough_layer,
 	};
 
-	if (projected_supported)
-	{
-		projected_layer.emplace(inst, s, XrPassthroughLayerCreateInfoFB{
-		                                        .type = XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB,
-		                                        .passthrough = id,
-		                                        .flags = 0,
-		                                        .purpose = XR_PASSTHROUGH_LAYER_PURPOSE_PROJECTED_FB,
-		                                });
-		projected_composition_layer = XrCompositionLayerPassthroughFB{
-		        .type = XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB,
-		        .next = nullptr,
-		        // Non-zero flags are required by the composition-layer
-		        // VUID (unlike the layer-create struct, where 0 is
-		        // legal), and signal that the layer carries meaningful
-		        // alpha: without it the compositor may treat the layer
-		        // as opaque, hiding video behind off-geometry pixels.
-		        // The flat layer keeps flags=0 (proven tolerated); do
-		        // not "harmonize" this.
-		        .flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-		        .space = XR_NULL_HANDLE,
-		        .layerHandle = *projected_layer,
-		};
-		// Explicit style: the spec states no default, so pin full
-		// opacity with edge rendering disabled (alpha 0) rather than
-		// relying on whatever the runtime assumes for an unstyled layer.
-		XrPassthroughStyleFB projected_style{
-		        .type = XR_TYPE_PASSTHROUGH_STYLE_FB,
-		        .next = nullptr,
-		        .textureOpacityFactor = 1.0f,
-		        .edgeColor = {0.f, 0.f, 0.f, 0.f},
-		};
-		// Warn-only: a throw here inside enable_passthrough()'s emplace
-		// would leave the passthrough variant valueless_by_exception and
-		// poison every later frame (bad_variant_access skips end_frame,
-		// surfacing as CALL_ORDER_INVALID). Flat default below is
-		// already warn-only; keep both consistent.
-		if (auto res = xrPassthroughLayerSetStyleFB(*projected_layer, &projected_style); res != XR_SUCCESS)
-			spdlog::warn("Default projected passthrough style failed: {}", (int)res);
-	}
-	else
-		spdlog::info("XR_FB_triangle_mesh not available, surface-projected passthrough disabled");
-
-	// Pin flat layer to the same explicit default so later style swaps
-	// have a known baseline on both layers.
+	// Pin the flat layer to an explicit default so later style swaps
+	// have a known baseline.
 	{
 		XrPassthroughStyleFB flat_style{
 		        .type = XR_TYPE_PASSTHROUGH_STYLE_FB,
@@ -457,8 +412,6 @@ void xr::passthrough_fb::apply_style(const passthrough_effects & fx)
 			spdlog::debug("Passthrough style {}: opacity {:.2f} edge_a {:.2f} mode {}", name, opacity, (double)edge.a, (int)v.mode);
 	};
 	apply_one(passthrough_layer, "flat");
-	if (projected_layer)
-		apply_one(*projected_layer, "projected");
 }
 
 void xr::passthrough_fb::set_effects(const passthrough_effects & fx)
@@ -470,48 +423,12 @@ void xr::passthrough_fb::start()
 {
 	CHECK_XR(xrPassthroughStartFB(id));
 	CHECK_XR(xrPassthroughLayerResumeFB(passthrough_layer));
-	if (projected_layer)
-		CHECK_XR(xrPassthroughLayerResumeFB(*projected_layer));
 }
 
 void xr::passthrough_fb::pause()
 {
-	if (projected_layer)
-		CHECK_XR(xrPassthroughLayerPauseFB(*projected_layer));
 	CHECK_XR(xrPassthroughLayerPauseFB(passthrough_layer));
 	CHECK_XR(xrPassthroughPauseFB(id));
-}
-
-void xr::passthrough_fb::set_projected_mesh(
-        std::span<const XrVector3f> vertices,
-        std::span<const uint32_t> indices,
-        XrSpace base_space,
-        const XrPosef & pose,
-        const XrVector3f & scale)
-{
-	if (not projected_supported or not projected_layer)
-		throw std::runtime_error("Surface-projected passthrough not supported by the runtime");
-
-	// Destroy the old geometry first: the instance references the mesh
-	projected_geometry.reset();
-	projected_mesh.reset();
-
-	projected_mesh.emplace(*inst, *sess, vertices, indices);
-	projected_geometry.emplace(*inst, *sess, *projected_layer, *projected_mesh, base_space, pose, scale);
-
-	spdlog::info("Projected passthrough mesh set: {} vertices, {} triangles", vertices.size(), indices.size() / 3);
-}
-
-void xr::passthrough_fb::clear_projected_mesh()
-{
-	projected_geometry.reset();
-	projected_mesh.reset();
-}
-
-void xr::passthrough_fb::update_projected_transform(XrSpace base_space, XrTime time, const XrPosef & pose, const XrVector3f & scale)
-{
-	if (projected_geometry)
-		projected_geometry->set_transform(base_space, time, pose, scale);
 }
 
 xr::passthrough_htc::passthrough_htc(instance & inst, session & s) :
@@ -538,53 +455,3 @@ xr::passthrough_htc::passthrough_htc(instance & inst, session & s) :
 	};
 }
 
-void xr::passthrough_fb::set_projected_instance_mesh(const std::string & key,
-                                                     std::span<const XrVector3f> vertices,
-                                                     std::span<const uint32_t> indices,
-                                                     XrSpace base_space,
-                                                     const XrPosef & pose,
-                                                     const XrVector3f & scale)
-{
-	if (not projected_supported or not projected_layer)
-		throw std::runtime_error("Surface-projected passthrough not supported by the runtime");
-
-	auto & pin = projected_instances[key];
-	// Destroy the old geometry first: the instance references the mesh
-	pin.geometry.reset();
-	pin.mesh.reset();
-
-	pin.mesh.emplace(*inst, *sess, vertices, indices);
-	pin.geometry.emplace(*inst, *sess, *projected_layer, *pin.mesh, base_space, pose, scale);
-
-	spdlog::info("Projected passthrough instance \"{}\": {} vertices, {} triangles", key, vertices.size(), indices.size() / 3);
-}
-
-void xr::passthrough_fb::remove_projected_instance(const std::string & key)
-{
-	projected_instances.erase(key);
-}
-
-void xr::passthrough_fb::clear_projected_instances()
-{
-	projected_instances.clear();
-}
-
-bool xr::passthrough_fb::has_projected_instance(const std::string & key) const
-{
-	return projected_instances.contains(key);
-}
-
-bool xr::passthrough_fb::has_projected_instances() const
-{
-	return not projected_instances.empty();
-}
-
-void xr::passthrough_fb::update_projected_instance_transform(const std::string & key,
-                                                             XrSpace base_space,
-                                                             XrTime time,
-                                                             const XrPosef & pose,
-                                                             const XrVector3f & scale)
-{
-	if (auto it = projected_instances.find(key); it != projected_instances.end() and it->second.geometry)
-		it->second.geometry->set_transform(base_space, time, pose, scale);
-}

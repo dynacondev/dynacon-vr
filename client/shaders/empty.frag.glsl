@@ -18,19 +18,8 @@
 
 #version 450
 
-// Flat silhouette: opacity replicated to all channels, so one body serves
-// single-channel intermediates (.r) and RGBA8 outputs (.a; RGB is ignored
-// downstream by the ZERO color blend factors).
-layout(push_constant) uniform PushConstants
-{
-	mat4 mvp;
-	float opacity;
-}
-pc;
-
-layout(location = 0) out vec4 out_color;
-
+// Empty fragment for the hidden proximity pipe: depth-only
+// (no color attachment, color writes off).
 void main()
 {
-	out_color = vec4(pc.opacity);
 }

@@ -21,7 +21,7 @@ Bit depth of the video. 8-bit is supported by all encoders. 10-bit is supported 
 The encoder to use, either a single string or object applied to all streams, or a list of string or objects with values for left, right, alpha and virtual depth (in that order).
 When a string it is used, it is equivalent to the `encoder` item of the object.
 
-WiVRn encodes each eye separately, and the alpha channel as one for both eyes. Each stream is processed independently, this may use resources more effectively and reduce latency. A fourth stream carries the warped virtual depth (640x320 side-by-side, 8-bit 1cm/LSB) for depth-tested passthrough; it prefers `h265` and is pinned to ~5% of the total bitrate.
+WiVRn encodes each eye separately, and the alpha channel as one for both eyes. Each stream is processed independently, this may use resources more effectively and reduce latency. A fourth stream carries the warped virtual depth (half stream resolution side-by-side, 10-bit 2mm/LSB clamped at ~2.04m so beyond-range VR occludes passthrough) for depth-tested passthrough; it requires `h265` and is pinned to ~15% of the total bitrate. When H.265 Main10 is unavailable (headset or GPU) the depth stream is disabled with a warning and the share returns to color.
 
 ### `encoder`
 Default value, in order: `vulkan` if supported, `nvenc` on Nvidia GPU, `vaapi` on all other GPU, else `x264`.
@@ -80,7 +80,7 @@ Creates a hardware encoder for left eye and transparency, and a software encoder
 
 A list may also have 3 entries (left, right, alpha): the virtual depth
 stream then uses default selection (same backend as configured, H.265
-preferred when the headset supports it).
+Main10 required; disabled with a warning when the headset or GPU lacks it).
 
 ### `device`, only for vaapi
 Default value: unset
@@ -414,8 +414,11 @@ frame, live or held.
 Each `passthrough` entry has:
 
 - `type`: behavior type (required). `"3d-passthrough"` renders the
-  model as a surface-projected passthrough cutout; unknown types are
-  skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
+  model as a flat-feed passthrough cutout through the single merged
+  alpha layer; unknown types are
+  skipped with a warning. Where a warped virtual-depth frame is paired,
+  VR content also occludes the cutout eye-space (`virt < object` at
+  half stream resolution, feathered like a silhouette edge). `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each
   pixel). `"3d-depth-passthrough"` reveals the flat feed where the
@@ -445,7 +448,14 @@ Each `passthrough` entry has:
   **closed volumes** (inside/outside comes from ray parity, undefined
   for open meshes); keep them simple (room-size boxes are ideal, ~5k
   triangles budget). Both eyes fade together from a single per-frame
-  headset distance.
+  headset distance. `"3d-passthrough-hidden"` reveals the flat feed
+  where the model sits inside the proximity radius around the head
+  or inside a body column of the same radius hanging 2 m down from
+  the head center
+  (hard-edged near-field cutout merged into the single merged submit layer;
+  front faces only, so hidden meshes read best as **closed volumes** like boundary
+  meshes): reversed cuts never apply to it (safety: hidden always wins),
+  and it needs `model-path` like boundary zones.
 - `id`: stable identifier (required, must be unique); `tag`:
   display-only label (optional)
 - `fiducial`: referenced fiducial id, or list of ids (required;
@@ -465,23 +475,28 @@ Each `passthrough` entry has:
   (default `24`; `0` disables feathering). Mask stacks group by this
   value so each object feathers independently; applied live. Depth
   volumes reuse their feather value and feather through the same
-  erode/blur chain. Not accepted for `3d-passthrough-reversed` or
-  `3d-boundary(-reversed)` (warned + ignored): negatives cut every
+  erode/blur chain. Not accepted for `3d-passthrough-reversed`,
+  `3d-boundary(-reversed)` or `3d-passthrough-hidden` (warned + ignored):
+  negatives cut every
   layer and inherit each layer's feathering, while zones fade by
-  distance instead (see `transition-distance`).
+  distance instead (see `transition-distance`) and hidden cutouts are
+  hard-edged (composited through the shared merged layer).
 - `transition-distance`: boundary fade width in meters
   (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
   scene cross-fades over ± this distance around the zone surface
   (symmetric smoothstep, 0.5 at the surface); `0` is a hard step.
   Composited by lifting the flat union's mask floor, so no extra layers
   or swapchains: exiting saturates the existing flat feed to fullscreen.
-- `surface-projected`: the headset projects camera imagery onto this
-  object's mesh instead of the flat reconstruction feed (default
-  `true`; opt out per object with `false`, plus a live in-headset
-  override in the Passthrough tab). Ignored for
-  `3d-passthrough-reversed`, `3d-boundary(-reversed)` or
-  `3d-depth-passthrough` (warned + ignored): zones never map camera
-  onto geometry, and depth volumes always reveal the flat feed.
+- `proximity-radius`: near-field reveal radius in meters
+  (`3d-passthrough-hidden` only, default `0.30`, clamped to `>= 0`,
+  applied live). The cutout shows only where the mesh sits
+  inside this distance of the head — or inside the body column
+  (same radius, 2 m down from the head center) — (hard edge);
+  `0` reveals nothing.
+- `hand-proximity-radius`: same gate measured from each hand in meters
+  (`3d-passthrough-hidden` only, default `0.20`, clamped to `>= 0`,
+  applied live). Uses palm tracking when valid, else the controller
+  grip pose.
 
 Poses compose as
 `objectPose = fiducialPose * fiducialToObjectOffset` (scale last).

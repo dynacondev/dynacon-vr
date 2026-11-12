@@ -39,17 +39,21 @@
 #include "ffmpeg/video_encoder_va.h"
 #include <libavutil/ffversion.h>
 #endif
+#if WIVRN_USE_VULKAN_ENCODE
+#include "video_encoder_vulkan_h265.h"
+#endif
 
 namespace wivrn
 {
 
 static const double passthrough_bitrate_factor = 0.05;
 
-// Depth stream (index 3, 640x320 SBS virtual depth) is pinned to 5% of the
-// total bitrate: it is tiny, low-entropy 8-bit luma, and must not starve
-// color. Weights for 0..2 are area-based as before; depth weight is derived
-// from their sum so the final share is exactly depth_share.
-static const double depth_bitrate_share = 0.05;
+// Depth stream (index 3, half-res SBS virtual depth) is pinned to 15% of
+// the total bitrate: it is larger than before but low-entropy 10-bit
+// luma, and must not starve color. Weights for 0..2 are area-based as
+// before; depth weight is derived from their sum so the final share is
+// exactly depth_share.
+static const double depth_bitrate_share = 0.15;
 
 static void split_bitrate(std::array<wivrn::encoder_settings, 4> & encoders, uint64_t bitrate)
 {
@@ -92,6 +96,7 @@ void print_encoders(const std::array<wivrn::encoder_settings, 4> & encoders)
 	for (auto & encoder: encoders)
 	{
 		str << "\n\t* " << encoder.encoder_name << " (" << magic_enum::enum_name(encoder.codec) << " " << encoder.bit_depth << "-bit)"
+		    << (encoder.enabled ? "" : " (disabled)")
 		    << "\n\t  size: " << encoder.width << "x" << encoder.height
 		    << "\n\t  bitrate: " << int(encoder.bitrate / 100'000) / 10. << "Mbit/s";
 	}
@@ -286,6 +291,91 @@ public:
 
 		throw std::runtime_error("Failed to find a suitable video encoder");
 	}
+
+	// 10-bit H.265 construction probe for the depth stream (index 3):
+	// mirrors the 8-bit probes above but exercises the Main10 path, so
+	// a backend advertising H.265 without 10-bit support disables depth
+	// instead of throwing later at encoder construction.
+	bool check_10bit_h265(const std::string & encoder_name)
+	{
+#if WIVRN_USE_NVENC
+		if (encoder_name == encoder_nvenc)
+		{
+			try
+			{
+				video_encoder_nvenc test(
+				        vk,
+				        encoder_settings{
+				                .width = 800,
+				                .height = 800,
+				                .codec = video_codec::h265,
+				                .fps = 60,
+				                .bitrate = 50'000'000,
+				                .bit_depth = 10,
+				        },
+				        3);
+				return true;
+			}
+			catch (std::exception & e)
+			{
+				U_LOG_I("nvenc 10-bit H.265 not supported for depth stream: %s", e.what());
+				return false;
+			}
+		}
+#endif
+#if WIVRN_USE_VAAPI
+		if (encoder_name == encoder_vaapi)
+		{
+			try
+			{
+				video_encoder_va test(
+				        vk,
+				        encoder_settings{
+				                .width = 800,
+				                .height = 800,
+				                .codec = video_codec::h265,
+				                .fps = 60,
+				                .bitrate = 50'000'000,
+				                .bit_depth = 10,
+				        },
+				        3);
+				return true;
+			}
+			catch (std::exception & e)
+			{
+				U_LOG_I("vaapi 10-bit H.265 not supported for depth stream: %s", e.what());
+				return false;
+			}
+		}
+#endif
+#if WIVRN_USE_VULKAN_ENCODE
+		if (encoder_name == encoder_vulkan)
+		{
+			try
+			{
+				auto encoder = video_encoder_vulkan_h265::create(
+				        vk,
+				        encoder_settings{
+				                .width = 800,
+				                .height = 800,
+				                .codec = video_codec::h265,
+				                .fps = 60,
+				                .bitrate = 50'000'000,
+				                .bit_depth = 10,
+				        },
+				        3);
+				return true;
+			}
+			catch (std::exception & e)
+			{
+				U_LOG_I("vulkan 10-bit H.265 not supported for depth stream: %s", e.what());
+				return false;
+			}
+		}
+#endif
+		// x264, raw and unknown backends have no 10-bit H.265 path.
+		return false;
+	}
 };
 } // namespace
 
@@ -313,23 +403,45 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 		std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(src);
 
-		// Depth stream (index 3) prefers H.265: lossy-tolerant 8-bit luma
-		// carrying 1cm/LSB virtual depth. If the config did not pin a
-		// codec, the headset advertised H.265, and H.265 probes cleanly
-		// on this backend, switch to it.
-		if (i == 3 and not src.codec and dst.codec != wivrn::h265 and
-		    std::ranges::contains(info.supported_codecs, wivrn::h265, &video_codec_capability::codec))
+		// Depth stream (index 3) requires H.265 Main10: 10-bit luma
+		// carrying 2mm/LSB virtual depth. The headset must advertise
+		// 10-bit-capable H.265 and the backend must construct a Main10
+		// encoder; otherwise the depth stream is disabled (the encoder
+		// keeps benign fallback settings and is never fed) instead of
+		// failing the session. There is no 8-bit fallback: the client
+		// decodes depth as 10-bit unconditionally.
+		if (i == 3)
 		{
-			try
+			// An explicit non-H.265 pin (including global raw test
+			// mode) disables depth with a warning instead of failing:
+			// depth is an optional enhancement, never worth the
+			// session.
+			dst.enabled = false;
+			if (src.codec and *src.codec != wivrn::h265)
 			{
-				configuration::encoder depth_cfg = src;
-				depth_cfg.codec = wivrn::h265;
-				std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(depth_cfg);
+				U_LOG_W("virtual depth stream disabled: pinned %s codec cannot carry 10-bit H.265 depth",
+				        std::string(magic_enum::enum_name(*src.codec)).c_str());
+				continue;
 			}
-			catch (std::exception &)
+			auto h265 = std::ranges::find(
+			        info.supported_codecs, wivrn::h265, &video_codec_capability::codec);
+			if (h265 != info.supported_codecs.end() and h265->supports_10bit)
 			{
-				// Keep the probed fallback (e.g. H.264-only stacks).
+				try
+				{
+					configuration::encoder depth_cfg = src;
+					depth_cfg.codec = wivrn::h265;
+					std::tie(dst.encoder_name, dst.codec) = prober.select_encoder(depth_cfg);
+					dst.enabled = dst.codec == wivrn::h265 and
+					              prober.check_10bit_h265(dst.encoder_name);
+				}
+				catch (std::exception &)
+				{
+					// Leave depth disabled below.
+				}
 			}
+			if (not dst.enabled)
+				U_LOG_W("virtual depth stream disabled: H.265 Main10 unavailable (headset or GPU)");
 		}
 	}
 
@@ -341,10 +453,13 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 	for (auto [i, dst]: std::ranges::enumerate_view(res))
 	{
-		if (i == 3) // virtual depth SBS: fixed 640x320 (L|R halves 320x320)
+		if (i == 3) // virtual depth SBS: half stream resolution per eye
+		            // (SBS width = full stream width, height = half).
+		            // width/height are 64-aligned above, so both stay
+		            // %32 for NVENC.
 		{
-			dst.width = 640;
-			dst.height = 320;
+			dst.width = width;
+			dst.height = height / 2;
 			uint16_t w = dst.width, h = dst.height;
 			check_video_size(dst.encoder_name, dst.codec, w, h);
 			dst.width = w;
@@ -362,8 +477,9 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	if (bit_depth and bit_depth != 8 and bit_depth != 10)
 		throw std::runtime_error("invalid bit-depth setting. supported values: 8, 10");
 
-	// Depth (index 3) is always 8-bit on its own staging image: it must
-	// not veto 10-bit color, nor be probed at 10-bit.
+	// Depth (index 3) is 10-bit only when enabled (see above): it must
+	// not veto 10-bit color, and a disabled depth stream is excluded
+	// from the 10-bit requirement entirely.
 	const bool all_encoders_10bit = std::ranges::all_of(
 	        std::span(res).first(3), [&](const encoder_settings & encoder) {
 		        auto it = std::ranges::find(info.supported_codecs, encoder.codec, &video_codec_capability::codec);
@@ -403,8 +519,12 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	auto check_vaapi = [&](int bit_depth) {
 		for (const auto [i, encoder]: std::ranges::enumerate_view(res))
 		{
-			if (i == 3)
-				continue; // depth is always 8-bit, probed separately
+			// Disabled depth is excluded: it keeps 8-bit fallback
+			// settings (assigned below), probed nowhere. Enabled depth
+			// is always 10-bit; color rides bit_depth.
+			if (i == 3 and not res[3].enabled)
+				continue;
+			int depth = (i == 3) ? 10 : bit_depth;
 			if (encoder.encoder_name == encoder_vaapi)
 			{
 				try
@@ -417,13 +537,13 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 					                .codec = encoder.codec,
 					                .fps = 60,
 					                .bitrate = 50'000'000,
-					                .bit_depth = bit_depth,
+					                .bit_depth = depth,
 					        },
 					        0};
 				}
 				catch (std::exception & e)
 				{
-					U_LOG_I("vaapi not supported for %s %d bits", std::string(magic_enum::enum_name(encoder.codec)).c_str(), bit_depth);
+					U_LOG_I("vaapi not supported for %s %d bits", std::string(magic_enum::enum_name(encoder.codec)).c_str(), depth);
 					return false;
 				}
 			}
@@ -436,7 +556,10 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	};
 #endif
 
-	if (bit_depth == 10 and not(check_format(vk::Format::eR16Unorm) and check_vaapi(*bit_depth)))
+	// R16 storage images back 10-bit color and the depth staging image
+	// alike; depth staging needs R16 unconditionally.
+	bool have_r16 = check_format(vk::Format::eR16Unorm);
+	if (bit_depth == 10 and not(have_r16 and check_vaapi(*bit_depth)))
 	{
 		U_LOG_W("GPU does not have sufficient support for 10-bit images, reverting to 8");
 		bit_depth = 8;
@@ -445,15 +568,37 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	{
 		U_LOG_W("GPU does not have sufficient support for 8-bit images");
 	}
+	if (res[3].enabled and not have_r16)
+	{
+		U_LOG_W("virtual depth stream disabled: GPU lacks R16 storage images");
+		res[3].enabled = false;
+	}
 
 	for (auto & i: res)
 		i.bit_depth = bit_depth.value_or(10);
-	// Virtual depth is defined as 8-bit 1cm/LSB luma regardless of the
-	// color bit depth: forcing 8-bit avoids wasting bits on a 10-bit
-	// depth container no client code reads.
-	res[3].bit_depth = 8;
+	// Virtual depth is 10-bit 2mm/LSB luma when enabled; a disabled depth
+	// stream keeps 8-bit fallback settings (always constructible) and is
+	// never fed.
+	res[3].bit_depth = res[3].enabled ? 10 : 8;
 
 	split_bitrate(res, settings.bitrate_bps);
+	if (not res[3].enabled)
+	{
+		// Reclaim the depth share for color instead of reserving 15%
+		// for an encoder that never runs.
+		res[3].bitrate = 0;
+		res[3].bitrate_multiplier = 0;
+		double color_sum = res[0].bitrate_multiplier + res[1].bitrate_multiplier +
+		                   res[2].bitrate_multiplier;
+		if (color_sum > 0)
+		{
+			for (int i = 0; i < 3; ++i)
+			{
+				res[i].bitrate_multiplier /= color_sum;
+				res[i].bitrate = uint64_t(res[i].bitrate_multiplier * settings.bitrate_bps);
+			}
+		}
+	}
 	return res;
 }
 } // namespace wivrn

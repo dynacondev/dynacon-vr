@@ -221,14 +221,14 @@ std::array<wivrn::compositor::image, 2> make_images(wivrn::vk_bundle & vk, std::
 	return {make_image(0), make_image(1)};
 }
 
-// Virtual-depth staging (stream 3): 640x320 SBS YCbCr, depth packed into
+// Virtual-depth staging (stream 3): SBS YCbCr, depth packed into
 // layer 3 so encoder backends keep indexing baseArrayLayer == stream_idx.
-// Always 8-bit (1cm/LSB luma + neutral chroma), independent of the color
+// 10-bit (2mm/LSB luma + neutral chroma), independent of the color
 // bit depth. Own image (not a 4th layer of the color image): different
 // extent and formats.
 std::array<wivrn::compositor::depth_image, 2> make_depth_images(wivrn::vk_bundle & vk, const wivrn::encoder_settings & depth_settings)
 {
-	auto formats = image_formats(8);
+	auto formats = image_formats(depth_settings.bit_depth);
 
 	vk::StructureChain image_info{
 	        vk::ImageCreateInfo{
@@ -408,6 +408,20 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	static std::atomic<uint64_t> triage_commits{0};
 	static std::atomic<uint64_t> triage_warped{0};
 	static std::atomic<uint64_t> triage_straight{0};
+	// Straight-frame attribution (logging only, no behavior change):
+	// no_depth = color-only fast path, i.e. no depth layer arrived
+	// (the xrizer-plain case); disabled = depth arrived but
+	// reprojection off; multilayer = squash path (layer_count != 1
+	// or non-projection type); multilayer_depth = subset of those
+	// that carried depth (warp stood down); predict = pose
+	// prediction failed; degenerate = reproject() rejected a view
+	// (non-finite pose or bad frustum).
+	static std::atomic<uint64_t> triage_straight_no_depth{0};
+	static std::atomic<uint64_t> triage_straight_disabled{0};
+	static std::atomic<uint64_t> triage_straight_multilayer{0};
+	static std::atomic<uint64_t> triage_straight_multilayer_depth{0};
+	static std::atomic<uint64_t> triage_straight_predict{0};
+	static std::atomic<uint64_t> triage_straight_degenerate{0};
 	static std::atomic<uint64_t> triage_drop_busy{0};
 	static std::atomic<uint64_t> triage_drop_acquire{0};
 	static std::atomic<uint64_t> triage_gap_over{0};
@@ -453,6 +467,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		uint64_t triage_n_commits = triage_commits.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_warped = triage_warped.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_straight = triage_straight.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_no_depth = triage_straight_no_depth.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_disabled = triage_straight_disabled.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_multilayer = triage_straight_multilayer.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_multilayer_depth = triage_straight_multilayer_depth.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_predict = triage_straight_predict.exchange(0, std::memory_order_relaxed);
+		uint64_t triage_n_straight_degenerate = triage_straight_degenerate.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_drop_busy = triage_drop_busy.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_drop_acquire = triage_drop_acquire.exchange(0, std::memory_order_relaxed);
 		uint64_t triage_n_gap_over = triage_gap_over.exchange(0, std::memory_order_relaxed);
@@ -483,10 +503,16 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		double triage_warp_avg_us = triage_n_warp_samples ? double(triage_n_warp_ns_sum) / double(triage_n_warp_samples) / 1000.0 : 0.0;
 		float triage_warp_gpu_max_us = warp_gpu_window_max_us;
 		warp_gpu_window_max_us = 0;
-		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu presented %llu skipped_idr %llu skipped_busy %llu depth_presented %llu depth_idr %llu depth_busy %llu enc_data %llu enc_empty %llu sender_max %llu sender_empty %llu fid_stall %llu",
+		U_LOG_I("reprojection triage (5 s): commits %llu warped %llu straight %llu straight_detail no_depth %llu disabled %llu multilayer %llu multilayer_depth %llu predict %llu degenerate %llu drop_busy %llu drop_acquire %llu gap_over %llu gap_worst_ms %.2f warp_cpu_avg_us %.1f warp_cpu_max_us %.1f warp_samples %llu warp_gpu_max_us %.1f drop_present %llu query_miss %llu wedge %llu presented %llu skipped_idr %llu skipped_busy %llu depth_presented %llu depth_idr %llu depth_busy %llu enc_data %llu enc_empty %llu sender_max %llu sender_empty %llu fid_stall %llu",
 		        (unsigned long long)triage_n_commits,
 		        (unsigned long long)triage_n_warped,
 		        (unsigned long long)triage_n_straight,
+		        (unsigned long long)triage_n_straight_no_depth,
+		        (unsigned long long)triage_n_straight_disabled,
+		        (unsigned long long)triage_n_straight_multilayer,
+		        (unsigned long long)triage_n_straight_multilayer_depth,
+		        (unsigned long long)triage_n_straight_predict,
+		        (unsigned long long)triage_n_straight_degenerate,
 		        (unsigned long long)triage_n_drop_busy,
 		        (unsigned long long)triage_n_drop_acquire,
 		        (unsigned long long)triage_n_gap_over,
@@ -611,6 +637,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	std::array<float, 2> src_far_z{1000, 1000};
 	std::array<xrt_pose, 2> src_pose{};
 	bool has_depth_src = false;
+	// Straight attribution inputs (logging only): which path this
+	// commit took and whether prediction succeeded.
+	bool triage_fast_path = false;
+	bool triage_squash_has_depth = false;
+	bool triage_dst_ok = true;
 
 	// Latest predicted warp target, filled by the entry point below and
 	// consumed by the foveation reroute when a warp recorded.
@@ -626,6 +657,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	{
 		const auto & layer = layer_accum.layers[0];
 		has_depth_src = layer.data.type == XRT_LAYER_PROJECTION_DEPTH;
+		triage_fast_path = true;
 		for (int view = 0; view < 2; ++view)
 		{
 			const auto & data = (layer.data.type == XRT_LAYER_PROJECTION ? layer.data.proj.v : layer.data.depth.v)[view];
@@ -662,6 +694,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		bool squash_has_depth = false;
 		for (uint32_t li = 0; li < layer_accum.layer_count; ++li)
 			squash_has_depth = squash_has_depth or layer_accum.layers[li].data.type == XRT_LAYER_PROJECTION_DEPTH;
+		triage_squash_has_depth = squash_has_depth;
 		if (squash_has_depth)
 		{
 			static std::atomic<uint64_t> last_stand_down_ns{0};
@@ -766,6 +799,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        &head,
 		        dst_fov.data(),
 		        dst_pose.data()) == XRT_SUCCESS;
+		triage_dst_ok = dst_ok;
 		if (dst_ok)
 		{
 			for (int view = 0; view < 2; ++view)
@@ -817,7 +851,26 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	if (warped)
 		triage_warped.fetch_add(1, std::memory_order_relaxed);
 	else
+	{
 		triage_straight.fetch_add(1, std::memory_order_relaxed);
+		if (not has_depth_src)
+		{
+			if (triage_fast_path)
+				triage_straight_no_depth.fetch_add(1, std::memory_order_relaxed);
+			else
+			{
+				triage_straight_multilayer.fetch_add(1, std::memory_order_relaxed);
+				if (triage_squash_has_depth)
+					triage_straight_multilayer_depth.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		else if (not depth_reprojection_enabled)
+			triage_straight_disabled.fetch_add(1, std::memory_order_relaxed);
+		else if (not triage_dst_ok)
+			triage_straight_predict.fetch_add(1, std::memory_order_relaxed);
+		else
+			triage_straight_degenerate.fetch_add(1, std::memory_order_relaxed);
+	}
 
 	if (session.get_info().eye_gaze)
 	{
@@ -875,13 +928,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	}
 
 	// Virtual-depth pack (stream 3): MIN-pool the warp's target-view splat
-	// to 320x320 per eye, linearise, quantize 1cm/LSB into the 640x320 SBS
-	// staging image (layer 3). Runs only on warped frames with valid
-	// near/far; otherwise images[slot].has_depth stays false and the
+	// to half stream resolution per eye, linearise, quantize 2mm/LSB
+	// clamped at ~2.04m (beyond-range VR reads as near and occludes
+	// passthrough) into the SBS staging image (layer 3). Runs only on warped frames with
+	// valid near/far; otherwise images[slot].has_depth stays false and the
 	// worker never touches the depth encoder (strict pairing: no stale
 	// virtual depth on the client).
 	images[slot].has_depth = false;
-	if (warped)
+	if (warped and settings[3].enabled)
 	{
 		auto & depth = depth_images[slot];
 
@@ -916,7 +970,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// memcpy: ClearColorValue union members are C arrays here (same
 		// as the splat clear in depth_reprojector), not assignable.
 		vk::ClearColorValue neutral{};
-		const float chroma[4] = {128.0f / 255.0f, 128.0f / 255.0f, 0.0f, 1.0f};
+		const float chroma[4] = {0.5f, 0.5f, 0.0f, 1.0f};
 		std::memcpy(neutral.float32, chroma, sizeof(chroma));
 		cmd.clearColorImage(
 		        depth.image,
@@ -942,7 +996,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            src_far_z[0],
 		            src_near_z[1],
 		            src_far_z[1],
-		            *depth.out_y))
+		            *depth.out_y,
+		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height}))
 		{
 			auto & depth_enc = encoders[3];
 			// Mirrors the color encoder handoff: single eColor barrier
@@ -985,6 +1040,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	for (auto & encoder: encoders)
 	{
+		if (not encoder)
+			continue; // depth backend skipped when settings[3] disabled
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
 		if (encoder->stream_idx == 3)
@@ -1061,6 +1118,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	for (auto & encoder: encoders)
 	{
+		if (not encoder)
+			continue; // depth backend skipped when settings[3] disabled
 		if (encoder->stream_idx == 2 and not view_info.alpha)
 			continue;
 		auto count_present = [&](video_encoder::present_outcome outcome) {
@@ -1083,9 +1142,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// recycles the image.
 		// Depth (stream 3) presents from its own staging image, only when
 		// this frame was packed (strict pairing: no depth, no present).
+		// A disabled depth stream never presents.
 		if (encoder->stream_idx == 3)
 		{
-			if (not images[slot].has_depth)
+			if (not settings[3].enabled or not images[slot].has_depth)
 				continue;
 			try
 			{
@@ -1233,13 +1293,16 @@ void compositor::encoder_work(std::stop_token tok)
 		// still clears below in all cases.
 		for (auto & encoder: encoders)
 		{
+			if (not encoder)
+				continue; // depth backend skipped when settings[3] disabled
 			// Depth (stream 3) encodes from its own staging image, only
 			// when this frame was packed (has_depth doubles as
 			// "present was attempted": the encode consumes the
-			// presented/skipped slot in lockstep, like color).
+			// presented/skipped slot in lockstep, like color). A
+			// disabled depth stream never encodes.
 			if (encoder->stream_idx == 3)
 			{
-				if (not image.has_depth)
+				if (not settings[3].enabled or not image.has_depth)
 					continue;
 				try
 				{
@@ -1275,6 +1338,9 @@ void compositor::send_video_stream_description()
 	to_headset::video_stream_description desc{
 	        .width = uint16_t(images[0].image.info().extent.width),
 	        .height = uint16_t(images[0].image.info().extent.height),
+	        // Advertised even when the depth stream is disabled (the
+	        // client sizes an idle decoder); a disabled stream simply
+	        // never sends frames, and depth_expected stays false.
 	        .depth_width = settings[3].width,
 	        .depth_height = settings[3].height,
 	        .frame_rate = settings[0].fps,
@@ -1317,9 +1383,17 @@ compositor::compositor(wivrn_session & session) :
                 vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
                 cached_reprojection_switches().source_reverse_z),
         packer(vk),
-        depth_reprojection_enabled(cached_reprojection_switches().enabled),
-        depth_images{make_depth_images(vk, settings[3])}
+        depth_reprojection_enabled(cached_reprojection_switches().enabled)
+        // depth_images left default-constructed (empty) here and filled
+        // below only when settings[3].enabled: no Vulkan depth staging
+        // when the depth stream is disabled. All depth paths are guarded
+        // by settings[3].enabled; advertisement uses settings[3]
+        // width/height only, so idle sizing still works.
 {
+	// Depth staging (stream 3) only when enabled: skip the Vulkan image
+	// allocation entirely when the depth stream is disabled.
+	if (settings[3].enabled)
+		depth_images = make_depth_images(vk, settings[3]);
 	// Per-slot frame context (see TODO.md): one pool+buffer+query pool
 	// per compositor image, so the commit for images[slot] only ever resets
 	// and records its own slot while the other slot may still execute.
@@ -1394,8 +1468,19 @@ compositor::compositor(wivrn_session & session) :
 		throw std::runtime_error("comp_swapchain_shared_init failed");
 
 	print_encoders(settings);
-	for (auto [i, settings]: std::ranges::enumerate_view(settings))
-		encoders[i] = video_encoder::create(vk, settings, i);
+	for (auto [i, s]: std::ranges::enumerate_view(settings))
+	{
+		// Skip the depth backend when disabled: no encoder instance,
+		// encoders[3] stays nullptr. print_encoders above still marks
+		// it (disabled) from settings, and the bitrate-zero reclaim in
+		// get_encoder_settings is untouched.
+		if (i == 3 and not this->settings[3].enabled)
+		{
+			encoders[i] = nullptr;
+			continue;
+		}
+		encoders[i] = video_encoder::create(vk, s, i);
+	}
 	send_video_stream_description();
 
 	u_var_add_root(this, "Compositor", false);
@@ -1450,7 +1535,11 @@ xrt_system_compositor_info compositor::sys_info() const
 void compositor::set_bitrate(uint32_t bitrate)
 {
 	for (auto & encoder: encoders)
+	{
+		if (not encoder)
+			continue; // depth backend skipped when disabled
 		encoder->set_bitrate(bitrate);
+	}
 }
 
 void compositor::set_framerate(float hz)
@@ -1460,7 +1549,11 @@ void compositor::set_framerate(float hz)
 	U_LOG_IFL_D(log_level, "Framerate change from %.0f to %.0f", frame_rate.load(), hz);
 	pacer.set_frame_duration(U_TIME_1S_IN_NS / hz);
 	for (auto & encoder: encoders)
+	{
+		if (not encoder)
+			continue; // depth backend skipped when disabled
 		encoder->set_framerate(hz);
+	}
 }
 
 void compositor::update_tracking(const from_headset::tracking & tracking)
@@ -1476,15 +1569,19 @@ void compositor::update_foveation_center_override(const from_headset::override_f
 void compositor::resume()
 {
 	for (auto & encoder: encoders)
+	{
+		if (not encoder)
+			continue; // depth backend skipped when disabled
 		encoder->reset();
+	}
 	send_video_stream_description();
 }
 
 void compositor::on_feedback(const from_headset::feedback & feedback, const clock_offset & o)
 {
 	uint8_t stream = feedback.stream_index;
-	if (stream >= encoders.size())
-		return;
+	if (stream >= encoders.size() or not encoders[stream])
+		return; // disabled depth stream has no backend
 	encoders[stream]->on_feedback(feedback);
 	if (not o)
 		return;

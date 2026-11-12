@@ -25,9 +25,9 @@
 
 namespace passthrough_mesh
 {
-// Baked, hierarchy-space (model-space) triangle list ready for
-// XrTriangleMeshFB. World placement arrives later via the geometry
-// instance transform, never baked here.
+// Baked, hierarchy-space (model-space) triangle list for the mask
+// raster. World placement arrives later via per-eye MVPs, never
+// baked here.
 // Only positions matter to the runtime: no normals, UVs or materials.
 struct triangle_soup
 {
@@ -39,4 +39,17 @@ struct triangle_soup
 // indexed triangle list. Skinned meshes use their rest pose, morph targets,
 // points/lines are skipped. Throws std::exception on parse errors.
 triangle_soup flatten_gltf(const std::filesystem::path & path);
+
+// Unit-sphere positions for the proximity depth field (non-indexed
+// triangles, outward-CCW winding so cull-front keeps the inside/exit
+// wall from any viewpoint). One shared generator, expanded with
+// per-frame MVPs by the hidden mask record.
+std::vector<XrVector3f> unit_sphere_positions();
+
+// Unit-cylinder positions for the proximity depth field (non-indexed
+// triangles, outward-CCW winding like the sphere above). Radius 1,
+// y in [-1,1] (inscribed in the unit cube, so the same cube-corner
+// scissor stays a conservative superset): the record scales it to
+// (r, depth/2, r) around the body column center.
+std::vector<XrVector3f> unit_cylinder_positions();
 } // namespace passthrough_mesh
