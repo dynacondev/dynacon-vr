@@ -139,6 +139,12 @@ public:
 	bool high_power_mode = true;
 	uint32_t fps_divider = 1;
 
+	// Server-side ADB CPU/GPU pin requested by the headset UI:
+	// -1 = Auto (no override), otherwise a forced level 0..6 applied
+	// by the server with `adb shell setprop` while streaming.
+	int8_t cpu_level_override = -1;
+	int8_t gpu_level_override = 4;
+
 	bool usb_network = false;
 
 	// Allow unsafe config values

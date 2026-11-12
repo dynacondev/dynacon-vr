@@ -301,6 +301,17 @@ configuration::configuration(xr::system & system, xr::session & session, const s
 		if (auto v = root["color_space"]; v.is_int64())
 			color_space = v.get_int64();
 
+		auto load_level_override = [](simdjson::dom::element root, const char * key, int8_t & out) {
+			if (auto v = root[key]; v.is_int64())
+			{
+				int64_t level = v.get_int64();
+				if (level >= -1 and level <= 6)
+					out = int8_t(level);
+			}
+		};
+		load_level_override(root, "cpu_level_override", cpu_level_override);
+		load_level_override(root, "gpu_level_override", gpu_level_override);
+
 		// feature flags, keyed by enum name
 		for (const auto & [f, name]: magic_enum::enum_entries<feature>())
 			if (auto val = root[name]; val.is_bool())
@@ -398,6 +409,10 @@ void configuration::save()
 	json << ",\"sharpening\":" << openxr_post_processing.sharpening << "}";
 
 	json << ",\"color_space\":" << color_space;
+
+	// int8_t would stream as a character, cast to int
+	json << ",\"cpu_level_override\":" << int(cpu_level_override);
+	json << ",\"gpu_level_override\":" << int(gpu_level_override);
 
 	// feature flags, keyed by enum name
 	for (auto & [key, value]: features)

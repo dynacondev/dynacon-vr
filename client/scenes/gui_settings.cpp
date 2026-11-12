@@ -67,6 +67,7 @@ enum class ui_kind
 {
 	toggle,
 	slider,
+	stepper,
 	segmented,
 	combo,
 	combo_multi,
@@ -140,6 +141,14 @@ void render_settings(const wivrn::gui::settings_context & ctx, const char * card
 			case ui_kind::slider: {
 				int v = s.get_int();
 				if (ui::slider_int(s.id, &v, s.v_min, s.v_max, s.fmt.c_str(), {control_w, 0}, dpi))
+					s.set_int(v);
+				break;
+			}
+			case ui_kind::stepper: {
+				// number field with -/+ steppers, no popup (safe near the
+				// bottom of scrollable pages, see AGENTS.md fullscreen-black rule)
+				int v = s.get_int();
+				if (ui::input_int(s.id, &v, 1, s.v_min, s.v_max, control_w))
 					s.set_int(v);
 				break;
 			}
@@ -850,6 +859,34 @@ void settings_system(const settings_context & ctx)
 		        .default_bool = default_config.high_power_mode,
 		});
 	}
+
+	// Server-side ADB clock pins (SideQuest-style setprop override, applied
+	// by the PC while streaming). Steppers, not combos: popups near the
+	// bottom of this page can overlap the tooltip viewport and black out
+	// the frame. Stepper index 0 = Auto, 1..7 = forced levels 0..6.
+	auto level_name = [](int8_t level) -> std::string {
+		if (level < 0)
+			return _C("cpu/gpu level override value", "Auto");
+		return fmt::format("{}", int(level));
+	};
+	auto add_level_override = [&](const char * id, const std::string & label, int8_t configuration::*field, const char * domain) {
+		list.push_back({
+		        .id = id,
+		        .label = label,
+		        .description = fmt::format(_cF("cpu/gpu level override", "Pin the headset {0} clocks while streaming; the PC applies it over ADB (needs wireless ADB paired on the PC, ignored otherwise). 0 lets the headset decide, 1-7 force levels 0-6. Currently: {1}."), domain, level_name(config.*field)),
+		        .ui = ui_kind::stepper,
+		        .get_int = [&config, field] { return int(config.*field) + 1; },
+		        .set_int = [&ctx, &config, field](int v) {
+			        config.*field = int8_t(std::clamp(v, 0, 7) - 1);
+			        config.save();
+			        if (ctx.on_streaming_changed)
+				        ctx.on_streaming_changed(); },
+		        .v_min = 0,
+		        .v_max = 7,
+		});
+	};
+	add_level_override("##cpu_override", _("CPU level override"), &configuration::cpu_level_override, "CPU");
+	add_level_override("##gpu_override", _("GPU level override"), &configuration::gpu_level_override, "GPU");
 
 	// No in-headset Meta boundary toggle: visibility while passthrough
 	// is shown is server-pushed (suppress-meta-boundary, applied on map

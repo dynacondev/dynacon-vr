@@ -277,6 +277,8 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 			info.settings.minimum_refresh_rate = config.minimum_refresh_rate.value_or(0);
 		}
 		info.settings.fps_divider = config.fps_divider;
+		info.settings.cpu_level_override = config.cpu_level_override;
+		info.settings.gpu_level_override = config.gpu_level_override;
 
 		if (info.available_refresh_rates.empty())
 		{
