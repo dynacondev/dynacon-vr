@@ -781,6 +781,26 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, scenes::stream::deco
 				result[i] = *min;
 			}
 		}
+		// Forensics for the stereo-divergence hypothesis: the fallback
+		// above pairs each eye independently, so left/right can display
+		// different frame_idx (depth below can only match left). Log the
+		// selected index + display-time delta per color eye every time.
+		{
+			std::string sel;
+			for (size_t i = 0; i < color_count; ++i)
+			{
+				if (result[i])
+				{
+					auto d_ms = (double)(result[i]->view_info.display_time - display_time) * 1e-6;
+					sel += fmt::format(" s{}={}({:+.1f}ms)", i, result[i]->feedback.frame_index, d_ms);
+				}
+				else
+					sel += fmt::format(" s{}=-", i);
+			}
+			bool divergent = color_count > 1 and result[0] and result[1] and
+			        result[0]->feedback.frame_index != result[1]->feedback.frame_index;
+			spdlog::warn("Common-frame fallback selected:{} divergent={}", sel, divergent);
+		}
 	}
 	// Virtual depth (stream 3) never joins the common-frame intersection:
 	// strict frame_idx pairing with the selected color frame, else null
@@ -790,6 +810,33 @@ std::array<std::shared_ptr<shard_accumulator::blit_handle>, scenes::stream::deco
 	// the left eye there (warn path only, same strict rule otherwise).
 	if (result[0])
 		result[depth_stream_index] = decoders[depth_stream_index].frame(result[0]->feedback.frame_index);
+	// Forensics for the color-without-depth hypothesis: expected (server
+	// packed depth for this frame_idx) but strict pairing found none.
+	// Throttled 1s: isolated single-frame misses each log, sustained
+	// outages don't spam. The depth decoder window is dumped so wire
+	// loss (frame never arrived) reads apart from pairing miss (frame
+	// arrived but outside the 3-slot window / display-time pick).
+	if (result[0] and not result[depth_stream_index] and result[0]->view_info.depth_expected)
+	{
+		XrTime now = instance.now();
+		if (now - depth_miss_last_log > 1'000'000'000LL)
+		{
+			depth_miss_last_log = now;
+			std::string dwin;
+			for (const auto & frame: decoders[depth_stream_index].latest_frames)
+			{
+				if (frame)
+					dwin += " " + std::to_string(frame->feedback.frame_index);
+				else
+					dwin += " -";
+			}
+			uint64_t left_idx = result[0]->feedback.frame_index;
+			uint64_t right_idx = result[1] ? result[1]->feedback.frame_index : UINT64_MAX;
+			spdlog::warn("Virt depth expected-but-missing: color L={} R={} depth window:{}, display_dt_L={:+.1f}ms", left_idx,
+			             result[1] ? std::to_string(right_idx) : std::string("-"),
+			             dwin, (double)(result[0]->view_info.display_time - display_time) * 1e-6);
+		}
+	}
 	return result;
 }
 
@@ -1653,6 +1700,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		volume_acquire_ms = volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = 0;
 		vr_raster_ms = vr_compare_ms = vr_merge_ms = 0;
 		volume_frame_virt_paired = false;
+		vr_frame_wanted = false;
+		vr_frame_virt_paired = false;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
@@ -2342,6 +2391,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						any_vr = not vr_draws.empty();
 					}
+					// Forensics for the VR-flicker hypothesis: window positives
+					// exist (a 3d-passthrough cutout wants the VR cut) but
+					// strict depth pairing failed, so the mask stays 1
+					// (passthrough) where VR should have won. Throttled 1s;
+					// the common_frame depth-miss line carries the
+					// frame_idx/window detail, this one marks the visible
+					// consequence (cut skipped) with the feather group.
+					if (any_positive and not virt_paired)
+					{
+						vr_frame_wanted = true;
+						bool expected = current_blit_handles[0] and current_blit_handles[0]->view_info.depth_expected;
+						if (expected)
+						{
+							XrTime now = instance.now();
+							if (now - vr_cut_skip_last_log > 1'000'000'000LL)
+							{
+								vr_cut_skip_last_log = now;
+								uint64_t cidx = current_blit_handles[0] ? current_blit_handles[0]->feedback.frame_index : UINT64_MAX;
+								spdlog::warn("VR cut skipped (depth expected-but-missing): color frame {} feather {}px draws {}", cidx, f,
+								             draws.size());
+							}
+						}
+					}
+					else if (any_vr)
+						vr_frame_wanted = true;
 					if ((draws.empty() or not any_positive) and not any_volume and not any_vr)
 					{
 						g.active = false;
@@ -2455,6 +2529,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					vr_merge_ms += mstats.vr_merge_ms;
 					if (virt_paired and (any_volume or any_vr))
 						volume_frame_virt_paired = true;
+					if (any_vr and virt_paired)
+						vr_frame_virt_paired = true;
 					mask_draws += (int)mstats.draws;
 					if (any_volume)
 					{

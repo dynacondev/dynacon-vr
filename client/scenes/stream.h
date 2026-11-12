@@ -522,6 +522,22 @@ private:
 	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
 	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
 	uint64_t volume_win_virt_missing = 0; // color expected depth (view_info flag) but none paired
+	// VR-occlusion diagnostics (unconditional: unlike the Volume block
+	// above, VR cut candidates in 3d-passthrough windows count even when
+	// no 3d-depth-passthrough volume is placed). wanted = any feather
+	// group carried window positives this frame; paired/missing split
+	// that by strict depth pairing (missing only when depth_expected).
+	// Windowed + 5s heartbeat in accumulate_metrics ("VRoccl:" line).
+	bool vr_frame_wanted = false; // set by the mask record loop (any group, any_positive)
+	bool vr_frame_virt_paired = false; // set alongside volume_frame_virt_paired when any_vr ran
+	uint64_t vr_win_frames = 0, vr_win_paired = 0, vr_win_missing = 0;
+	XrTime vr_win_t0 = 0;
+	XrTime vr_last_log = 0;
+	// Throttles for the per-event pairing forensics in common_frame and
+	// the mask record loop (1s: isolated single-frame misses each log,
+	// sustained outages don't spam at 90Hz).
+	XrTime depth_miss_last_log = 0;
+	XrTime vr_cut_skip_last_log = 0;
 	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;

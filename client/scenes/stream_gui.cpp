@@ -321,6 +321,34 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		volume_win_t0 = predicted_display_time;
 	}
 
+	// VR-occlusion heartbeat (unconditional: counts 3d-passthrough window
+	// frames even when no depth volume is placed, where the Volume block
+	// above stays silent). wanted = any group carried window positives;
+	// paired = the VR cut ran; missing = wanted but depth_expected with
+	// no strict pairing (the flicker frame: mask stays passthrough).
+	if (vr_frame_wanted)
+	{
+		++vr_win_frames;
+		if (vr_frame_virt_paired)
+			++vr_win_paired;
+		else if (blit_handles.size() > depth_stream_index and blit_handles[0] and not blit_handles[depth_stream_index] and
+		         blit_handles[0]->view_info.depth_expected)
+			++vr_win_missing;
+		if (vr_win_t0 == 0)
+			vr_win_t0 = predicted_display_time;
+	}
+	if (vr_win_frames > 0 and predicted_display_time - vr_last_log > 5'000'000'000LL)
+	{
+		vr_last_log = predicted_display_time;
+		double vf = (double)std::max<uint64_t>(vr_win_frames, 1);
+		double win_s = vr_win_t0 != 0 ? (double)(predicted_display_time - vr_win_t0) * 1e-9 : 5.0;
+		spdlog::info("VRoccl: wanted/paired/missing/frames {}/{}/{}/{} ({:.1f}% paired, {:.1f}% missing) over {:.1f}s", vr_win_frames,
+		             vr_win_paired, vr_win_missing, vr_win_frames, 100.0 * (double)vr_win_paired / vf,
+		             100.0 * (double)vr_win_missing / vf, win_s);
+		vr_win_frames = vr_win_paired = vr_win_missing = 0;
+		vr_win_t0 = predicted_display_time;
+	}
+
 	std::vector<shard_accumulator::blit_handle *> active_handles;
 	active_handles.reserve(blit_handles.size());
 	for (const auto & h: blit_handles)
