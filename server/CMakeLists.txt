@@ -119,6 +119,7 @@ if (WIVRN_BUILD_SERVER)
 			encoder/video_encoder_raw.cpp
 
 			driver/app_pacer.cpp
+			driver/adb_power.cpp
 			driver/clock_offset.cpp
 			driver/configuration.cpp
 			driver/hand_joints_list.cpp

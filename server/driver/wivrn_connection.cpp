@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <arpa/inet.h>
 #include <chrono>
+#include <netdb.h>
 #include <poll.h>
 #include <regex>
 #include <sys/socket.h>
@@ -93,6 +94,12 @@ void wivrn::wivrn_connection::init(std::stop_token stop_token, std::function<voi
 	{
 		throw std::system_error(errno, std::system_category(), "Cannot get client address");
 	}
+
+	// Stash the numeric peer IP for ADB target derivation; failure here
+	// is non-fatal (target selection falls back to config/single device).
+	char peer_host[NI_MAXHOST] = {};
+	if (getnameinfo((sockaddr *)&client_address, len, peer_host, sizeof(peer_host), nullptr, 0, NI_NUMERICHOST) == 0)
+		peer_host_ = peer_host;
 
 	if (configuration().tcp_only)
 	{

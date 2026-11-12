@@ -68,6 +68,8 @@ nlohmann::json settings_to_json(const from_headset::settings_changed & settings)
 	        {"bitrate_bps", settings.bitrate_bps},
 	        {"mirror_gamepad", settings.mirror_gamepad},
 	        {"enabled_body_parts", settings.enabled_body_parts},
+	        {"cpu_level_override", settings.cpu_level_override},
+	        {"gpu_level_override", settings.gpu_level_override},
 	};
 }
 
@@ -80,6 +82,11 @@ from_headset::settings_changed settings_from_json(const nlohmann::json & json)
 	settings.bitrate_bps = json.at("bitrate_bps");
 	settings.mirror_gamepad = json.at("mirror_gamepad");
 	settings.enabled_body_parts = json.at("enabled_body_parts");
+	// optional: caches written before overrides existed lack these keys
+	if (auto it = json.find("cpu_level_override"); it != json.end())
+		settings.cpu_level_override = it->get<int8_t>();
+	if (auto it = json.find("gpu_level_override"); it != json.end())
+		settings.gpu_level_override = it->get<int8_t>();
 	return settings;
 }
 

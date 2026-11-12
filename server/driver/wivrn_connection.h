@@ -57,6 +57,8 @@ private:
 
 	from_headset::headset_info_packet info_packet;
 
+	std::string peer_host_;
+
 	void init(std::stop_token stop_token, std::function<void()> tick = []() {});
 
 public:
@@ -120,6 +122,14 @@ public:
 	const from_headset::headset_info_packet & info()
 	{
 		return info_packet;
+	}
+
+	// Numeric IP of the control-connection peer (the headset as seen by
+	// the server). Empty for headless/cached connections. Used to derive
+	// the wireless-ADB target <ip>:5555 when no explicit target is set.
+	const std::string & peer_host() const
+	{
+		return peer_host_;
 	}
 
 	template <typename T>

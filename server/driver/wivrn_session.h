@@ -20,6 +20,7 @@
 #pragma once
 
 #include "app_pacer.h"
+#include "adb_power.h"
 #include "clock_offset.h"
 #include "compositor/compositor.h"
 #include "inplace_vector.hpp"
@@ -68,6 +69,11 @@ class wivrn_session : public xrt_system_devices
 	from_headset::headset_info_packet headset_info;
 	// run-time editable settings
 	thread_safe<from_headset::settings_changed> settings;
+
+	// Server-side ADB clock override (SideQuest-style setprop), driven by
+	// settings_changed. Best-effort: failures only log. Cleared by the
+	// member destructor on session teardown.
+	adb_power_control adb_power_;
 
 	wivrn::compositor compositor;
 	pacing_app_factory app_pacers;
@@ -236,6 +242,11 @@ private:
 	void run_net(std::stop_token stop);
 	void run_worker(std::stop_token stop);
 	void reconnect(std::stop_token stop, bool first);
+
+	// (Re)resolve the ADB clock-override target for the current
+	// transport and re-push the wants (reconnects may follow reboots,
+	// which wipe debug props).
+	void refresh_adb_target();
 
 	void pause_session();
 	void resume_session();

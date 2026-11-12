@@ -55,6 +55,7 @@
 #include "xrt/xrt_session.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -81,6 +82,18 @@
 namespace wivrn
 {
 
+// Snapshot of configuration().adb for the ADB clock override member:
+// configuration() value-constructs a temporary (its ctor reads the files).
+static adb_power_config adb_power_config_from_server_config()
+{
+	const auto adb = configuration().adb;
+	adb_power_config config;
+	config.enabled = adb.enabled;
+	config.binary = adb.binary;
+	config.timeout_s = adb.timeout_s;
+	return config;
+}
+
 bool is_forced_extension(const char * ext_name)
 {
 	const char * val = std::getenv("WIVRN_FORCE_EXTENSIONS");
@@ -101,6 +114,7 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
         connection(std::move(connection)),
         headset_info(this->connection->info()),
         settings(get_info().settings),
+        adb_power_(adb_power_config_from_server_config()),
         compositor(*this),
         xrt_system(system),
         control(*this->connection),
@@ -145,6 +159,10 @@ wivrn::wivrn_session::wivrn_session(std::unique_ptr<wivrn_connection> connection
 	static_xdevs[static_xdev_count++] = &gamepad_device.emplace(*this);
 
 	auto conf = configuration();
+
+	// Server-side ADB clock override, re-resolved on every (re)connect.
+	refresh_adb_target();
+	adb_power_.request(get_info().settings.cpu_level_override, get_info().settings.gpu_level_override);
 
 #if WIVRN_FEATURE_STEAMVR_LIGHTHOUSE
 
@@ -692,6 +710,8 @@ void wivrn_session::operator()(from_headset::headset_info_packet &&)
 void wivrn_session::operator()(const from_headset::settings_changed & settings)
 {
 	*this->settings.lock() = settings;
+
+	adb_power_.request(settings.cpu_level_override, settings.gpu_level_override);
 
 	if (settings.bitrate_bps != 0)
 		compositor.set_bitrate(settings.bitrate_bps);
@@ -1487,6 +1507,34 @@ std::pair<bool, std::optional<std::string>> wivrn_session::validate_headset_info
 	return std::make_pair(warn, std::nullopt);
 }
 
+void wivrn_session::refresh_adb_target()
+{
+	// Address the headset at its control-connection IP unless adb.target
+	// is set explicitly. Re-run on every (re)connect: the peer IP may
+	// change (DHCP), and a reconnect often follows a headset reboot which
+	// wipes debug props (note_reconnected forces a re-push of the wants).
+	auto adb_conf = configuration().adb;
+	std::string target = adb_conf.target;
+	bool auto_connect = false;
+	if (target.empty())
+	{
+		target = adb_power_control::target_for_peer_host(connection->peer_host());
+		auto_connect = not target.empty();
+	}
+	else
+	{
+		// Bare IPv4 = wireless ADB default port; anything else (USB
+		// serial, host:port, [ipv6]:port) passes through to `adb -s`.
+		bool numeric = not target.empty();
+		for (char c: target)
+			numeric = numeric and (std::isdigit((unsigned char)c) or c == '.');
+		if (numeric)
+			target += ":5555";
+		auto_connect = target.find('.') != std::string::npos or target.find(':') != std::string::npos;
+	}
+	adb_power_.note_reconnected(std::move(target), auto_connect);
+}
+
 void wivrn_session::reconnect(std::stop_token stop, bool first)
 {
 	assert(mnd_ipc_server);
@@ -1574,6 +1622,10 @@ void wivrn_session::reconnect(std::stop_token stop, bool first)
 
 			headset_info.settings = info.settings;
 			(*this)(headset_info.settings);
+
+			// New transport: refresh the ADB target (peer IP may have
+			// changed) and re-push the wants (a reboot wipes debug props).
+			refresh_adb_target();
 
 			headset_info.language = info.language;
 			headset_info.country = info.country;
