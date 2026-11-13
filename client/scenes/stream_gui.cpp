@@ -34,7 +34,6 @@
 #include <IconsFontAwesome7.h>
 #include <chrono>
 #include <cmath>
-#include <imspinner.h>
 #include <glm/ext.hpp>
 #include <glm/ext/matrix_transform.hpp>
 #include <glm/gtc/matrix_access.hpp>
@@ -896,13 +895,8 @@ void scenes::stream::gui_applications()
 
 void scenes::stream::gui_kiosk_waiting()
 {
-	const auto & t = wivrn::ui::current();
-
-	// spinner + title on one row, matching the lobby kiosk overlay
+	// title on its own row, matching the lobby kiosk overlay
 	ImGui::PushFont(nullptr, constants::gui::font_size_large);
-	const float r = ImGui::GetFontSize() * 0.55f;
-	ImSpinner::SpinnerAng("kiosk-waiting", r, wivrn::ui::metrics::app_spinner_thickness, ImColor{t.accent}, ImColor{t.card}, 6, 4.7124f);
-	ImGui::SameLine(0, ImGui::GetStyle().ItemSpacing.x * 2);
 	ImGui::TextUnformatted(_S("Waiting for Simulation"));
 	ImGui::PopFont();
 }
@@ -1113,9 +1107,21 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 	wivrn::ui::set_hover_haptic([this] { imgui_ctx->vibrate_on_hover(); });
 	wivrn::ui::set_tooltip_hook([this](const char * text) { imgui_ctx->tooltip(text); });
 
-	// model planes wheeling behind the waiting overlay (hidden otherwise)
+	// model planes parked around the waiting overlay (hidden otherwise).
+	// Same swatter gathering as the lobby: hands when tracked, grips when
+	// located (hands don't exist here while non-interactable, so this is
+	// usually grips-only — identical logic, graceful degradation).
 	if (kiosk_planes_)
-		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown);
+	{
+		std::optional<glm::vec3> camera;
+		if (not live_views.empty())
+		{
+			const auto & p = live_views[0].pose.position;
+			camera = glm::vec3(p.x, p.y, p.z);
+		}
+		auto swatters = wivrn::kiosk_planes::gather_swatters(predicted_display_time, world_space, left_hand, right_hand);
+		kiosk_planes_->update(predicted_display_time, imgui_ctx->layers()[0].position, imgui_ctx->layers()[0].orientation, stream_kiosk_shown, camera, swatters);
+	}
 
 	ImVec2 viewport_size(imgui_ctx->layers()[0].vp_size.x, imgui_ctx->layers()[0].vp_size.y);
 	ImVec2 content_size{viewport_size - ImVec2{tab_width, 0} - margin_around_window * 2};
@@ -1472,7 +1478,7 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 			             width,
 			             height,
 			             true,
-			             layer_controllers,
+			             layer_controllers | layer_trails,
 			             {});
 			set_depth_test(true, XR_COMPARE_OP_ALWAYS_FB);
 		}

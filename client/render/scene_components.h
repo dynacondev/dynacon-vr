@@ -91,6 +91,7 @@ struct material
 	bool double_sided = true;
 
 	bool blend_enable = false;
+	bool blend_additive = false;
 	bool depth_test_enable = true;
 	bool depth_write_enable = true;
 

@@ -497,6 +497,26 @@ void settings_post_processing(const settings_context & ctx)
 		flag_combo("##sharpening", _("Sharpening"), _("Improve clarity of high contrast edges and counteract blur. Useful when the input resolution is low compared to the headset display."), {0, XR_COMPOSITION_LAYER_SETTINGS_NORMAL_SHARPENING_BIT_FB, XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB}, &configuration::openxr_post_processing_settings::sharpening);
 	}
 
+	{
+		// Client-side MSAA (transient 4x render, resolved into the swapchain
+		// images): always shown, takes effect immediately on next frames.
+		// WIVRN_MSAA=0/4 env var overrides the saved setting.
+		list.push_back({
+		        .id = "##msaa",
+		        .label = _C("setting name", "Anti-aliasing (MSAA)"),
+		        .description = _("Smooth jagged edges on local lobby and controller rendering. Higher values cost some GPU performance."),
+		        .ui = ui_kind::combo,
+		        .get_int = [&config] { return config.msaa_enabled ? 1 : 0; },
+		        .set_int = [&config](int v) {
+			        config.msaa_enabled = v == 1;
+			        config.save(); },
+		        .options = [] {
+			        return std::vector<std::string>{_("Off"), "4x"}; },
+		        .title = _C("setting name", "Anti-aliasing (MSAA)"),
+		        .default_int = default_config.msaa_enabled ? 1 : 0,
+		});
+	}
+
 	if (ctx.session.color_space_supported())
 	{
 		auto spaces = ctx.session.get_color_spaces();

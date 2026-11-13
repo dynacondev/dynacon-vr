@@ -99,6 +99,12 @@ public:
 
 	bool enable_stream_gui = true;
 
+	// 4x MSAA for the client-side lobby/controllers renderer (transient
+	// multisample images resolved into the single-sample swapchain images).
+	// WIVRN_MSAA=0/4 env var overrides this. Falls back to single-sample if
+	// the device does not support 4x for the swapchain formats.
+	bool msaa_enabled = true;
+
 	// Kiosk mode: at startup, when an auto-connect computer is configured,
 	// show only a minimal "Waiting for Connection" overlay over passthrough
 	// instead of the full lobby. Both thumbsticks reveal the full GUI.

@@ -20,11 +20,13 @@
 #pragma once
 
 #include "render/scene_components.h"
+#include "xr/hand_tracker.h"
 #include <entt/entity/fwd.hpp>
 #include <glm/vec3.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <memory>
 #include <openxr/openxr.h>
+#include <optional>
 #include <random>
 #include <vector>
 
@@ -34,22 +36,39 @@ namespace wivrn
 {
 
 // Small fleet of model planes for the kiosk waiting overlays, shared by the
-// lobby and stream scenes. Each plane flies a frozen world-space Bezier path
-// launched from behind the overlay panel, then fades out and respawns: later
-// panel motion never perturbs a flight in progress. Create once the scene
-// world exists (on_focused), update every frame the overlay may show, destroy
-// with the scene (planes hold entities in the scene registry).
+// lobby and stream scenes. Planes spawn one by one at random positions
+// within 1m of the overlay panel, fade in, then fly forever under a
+// curvature integrator: maneuvers (cruise/turn/loop/roll) are just rate
+// targets, banking emerges from turn rate, and a weak containment bias pulls
+// the fleet back toward the live anchor moth-to-light style (positions stay
+// world-frozen, nothing translates with the panel). Create once the scene
+// world exists (on_focused), update every frame the overlay may show,
+// destroy with the scene (planes hold entities in the scene registry).
 class kiosk_planes
 {
 public:
-	kiosk_planes(::scene & scene, uint32_t layer_mask);
+	kiosk_planes(::scene & scene, uint32_t layer_mask, uint32_t trail_layer_mask);
 
-	// anchor is the overlay panel pose sampled this frame; only used when
-	// (re)spawning. Inactive planes are hidden and frozen.
-	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active);
+	// anchor is the overlay panel pose sampled this frame: spawn placement
+	// uses it once (positions freeze once spawned), and the containment bias
+	// steers toward its live position every frame. camera is the viewer
+	// position for billboarding the trails; without it the ribbons fall back
+	// to facing up. swatters are hand/controller positions in the same world
+	// space as the planes (stable order helps velocity tracking, but any
+	// order works): a plane within swat_radius of one is swatted into a
+	// gravity fall and stays down for the rest of the showing (no respawn).
+	// Inactive planes are hidden; re-showing replays the one-by-one spawn-in.
+	void update(XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, bool active, const std::optional<glm::vec3> & camera, const std::vector<glm::vec3> & swatters = {});
+
+	// Shared swatter gathering so lobby and stream behave identically: hand
+	// palms + index tips when hands are the tracked input source, controller
+	// grips whenever they locate (physical controllers exist even when
+	// hidden). Missing sources are simply absent; callers pass the result
+	// straight to update().
+	static std::vector<glm::vec3> gather_swatters(XrTime when, XrSpace space, std::optional<xr::hand_tracker> & left, std::optional<xr::hand_tracker> & right);
 
 private:
-	struct flight
+	struct plane
 	{
 		entt::entity root;
 		std::vector<std::shared_ptr<renderer::material>> materials;
@@ -57,20 +76,72 @@ private:
 		// index-aligned with materials
 		std::vector<glm::vec4> base_colors;
 		std::vector<glm::vec3> base_emissives;
-		glm::vec3 p0, p1, p2, p3;
-		XrTime t0 = 0;
-		XrDuration dur = 0;
-		float phase = 0;
+		XrTime spawn_t0 = 0; // scheduled spawn moment (fade clock starts here)
+		bool spawned = false; // position assigned, never un-spawned while active
+		// curvature-integrator flight state (world space; the live anchor
+		// only steers via the containment bias, never translates the plane)
+		glm::vec3 pos{0.f};
+		glm::vec3 dir{0.f, 0.f, -1.f}; // unit flight direction
+		glm::vec3 right{1.f, 0.f, 0.f}; // cached lateral axis (rebuilt unless near-vertical)
+		float speed = 0.35f; // base cruise (m/s); live speed is climb-coupled
+		float bias_w = 1.f; // leash-bias gate: slewed, never snapped (loop stand-down)
+		float bank = 0.f; // smoothed visual bank (radians, wrapped to [-pi, pi])
+		float pitch_rate = 0.f, yaw_rate = 0.f, roll_rate = 0.f; // smoothed rates (rad/s)
+		float pitch_tgt = 0.f, yaw_tgt = 0.f, roll_tgt = 0.f; // maneuver targets (rad/s)
+		bool roll_free = false; // roll maneuver: relax suppressed, roll owns the bank
+		bool loop_maneuver = false; // loop: exempt from the climb/dive rate clamp
+		double man_t = 0.; // time left in the current maneuver (seconds; backstop for figures)
+		double man_dur = 1.; // expected maneuver duration (envelope runs on this)
+		double man_age = 0.; // elapsed time in the current maneuver (seconds)
+		double man_angle = 0.; // accumulated figure angle (loops/rolls terminate at 2pi)
+		XrTime prev_now = 0; // dt clock (0 = uninitialized)
+		// engine trail history (world space, newest last) with sample
+		// timestamps so the fade keys off real age; trail_tint follows the
+		// livery body color. trail_alpha mirrors the plane fade.
+		std::vector<glm::vec3> trail;
+		std::vector<XrTime> trail_t;
+		XrTime last_sample_t = 0;
+		float trail_alpha = 0.f;
+		glm::vec3 trail_tint{1.f};
+		// swatted state: ballistic gravity fall with tumble, fading out.
+		// gone planes stay down for the rest of the showing (no respawn).
+		bool shot_down = false;
+		bool gone = false;
+		glm::vec3 shot_vel{0.f};
+		float shot_tumble = 0.f;
+		double shot_age = 0.;
 	};
 
 	::scene & scene_;
-	std::vector<flight> flights_;
+	std::vector<plane> planes_;
 	std::mt19937 rng_;
 	bool was_active_ = false;
+	XrTime activated_t0_ = 0; // rising-edge time: plane i spawns at + i * spawn_interval
+	// per-activation livery bag: one of each paint (orange included), shuffled.
+	// Guarantees variety (no all-session hidden colors) with orange always
+	// present; reshuffled on every re-show.
+	std::vector<size_t> livery_bag_;
+	size_t livery_next_ = 0;
 
-	void respawn(flight & f, XrTime now, const glm::vec3 & anchor_pos, const glm::quat & anchor_orient, double age_offset);
-	static glm::vec3 bezier(const flight & f, double t);
-	static glm::vec3 bezier_vel(const flight & f, double t);
+	// Shared engine-trail ribbon: one node/primitive holding every plane's
+	// camera-facing strip, rebuilt on the CPU each frame.
+	entt::entity trail_entity = entt::null;
+	std::shared_ptr<renderer::mesh> trail_mesh;
+	std::shared_ptr<buffer_allocation> trail_buffer;
+	// swatter velocity tracking: previous frame's points in caller order, so
+	// the fling inherits hand momentum. Cleared while inactive; new indices
+	// after a count change start at zero velocity.
+	std::vector<glm::vec3> prev_swatters_;
+	XrTime prev_swat_now_ = 0;
+	// Emitter in construction-time world units (tail center of the measured
+	// model OBB at origin); only the plane orientation applies per frame
+	// since the node scale never changes after construction.
+	glm::vec3 tail_root{0.f};
+
+	void spawn_at(plane & f, const glm::vec3 & anchor_pos);
+	void apply_livery(plane & f);
+	void pick_maneuver(plane & f);
+	void build_trail(const std::optional<glm::vec3> & camera, XrTime now);
 };
 
 } // namespace wivrn

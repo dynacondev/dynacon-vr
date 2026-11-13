@@ -1209,6 +1209,10 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	}
 #endif
 
+	kiosk_camera.reset();
+	if (head_position)
+		kiosk_camera = head_position->first;
+
 	std::vector<std::pair<int, XrCompositionLayerQuad>> imgui_layers = draw_gui(frame_state.predictedDisplayTime);
 
 #if WIVRN_CLIENT_DEBUG_MENU
@@ -1247,14 +1251,23 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	render_start(application::get_config().passthrough_enabled or kiosk_shown, frame_state.predictedDisplayTime);
 
 	const XrColor4f clear_color = (application::get_config().passthrough_enabled or kiosk_shown) ? XrColor4f{0, 0, 0, 0} : constants::lobby::sky_color;
+
+	// Supersample the lobby with the render resolution setting (streaming
+	// uses it for the server render size; the lobby renders locally, so
+	// apply it here). Rounded down to even dimensions. Takes effect live;
+	// swapchains are recreated on size change.
+	const float lobby_scale = application::get_config().resolution_scale;
+	const uint32_t render_width = uint32_t(width * lobby_scale) & ~1u;
+	const uint32_t render_height = uint32_t(height * lobby_scale) & ~1u;
+
 	render_world(
 	        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 	        world_space,
 	        views,
-	        width,
-	        height,
+	        render_width,
+	        render_height,
 	        composition_layer_depth_test_supported,
-	        composition_layer_depth_test_supported ? layer_lobby | layer_controllers : layer_lobby,
+	        composition_layer_depth_test_supported ? layer_lobby | layer_controllers | layer_trails : layer_lobby | layer_trails,
 	        clear_color,
 	        true);
 
@@ -1276,8 +1289,8 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 	        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
 	        world_space,
 	        views,
-	        width,
-	        height,
+	        render_width,
+	        render_height,
 	        composition_layer_depth_test_supported,
 	        composition_layer_depth_test_supported ? layer_rays : layer_rays | layer_controllers,
 	        {0, 0, 0, 0});
@@ -1536,7 +1549,7 @@ void scenes::lobby::on_focused()
 	setup_passthrough();
 	discover.emplace();
 
-	kiosk_planes_.emplace(*this, layer_controllers);
+	kiosk_planes_.emplace(*this, layer_controllers, layer_trails);
 
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_CPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
 	session.set_performance_level(XR_PERF_SETTINGS_DOMAIN_GPU_EXT, XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
