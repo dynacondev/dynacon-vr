@@ -964,37 +964,21 @@ bool scenes::stream::is_gui_interactable() const
 	return is_interactable(gui_status);
 }
 
-bool scenes::stream::has_active_simulation()
-{
-	auto apps = running_applications.lock();
-	for (auto & app: apps->applications)
-		if (app.active and not app.overlay)
-			return true;
-	return false;
-}
-
 void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 {
 	const auto & config = application::get_config();
-	// no overlay (and no need to poll) when the in-stream GUI is disabled:
-	// the chord that would reveal it is dead too
+	// no overlay when the in-stream GUI is disabled: the chord that would
+	// reveal it is dead too
 	const bool allowed = config.kiosk_mode and config.enable_stream_gui;
 
-	// keep the running-apps picture fresh while the overlay may show; the
-	// applications tab polls itself when visible, this covers the overlay
-	if (allowed and predicted_display_time - last_kiosk_app_req > 2'000'000'000LL)
-	{
-		last_kiosk_app_req = predicted_display_time;
-		network_session->send_control(from_headset::get_running_applications{});
-	}
-
-	bool has_active = allowed and stream_apps_known and has_active_simulation();
-	if (stream_had_active_app and not has_active)
-		stream_kiosk_dismissed = false; // app stopped: waiting overlay returns
-	stream_had_active_app = has_active;
-
-	stream_kiosk_shown = allowed and not stream_kiosk_dismissed and
-	                     stream_apps_known and not has_active and not is_gui_interactable();
+	// Video decoders are the only signal: a frame on the video path within
+	// the holdoff means a simulation is streaming. last_video_t is stamped
+	// in render() where the video path is confirmed (both decoder queues
+	// non-empty, so it can't go stale); 0 at connect shows the kiosk at
+	// once, and it returns 2s after the decoders run dry.
+	static constexpr XrDuration kiosk_video_holdoff = 2'000'000'000LL; // 2s
+	stream_kiosk_shown = allowed and not is_gui_interactable() and
+	                     (predicted_display_time - last_video_t > kiosk_video_holdoff);
 }
 
 void scenes::stream::render(const XrFrameState & frame_state)
@@ -1054,16 +1038,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// Ensure we can't have a set of 2 non interactable states
 			if (stream_kiosk_shown)
 			{
-				stream_kiosk_dismissed = true;
 				next_gui_status = stream_tab::settings;
 			}
 			else if (is_gui_interactable())
 			{
 				next_gui_status = stream_tab::hidden;
-				stream_kiosk_dismissed = false;
-				// fresh app list so the reshow decision isn't stale
-				last_kiosk_app_req = frame_state.predictedDisplayTime;
-				network_session->send_control(from_headset::get_running_applications{});
 			}
 			else if (is_interactable(stored_gui_status))
 				next_gui_status = stored_gui_status;
@@ -1096,6 +1075,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			session.end_frame(frame_state.predictedDisplayTime, {});
 		return;
 	}
+
+	// Video path taken: both decoder queues held frames, so a simulation
+	// is streaming — stamp it for the kiosk holdoff in update_stream_kiosk.
+	// Queues drain every frame on this path, so the stamp can't go stale
+	// while frames keep arriving.
+	last_video_t = frame_state.predictedDisplayTime;
 
 	if (state_ == state::stalled)
 	{

@@ -262,18 +262,18 @@ private:
 	XrTime running_application_req = 0;
 	thread_safe<to_headset::running_applications> running_applications;
 
-	// Kiosk "Waiting for Simulation" overlay: shown over the (idle) video
-	// while connected with no XR application active. Render thread only,
-	// except stream_apps_known which latches on the network thread.
-	bool stream_kiosk_dismissed = false;
+	// Kiosk "Waiting for Simulation" overlay: shown while connected with no
+	// video flowing. The video decoders are the only signal — a frame on
+	// the video path within the holdoff means a simulation is streaming,
+	// no app list, no latches (those go stale across server-side session
+	// churn while video keeps flowing). Render thread only.
 	bool stream_kiosk_shown = false;
-	bool stream_had_active_app = false;
-	XrTime last_kiosk_app_req = 0;
+	// predictedDisplayTime of the last frame that took the video path (both
+	// decoder queues non-empty); the kiosk returns 2s after this goes stale
+	XrTime last_video_t = 0;
 	XrTime last_stream_kiosk_toggle = 0;
 	bool stream_chord_held = false;
 	std::optional<wivrn::kiosk_planes> kiosk_planes_;
-	std::atomic<bool> stream_apps_known = false;
-	bool has_active_simulation();
 	void update_stream_kiosk(XrTime predicted_display_time);
 
 	// Fiducial tracking markers (Quest only, see docs/configuration.md).
