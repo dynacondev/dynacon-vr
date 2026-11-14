@@ -2622,7 +2622,7 @@ void feather_mask_renderer::ensure_volume_targets(vk::Extent2D working, vk::Exte
 
 	// Furthest-D canvas (R16, sensor-compatible): array view for the
 	// compare sampler + one layers=2 MV raster FB.
-	std::tie(volume_depth.image, volume_depth.memory) = make_target_image(ve, volume_depth_format);
+	std::tie(volume_depth.image, volume_depth.memory) = make_target_image(volume_depth_format, ve);
 	volume_depth.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
 	                .image = *volume_depth.image,
@@ -2652,7 +2652,7 @@ void feather_mask_renderer::ensure_volume_targets(vk::Extent2D working, vk::Exte
 	// Virtual-depth D canvas (R16, same 320px 2-layer shape): SBS
 	// meters->D conversion output, cleared to far. Own MV framebuffer
 	// under volume_virt_renderpass (CLEAR R16 MV).
-	std::tie(volume_virt.image, volume_virt.memory) = make_target_image(ce, volume_depth_format);
+	std::tie(volume_virt.image, volume_virt.memory) = make_target_image(volume_depth_format, ce);
 	volume_virt.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
 	                .image = *volume_virt.image,
@@ -2679,7 +2679,7 @@ void feather_mask_renderer::ensure_volume_targets(vk::Extent2D working, vk::Exte
 
 	// Binary canvas (R8): compare renders MV into blur_fb_mv under the
 	// shared R8 pass; merge samples the array view with LINEAR.
-	std::tie(volume_bin.image, volume_bin.memory) = make_target_image(ve, blur_format);
+	std::tie(volume_bin.image, volume_bin.memory) = make_target_image(blur_format, ve);
 	volume_bin.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
 	                .image = *volume_bin.image,
@@ -2707,7 +2707,7 @@ void feather_mask_renderer::ensure_volume_targets(vk::Extent2D working, vk::Exte
 	// Exact-depth canvas (R16 nearest, same 320px shape): soft-occlusion
 	// exact occluders (passthrough + hidden, reversed excluded). Far (1.0)
 	// clear, MIN blend via exact_raster_pipeline_mv, sampled as binding 3.
-	std::tie(exact_depth.image, exact_depth.memory) = make_target_image(ce, volume_depth_format);
+	std::tie(exact_depth.image, exact_depth.memory) = make_target_image(volume_depth_format, ce);
 	exact_depth.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
 	                .image = *exact_depth.image,
@@ -3664,7 +3664,7 @@ raster_exact(paired_virt ? cutE : workE);
 				// into the seed; the shared blur chain below does all feathering.
 				// Box support already covered by the silhouette/erode margins.
 
-LOAD-after-write ordering, same as the cutout punch
+				// LOAD-after-write ordering, same as the cutout punch
 				// barrier below: without it a tile GPU may MAX against
 				// stale seed tiles.
 				vk::ImageMemoryBarrier merge_barrier{

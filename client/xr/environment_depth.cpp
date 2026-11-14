@@ -324,7 +324,7 @@ bool xr::environment_depth::set_hand_removal(bool enabled)
         return true;
     XrEnvironmentDepthHandRemovalSetInfoMETA info{
         .type = XR_TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META,
-        .enabled = enabled ? XR_TRUE : XR_FALSE,
+        .enabled = static_cast<XrBool32>(enabled),
     };
     if (XrResult res = xrSetEnvironmentDepthHandRemovalMETA(provider, &info); res != XR_SUCCESS)
     {
