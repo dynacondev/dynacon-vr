@@ -220,7 +220,13 @@ public:
 		// eye-space virt < object; the seed MIN-cuts where VR wins.
 		// Empty (or no paired virtual depth) = no VR occlusion in this
 		// group.
-		std::vector<instance_draw> vr_draws;
+		std::vector<instance_draw> vr_draws; // LEGACY (removed in soft path)
+		// Soft-occlusion exact occluders: 3d-passthrough (same feather,
+		// non-reversed) + 3d-passthrough-hidden (+ single depth volume
+		// mesh), eye MVP space. Rasterized nearest-point into exact_depth;
+		// the soft compare tests sensor < min(volume, virtual, exact).
+		std::vector<instance_draw> exact_draws;
+		float bias = 0.06f;
 		vk::ImageView sensor_view = nullptr; // runtime D16 2-layer array
 		float near_z = 0.1f; // depth frustum the raster must match
 		float far_z = 10.f;
@@ -527,7 +533,10 @@ private:
 	{
 		glm::vec4 col[6]{};
 		glm::vec4 corr[2]{};
+		// x = distance-scaled bias, y = near (m), z = far (m, may be inf).
+		glm::vec4 bias_near_far{0.06f, 0.1f, 10.f, 0.f};
 	};
+	static_assert(sizeof(volume_homography) == 144);
 	vk::raii::Pipeline compare_pipeline_mv{nullptr};
 	// VR-occlusion compare (fullscreen _mv, 2 samplers: object R16 +
 	// virtual D canvas). Eye-space virt < object, no sensor remap, no
@@ -582,6 +591,9 @@ private:
 	// is not part of compatibility); only the blend op differs.
 	vk::raii::Pipeline vr_min_r8_pipeline{nullptr};
 	vk::raii::Pipeline vr_min_rgb8_pipeline{nullptr};
+	blur_target exact_depth; // R16 nearest-D canvas (half-res, 2 layers):
+	// soft-occlusion exact occluders (passthrough + hidden, reversed
+	// excluded). Far (1.0) clear, MIN blend, cull-nothing.
 	blur_target volume_depth; // R16 furthest-D canvas (320, 2 layers)
 	blur_target vr_depth; // R16 nearest-D canvas (depth-res, 2 layers):
 	// object depth for the VR-occlusion compare above. Far (1.0) clear,
