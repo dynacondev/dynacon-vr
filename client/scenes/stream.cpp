@@ -1735,7 +1735,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// Crisp hands: remove sensor hands (background fill) so the
 					// tracked-mesh coverage raster owns the edge. Unsupported
 					// runtimes keep depth hands (fuzzy but present).
-					if (xr::environment_depth::supports_hand_removal(instance, system))
+					if (not hand_removal_probed)
+					{
+						hand_removal_probed = true;
+						hand_removal_supported = xr::environment_depth::supports_hand_removal(instance, system);
+					}
+					if (hand_removal_supported)
 						soft_hand_removal_on = env_depth->set_hand_removal(true);
 					else
 						soft_hand_removal_on = false;
@@ -2537,7 +2542,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					// Soft-unpaired forensic: volume placed but the color frame
 					// carried no depth warp, so the compare falls back to
-					// sensor-vs-volume (no virtual). Throttled 1s.
+					// sensor-vs-volume (no virtual). Throttled (shared 5s depth-miss
+			// window; see common_frame): isolated misses log once, outages
+			// do not spam at refresh rate.
 					if (any_volume and not virt_paired)
 					{
 						bool expected = current_blit_handles[0] and current_blit_handles[0]->view_info.depth_expected;

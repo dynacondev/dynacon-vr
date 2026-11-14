@@ -544,6 +544,8 @@ private:
 	float soft_bias = 0.06f; // virtualLinear -= virtualLinear*bias
 	bool soft_multi_volume_error = false; // latched, logged once
 	bool soft_hand_removal_on = false; // removal active (depth hands fallback otherwise)
+	bool hand_removal_probed = false; // supports_hand_removal cached (system props query once)
+	bool hand_removal_supported = false;
 	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
 	bool volume_remap_logged = false; // one-shot H log for convention validation
 	// Sensor-mapping forensics (Volume heartbeat): content age from the

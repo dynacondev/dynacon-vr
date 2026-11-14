@@ -200,6 +200,7 @@ void xr::environment_depth::stop()
 	if (not provider_started)
 		return;
 	provider_started = false;
+	hand_removal_enabled = false; // re-armed on next start (new provider handle)
 	if (XrResult res = xrStopEnvironmentDepthProviderMETA(provider); res != XR_SUCCESS)
 		spdlog::warn("environment_depth: stop failed: {}", xr::to_string(res));
 	else

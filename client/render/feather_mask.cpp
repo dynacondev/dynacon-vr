@@ -825,7 +825,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// (Legacy high-res VR path removed: exact-depth soft compare covers it.)
 	static_assert(sizeof(volume_mv_push) == 136);
 	static_assert(sizeof(volume_mv_push) <= 256);
-	static_assert(sizeof(volume_homography) == 128);
+	static_assert(sizeof(volume_homography) == 144);
 	{
 		vk::VertexInputBindingDescription volume_binding{
 		        .binding = 0,
@@ -3043,11 +3043,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 		// Virtual-depth conversion, once per record: SBS meters->D at
 		// 320px into volume_virt (shared by the soft compare).
-		// Descriptor set update once per record: both conversions sample
-		// the same decoded view, so the first conversion binds it and
-		// the second reuses the binding (same-CB draws would otherwise
-		// all read the last update).
+		// Descriptor set update once per record: the conversion binds the
+		// decoded view on first use (same-CB draws would otherwise all
+		// read the last update).
 		bool virt_desc_updated = false;
+		bool low_virt_done = false;
 		auto convert_virt_canvas = [&](blur_target & virt, vk::raii::Framebuffer & virt_fb, vk::Extent2D ve, bool & done) {
 			if (done or not volume or not volume->virt_valid)
 				return;

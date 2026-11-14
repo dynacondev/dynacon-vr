@@ -91,10 +91,7 @@ void main()
 	ok *= step(0.0, s.x) * step(s.x, 1.0) * step(0.0, s.y) * step(s.y, 1.0);
 
 	vec2 suv0 = s;
-	float k_vol = 0.0;
 	float v0 = texture(volume_tex, vec3(uv, vi)).r;
-	float w0 = texture(virt_tex, vec3(uv, vi)).r;
-	float e0 = texture(exact_tex, vec3(uv, vi)).r;
 	// Depth-dependent lateral nudge from the rotation-only spot.
 	float k_seed = ka * texture(sensor_tex, vec3(suv0, vi)).r + kb;
 	float k = min(max(k_seed, ka * v0 + kb), 20.0);
