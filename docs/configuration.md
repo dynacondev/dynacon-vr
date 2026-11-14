@@ -324,6 +324,17 @@ only — boundary zones and everything else are untouched (zones still
 hold passthrough independently via min-combine: either source can
 demand it). `0` releases instantly.
 
+## `startup-fade-time`
+Default value: `2` (seconds)
+
+Smoothstep fade from full passthrough to video whenever the video
+feed (re)starts after a gap. Re-arms whenever video has been absent
+for ~2s (same holdoff as the waiting kiosk), independent of
+kiosk-mode: first connect and stop->start both fade. Min-combined
+with boundary zones / `passthrough-until-lock`, so a starting feed
+always forces fullscreen passthrough while fading. `0` disables
+(instant cut).
+
 ## `alignment`
 Default value: unset (feature disabled)
 

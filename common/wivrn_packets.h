@@ -1122,6 +1122,10 @@ struct fiducial_map
 	// Smoothstep fade from full passthrough to VR once the until-lock
 	// target latches, in seconds (default 2). 0 = instant release.
 	float passthrough_fade_time_s = 2.0f;
+	// Smoothstep fade from full passthrough to video whenever the
+	// video feed (re)starts after a gap, in seconds (default 2).
+	// 0 disables (instant cut). Re-arms after the kiosk holdoff.
+	float startup_fade_time_s = 2.0f;
 };
 
 struct fiducial_model_chunk
