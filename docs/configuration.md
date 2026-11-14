@@ -427,27 +427,30 @@ Each `passthrough` entry has:
 - `type`: behavior type (required). `"3d-passthrough"` renders the
   model as a flat-feed passthrough cutout through the single merged
   alpha layer; unknown types are
-  skipped with a warning. Where a warped virtual-depth frame is paired,
-  VR content also occludes the cutout eye-space (`virt < object` at
-  half stream resolution, feathered like a silhouette edge). `"3d-passthrough-reversed"` reverse-cuts
+  skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each
   pixel). `"3d-depth-passthrough"` reveals the flat feed where the
   runtime depth map resolves *inside* the model volume (depth-tested
-  volume, feathered like a normal window): the volume rasterizes its
-  far side at 320px, strict `sensor < render` flattens to a binary
-  mask, and it upscales+MAXes over every layer — including reversed
-  cutthroughs — before the shared erode/blur. Per-eye display MVPs
-  keep it in sync with VR content; pose-delay correction is future
-  work, so expect a texel of swim during fast motion. The headset
-  Passthrough tab offers a Rotation reprojection toggle (default on):
-  the sensor tap is remapped through the capture <-> display relative
-  rotation plus a depth-dependent lateral shift (sideways parallax;
-  forward/radial and depth-value terms excluded), so the comparison
-  tests the same world ray, falling back to the direct tap when off.
-  A Depth time bias slider (+/-50ms) shifts the assumed content age
-  to hunt a constant sensor lag (+ = older = larger correction). Meshes should be
-  **closed volumes** (far side is well-defined). `"3d-boundary"` shows
+  volume, feathered like a normal window): the soft-occlusion compare
+  tests `sensor < min(volume far, virtual, exact)` in linear meters
+  with a distance-scaled bias (`virtual -= virtual*bias`, Passthrough
+  tab slider, default 0.06), single binary tap per pixel at the 320px
+  working size, then upscales+MAXes over every layer — including
+  reversed cutthroughs — before the shared erode/blur. `exact` is the
+  nearest depth of `3d-passthrough` windows (same feather) plus every
+  placed `3d-passthrough-hidden` object (reversed excluded); ties fall
+  back to the exact cutout. Only one `3d-depth-passthrough` object is
+  supported (>1 disables the soft path with an error, exact-only
+  fallback). Hands are removed from the sensor depth (where supported)
+  and re-added as tracked joint-sphere coverage in the same group, so
+  they feather identically. Per-eye display MVPs keep it in sync with
+  VR content. The headset Passthrough tab offers a Rotation
+  reprojection toggle (default on): the sensor tap is remapped through
+  the capture <-> display relative rotation plus a depth-dependent
+  lateral shift (sideways parallax; forward/radial and depth-value
+  terms excluded), falling back to the direct tap when off. Meshes
+  should be **closed volumes** (far side is well-defined). `"3d-boundary"` shows
   game video only *inside* the model volume and passthrough outside
   it — a Quest-guardian-style zone with adjustable size, shape and
   fade. `"3d-boundary-reversed"` inverts it (passthrough inside, game
@@ -483,7 +486,7 @@ Each `passthrough` entry has:
 - `scale`: uniform object scale, number or single-element array
   (default `1`, applied last)
 - `feather-px`: passthrough window feather width in screen pixels
-  (default `24`; `0` disables feathering). Mask stacks group by this
+  (default `12`; `0` disables feathering). Mask stacks group by this
   value so each object feathers independently; applied live. Depth
   volumes reuse their feather value and feather through the same
   erode/blur chain. Not accepted for `3d-passthrough-reversed`,

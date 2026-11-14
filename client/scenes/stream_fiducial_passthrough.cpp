@@ -1198,20 +1198,6 @@ void scenes::stream::gui_passthrough()
 	// above is what the shader receives, unchanged.
 	if (ImGui::Checkbox(_S("Rotation reprojection"), &volume_remap_enabled))
 		spdlog::info("Depth rotation reprojection {}", volume_remap_enabled ? "on" : "off");
-	// Depth time-bias test: shifts the assumed content age to hunt a
-	// constant sensor lag (+ = content older = larger correction, the
-	// trailing direction). 0 = unshifted. Log debounced per integer ms.
-	ImGui::BeginDisabled(not volume_remap_enabled);
-	if (ImGui::SliderFloat(_S("Depth time bias"), &volume_time_bias_ms, -50, 50, "%.0fms"))
-	{
-		int bias_ms = (int)std::round(volume_time_bias_ms);
-		if (bias_ms != volume_bias_logged_ms)
-		{
-			volume_bias_logged_ms = bias_ms;
-			spdlog::info("Depth time bias {}ms", bias_ms);
-		}
-	}
-	ImGui::EndDisabled();
 	// Soft-occlusion depth bias: virtualLinear -= virtualLinear*bias.
 	// Distance-scaled (sensor error grows with distance); start 0.06.
 	if (ImGui::SliderFloat(_S("Soft occlusion bias"), &soft_bias, 0, 0.25f, "%.3f"))

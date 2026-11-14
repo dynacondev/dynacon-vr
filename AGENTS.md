@@ -69,3 +69,30 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   without a video tap); binary hole-punch was discussed but not shipped.
 - Config + packet fields removed too (server dot-pitch/dot-color,
   packet members, session fill, docs): dev branch, no compat shims.
+
+## Soft-occlusion depth path replaces volume/VR compare (Nov 2026)
+
+- Single `3d-depth-passthrough` only: `stream.cpp` counts placed depth
+  volumes, `>1` latches `soft_multi_volume_error` + error log and sits
+  out (exact-only) so no merge semantics are needed. Feather default is
+  12px (packets + server config + docs), tier-1 half-res group.
+- Compare is `soft_occlude_mv.frag.glsl`: single center tap, binary
+  `sensorLin < mergedLin - mergedLin*bias` in linear meters (infinite-far
+  branch like `depth_viz`), merged = `min(volume far, virtual, exact)`.
+  144B push (`volume_homography` + `bias_near_far`) exceeds the 128B
+  Vulkan minimum — ctor throws loudly under 144B like the silhouette
+  (132B) and volume (136B) paths; Adreno 740 has 256B.
+- Exact depth = passthrough (same feather, non-reversed) + hidden
+  nearest raster (`exact_raster_pipeline_mv`, the renamed VR MIN pipe)
+  into new `exact_depth` 320px target, binding 3; empty set rebinds the
+  volume canvas. Reversed never rastered to depth (tweak). Hands: sensor
+  hand removal on (fallback: depth hands), joint spheres
+  (`soft_hand_sphere` soup, radii from `hand_tracker::mesh()` or
+  35/16mm) appended as silhouette positives so they share the blur.
+  Behind-virtual hands over-reveal (accepted, documented).
+- Deleted outright: `volume_compare_mv` / `vr_occlude_compare_mv`
+  shaders, VR eye-space compare + MIN-merge pipes, presmooth
+  (binary feeds the shared blur directly), time-bias + eye-velocity
+  history + slider (bias slider replaces it), all `vr_*` stats/plots/
+  heartbeat, `ensure_vr_targets`, `volume_smooth`. `vr_draws` field and
+  `use_vr` gating removed; `virt_eye_extent` field kept but unread.
