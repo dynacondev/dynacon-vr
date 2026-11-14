@@ -1713,15 +1713,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// sensor acquire runs at the top of the mask record phase below
 		// (both async and inline paths), gated on the mask path: without
 		// alpha blend there is no mask to merge into.
-		bool need_volume_depth = false;
+		int depth_volume_count = 0;
 		for (auto & [oid, ost]: passthrough_objects)
 		{
 			if (ost.def.type == "3d-depth-passthrough" and ost.soup_ready and ost.fused.placed)
-			{
-				need_volume_depth = true;
-				break;
-			}
+				++depth_volume_count;
 		}
+		// Single-volume scope for the soft-occlusion path: >1 disables
+		// soft (error, exact-only fallback) so no merge semantics apply.
+		if (depth_volume_count > 1 and not soft_multi_volume_error)
+		{
+			soft_multi_volume_error = true;
+			spdlog::error("Soft occlusion: {} depth volumes placed, expected <=1; soft off (exact-only)", depth_volume_count);
+		}
+		if (depth_volume_count <= 1 and depth_volume_count > 0 and soft_multi_volume_error)
+			soft_multi_volume_error = false; // recovered
+		bool need_volume_depth = depth_volume_count == 1;
 		vk::ImageView volume_sensor = nullptr;
 		float volume_near = 0.1f, volume_far = 10.f;
 		bool have_volume_sensor = false;
@@ -1756,6 +1763,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (env_depth->ready())
 				{
 					env_depth->start();
+					// Crisp hands: remove sensor hands (background fill) so the
+					// tracked-mesh coverage raster owns the edge. Unsupported
+					// runtimes keep depth hands (fuzzy but present).
+					if (xr::environment_depth::supports_hand_removal(instance, system))
+						soft_hand_removal_on = env_depth->set_hand_removal(true);
+					else
+						soft_hand_removal_on = false;
 					auto acq_t0 = std::chrono::steady_clock::now();
 					// Live acquire: sensor pose rides predicted time; H
 					// absorbs the server-eye delta at compare time.

@@ -125,7 +125,7 @@ struct configuration
 		// feathers independently. Not accepted for
 		// 3d-passthrough-reversed, 3d-boundary(-reversed) and
 		// 3d-passthrough-hidden (warned + ignored).
-		float feather_px = 24;
+		float feather_px = 12;
 		// Boundary fade width in meters (3d-boundary(-reversed) only):
 		// the scene cross-fades over +/- this distance around the mesh
 		// surface (symmetric smoothstep, 0.5 at the surface). 0 = hard

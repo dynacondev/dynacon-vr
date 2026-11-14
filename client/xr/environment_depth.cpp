@@ -42,6 +42,7 @@ xr::environment_depth::environment_depth(instance & inst_, session & sess_, syst
         xrStartEnvironmentDepthProviderMETA(inst_.get_proc<PFN_xrStartEnvironmentDepthProviderMETA>("xrStartEnvironmentDepthProviderMETA")),
         xrStopEnvironmentDepthProviderMETA(inst_.get_proc<PFN_xrStopEnvironmentDepthProviderMETA>("xrStopEnvironmentDepthProviderMETA")),
         xrAcquireEnvironmentDepthImageMETA(inst_.get_proc<PFN_xrAcquireEnvironmentDepthImageMETA>("xrAcquireEnvironmentDepthImageMETA")),
+        xrSetEnvironmentDepthHandRemovalMETA(inst_.get_proc<PFN_xrSetEnvironmentDepthHandRemovalMETA>("xrSetEnvironmentDepthHandRemovalMETA")),
         provider(provider_handle{xrDestroyEnvironmentDepthProviderMETA}),
         swapchain(swapchain_handle{xrDestroyEnvironmentDepthSwapchainMETA})
 #endif
@@ -294,5 +295,46 @@ uint32_t xr::environment_depth::depth_image_count() const
 	return (uint32_t)depth_images.size();
 #else
 	return 0;
+#endif
+}
+
+bool xr::environment_depth::supports_hand_removal(instance & inst, system & sys)
+{
+#ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
+    if (not inst.has_extension(XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME))
+        return false;
+    XrSystemEnvironmentDepthPropertiesMETA props;
+    if (not query_depth_properties(inst, sys, props))
+        return false;
+    return props.supportsHandRemoval == XR_TRUE;
+#else
+    (void)inst;
+    (void)sys;
+    return false;
+#endif
+}
+
+bool xr::environment_depth::set_hand_removal(bool enabled)
+{
+#ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
+    if (not provider_started or not xrSetEnvironmentDepthHandRemovalMETA)
+        return false;
+    if (enabled == hand_removal_enabled)
+        return true;
+    XrEnvironmentDepthHandRemovalSetInfoMETA info{
+        .type = XR_TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META,
+        .enabled = enabled ? XR_TRUE : XR_FALSE,
+    };
+    if (XrResult res = xrSetEnvironmentDepthHandRemovalMETA(provider, &info); res != XR_SUCCESS)
+    {
+        spdlog::warn("environment_depth: hand removal {} failed: {}", enabled, xr::to_string(res));
+        return false;
+    }
+    hand_removal_enabled = enabled;
+    spdlog::info("environment_depth: hand removal {}", enabled ? "on" : "off");
+    return true;
+#else
+    (void)enabled;
+    return false;
 #endif
 }

@@ -1212,6 +1212,10 @@ void scenes::stream::gui_passthrough()
 		}
 	}
 	ImGui::EndDisabled();
+	// Soft-occlusion depth bias: virtualLinear -= virtualLinear*bias.
+	// Distance-scaled (sensor error grows with distance); start 0.06.
+	if (ImGui::SliderFloat(_S("Soft occlusion bias"), &soft_bias, 0, 0.25f, "%.3f"))
+		soft_bias = std::clamp(soft_bias, 0.f, 0.25f);
 
 	ImGui::SeparatorText(_S("Passthrough effects demo"));
 	{

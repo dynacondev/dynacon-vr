@@ -550,6 +550,13 @@ private:
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
 	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
+	// Soft-occlusion replacement (single 3d-depth-passthrough only):
+	// binary sensor<merged with distance-scaled bias, half-res, one
+	// shared blur via the feather group. >1 depth volume disables soft
+	// (error, exact-only fallback) so no merge semantics are needed.
+	float soft_bias = 0.06f; // virtualLinear -= virtualLinear*bias
+	bool soft_multi_volume_error = false; // latched, logged once
+	bool soft_hand_removal_on = false; // removal active (depth hands fallback otherwise)
 	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
 	bool volume_remap_logged = false; // one-shot H log for convention validation
 	// Depth time-bias test (Passthrough tab slider, ms, +/-50): assumes
