@@ -1089,8 +1089,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			startup_fading = true;
 			startup_time = instance.now();
-			spdlog::info("startup fade: video resumed after {:.1f}s gap, fading over {:.1f}s",
-			             (double)gap * 1e-9, (double)startup_fade_s);
+			if (last_video_t == 0)
+				spdlog::info("startup fade: initial video start, fading over {:.1f}s",
+				             (double)startup_fade_s);
+			else
+				spdlog::info("startup fade: video resumed after {:.1f}s gap, fading over {:.1f}s",
+				             (double)gap * 1e-9, (double)startup_fade_s);
 		}
 	}
 	last_video_t = frame_state.predictedDisplayTime;
