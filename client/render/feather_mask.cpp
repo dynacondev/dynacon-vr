@@ -3512,7 +3512,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 		};
 
-		// Depth-volume layer: furthest-D raster at 320px, strict
+		// Depth-volume layer: furthest-D raster at working res, strict
 		// sensor<render> flatten, upscale+MAX into the seed. The seed
 		// already holds silhouettes + reversed MIN cuts (or is clear),
 		// so the merge LOADs and MAXes over them: the volume overlays
