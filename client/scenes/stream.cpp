@@ -2322,9 +2322,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// Reversed objects live in every group (no feather of
 						// their own): evict on removal/unready only, never on
 						// feather mismatch. Positives must match feather.
-						// Soft-occlusion retention: hidden objects live in the soft
-						// group (any feather) while placed, and the procedural hand
-						// sphere persists while a single depth volume is placed.
+					// Soft-occlusion retention: hidden objects live in the soft
+					// group (any feather) while placed, and the skinned hand
+					// meshes persist while a single depth volume is placed.
 						bool soft_here = not soft_multi_volume_error and soft_feather >= 0.f and g.feather_px == soft_feather;
 						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
 						        oit->second.fused.placed and
@@ -2478,11 +2478,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// group with no positive draws is skipped exactly like an
 					// empty one. Soft exact occluders ride the same
 					// positives, so no extra culling pass.
-					// Soft-occlusion hand coverage (single-volume groups only):
-					// palm + finger joint spheres as silhouette positives so they
-					// feather with the shared blur. Sensor hands are removed
-					// (hand removal), so the mesh owns the edge; depth hands are the
-					// fallback when removal is unsupported (soft_hand_removal_on).
+					// Soft-occlusion hands (single-volume groups only): real
+					// skinned hand meshes as silhouette positives (reveal) and
+					// exact-depth inputs (VR cut), sharing the group feather.
+					// Sensor hands are removed (hand removal), so the meshes
+					// own the edge; depth hands are the fallback when removal
+					// is unsupported (soft_hand_removal_on).
 					bool soft_group = have_volume_sensor and not soft_multi_volume_error and soft_feather >= 0.f and f == soft_feather;
 					if (soft_group and not soft_hand_removal_on)
 					{

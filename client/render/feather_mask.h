@@ -191,7 +191,7 @@ public:
 	// display-eye MVP space plus the runtime D16 sensor view they test
 	// against (strict sensor < render, far hidden). Null = no volume in
 	// this group: the seed passes through untouched. Non-null with draws
-	// and a valid sensor view rasterizes at 320px, flattens to binary R8,
+	// and a valid sensor view rasterizes at the working res, flattens to binary R8,
 	// and upscales+MAXes into the tier seed AFTER the reversed MIN cuts
 	// (the volume overlays everything, including VR cutthroughs) and
 	// BEFORE erode/blur, so it feathers exactly like silhouettes.
@@ -226,7 +226,7 @@ public:
 		bool virt_valid = false;
 		// Per-eye virtual-depth resolution (SBS width/2 x height), from
 		// the stream description (forensics only; the soft compare runs
-		// at the fixed 320px working size).
+		// at the working res; its size also drives the VR-cut res).
 		vk::Extent2D virt_eye_extent{0, 0};
 		// Rotation reprojection: per-eye homography columns (eye e uses
 		// [3*e .. 3*e+2], w unused) mapping eye UV to sensor UV. Identity
@@ -400,8 +400,8 @@ private:
 	// data). Distinct sets make each binding stable across the frame.
 	// Index: 0 = blur-H, 1 = upscale merges (volume MAX — triple never
 	// touches it), 2 = blur-V upscale; 4,5 = downsample levels
-	// 2,3; 7 = erode-H, 8 = erode-V. (3 and 6 were the removed
-	// presmooth-H and VR MIN-merge slots.)
+	// 2,3; 7 = erode-H, 8 = erode-V. (3 is the VR-cut MIN merge; 6 was
+	// the removed VR MIN-merge slot, now reused by the cut.)
 	// One set per pass (not
 	// per eye): the multiview passes sample the array view, so no
 	// per-eye slots exist. Erosion needs two sets because its H and V
@@ -522,7 +522,7 @@ private:
 	static_assert(sizeof(volume_homography) == 144);
 	vk::raii::Pipeline compare_pipeline_mv{nullptr};
 	// Linear sampler for the compare taps (sensor + volume + virtual +
-	// exact depth): bilinear upscale of the 320px canvases; the binary
+	// exact depth): bilinear upscale of the working-res canvases; the binary
 	// verdict is feathered by the shared blur chain below.
 	vk::raii::Sampler volume_sampler_linear{nullptr};
 	// Virtual-depth SBS -> sensor-compatible D canvas (fullscreen MV

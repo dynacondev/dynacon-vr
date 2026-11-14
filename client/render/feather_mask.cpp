@@ -818,8 +818,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		descriptor_sets.emplace_back(std::move(device.allocateDescriptorSets(set_alloc_info)[0]));
 	}
 
-	// Depth-volume chain (3d-depth-passthrough, fixed 320px, format-fixed:
-	// built once here, never rebuilt). Raster encodes furthest-D as R16
+	// Depth-volume chain (3d-depth-passthrough, extent-driven: working
+	// res for the sensor path, cut res for the VR cut; rebuilt on
+	// extent change). Raster encodes furthest-D as R16
 	// (MAX blend over a 0 clear, no MIN cuts); compare flattens to binary
 	// R8; merge upscales+MAXes into the tier seed ahead of erode/blur.
 	// (Legacy high-res VR path removed: exact-depth soft compare covers it.)
@@ -1390,7 +1391,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		volume_sampler_linear = vk::raii::Sampler(device, volume_linear_info);
 	}
-	// Merge: upscale the 320px binary canvas into the tier seed with MAX
+	// Merge: upscale the working-res binary canvas into the tier seed with MAX
 	// blending (LOAD preserves silhouettes + reversed cuts, 1s set where
 	// the sensor is inside). Reuses the blur shaders with spread 0 (the
 	// linear sampler is the upscale) under the shared blur layout; the
@@ -1625,7 +1626,15 @@ void feather_mask_renderer::update_mesh_positions(const std::string & key, const
 	vk::DeviceSize vertex_bytes = verts.size() * sizeof(XrVector3f);
 	vk::DeviceSize index_bytes = mesh.index_count * sizeof(uint32_t);
 	if (mesh.staging_size < vertex_bytes + index_bytes)
-		return; // size changed: caller falls back to set_mesh
+		{
+		static bool warned = false;
+		if (not warned)
+		{
+		warned = true;
+		spdlog::warn("update_mesh_positions: size changed, use set_mesh");
+		}
+		return;
+	}
 	if (vertex_bytes == 0)
 		return;
 	void * mapped = mesh.staging_memory.mapMemory(0, vertex_bytes + index_bytes);
@@ -2649,7 +2658,7 @@ void feather_mask_renderer::ensure_volume_targets(vk::Extent2D working, vk::Exte
 		        });
 	}
 
-	// Virtual-depth D canvas (R16, same 320px 2-layer shape): SBS
+	// Virtual-depth D canvas (R16, cut-res 2-layer shape): SBS
 	// meters->D conversion output, cleared to far. Own MV framebuffer
 	// under volume_virt_renderpass (CLEAR R16 MV).
 	std::tie(volume_virt.image, volume_virt.memory) = make_target_image(volume_depth_format, ce);
@@ -2704,7 +2713,7 @@ void feather_mask_renderer::ensure_volume_targets(vk::Extent2D working, vk::Exte
 	                .layers = 2,
 	        });
 
-	// Exact-depth canvas (R16 nearest, same 320px shape): soft-occlusion
+	// Exact-depth canvas (R16 nearest, cut-res 2-layer shape): soft-occlusion
 	// exact occluders (passthrough + hidden, reversed excluded). Far (1.0)
 	// clear, MIN blend via exact_raster_pipeline_mv, sampled as binding 3.
 	std::tie(exact_depth.image, exact_depth.memory) = make_target_image(volume_depth_format, ce);
@@ -3305,7 +3314,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		tier_out = tier;
 
 		// Virtual-depth conversion, once per record: SBS meters->D at
-		// 320px into volume_virt (shared by the soft compare).
+		// the cut res into volume_virt (shared by the cut and the soft compare).
 		// Descriptor set update once per record: the conversion binds the
 		// decoded view on first use (same-CB draws would otherwise all
 		// read the last update).
@@ -3411,6 +3420,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			if (!use_cut)
 			        return;
 			raster_exact(cutE);
+			// Virtual depth at the cut res (idempotent: convert_virt_canvas
+			// skips when already done this record, so the per-stage cut
+			// reuses the first conversion). Must run before the compare:
+			// run_volume converts lazily and runs after the cut.
+			convert_virt_canvas(volume_virt, volume_virt_fb_mv, cutE, low_virt_done);
 			{
 				section_clock compare_clk(&ms_cut);
 				vk::DescriptorImageInfo cut_virt_info{
