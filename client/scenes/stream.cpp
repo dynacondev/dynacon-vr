@@ -976,9 +976,8 @@ void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 	// in render() where the video path is confirmed (both decoder queues
 	// non-empty, so it can't go stale); 0 at connect shows the kiosk at
 	// once, and it returns 2s after the decoders run dry.
-	static constexpr XrDuration kiosk_video_holdoff = 2'000'000'000LL; // 2s
 	stream_kiosk_shown = allowed and not is_gui_interactable() and
-	                     (predicted_display_time - last_video_t > kiosk_video_holdoff);
+	                     (predicted_display_time - last_video_t > video_gap_holdoff);
 }
 
 void scenes::stream::render(const XrFrameState & frame_state)
@@ -1080,6 +1079,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// is streaming — stamp it for the kiosk holdoff in update_stream_kiosk.
 	// Queues drain every frame on this path, so the stamp can't go stale
 	// while frames keep arriving.
+	// Startup fade re-arms on the same gap as the kiosk (video absent
+	// > holdoff), independent of kiosk-mode / GUI state so it works
+	// with the kiosk off. Triggers on path-taken like the kiosk, not
+	// on first displayed frame.
+	{
+		XrTime gap = frame_state.predictedDisplayTime - last_video_t;
+		if (gap > video_gap_holdoff and startup_fade_s > 0)
+		{
+			startup_fading = true;
+			startup_time = instance.now();
+			spdlog::info("startup fade: video resumed after {:.1f}s gap, fading over {:.1f}s",
+			             (double)gap * 1e-9, (double)startup_fade_s);
+		}
+	}
 	last_video_t = frame_state.predictedDisplayTime;
 
 	if (state_ == state::stalled)
@@ -3783,10 +3796,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// The debug window cutout needs a live passthrough to reveal,
 		// map or not (it punches every live vote). The depth debug
 		// overlay and the passthrough effects demo need fullscreen
-		// passthrough underneath them.
+		// passthrough underneath them. The boundary veil (which the
+		// startup fade folds into) needs it too — including with an
+		// empty map, where have_fiducial_map is false but the fade
+		// still has to ride the flat layer.
 		bool want_debug_cutout = debug_overlays and debug_window_mm >= 0;
 		bool effects_full = session.effects_fullscreen_passthrough();
-		if (use_alpha or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough() or effects_full)
+		if (use_alpha or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough() or effects_full or boundary_veil)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();

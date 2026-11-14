@@ -271,6 +271,10 @@ private:
 	// predictedDisplayTime of the last frame that took the video path (both
 	// decoder queues non-empty); the kiosk returns 2s after this goes stale
 	XrTime last_video_t = 0;
+	// Video-absent gap that re-shows the kiosk and re-arms the startup
+	// fade (shared: the fade mirrors the kiosk signal but ignores
+	// kiosk-mode / GUI state so it works with the kiosk off).
+	static constexpr XrDuration video_gap_holdoff = 2'000'000'000LL; // 2s
 	XrTime last_stream_kiosk_toggle = 0;
 	bool stream_chord_held = false;
 	std::optional<wivrn::kiosk_planes> kiosk_planes_;
@@ -839,6 +843,16 @@ private:
 	float until_lock_fade_s = 2.0f;
 	XrTime until_lock_time = 0; // latch time; 0 = not fading
 	bool until_lock_fading = false;
+	// Video (re)start fade: fullscreen passthrough whenever the feed
+	// resumes after a gap, fading to normal over startup-fade-time
+	// (smoothstep, min-combined into boundary_s so a starting feed
+	// always wins while fading). Re-arms on the same gap as the
+	// waiting kiosk (video absent > holdoff) but independent of
+	// kiosk-mode, so first connect and stop->start both fade with
+	// the kiosk off. Render thread only.
+	float startup_fade_s = 2.0f;
+	XrTime startup_time = 0; // fade start; 0 = never
+	bool startup_fading = false;
 	// Origin alignment (alignment -> local-origin): render thread derives
 	// the correction from the resolved board pose every frame, tracking
 	// thread applies it to outgoing poses. configured = map carries a
