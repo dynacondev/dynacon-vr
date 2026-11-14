@@ -82,17 +82,31 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   144B push (`volume_homography` + `bias_near_far`) exceeds the 128B
   Vulkan minimum — ctor throws loudly under 144B like the silhouette
   (132B) and volume (136B) paths; Adreno 740 has 256B.
-- Exact depth = passthrough (same feather, non-reversed) + hidden
-  nearest raster (`exact_raster_pipeline_mv`, the renamed VR MIN pipe)
-  into new `exact_depth` 320px target, binding 3; empty set rebinds the
-  volume canvas. Reversed never rastered to depth (tweak). Hands: sensor
-  hand removal on (fallback: depth hands), joint spheres
-  (`soft_hand_sphere` soup, radii from `hand_tracker::mesh()` or
-  35/16mm) appended as silhouette positives so they share the blur.
-  Behind-virtual hands over-reveal (accepted, documented).
+- Two working resolutions, both extent-driven (no fixed 320 anywhere;
+  the only fixed size is the runtime depth texture, queried never
+  assumed): sensor path at quarter of full working size
+  (`extent/4`, one line to switch to half); VR cut at
+  `min(group submit, virt eye)` so it is per layer pixel, never
+  upscaled. `ensure_volume_targets(working, cut)` rebuilds on change.
+- Exact depth = passthrough + hidden + tracked hands nearest raster
+  (`exact_raster_pipeline_mv`, the renamed VR MIN pipe); empty set
+  rebinds the volume canvas. Reversed never rastered to depth.
+  VR cut (`vr_cut_mv.frag.glsl`, 2 bindings, no push) MIN-cuts the seed
+  where virt is strictly nearer, ahead of the soft MAX (cut-before-add);
+  `cut_min_*` pipes reuse the volume MAX renderpasses. Sensor never
+  involved in the cut (hands work with removal on).
+- Hands are real skinned Meta meshes: `skin_hand_soup` CPU-skins the
+  `hand_tracker::mesh` bind data with per-frame located joints
+  (palm-gated, palm-delta fallback for untracked joints), uploaded via
+  new `update_mesh_positions` (no waitIdle: buffers never replaced,
+  same frame-fenced pattern as `cutout_verts`; first sight still uses
+  `set_mesh`). `soft_hand_left/right` keys, retained while the soft
+  group is live. Untracked hands = no mesh, no draws (fail closed).
 - Deleted outright: `volume_compare_mv` / `vr_occlude_compare_mv`
-  shaders, VR eye-space compare + MIN-merge pipes, presmooth
-  (binary feeds the shared blur directly), time-bias + eye-velocity
-  history + slider (bias slider replaces it), all `vr_*` stats/plots/
-  heartbeat, `ensure_vr_targets`, `volume_smooth`. `vr_draws` field and
-  `use_vr` gating removed; `virt_eye_extent` field kept but unread.
+  shaders, VR eye-space path, presmooth (`volume_smooth`,
+  `volume_smooth_spread`), time-bias + eye-velocity history + slider
+  (bias slider replaces it), all `vr_*` stats/plots/heartbeat,
+  `ensure_vr_targets`, `volume_size = 320`. `vr_draws` field and
+  `use_vr` gating removed. `flush_upload` (declared, called, never
+  defined — link break) restored verbatim from the parent commit during
+  this work; audit caught it plus a stale 128B assert.

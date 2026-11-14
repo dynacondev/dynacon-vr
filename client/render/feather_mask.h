@@ -81,6 +81,12 @@ public:
 	// per frame. Empty soup erases the entry.
 	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
 	void remove_mesh(const std::string & key);
+	// In-place vertex rewrite for dynamic meshes (skinned hands): same
+	// vertex/index counts as the uploaded soup (topology is fixed),
+	// new positions only. No waitIdle (buffers are never replaced),
+	// flushed by the normal per-draw flush_upload path. No-op on
+	// unknown key or size mismatch (caller falls back to set_mesh).
+	void update_mesh_positions(const std::string & key, const std::vector<XrVector3f> & verts);
 	// Model-space AABB for frustum skip (nullopt = unknown key: keep the
 	// draw). Computed once at upload; the draws filter in stream.cpp
 	// consults it before acquire, so fully-culled groups cost nothing.
@@ -156,15 +162,16 @@ public:
 		float box_frac = 1;   // scissor-box area fraction (0-1) at working
 		                      // res; 1 = fullscreen fallback. Diagnostic for
 		                      // cull effectiveness (log only, no plot).
-		// Depth-volume stages (3d-depth-passthrough objects in this
-		// group): furthest-point raster at 320px, virtual-depth SBS->D
-		// conversion at 320px (when paired), strict sensor<min(volume,
-		// virtual) flatten, upscale+MAX merge into the seed ahead of erode.
-		// Zero when the group carries no volume draws.
+		// Soft chain stages: volume far raster + virtual-depth SBS->D
+		// conversion (working res, quarter of full) with binary sensor
+		// compare flattened to R8 and MAX-merged into the seed; exact-depth
+		// MIN raster + VR-cut compare at the cut res with MIN-merge.
+		// Zero when the group carries no matching draws.
 		double volume_raster_ms = 0;
 		double volume_virt_ms = 0;
 		double volume_compare_ms = 0;
 		double volume_merge_ms = 0;
+		double cut_ms = 0; // VR-cut raster + compare + MIN merge (cut res)
 		float volume_box_frac = 1; // merge-box area fraction of the seed
 		// (0-1); drives the renderArea scissor economics, logged.
 	};
@@ -454,15 +461,14 @@ private:
 	// skip them — see ensure_targets; part of the rebuild gate).
 	bool targets_has_intermediates = false;
 
-	// Soft-occlusion depth chain (single 3d-depth-passthrough,
-	// fixed 320px working size regardless of mask extent). Raster outputs
-	// R16 sensor-D (volume far MAX, exact passthrough+hidden MIN) +
-	// R16 virtual-D from SBS; the binary compare writes R8 coverage and
-	// merges (spread-0 upscale) MAX into the tier seed ahead of the shared
-	// erode/blur. Created once in the constructor (format-fixed); targets
-	// are extent-fixed, so no rebuilds ever (unlike the mask
-	// intermediates).
-	static constexpr uint32_t volume_size = 320;
+	// Soft-occlusion depth chain (single 3d-depth-passthrough).
+	// extents are driven per record, never fixed: sensor path
+	// (volume far MAX, virtual-D SBS decode, binary compare) runs at
+	// the working res (quarter of full, one line to switch to half);
+	// the exact-depth MIN raster + VR-cut compare run at the cut res
+	// (min(group submit, virtual eye), floored at 64px) so the cut is
+	// evaluated per layer pixel, never upscaled from a coarser grid.
+	// Created on first use and rebuilt on extent change (format-fixed).
 	static constexpr vk::Format volume_depth_format = vk::Format::eR16Unorm;
 	// Multiview volume raster (volume_mv.vert, 136B MVP-pair push):
 	// one draw broadcasts to both layers. Same CLEAR/STORE/OPTIMAL R16
@@ -491,7 +497,7 @@ private:
 	// Dedicated CLEAR renderpass over volume_bin.blur_fb_mv (same R8 MV
 	// shape as the blur intermediates; loadOp is not part of render-pass
 	// compatibility, so the framebuffer is shared). CLEAR, not DONT_CARE:
-	// the merge LINEAR-upscales the whole 320 canvas, and any texel the
+	// the merge LINEAR-upscales the working canvas, and any texel the
 	// compare draw did not write must read back deterministic 0, never
 	// undefined tile garbage.
 	vk::raii::RenderPass compare_renderpass_mv{nullptr};
@@ -499,8 +505,10 @@ private:
 	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
 	vk::raii::DescriptorPool compare_pool{nullptr};
 	vk::raii::DescriptorSet compare_set{nullptr};
-	// Compare homography + B2 lateral correction: per-eye 3x3 columns as
-	// 6 vec4s plus per-eye corr (T.xy, a, b), 8 vec4s / 128B total,
+	// Compare homography + B2 lateral correction + bias: per-eye 3x3
+	// columns as 6 vec4s plus per-eye corr (T.xy, a, b) plus one
+	// bias/near/far vec4, 9 vec4s / 144B total (over the 128B Vulkan
+	// minimum; Adreno 740 provides 256B, enforced by ctor throw),
 	// filled per volume record from volume_input and pushed (named
 	// members, never an array: push-constant arrays have driver-defined
 	// packing). Layout matches mat4 columns exactly.
@@ -518,7 +526,7 @@ private:
 	// verdict is feathered by the shared blur chain below.
 	vk::raii::Sampler volume_sampler_linear{nullptr};
 	// Virtual-depth SBS -> sensor-compatible D canvas (fullscreen MV
-	// pass at 320px, meters->D with the volume near/far). Comparison
+	// pass at the cut res, meters->D with the volume near/far). Comparison
 	// stays in D space (sensor < min(volume, virtual, exact) with
 	// distance-scaled bias in linear meters). Canvas cleared to far (1.0):
 	// unpaired frames leave the min() a no-op. Written with plain STORE
@@ -543,20 +551,35 @@ private:
 	vk::raii::Pipeline volume_max_r8_pipeline{nullptr};
 	vk::raii::RenderPass volume_max_rgb8_renderpass{nullptr};
 	vk::raii::Pipeline volume_max_rgb8_pipeline{nullptr};
-	blur_target exact_depth; // R16 nearest-D canvas (320, 2 layers):
+	blur_target exact_depth; // R16 nearest-D canvas (cut res, 2 layers):
 	// soft-occlusion exact occluders (passthrough + hidden, reversed
 	// excluded). Far (1.0) clear, MIN blend, cull-nothing.
-	blur_target volume_depth; // R16 furthest-D canvas (320, 2 layers)
+	blur_target volume_depth; // R16 furthest-D canvas (working res, 2 layers)
 	blur_target volume_virt; // R16 virtual-depth D canvas (320, 2 layers):
 	// SBS meters->D conversion output, cleared to far, sampled by the
 	// volume compare pass alongside volume_depth. Own MV framebuffer
 	// (volume_virt_fb_mv) under volume_virt_renderpass (CLEAR R16 MV).
 	vk::raii::Framebuffer volume_virt_fb_mv{nullptr};
-	blur_target volume_bin; // R8 coverage canvas (320, 2 layers):
+	blur_target volume_bin; // R8 coverage canvas (working res, 2 layers):
 	// soft-occlusion binary output, MAX-merged straight into the seed
 	// (no presmooth: the shared blur chain feathers the edge).
 	bool volume_targets_ready = false;
-	void ensure_volume_targets();
+	vk::Extent2D volume_working_extent{0, 0}; // sensor path (quarter)
+	vk::Extent2D volume_cut_extent{0, 0}; // exact raster + VR cut
+	void ensure_volume_targets(vk::Extent2D working, vk::Extent2D cut);
+	// VR-cut chain (cut res): binary virt-nearer-than-exact keep field
+	// (cut_bin, R8 CLEAR MV pass) MIN-merged spread-0 into the seed
+	// ahead of the soft MAX, so VR occludes known geometry (and hands)
+	// per layer pixel with no sensor involvement. Created with the
+	// volume targets above (same extent gate).
+	blur_target cut_bin; // R8 keep field (cut res, 2 layers)
+	vk::raii::DescriptorSetLayout cut_set_layout{nullptr};
+	vk::raii::PipelineLayout cut_pipe_layout{nullptr};
+	vk::raii::DescriptorPool cut_pool{nullptr};
+	vk::raii::DescriptorSet cut_set{nullptr};
+	vk::raii::Pipeline cut_pipeline_mv{nullptr};
+	vk::raii::Pipeline cut_min_r8_pipeline{nullptr};
+	vk::raii::Pipeline cut_min_rgb8_pipeline{nullptr};
 	void update_source(vk::ImageView view, uint32_t set, bool nearest = false,
 	                     vk::ImageLayout layout = vk::ImageLayout::eShaderReadOnlyOptimal);
 

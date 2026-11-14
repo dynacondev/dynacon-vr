@@ -1127,6 +1127,110 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .renderPass = *compare_renderpass_mv,
 		};
 			compare_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), compare_pipeline_info);
+	// VR-cut compare: fullscreen _mv eye-space test (virtual D vs exact
+	// nearest D, both sensor-compatible). Renders keep=1 into
+	// cut_bin.blur_fb_mv under the shared R8 MV CLEAR pass. No push
+	// constants: both inputs are already D, no reprojection.
+	{
+		auto cut_frag = load_shader(device, "vr_cut_mv.frag");
+		vk::PipelineShaderStageCreateInfo cut_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **blur_vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **cut_frag,
+		                .pName = "main",
+		        },
+		};
+		vk::DescriptorSetLayoutBinding cut_bindings[2] = {
+		        {
+		                .binding = 0,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        },
+		        {
+		                .binding = 1,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        },
+		};
+		vk::DescriptorSetLayoutCreateInfo cut_set_info{
+		        .bindingCount = 2,
+		        .pBindings = cut_bindings,
+		};
+		cut_set_layout = vk::raii::DescriptorSetLayout(device, cut_set_info);
+		vk::PipelineLayoutCreateInfo cut_pipe_layout_info{
+		        .setLayoutCount = 1,
+		        .pSetLayouts = &*cut_set_layout,
+		};
+		cut_pipe_layout = vk::raii::PipelineLayout(device, cut_pipe_layout_info);
+		vk::DescriptorPoolSize cut_pool_size{
+		        .type = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 3,
+		};
+		vk::DescriptorPoolCreateInfo cut_pool_info{
+		        .maxSets = 1,
+		        .poolSizeCount = 1,
+		        .pPoolSizes = &cut_pool_size,
+		};
+		cut_pool = vk::raii::DescriptorPool(device, cut_pool_info);
+		vk::DescriptorSetAllocateInfo cut_alloc_info{
+		        .descriptorPool = *cut_pool,
+		        .descriptorSetCount = 1,
+		        .pSetLayouts = &*cut_set_layout,
+		};
+		cut_set = std::move(device.allocateDescriptorSets(cut_alloc_info)[0]);
+		vk::PipelineVertexInputStateCreateInfo cut_vertex_input{};
+		vk::PipelineInputAssemblyStateCreateInfo cut_input_assembly{
+		        .topology = vk::PrimitiveTopology::eTriangleList,
+		};
+		vk::PipelineViewportStateCreateInfo cut_viewport_state{
+		        .viewportCount = 1,
+		        .scissorCount = 1,
+		};
+		vk::PipelineRasterizationStateCreateInfo cut_rasterization{
+		        .polygonMode = vk::PolygonMode::eFill,
+		        .cullMode = vk::CullModeFlagBits::eNone,
+		        .frontFace = vk::FrontFace::eCounterClockwise,
+		        .lineWidth = 1,
+		};
+		vk::PipelineMultisampleStateCreateInfo cut_multisample{
+		        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+		};
+		vk::PipelineColorBlendAttachmentState cut_blend_attachment{
+		        .blendEnable = VK_FALSE,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		};
+		vk::PipelineColorBlendStateCreateInfo cut_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &cut_blend_attachment,
+		};
+		vk::DynamicState cut_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+		vk::PipelineDynamicStateCreateInfo cut_dynamic{
+		        .dynamicStateCount = 2,
+		        .pDynamicStates = cut_dynamics,
+		};
+		vk::GraphicsPipelineCreateInfo cut_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = cut_stages,
+		        .pVertexInputState = &cut_vertex_input,
+		        .pInputAssemblyState = &cut_input_assembly,
+		        .pViewportState = &cut_viewport_state,
+		        .pRasterizationState = &cut_rasterization,
+		        .pMultisampleState = &cut_multisample,
+		        .pColorBlendState = &cut_blend,
+		        .pDynamicState = &cut_dynamic,
+		        .layout = *cut_pipe_layout,
+		        .renderPass = *compare_renderpass_mv,
+		};
+		cut_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), cut_pipeline_info);
+	}
 	}
 	// Virtual depth SBS -> sensor-D canvas: fullscreen _mv conversion
 	// (meters->D with the volume near/far), so the compare stays in D
@@ -1385,6 +1489,34 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		volume_max_r8_pipeline = make_max_pipe(volume_max_r8_renderpass);
 		volume_max_rgb8_pipeline = make_max_pipe(volume_max_rgb8_renderpass);
+		// VR-cut MIN merges: same blur shaders/layout/renderpasses as the
+		// MAX merges above, MIN blend instead. LOAD preserves the seed,
+		// 0s cut where VR wins over known geometry (and hands).
+		vk::PipelineColorBlendAttachmentState cut_min_attachment = volume_max_attachment;
+		cut_min_attachment.colorBlendOp = vk::BlendOp::eMin;
+		cut_min_attachment.alphaBlendOp = vk::BlendOp::eMin;
+		vk::PipelineColorBlendStateCreateInfo cut_min_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &cut_min_attachment,
+		};
+		auto make_cut_min_pipe = [&](vk::raii::RenderPass & rp) {
+		        vk::GraphicsPipelineCreateInfo cut_min_pipe_info{
+		                .stageCount = 2,
+		                .pStages = blur_mv_stages,
+		                .pVertexInputState = &blur_vertex_input,
+		                .pInputAssemblyState = &blur_input_assembly,
+		                .pViewportState = &blur_viewport_state,
+		                .pRasterizationState = &blur_rasterization,
+		                .pMultisampleState = &blur_multisample,
+		                .pColorBlendState = &cut_min_blend,
+		                .pDynamicState = &blur_dynamic,
+		                .layout = *blur_layout,
+		                .renderPass = *rp,
+		        };
+		        return vk::raii::Pipeline(device, *pipeline_cache(device), cut_min_pipe_info);
+		};
+		cut_min_r8_pipeline = make_cut_min_pipe(volume_max_r8_renderpass);
+		cut_min_rgb8_pipeline = make_cut_min_pipe(volume_max_rgb8_renderpass);
 	}
 }
 
@@ -1477,6 +1609,38 @@ void feather_mask_renderer::remove_mesh(const std::string & key)
 	// Same in-flight hazard as replace.
 	device.waitIdle();
 	meshes.erase(it);
+}
+
+// In-place vertex rewrite for dynamic meshes (skinned hands): same
+// vertex count as the uploaded soup, so every buffer is reused and no
+// waitIdle is needed. Staging is host-visible + coherent (same pattern
+// as the cutout quads); the pending copy is flushed by the normal
+// per-draw flush_upload path with a transfer->vertex barrier.
+void feather_mask_renderer::update_mesh_positions(const std::string & key, const std::vector<XrVector3f> & verts)
+{
+	auto it = meshes.find(key);
+	if (it == meshes.end())
+		return;
+	auto & mesh = it->second;
+	vk::DeviceSize vertex_bytes = verts.size() * sizeof(XrVector3f);
+	vk::DeviceSize index_bytes = mesh.index_count * sizeof(uint32_t);
+	if (mesh.staging_size < vertex_bytes + index_bytes)
+		return; // size changed: caller falls back to set_mesh
+	if (vertex_bytes == 0)
+		return;
+	void * mapped = mesh.staging_memory.mapMemory(0, vertex_bytes + index_bytes);
+	std::memcpy(mapped, verts.data(), vertex_bytes);
+	mesh.staging_memory.unmapMemory();
+	mesh.pending_upload = {vertex_bytes, index_bytes};
+	glm::vec3 lo{verts[0].x, verts[0].y, verts[0].z};
+	glm::vec3 hi = lo;
+	for (const auto & v: verts)
+	{
+		lo = glm::min(lo, glm::vec3(v.x, v.y, v.z));
+		hi = glm::max(hi, glm::vec3(v.x, v.y, v.z));
+	}
+	mesh.aabb_min = lo;
+	mesh.aabb_max = hi;
 }
 
 vk::ImageView feather_mask_renderer::submitted_view_array(vk::Image image) const
@@ -2419,21 +2583,24 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 	spdlog::info("Feather mask blur targets: {}x{} (A/B at half, levels below)", extent.width, extent.height);
 }
 
-void feather_mask_renderer::ensure_volume_targets()
+void feather_mask_renderer::ensure_volume_targets(vk::Extent2D working, vk::Extent2D cut)
 {
-	if (volume_targets_ready)
+	if (volume_targets_ready and volume_working_extent.width == working.width and
+	    volume_working_extent.height == working.height and volume_cut_extent.width == cut.width and
+	    volume_cut_extent.height == cut.height)
 		return;
 
-	// One-time path (fixed 320px size): in-flight frames cannot exist
-	// before the first volume record, but waitIdle is cheap insurance
-	// on this cold path, mirroring ensure_targets.
+	// Rebuilt on extent change (video resize, depth-size change):
+	// waitIdle retires in-flight frames using the old views, mirroring
+	// the scene swapchain recreation discipline above.
 	device.waitIdle();
-	vk::Extent2D ve{volume_size, volume_size};
-	auto make_target_image = [&](vk::Format fmt) {
+	vk::Extent2D ve = working;
+	vk::Extent2D ce = cut;
+	auto make_target_image = [&](vk::Format fmt, vk::Extent2D e) {
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
 		        .format = fmt,
-		        .extent = {ve.width, ve.height, 1},
+		        .extent = {e.width, e.height, 1},
 		        .mipLevels = 1,
 		        .arrayLayers = 2,
 		        .samples = vk::SampleCountFlagBits::e1,
@@ -2455,7 +2622,7 @@ void feather_mask_renderer::ensure_volume_targets()
 
 	// Furthest-D canvas (R16, sensor-compatible): array view for the
 	// compare sampler + one layers=2 MV raster FB.
-	std::tie(volume_depth.image, volume_depth.memory) = make_target_image(volume_depth_format);
+	std::tie(volume_depth.image, volume_depth.memory) = make_target_image(ve, volume_depth_format);
 	volume_depth.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
 	                .image = *volume_depth.image,
@@ -2485,7 +2652,7 @@ void feather_mask_renderer::ensure_volume_targets()
 	// Virtual-depth D canvas (R16, same 320px 2-layer shape): SBS
 	// meters->D conversion output, cleared to far. Own MV framebuffer
 	// under volume_virt_renderpass (CLEAR R16 MV).
-	std::tie(volume_virt.image, volume_virt.memory) = make_target_image(volume_depth_format);
+	std::tie(volume_virt.image, volume_virt.memory) = make_target_image(ce, volume_depth_format);
 	volume_virt.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
 	                .image = *volume_virt.image,
@@ -2505,14 +2672,14 @@ void feather_mask_renderer::ensure_volume_targets()
 	                .renderPass = *volume_virt_renderpass,
 	                .attachmentCount = 1,
 	                .pAttachments = &raw_virt_array,
-	                .width = ve.width,
-	                .height = ve.height,
+	                .width = ce.width,
+	                .height = ce.height,
 	                .layers = 2,
 	        });
 
 	// Binary canvas (R8): compare renders MV into blur_fb_mv under the
 	// shared R8 pass; merge samples the array view with LINEAR.
-	std::tie(volume_bin.image, volume_bin.memory) = make_target_image(blur_format);
+	std::tie(volume_bin.image, volume_bin.memory) = make_target_image(ve, blur_format);
 	volume_bin.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
 	                .image = *volume_bin.image,
@@ -2540,7 +2707,7 @@ void feather_mask_renderer::ensure_volume_targets()
 	// Exact-depth canvas (R16 nearest, same 320px shape): soft-occlusion
 	// exact occluders (passthrough + hidden, reversed excluded). Far (1.0)
 	// clear, MIN blend via exact_raster_pipeline_mv, sampled as binding 3.
-	std::tie(exact_depth.image, exact_depth.memory) = make_target_image(volume_depth_format);
+	std::tie(exact_depth.image, exact_depth.memory) = make_target_image(ce, volume_depth_format);
 	exact_depth.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
 	                .image = *exact_depth.image,
@@ -2561,14 +2728,91 @@ void feather_mask_renderer::ensure_volume_targets()
 		                .renderPass = *volume_raster_renderpass_mv,
 		                .attachmentCount = 1,
 		                .pAttachments = &raw_mv,
-		                .width = ve.width,
-		                .height = ve.height,
+		                .width = ce.width,
+		                .height = ce.height,
 		                .layers = 2,
 		        });
 	}
 
+	// VR-cut keep field (R8): compare renders MV into blur_fb_mv under
+	// the dedicated CLEAR R8 pass (same shape as the binary canvas).
+	std::tie(cut_bin.image, cut_bin.memory) = make_target_image(blur_format, ce);
+	cut_bin.view_array = vk::raii::ImageView(device,
+	        vk::ImageViewCreateInfo{
+	                .image = *cut_bin.image,
+	                .viewType = vk::ImageViewType::e2DArray,
+	                .format = blur_format,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .baseMipLevel = 0,
+	                        .levelCount = 1,
+	                        .baseArrayLayer = 0,
+	                        .layerCount = 2,
+	                },
+	        });
+	vk::ImageView raw_cut_array = *cut_bin.view_array;
+	cut_bin.blur_fb_mv = vk::raii::Framebuffer(device,
+	        vk::FramebufferCreateInfo{
+	                .renderPass = *compare_renderpass_mv,
+	                .attachmentCount = 1,
+	                .pAttachments = &raw_cut_array,
+	                .width = ce.width,
+	                .height = ce.height,
+	                .layers = 2,
+	        });
+
+	volume_working_extent = working;
+	volume_cut_extent = cut;
 	volume_targets_ready = true;
-	spdlog::info("Feather mask depth-volume targets: {}x{}", ve.width, ve.height);
+	spdlog::info("Feather mask depth targets: work {}x{} cut {}x{}", ve.width, ve.height, ce.width, ce.height);
+}
+
+void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh)
+{
+	if (not mesh.pending_upload)
+		return;
+	auto [vertex_bytes, index_bytes] = *mesh.pending_upload;
+	mesh.pending_upload.reset();
+
+	vk::BufferCopy vertex_copy{
+	        .srcOffset = 0,
+	        .dstOffset = 0,
+	        .size = vertex_bytes,
+	};
+	cmd.copyBuffer(*mesh.staging_buffer, *mesh.vertex_buffer, vertex_copy);
+	vk::BufferCopy index_copy{
+	        .srcOffset = vertex_bytes,
+	        .dstOffset = 0,
+	        .size = index_bytes,
+	};
+	cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
+
+	std::vector<vk::BufferMemoryBarrier> barriers = {
+	        vk::BufferMemoryBarrier{
+	                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+	                .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
+	                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                .buffer = *mesh.vertex_buffer,
+	                .offset = 0,
+	                .size = vertex_bytes,
+	        },
+	        vk::BufferMemoryBarrier{
+	                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+	                .dstAccessMask = vk::AccessFlagBits::eIndexRead,
+	                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                .buffer = *mesh.index_buffer,
+	                .offset = 0,
+	                .size = index_bytes,
+	        },
+	};
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                    vk::PipelineStageFlagBits::eVertexInput,
+	                    {},
+	                    {},
+	                    barriers,
+	                    {});
 }
 
 void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set, bool nearest,
@@ -2605,10 +2849,27 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	auto t_total0 = std::chrono::steady_clock::now();
 	double ms_raster = 0, ms_erode = 0, ms_blur = 0, ms_punch = 0;
 	double ms_volume_raster = 0, ms_volume_virt = 0, ms_volume_compare = 0, ms_volume_merge = 0;
+	double ms_cut = 0;
 	// Depth volume engages exactly when the group carries depth draws
 	// with a valid sensor view. The raster is a plain MAX accumulation
 	// (no MIN cuts: the merge below MAXes over the reversed result).
 	bool use_volume = volume && !volume->draws.empty() && volume->sensor_view != vk::ImageView{};
+	// VR cut engages when virtual depth paired and exact geometry exists,
+	// independent of use_volume (cut needs no sensor). Extents: sensor
+	// path at quarter of full working size (one line to switch to half);
+	// cut at min(submit, virt eye) so it is per layer pixel, never
+	// upscaled from a coarser grid. Both floor at 64px.
+	bool paired_virt = volume && volume->virt_valid && volume->virt_eye_extent.width > 0 && volume->virt_eye_extent.height > 0;
+	vk::Extent2D workE{std::max(64u, extent.width / 4), std::max(64u, extent.height / 4)};
+	vk::Extent2D cutE = workE;
+	if (paired_virt)
+	        cutE = {std::max(64u, std::min(out_extent.width, volume->virt_eye_extent.width)),
+	                std::max(64u, std::min(out_extent.height, volume->virt_eye_extent.height))};
+	bool use_cut = paired_virt && volume && !volume->exact_draws.empty();
+	if (use_cut || use_volume)
+	        ensure_volume_targets(workE, cutE);
+	bool exact_done = false;
+	vk::Extent2D exact_done_ext{0, 0};
 	float box_frac = 1;
 	float volume_box_frac = 1;
 	size_t n_draws = 0;
@@ -2630,6 +2891,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cpu_stats->volume_virt_ms = ms_volume_virt;
 			cpu_stats->volume_compare_ms = ms_volume_compare;
 			cpu_stats->volume_merge_ms = ms_volume_merge;
+			cpu_stats->cut_ms = ms_cut;
 			cpu_stats->total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_total0).count();
 			cpu_stats->tier = tier_out;
 			cpu_stats->draws = n_draws;
@@ -2983,10 +3245,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		// Content box only feeds pass_scissor, which the tier-0 direct
 		// raster never calls: skip the 16N projections + N finds when
-		// tier==0 with no volume/VR draws. A future tier-0 consumer of
+		// tier==0 with no volume/cut draws. A future tier-0 consumer of
 		// pass_scissor must lift this gate (unconsumed, eye_box stays
 		// empty and pass_scissor falls back to fullscreen — fail-safe).
-		if (tier != 0 or use_volume)
+		if (tier != 0 or use_volume or use_cut)
 		{
 			for (const auto & d: draws)
 				accumulate_box(d);
@@ -2996,8 +3258,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			if (use_volume)
 				for (const auto & d: volume->draws)
 					accumulate_box(d);
-			// Exact occluders feed the same chain: cover them too.
-			if (use_volume)
+			// Exact occluders feed the same chain: cover them too
+// (cut-only groups have no volume draws but still merge).
+			if (volume && !volume->exact_draws.empty())
 				for (const auto & d: volume->exact_draws)
 					accumulate_box(d);
 		}
@@ -3097,9 +3360,143 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*virt.image);
 		};
 
-		// LEGACY run_vr_occlusion removed: exact-depth soft compare (run_volume)
-		// covers window cutouts via the sensor test. exact_raster_pipeline_mv is
-		// retained as the exact-depth MIN raster used by run_volume.
+		// Exact-depth MIN raster shared by the cut (cut res, per-pixel) and
+		// the sensor compare (LINEAR-downsampled when cut res > working).
+		// Rasterized once per group iteration at the first needed extent.
+		auto raster_exact = [&](vk::Extent2D re) {
+			if (exact_done && exact_done_ext.width == re.width && exact_done_ext.height == re.height)
+			        return;
+			section_clock exact_clk(&ms_cut);
+			for (const auto & d: volume->exact_draws)
+			{
+				auto mit = meshes.find(d.mesh);
+				if (mit != meshes.end())
+				        flush_upload(cmd, mit->second);
+			}
+			vk::ClearValue exact_clear{};
+			const float far1[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+			std::memcpy(exact_clear.color.float32, far1, sizeof(far1));
+			vk::RenderPassBeginInfo begin_exact{
+			        .renderPass = *volume_raster_renderpass_mv,
+			        .framebuffer = *exact_depth.raster_fb_mv,
+			        .renderArea = {.offset = {0, 0}, .extent = re},
+			        .clearValueCount = 1,
+			        .pClearValues = &exact_clear,
+			};
+			cmd.beginRenderPass(begin_exact, vk::SubpassContents::eInline);
+			set_full_viewport(re);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *exact_raster_pipeline_mv);
+			for (const auto & d: volume->exact_draws)
+			{
+				auto mit = meshes.find(d.mesh);
+				if (mit == meshes.end() or mit->second.index_count == 0)
+				        continue;
+				cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+				cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+				cmd.pushConstants<volume_mv_push>(*volume_raster_layout_mv, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
+				                  volume_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .near_z = volume->near_z, .far_z = volume->far_z});
+				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+				++n_draws;
+			}
+			cmd.endRenderPass();
+			make_readable(*exact_depth.image);
+			exact_done = true;
+			exact_done_ext = re;
+		};
+		// VR cut (cut res): MIN-cuts the seed where virtual is nearer than
+		// the rasterized known geometry (passthrough + hidden + hands),
+		// so VR occludes known geometry per layer pixel with no sensor
+		// involvement. Runs ahead of the soft MAX (cut-before-add).
+		auto run_cut = [&](vk::Image seed_img, vk::Framebuffer seed_fb, vk::Extent2D seed_ext, bool seed_is_rgb8) {
+			if (!use_cut)
+			        return;
+			raster_exact(cutE);
+			{
+				section_clock compare_clk(&ms_cut);
+				vk::DescriptorImageInfo cut_virt_info{
+				        .sampler = *sampler_nearest,
+				        .imageView = *volume_virt.view_array,
+				        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+				};
+				vk::DescriptorImageInfo cut_exact_info{
+				        .sampler = *sampler_nearest,
+				        .imageView = *exact_depth.view_array,
+				        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+				};
+				std::array<vk::CopyDescriptorSet, 0> no_cut_copies{};
+				std::array<vk::WriteDescriptorSet, 2> cut_writes = {{
+				        {
+				                .dstSet = *cut_set,
+				                .dstBinding = 0,
+				                .descriptorCount = 1,
+				                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+				                .pImageInfo = &cut_virt_info,
+				        },
+				        {
+				                .dstSet = *cut_set,
+				                .dstBinding = 1,
+				                .descriptorCount = 1,
+				                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+				                .pImageInfo = &cut_exact_info,
+				        },
+				}};
+				device.updateDescriptorSets(cut_writes, no_cut_copies);
+				vk::RenderPassBeginInfo begin_cut_cmp{
+				        .renderPass = *compare_renderpass_mv,
+				        .framebuffer = *cut_bin.blur_fb_mv,
+				        .renderArea = {.offset = {0, 0}, .extent = cutE},
+				        .clearValueCount = 1,
+				        .pClearValues = &clear,
+				};
+				cmd.beginRenderPass(begin_cut_cmp, vk::SubpassContents::eInline);
+				set_full_viewport(cutE);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *cut_pipeline_mv);
+				std::array<vk::DescriptorSet, 1> cut_sets{*cut_set};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *cut_pipe_layout, 0, cut_sets, no_offsets);
+				cmd.draw(3, 1, 0, 0);
+				cmd.endRenderPass();
+			}
+			make_readable(*cut_bin.image);
+			{
+				section_clock merge_clk(&ms_cut);
+				vk::ImageMemoryBarrier cut_barrier{
+				        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+				        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
+				        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+				        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+				        .image = seed_img,
+				        .subresourceRange = {
+				                .aspectMask = vk::ImageAspectFlagBits::eColor,
+				                .levelCount = 1,
+				                .layerCount = 2,
+				        },
+				};
+				cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				                    vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				                    {},
+				                    {},
+				                    {},
+				                    cut_barrier);
+				vk::Rect2D merge_box = pass_scissor(seed_ext);
+				vk::RenderPassBeginInfo begin_cut_min{
+				        .renderPass = seed_is_rgb8 ? *volume_max_rgb8_renderpass : *volume_max_r8_renderpass,
+				        .framebuffer = seed_fb,
+				        .renderArea = merge_box,
+				        .clearValueCount = 0,
+				};
+				cmd.beginRenderPass(begin_cut_min, vk::SubpassContents::eInline);
+				set_full_viewport(seed_ext);
+				cmd.setScissor(0, merge_box);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, seed_is_rgb8 ? *cut_min_rgb8_pipeline : *cut_min_r8_pipeline);
+				update_source(*cut_bin.view_array, 3, true);
+				std::array<vk::DescriptorSet, 1> min_sets{*descriptor_sets[3]};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, min_sets, no_offsets);
+				blur_push cut_push{{1.f / cutE.width, 1.f / cutE.height}, {0, 1}, 0, 0};
+				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, cut_push);
+				cmd.draw(3, 1, 0, 0);
+				cmd.endRenderPass();
+			}
+		};
 
 		// Depth-volume layer: furthest-D raster at 320px, strict
 		// sensor<render> flatten, upscale+MAX into the seed. The seed
@@ -3107,8 +3504,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// so the merge LOADs and MAXes over them: the volume overlays
 		// everything, then erode/blur feather it like silhouettes.
 		auto run_volume = [&](vk::Image seed_img, vk::Framebuffer seed_fb, vk::Extent2D seed_ext, bool seed_is_rgb8) {
-			ensure_volume_targets();
-			vk::Extent2D ve{volume_size, volume_size};
+			ensure_volume_targets(workE, cutE);
+			vk::Extent2D ve = workE;
 			// GPU brackets for the volume stages (TopOfPipe discipline,
 			// same caveat as the mask spans: a late producer inflates the
 			// following span). Null pool = no stamping (zero GPU cost).
@@ -3161,45 +3558,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 			volume_stamp(1);
 			make_readable(*volume_depth.image);
-			// Exact-depth raster (passthrough + hidden nearest, reversed
-			// excluded): MIN accumulation over a far (1.0) clear so the
-			// closest surface wins order-independently. Same 320px shape.
-			{
-				for (const auto & d: volume->exact_draws)
-					{
-						auto mit = meshes.find(d.mesh);
-						if (mit != meshes.end())
-							flush_upload(cmd, mit->second);
-					}
-				vk::ClearValue exact_clear{};
-				const float far1[4] = {1.0f, 1.0f, 1.0f, 1.0f};
-				std::memcpy(exact_clear.color.float32, far1, sizeof(far1));
-				vk::RenderPassBeginInfo begin_exact{
-					        .renderPass = *volume_raster_renderpass_mv,
-					        .framebuffer = *exact_depth.raster_fb_mv,
-					        .renderArea = {.offset = {0, 0}, .extent = ve},
-					        .clearValueCount = 1,
-					        .pClearValues = &exact_clear,
-				};
-				cmd.beginRenderPass(begin_exact, vk::SubpassContents::eInline);
-				set_full_viewport(ve);
-				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *exact_raster_pipeline_mv);
-				for (const auto & d: volume->exact_draws)
-					{
-						auto mit = meshes.find(d.mesh);
-						if (mit == meshes.end() or mit->second.index_count == 0)
-							continue;
-						cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-						cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-						cmd.pushConstants<volume_mv_push>(*volume_raster_layout_mv, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-							        volume_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .near_z = volume->near_z, .far_z = volume->far_z});
-						cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-						++n_draws;
-					}
-				cmd.endRenderPass();
-			}
-			make_readable(*exact_depth.image);
-			convert_virt_canvas(volume_virt, volume_virt_fb_mv, ve, low_virt_done);
+			// Exact depth comes from the shared raster (cut res when paired
+// so the VR cut sees it, working res otherwise for the sensor
+// tie-break; LINEAR-downsampled by the compare when larger).
+if (!volume->exact_draws.empty())
+raster_exact(paired_virt ? cutE : workE);
+			convert_virt_canvas(volume_virt, volume_virt_fb_mv, cutE, low_virt_done);
 			volume_stamp(2);
 			{
 				section_clock compare_clk(&ms_volume_compare);
@@ -3296,18 +3660,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*volume_bin.image);
 			{
 				section_clock merge_clk(&ms_volume_merge);
-				// Presmooth the 320px coverage field (wide kernel): H here,
-				// V folded into the merge upscale below. Stairs smaller than
-				// the blur radius vanish into a stable gradient instead of
-				// shimmering through the upscale. CPU and GPU cost land in
-				// the merge spans by construction.
-				// H: bin -> smooth. Box-sized render area (like the merge
-				// below): the renderpass loadOp is DONT_CARE, so outside
-				// the box is stale — but the box covers total downstream
-				// support by construction (margin + rounding), and the
-				// box-scissored merge below never writes outside it.
+			// No presmooth: the binary compare output upscales straight
+				// into the seed; the shared blur chain below does all feathering.
+				// Box support already covered by the silhouette/erode margins.
 
-				// LOAD-after-write ordering, same as the cutout punch
+LOAD-after-write ordering, same as the cutout punch
 				// barrier below: without it a tile GPU may MAX against
 				// stale seed tiles.
 				vk::ImageMemoryBarrier merge_barrier{
@@ -3345,10 +3702,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(seed_ext);
 				cmd.setScissor(0, merge_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, seed_is_rgb8 ? *volume_max_rgb8_pipeline : *volume_max_r8_pipeline);
-				// V-blur folded into the upscale (source texel 1/320, V
-				// direction) under the existing MAX blend; separable with
-				// the H pass above by linearity.
-				// No presmooth: binary compare feeds the shared blur directly.
+				// Spread-0 plain upscale under MAX blend (source texel =
+				// working res); the shared blur chain feathers the edge.
 				update_source(*volume_bin.view_array, 1);
 				std::array<vk::DescriptorSet, 1> max_sets{*descriptor_sets[1]};
 				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, max_sets, no_offsets);
@@ -3367,7 +3722,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// image. Exact, one multiview raster pass, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
 			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed);
-			// Soft reveal (MAX add) after silhouettes + reversed cuts.
+			// VR cut (MIN) then soft reveal (MAX add) after silhouettes +
+			// reversed cuts. Cut-before-add lets a sensor-inside reveal
+			// win where the real world is nearer than VR.
+			if (use_cut)
+				run_cut(image, *it->second.framebuffer_mv, out_extent, true);
 			if (use_volume)
 				run_volume(image, *it->second.framebuffer_mv, out_extent, true);
 		}
@@ -3392,6 +3751,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed);
 		}
 
+		if (use_cut)
+			run_cut(*target_a.image, *target_a.blur_fb_mv, half_extent, false);
 		if (use_volume)
 			run_volume(*target_a.image, *target_a.blur_fb_mv, half_extent, false);
 		make_readable(*target_a.image);
@@ -3541,6 +3902,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 			blur_target & h_src = down_targets[h_src_level - 1];
 
+			if (use_cut)
+				run_cut(*h_src.image, *h_src.blur_fb_mv, te, false);
 			if (use_volume)
 				run_volume(*h_src.image, *h_src.blur_fb_mv, te, false);
 			make_readable(*h_src.image);

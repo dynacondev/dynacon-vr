@@ -502,6 +502,7 @@ private:
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
 	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
 	double volume_raster_ms = 0, volume_virt_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
+	double cut_ms = 0; // VR-cut raster + compare + MIN merge (cut res)
 	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
 	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
 	// never read unwritten queries). volume_ts_async selects the fence
@@ -633,6 +634,7 @@ private:
 		float volume_virt_ms = 0;
 		float volume_compare_ms = 0;
 		float volume_merge_ms = 0;
+		float cut_ms = 0;
 		float volume_raster_gpu_ms = 0;
 		float volume_virt_gpu_ms = 0;
 		float volume_compare_gpu_ms = 0;

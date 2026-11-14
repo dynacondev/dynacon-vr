@@ -1772,7 +1772,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// above, so it is not reset here; gui_ms/submit_ms are
 		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
-		volume_acquire_ms = volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = 0;
+		volume_acquire_ms = volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = cut_ms = 0;
 		volume_frame_virt_paired = false;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
@@ -2036,33 +2036,74 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				hidden_silhouettes.push_back(std::move(s));
 			}
 		};
-		// Soft-occlusion helpers: unit-sphere soup (radius 1, centered
-		// origin) for hand-joint coverage spheres, uploaded once per group
-		// as "soft_hand_sphere" and instanced per tracked joint. Coverage
-		// rides the silhouette path (always reveal, shared blur) while hand
-		// removal keeps the sensor free of hands. Full skinned hand meshes
-		// are a follow-up; joint spheres match the sensor-blur scale.
-		static const std::string soft_hand_mesh_key = "soft_hand_sphere";
-		auto make_unit_sphere_soup = []() {
-			passthrough_mesh::triangle_soup soup;
-			const int lat = 10, lon = 12;
-			for (int i = 0; i <= lat; ++i)
-			{
-				float theta = (float)i / (float)lat * 3.14159265f;
-				for (int j = 0; j <= lon; ++j)
-				{
-					float phi = (float)j / (float)lon * 2.f * 3.14159265f;
-					soup.vertices.push_back({std::sin(theta) * std::cos(phi), std::cos(theta), std::sin(theta) * std::sin(phi)});
-				}
-			}
-			for (int i = 0; i < lat; ++i)
-			for (int j = 0; j < lon; ++j)
-			{
-				uint32_t a = (uint32_t)(i * (lon + 1) + j);
-				uint32_t b = a + lon + 1;
-				soup.indices.insert(soup.indices.end(), {a, b, a + 1, b, b + 1, a + 1});
-			}
-			return soup;
+		// Soft-occlusion hand meshes: real Meta hand geometry
+		// (hand_tracker::mesh bind data skinned on the CPU with per-frame
+		// located joints, same convention as the lobby GPU path: world =
+		// jointWorld * inverse(bind) per influence). Rasterized as seed
+		// silhouettes (reveal) and exact MIN depth (VR cut) in the soft
+		// group, so hands behave exactly like fixed known-location geometry
+		// with the shared feather. Skipped when untracked (sensor + known
+		// geometry only).
+		static const std::string soft_hand_left_key = "soft_hand_left";
+		static const std::string soft_hand_right_key = "soft_hand_right";
+		static passthrough_mesh::triangle_soup skin_hand_soup(
+		    const xr::hand_tracker::mesh_data & bind,
+		    const xr::hand_tracker::joint_array & joints)
+		{
+		        passthrough_mesh::triangle_soup out;
+		        const size_t nj = bind.joint_bind_poses.size();
+		        if (nj == 0 or bind.vertex_positions.empty() or bind.indices.empty())
+		                return out;
+		        if ((size_t)XR_HAND_JOINT_PALM_EXT >= nj or (size_t)XR_HAND_JOINT_PALM_EXT >= joints.size())
+		                return out;
+		        const auto & pj = joints[(size_t)XR_HAND_JOINT_PALM_EXT].first;
+		        if (!(pj.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+		                return out; // untracked palm: no mesh, no draws
+		        auto to_mat = [](const XrPosef & p) {
+		                glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+		                glm::vec3 t(p.position.x, p.position.y, p.position.z);
+		                return glm::translate(glm::mat4(1), t) * glm::mat4_cast(q);
+		        };
+		        glm::mat4 palm_delta = to_mat(pj.pose) * glm::inverse(to_mat(bind.joint_bind_poses[(size_t)XR_HAND_JOINT_PALM_EXT]));
+		        std::vector<glm::mat4> world(nj), inv_bind(nj);
+		        for (size_t i = 0; i < nj; ++i)
+		        {
+		                glm::mat4 b = to_mat(bind.joint_bind_poses[i]);
+		                inv_bind[i] = glm::inverse(b);
+		                if (i < joints.size() and (joints[i].first.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+		                        world[i] = to_mat(joints[i].first.pose);
+		                else
+		                        world[i] = palm_delta * b; // rigid fallback: ride the palm
+		        }
+		        out.vertices.reserve(bind.vertex_positions.size());
+		        for (size_t vi = 0; vi < bind.vertex_positions.size(); ++vi)
+		        {
+		                if (vi >= bind.vertex_blend_indices.size() or vi >= bind.vertex_blend_weights.size())
+		                        break;
+		                const auto & bp = bind.vertex_positions[vi];
+		                glm::vec4 pp(bp.x, bp.y, bp.z, 1);
+		                const auto & bi = bind.vertex_blend_indices[vi];
+		                const auto & bw = bind.vertex_blend_weights[vi];
+		                const int jidx[4] = {(int)bi.x, (int)bi.y, (int)bi.z, (int)bi.w};
+		                const float wgt[4] = {bw.x, bw.y, bw.z, bw.w};
+		                glm::vec3 skinned(0);
+		                for (int k = 0; k < 4; ++k)
+		                {
+		                        if (wgt[k] == 0.f or jidx[k] < 0 or (size_t)jidx[k] >= nj)
+		                                continue;
+		                        skinned += wgt[k] * glm::vec3(world[(size_t)jidx[k]] * inv_bind[(size_t)jidx[k]] * pp);
+		                }
+		                out.vertices.push_back({skinned.x, skinned.y, skinned.z});
+		        }
+		        if (out.vertices.size() != bind.vertex_positions.size())
+		        {
+		                out.vertices.clear(); // malformed bind data: fail closed
+		                return out;
+		        }
+		        out.indices.reserve(bind.indices.size());
+		        for (int16_t idx : bind.indices)
+		                out.indices.push_back((uint32_t)(uint16_t)idx);
+		        return out;
 		};
 		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit, uint32_t qmerge) {
 			// Volume sensor from the shared frame (acquired once above).
@@ -2292,7 +2333,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						         (oit->second.def.feather_px == g.feather_px and
 						                (oit->second.def.type == "3d-passthrough" or oit->second.def.type == "3d-depth-passthrough")) or
 						         (soft_here and oit->second.def.type == "3d-passthrough-hidden"));
-						if (not member and hit->first == soft_hand_mesh_key and soft_here and have_volume_sensor)
+						if (not member and (hit->first == soft_hand_left_key or hit->first == soft_hand_right_key) and soft_here and have_volume_sensor)
 							member = true;
 						if (not member)
 						{
@@ -2446,8 +2487,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					bool soft_group = have_volume_sensor and not soft_multi_volume_error and soft_feather >= 0.f and f == soft_feather;
 					if (soft_group and not soft_hand_removal_on)
 					{
-						// Removal unsupported: sensor depth hands stay; skip the mesh
-						// spheres so the two do not double-reveal.
+						// Removal unsupported: sensor depth hands stay; skip the meshes
+						// so the two do not double-reveal.
 					}
 					else if (soft_group and system.hand_tracking_supported())
 					{
@@ -2455,47 +2496,41 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
 						if (not right_hand)
 							right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
-						auto hhit = g.mesh_hashes.find(soft_hand_mesh_key);
-						if (hhit == g.mesh_hashes.end() or hhit->second != "v1")
-						{
-							g.renderer->set_mesh(soft_hand_mesh_key, make_unit_sphere_soup());
-							g.mesh_hashes[soft_hand_mesh_key] = "v1";
-						}
 						XrSpace wspace = application::space(xr::spaces::world);
-						const float * radii = nullptr;
-						size_t nradii = 0;
-						if (left_hand)
-						{
-							if (auto * hm = left_hand->mesh())
-							{
-								radii = hm->joint_radii.data();
-								nradii = hm->joint_radii.size();
-							}
-						}
-						auto push_hand = [&](std::optional<xr::hand_tracker> & tracker) {
+						auto push_hand = [&](std::optional<xr::hand_tracker> & tracker, const std::string & key) {
 							if (not tracker)
 								return;
 							auto located = tracker->locate(wspace, sync_display_time);
 							if (not located)
 								return;
-							for (size_t ji = 0; ji < located->joints.size(); ++ji)
+							const auto * hm = tracker->mesh();
+							if (not hm)
+								return;
+							auto soup = skin_hand_soup(*hm, located->joints);
+							if (soup.vertices.empty() or soup.indices.empty())
+								return; // untracked: sensor + known geometry only
+							auto mhit = g.mesh_hashes.find(key);
+							if (mhit == g.mesh_hashes.end())
 							{
-								const auto & j = located->joints[ji].first;
-								if (not (j.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
-									continue;
-								float r = (radii and ji < nradii and radii[ji] > 0.f) ? radii[ji] : (ji == XR_HAND_JOINT_PALM_EXT ? 0.035f : 0.016f);
-								glm::vec3 c(j.pose.position.x, j.pose.position.y, j.pose.position.z);
-								glm::mat4 model = glm::translate(glm::mat4(1), c) * glm::scale(glm::mat4(1), glm::vec3(r));
-								std::array<glm::mat4, 2> hmvp;
-								for (uint32_t view = 0; view < view_count; ++view)
-									hmvp[view] = server_mvp[view] * model;
-								if (not draw_visible(soft_hand_mesh_key, hmvp))
-									continue;
-								draws.push_back({soft_hand_mesh_key, hmvp, 1, false});
+								// First sight (or post-evict): full upload, waitIdle is a rare
+								// map-change-class hitch, never per-frame.
+								g.renderer->set_mesh(key, soup);
+								g.mesh_hashes[key] = "skinned";
 							}
+							else
+								g.renderer->update_mesh_positions(key, soup.vertices);
+							// World-space verts: identity model, sync eye MVPs. In draws
+							// (silhouette reveal) and picked up below by exact_draws
+							// (VR-cut depth) like any other fixed geometry.
+							std::array<glm::mat4, 2> hmvp;
+							for (uint32_t view = 0; view < view_count; ++view)
+								hmvp[view] = server_mvp[view];
+							if (not draw_visible(key, hmvp))
+								return;
+							draws.push_back({key, hmvp, 1, false});
 						};
-						push_hand(left_hand);
-						push_hand(right_hand);
+						push_hand(left_hand, soft_hand_left_key);
+						push_hand(right_hand, soft_hand_right_key);
 					}
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
 					// Tolerant virtual-depth pairing (soft compare input):
@@ -2515,18 +2550,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 					}
 					// Soft-occlusion exact occluders (tweak: passthrough + hidden
-					// nearest depth, reversed excluded): passthrough positives in
-					// this feather group plus every placed hidden object. Hidden
-					// soups upload into this group renderer on hash change (see
-					// mesh_hashes retention below).
+					// nearest depth, reversed excluded): this group positives always
+					// (VR cut works in every group with paired virtual depth), plus
+					// every placed hidden object in the soft group. Hidden soups
+					// upload into this group renderer on hash change (see mesh_hashes
+					// retention below).
 					std::vector<feather_mask_renderer::instance_draw> exact_draws;
-					if (soft_group and have_volume_sensor)
-					{
 						for (const auto & d: draws)
 						{
 							if (!d.reverse)
 								exact_draws.push_back(d);
 						}
+					if (soft_group and have_volume_sensor)
+					{
 						for (auto & [oid, ost]: passthrough_objects)
 						{
 							if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
@@ -2608,7 +2644,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					try
 					{
 						feather_mask_renderer::volume_input vol_in;
-						bool use_vol_in = any_volume;
+						bool use_cut = virt_paired && !exact_draws.empty();
+						bool use_vol_in = any_volume || use_cut;
 						if (use_vol_in)
 						{
 							vol_in.draws = volume_draws;
@@ -2660,6 +2697,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					volume_virt_ms += mstats.volume_virt_ms;
 					volume_compare_ms += mstats.volume_compare_ms;
 					volume_merge_ms += mstats.volume_merge_ms;
+					cut_ms += mstats.cut_ms;
 					if (virt_paired and any_volume)
 						volume_frame_virt_paired = true;
 					mask_draws += (int)mstats.draws;
@@ -2784,6 +2822,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						volume_raster_ms += mstats.volume_raster_ms;
 						volume_compare_ms += mstats.volume_compare_ms;
 						volume_merge_ms += mstats.volume_merge_ms;
+					cut_ms += mstats.cut_ms;
 						mask_draws += (int)mstats.draws;
 					}
 				}
