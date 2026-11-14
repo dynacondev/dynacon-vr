@@ -525,6 +525,7 @@ void wivrn_session::send_fiducial_map()
 	msg.suppress_meta_boundary = config.suppress_meta_boundary;
 	msg.passthrough_until_lock = config.passthrough_until_lock;
 	msg.passthrough_fade_time_s = config.passthrough_fade_time_s;
+	msg.startup_fade_time_s = config.startup_fade_time_s;
 	if (config.alignment_local_origin)
 	{
 		msg.local_origin = to_headset::alignment_origin{

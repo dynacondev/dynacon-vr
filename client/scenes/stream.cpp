@@ -976,9 +976,8 @@ void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 	// in render() where the video path is confirmed (both decoder queues
 	// non-empty, so it can't go stale); 0 at connect shows the kiosk at
 	// once, and it returns 2s after the decoders run dry.
-	static constexpr XrDuration kiosk_video_holdoff = 2'000'000'000LL; // 2s
 	stream_kiosk_shown = allowed and not is_gui_interactable() and
-	                     (predicted_display_time - last_video_t > kiosk_video_holdoff);
+	                     (predicted_display_time - last_video_t > video_gap_holdoff);
 }
 
 void scenes::stream::render(const XrFrameState & frame_state)
@@ -1080,6 +1079,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// is streaming — stamp it for the kiosk holdoff in update_stream_kiosk.
 	// Queues drain every frame on this path, so the stamp can't go stale
 	// while frames keep arriving.
+	// Startup fade re-arms on the same gap as the kiosk (video absent
+	// > holdoff), independent of kiosk-mode / GUI state so it works
+	// with the kiosk off. Triggers on path-taken like the kiosk, not
+	// on first displayed frame.
+	{
+		XrTime gap = frame_state.predictedDisplayTime - last_video_t;
+		if (gap > video_gap_holdoff and startup_fade_s > 0)
+		{
+			startup_fading = true;
+			startup_time = instance.now();
+			if (last_video_t == 0)
+				spdlog::info("startup fade: initial video start, fading over {:.1f}s",
+				             (double)startup_fade_s);
+			else
+				spdlog::info("startup fade: video resumed after {:.1f}s gap, fading over {:.1f}s",
+				             (double)gap * 1e-9, (double)startup_fade_s);
+		}
+	}
 	last_video_t = frame_state.predictedDisplayTime;
 
 	if (state_ == state::stalled)
@@ -1461,8 +1478,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	}
 
 	// Mask record/submit views: server eye timebase, not live predicted.
-	// The mask alpha composites with server video (and the VR-occlusion
-	// compare tests server virtual depth against the object raster), so
+	// The mask alpha composites with server video (and the soft
+	// compare tests sensor depth against merged virtual depth), so
 	// raster + submit share one reference eye and the runtime warps each
 	// layer to display from its own submitted pose. The reference eye is
 	// the paired depth frame's eye whenever depth is paired (identical
@@ -1546,41 +1563,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			sync_pose[view] = have_eye ? pose[view] : mask_pose[view];
 			sync_fov[view] = have_eye ? fov[view] : mask_fov[view];
 		}
-	}
-
-	// Eye velocity history for the depth time-bias test slider: finite
-	// difference of consecutive predicted mask poses (world frame).
-	// Unconditional per frame so history exists when depth needs it.
-	{
-		XrTime now = frame_state.predictedDisplayTime;
-		if (volume_have_prev_mask and now > volume_prev_mask_time)
-		{
-			double dt = (double)(now - volume_prev_mask_time) * 1e-9;
-			if (dt > 1e-3 and dt < 0.1)
-			{
-				for (uint32_t view = 0; view < view_count; ++view)
-				{
-					const auto & pp = volume_prev_mask_pose[view].position;
-					const auto & cp = mask_pose[view].position;
-					volume_eye_lin_vel[view] = glm::vec3((float)((cp.x - pp.x) / dt), (float)((cp.y - pp.y) / dt), (float)((cp.z - pp.z) / dt));
-					glm::quat q0(volume_prev_mask_pose[view].orientation.w, volume_prev_mask_pose[view].orientation.x,
-					             volume_prev_mask_pose[view].orientation.y, volume_prev_mask_pose[view].orientation.z);
-					glm::quat q1(mask_pose[view].orientation.w, mask_pose[view].orientation.x,
-					             mask_pose[view].orientation.y, mask_pose[view].orientation.z);
-					glm::quat dq = q1 * glm::inverse(q0);
-					if (dq.w < 0)
-						dq = -dq;
-					float ang = 2.f * std::acos(std::clamp(dq.w, -1.f, 1.f));
-					if (ang > 1e-6f)
-						volume_eye_ang_vel[view] = glm::vec3(dq.x, dq.y, dq.z) * (ang / (std::sin(ang * 0.5f) * (float)dt));
-					else
-						volume_eye_ang_vel[view] = glm::vec3(0);
-				}
-			}
-		}
-		volume_prev_mask_pose = mask_pose;
-		volume_prev_mask_time = now;
-		volume_have_prev_mask = true;
 	}
 
 	// Allow the headset to time warp if we are redisplaying a frame
@@ -1696,15 +1678,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// sensor acquire runs at the top of the mask record phase below
 		// (both async and inline paths), gated on the mask path: without
 		// alpha blend there is no mask to merge into.
-		bool need_volume_depth = false;
+		int depth_volume_count = 0;
+		float soft_feather = -1.f; // feather of the single placed depth volume
 		for (auto & [oid, ost]: passthrough_objects)
 		{
 			if (ost.def.type == "3d-depth-passthrough" and ost.soup_ready and ost.fused.placed)
 			{
-				need_volume_depth = true;
-				break;
+				++depth_volume_count;
+				soft_feather = ost.def.feather_px;
 			}
 		}
+		// Single-volume scope for the soft-occlusion path: >1 disables
+		// soft (error, exact-only fallback) so no merge semantics apply.
+		if (depth_volume_count > 1 and not soft_multi_volume_error)
+		{
+			soft_multi_volume_error = true;
+			spdlog::error("Soft occlusion: {} depth volumes placed, expected <=1; soft off (exact-only)", depth_volume_count);
+		}
+		if (depth_volume_count <= 1 and depth_volume_count > 0 and soft_multi_volume_error)
+			soft_multi_volume_error = false; // recovered
+		bool need_volume_depth = depth_volume_count == 1;
 		vk::ImageView volume_sensor = nullptr;
 		float volume_near = 0.1f, volume_far = 10.f;
 		bool have_volume_sensor = false;
@@ -1739,6 +1732,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (env_depth->ready())
 				{
 					env_depth->start();
+					// Crisp hands: remove sensor hands (background fill) so the
+					// tracked-mesh coverage raster owns the edge. Unsupported
+					// runtimes keep depth hands (fuzzy but present).
+					if (not hand_removal_probed)
+					{
+						hand_removal_probed = true;
+						hand_removal_supported = xr::environment_depth::supports_hand_removal(instance, system);
+					}
+					if (hand_removal_supported)
+						soft_hand_removal_on = env_depth->set_hand_removal(true);
+					else
+						soft_hand_removal_on = false;
 					auto acq_t0 = std::chrono::steady_clock::now();
 					// Live acquire: sensor pose rides predicted time; H
 					// absorbs the server-eye delta at compare time.
@@ -1767,11 +1772,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// above, so it is not reset here; gui_ms/submit_ms are
 		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
-		volume_acquire_ms = volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = 0;
-		vr_raster_ms = vr_compare_ms = vr_merge_ms = 0;
+		volume_acquire_ms = volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = cut_ms = 0;
 		volume_frame_virt_paired = false;
-		vr_frame_wanted = false;
-		vr_frame_virt_paired = false;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
@@ -1811,41 +1813,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// depth row 1). Identity reproduces today's (u, 1-v) tap.
 			const glm::mat3 Suv(glm::vec3(0.5f, 0, 0), glm::vec3(0, -0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
 			bool h_ok = true;
-			// Time-bias test: assume the depth content is bias_ms older than
-			// its pose claims (+bias = older = larger correction, the
-			// trailing direction). Extrapolate the reported depth pose
-			// backward along head motion; bias 0 leaves it untouched.
-			// Clamps (50mm, ~11deg) bound prediction glitches, not heads.
+					// Sensor pose rides the acquire display time directly (no
+			// time-bias extrapolation: the distance-scaled soft bias absorbs
+			// residual lag as a depth margin, not a pose shift).
 			std::array<XrPosef, 2> depth_pose{shared_depth.pose[0], shared_depth.pose[1]};
-			if (volume_time_bias_ms != 0.f)
-			{
-				float ds = volume_time_bias_ms * 1e-3f;
-				for (uint32_t view = 0; view < view_count; ++view)
-				{
-					glm::vec3 shift = volume_eye_lin_vel[view] * ds;
-					float shift_len = glm::length(shift);
-					if (shift_len > 0.05f)
-						shift *= 0.05f / shift_len;
-					auto & dp = depth_pose[view].position;
-					const auto & rp = shared_depth.pose[view].position;
-					dp.x = rp.x - shift.x;
-					dp.y = rp.y - shift.y;
-					dp.z = rp.z - shift.z;
-					float rate = glm::length(volume_eye_ang_vel[view]);
-					if (rate > 1e-4f)
-					{
-						float ang = rate * ds;
-						if (ang > 0.2f or ang < -0.2f)
-							ang = std::copysign(0.2f, ang);
-						glm::vec3 axis = volume_eye_ang_vel[view] / rate;
-						glm::quat dq = glm::angleAxis(-ang, axis);
-						const auto & ro = shared_depth.pose[view].orientation;
-						glm::quat qr(ro.w, ro.x, ro.y, ro.z);
-						glm::quat qu = dq * qr;
-						depth_pose[view].orientation = {qu.x, qu.y, qu.z, qu.w};
-					}
-				}
-			}
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
 				// Q maps a camera-frame direction to [clip.x, clip.y,
@@ -2065,6 +2036,74 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				hidden_silhouettes.push_back(std::move(s));
 			}
 		};
+		// Soft-occlusion hand meshes: real Meta hand geometry
+		// (hand_tracker::mesh bind data skinned on the CPU with per-frame
+		// located joints, same convention as the lobby GPU path: world =
+		// jointWorld * inverse(bind) per influence). Rasterized as seed
+		// silhouettes (reveal) and exact MIN depth (VR cut) in the soft
+		// group, so hands behave exactly like fixed known-location geometry
+		// with the shared feather. Skipped when untracked (sensor + known
+		// geometry only).
+		static const std::string soft_hand_left_key = "soft_hand_left";
+		static const std::string soft_hand_right_key = "soft_hand_right";
+		auto skin_hand_soup = [](const xr::hand_tracker::mesh_data & bind,
+		    const xr::hand_tracker::joint_array & joints) -> passthrough_mesh::triangle_soup
+		{
+		        passthrough_mesh::triangle_soup out;
+		        const size_t nj = bind.joint_bind_poses.size();
+		        if (nj == 0 or bind.vertex_positions.empty() or bind.indices.empty())
+		                return out;
+		        if ((size_t)XR_HAND_JOINT_PALM_EXT >= nj or (size_t)XR_HAND_JOINT_PALM_EXT >= joints.size())
+		                return out;
+		        const auto & pj = joints[(size_t)XR_HAND_JOINT_PALM_EXT].first;
+		        if (!(pj.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+		                return out; // untracked palm: no mesh, no draws
+		        auto to_mat = [](const XrPosef & p) {
+		                glm::quat q(p.orientation.w, p.orientation.x, p.orientation.y, p.orientation.z);
+		                glm::vec3 t(p.position.x, p.position.y, p.position.z);
+		                return glm::translate(glm::mat4(1), t) * glm::mat4_cast(q);
+		        };
+		        glm::mat4 palm_delta = to_mat(pj.pose) * glm::inverse(to_mat(bind.joint_bind_poses[(size_t)XR_HAND_JOINT_PALM_EXT]));
+		        std::vector<glm::mat4> world(nj), inv_bind(nj);
+		        for (size_t i = 0; i < nj; ++i)
+		        {
+		                glm::mat4 b = to_mat(bind.joint_bind_poses[i]);
+		                inv_bind[i] = glm::inverse(b);
+		                if (i < joints.size() and (joints[i].first.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+		                        world[i] = to_mat(joints[i].first.pose);
+		                else
+		                        world[i] = palm_delta * b; // rigid fallback: ride the palm
+		        }
+		        out.vertices.reserve(bind.vertex_positions.size());
+		        for (size_t vi = 0; vi < bind.vertex_positions.size(); ++vi)
+		        {
+		                if (vi >= bind.vertex_blend_indices.size() or vi >= bind.vertex_blend_weights.size())
+		                        break;
+		                const auto & bp = bind.vertex_positions[vi];
+		                glm::vec4 pp(bp.x, bp.y, bp.z, 1);
+		                const auto & bi = bind.vertex_blend_indices[vi];
+		                const auto & bw = bind.vertex_blend_weights[vi];
+		                const int jidx[4] = {(int)bi.x, (int)bi.y, (int)bi.z, (int)bi.w};
+		                const float wgt[4] = {bw.x, bw.y, bw.z, bw.w};
+		                glm::vec3 skinned(0);
+		                for (int k = 0; k < 4; ++k)
+		                {
+		                        if (wgt[k] == 0.f or jidx[k] < 0 or (size_t)jidx[k] >= nj)
+		                                continue;
+		                        skinned += wgt[k] * glm::vec3(world[(size_t)jidx[k]] * inv_bind[(size_t)jidx[k]] * pp);
+		                }
+		                out.vertices.push_back({skinned.x, skinned.y, skinned.z});
+		        }
+		        if (out.vertices.size() != bind.vertex_positions.size())
+		        {
+		                out.vertices.clear(); // malformed bind data: fail closed
+		                return out;
+		        }
+		        out.indices.reserve(bind.indices.size());
+		        for (int16_t idx : bind.indices)
+		                out.indices.push_back((uint32_t)(uint16_t)idx);
+		        return out;
+		};
 		auto record_masks_phase = [&](vk::raii::CommandBuffer & rec_cmd, vk::raii::QueryPool & rec_pool, uint32_t qsplit, uint32_t qmerge) {
 			// Volume sensor from the shared frame (acquired once above).
 			// Content age + index rate feed the Volume heartbeat: age is
@@ -2283,11 +2322,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// Reversed objects live in every group (no feather of
 						// their own): evict on removal/unready only, never on
 						// feather mismatch. Positives must match feather.
+					// Soft-occlusion retention: hidden objects live in the soft
+					// group (any feather) while placed, and the skinned hand
+					// meshes persist while a single depth volume is placed.
+						bool soft_here = not soft_multi_volume_error and soft_feather >= 0.f and g.feather_px == soft_feather;
 						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
 						        oit->second.fused.placed and
 						        (oit->second.def.type == "3d-passthrough-reversed" or
 						         (oit->second.def.feather_px == g.feather_px and
-						          (oit->second.def.type == "3d-passthrough" or oit->second.def.type == "3d-depth-passthrough")));
+						                (oit->second.def.type == "3d-passthrough" or oit->second.def.type == "3d-depth-passthrough")) or
+						         (soft_here and oit->second.def.type == "3d-passthrough-hidden"));
+						if (not member and (hit->first == soft_hand_left_key or hit->first == soft_hand_right_key) and soft_here and have_volume_sensor)
+							member = true;
 						if (not member)
 						{
 							g.renderer->remove_mesh(hit->first);
@@ -2430,13 +2476,65 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					// Reversed-only draws rasterize to a provable no-op, so a
 					// group with no positive draws is skipped exactly like an
-					// empty one. VR occlusion needs positives + paired
-					// virtual depth (resolved below); it rides the same
+					// empty one. Soft exact occluders ride the same
 					// positives, so no extra culling pass.
+					// Soft-occlusion hands (single-volume groups only): real
+					// skinned hand meshes as silhouette positives (reveal) and
+					// exact-depth inputs (VR cut), sharing the group feather.
+					// Sensor hands are removed (hand removal), so the meshes
+					// own the edge; depth hands are the fallback when removal
+					// is unsupported (soft_hand_removal_on).
+					bool soft_group = have_volume_sensor and not soft_multi_volume_error and soft_feather >= 0.f and f == soft_feather;
+					if (soft_group and not soft_hand_removal_on)
+					{
+						// Removal unsupported: sensor depth hands stay; skip the meshes
+						// so the two do not double-reveal.
+					}
+					else if (soft_group and system.hand_tracking_supported())
+					{
+						if (not left_hand)
+							left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
+						if (not right_hand)
+							right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+						XrSpace wspace = application::space(xr::spaces::world);
+						auto push_hand = [&](std::optional<xr::hand_tracker> & tracker, const std::string & key) {
+							if (not tracker)
+								return;
+							auto located = tracker->locate(wspace, sync_display_time);
+							if (not located)
+								return;
+							const auto * hm = tracker->mesh();
+							if (not hm)
+								return;
+							auto soup = skin_hand_soup(*hm, located->joints);
+							if (soup.vertices.empty() or soup.indices.empty())
+								return; // untracked: sensor + known geometry only
+							auto mhit = g.mesh_hashes.find(key);
+							if (mhit == g.mesh_hashes.end())
+							{
+								// First sight (or post-evict): full upload, waitIdle is a rare
+								// map-change-class hitch, never per-frame.
+								g.renderer->set_mesh(key, soup);
+								g.mesh_hashes[key] = "skinned";
+							}
+							else
+								g.renderer->update_mesh_positions(key, soup.vertices);
+							// World-space verts: identity model, sync eye MVPs. In draws
+							// (silhouette reveal) and picked up below by exact_draws
+							// (VR-cut depth) like any other fixed geometry.
+							std::array<glm::mat4, 2> hmvp;
+							for (uint32_t view = 0; view < view_count; ++view)
+								hmvp[view] = server_mvp[view];
+							if (not draw_visible(key, hmvp))
+								return;
+							draws.push_back({key, hmvp, 1, false});
+						};
+						push_hand(left_hand, soft_hand_left_key);
+						push_hand(right_hand, soft_hand_right_key);
+					}
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					// Tolerant virtual-depth pairing (shared by the volume
-					// reveal and the VR occlusion): null when the color
-					// frame had no depth warp.
+					// Tolerant virtual-depth pairing (soft compare input):
+					// null when the color frame had no depth warp.
 					bool virt_paired = false;
 					vk::ImageView virt_view = nullptr;
 					vk::Sampler virt_sampler = nullptr;
@@ -2451,44 +2549,53 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							virt_paired = true;
 						}
 					}
-					std::vector<feather_mask_renderer::instance_draw> vr_draws;
-					bool any_vr = false;
-					if (virt_paired and any_positive)
-					{
+					// Soft-occlusion exact occluders (tweak: passthrough + hidden
+					// nearest depth, reversed excluded): this group positives always
+					// (VR cut works in every group with paired virtual depth), plus
+					// every placed hidden object in the soft group. Hidden soups
+					// upload into this group renderer on hash change (see mesh_hashes
+					// retention below).
+					std::vector<feather_mask_renderer::instance_draw> exact_draws;
 						for (const auto & d: draws)
 						{
 							if (!d.reverse)
-								vr_draws.push_back(d);
+								exact_draws.push_back(d);
 						}
-						any_vr = not vr_draws.empty();
-					}
-					// Forensics for the VR-flicker hypothesis: window positives
-					// exist (a 3d-passthrough cutout wants the VR cut) but
-					// strict depth pairing failed (exact and ±1 neighbor
-					// both absent), so the mask stays 1
-					// (passthrough) where VR should have won. Throttled 1s;
-					// the common_frame depth-miss line carries the
-					// frame_idx/window detail, this one marks the visible
-					// consequence (cut skipped) with the feather group.
-					if (any_positive and not virt_paired)
+					if (soft_group and have_volume_sensor)
 					{
-						vr_frame_wanted = true;
+						for (auto & [oid, ost]: passthrough_objects)
+						{
+							if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+								continue;
+							auto mhit = g.mesh_hashes.find(oid);
+							if (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash)
+							{
+								g.renderer->set_mesh(oid, ost.soup);
+								g.mesh_hashes[oid] = ost.soup_hash;
+							}
+							append_draw(oid, ost, false, exact_draws);
+						}
+					}
+					// Soft-unpaired forensic: volume placed but the color frame
+					// carried no depth warp, so the compare falls back to
+					// sensor-vs-volume (no virtual). Throttled (shared 5s depth-miss
+			// window; see common_frame): isolated misses log once, outages
+			// do not spam at refresh rate.
+					if (any_volume and not virt_paired)
+					{
 						bool expected = current_blit_handles[0] and current_blit_handles[0]->view_info.depth_expected;
 						if (expected)
 						{
 							XrTime now = instance.now();
-							if (now - vr_cut_skip_last_log > 1'000'000'000LL)
+							if (now - depth_miss_last_log > 5'000'000'000LL)
 							{
-								vr_cut_skip_last_log = now;
+								depth_miss_last_log = now;
 								uint64_t cidx = current_blit_handles[0] ? current_blit_handles[0]->feedback.frame_index : UINT64_MAX;
-								spdlog::warn("VR cut skipped (depth expected-but-missing): color frame {} feather {}px draws {}", cidx, f,
-								             draws.size());
+								spdlog::info("Soft unpaired (sensor-vs-volume only): color frame {} feather {}px", cidx, f);
 							}
 						}
 					}
-					else if (any_vr)
-						vr_frame_wanted = true;
-					if ((draws.empty() or not any_positive) and not any_volume and not any_vr)
+					if ((draws.empty() or not any_positive) and not any_volume)
 					{
 						g.active = false;
 						// Mesh-pipeline edge forensics: draws present ->
@@ -2537,25 +2644,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					try
 					{
 						feather_mask_renderer::volume_input vol_in;
-						bool use_vol_in = any_volume or any_vr;
+						bool use_cut = virt_paired && !exact_draws.empty();
+						bool use_vol_in = any_volume || use_cut;
 						if (use_vol_in)
 						{
 							vol_in.draws = volume_draws;
 							vol_in.remap_cols = volume_remap;
 							vol_in.remap_corr = volume_remap_corr;
-							// May be null in VR-only groups (no sensor this
-							// frame): use_volume stays false there, so the
-							// view is never sampled.
+							// Null without a sensor view: use_volume stays
+							// false there, so the view is never sampled.
 							vol_in.sensor_view = volume_sensor;
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
-							// Virtual depth (shared by the volume reveal and
-							// the VR occlusion): tolerant (±1) pairing
-							// resolved above, null when the color frame had
-							// no depth warp. Near/far ride the sensor frustum so both
-							// D canvases agree. Eye extent comes from the
-							// stream description and sizes the high-res VR
-							// canvases (the sensor path stays at 320px).
+							// Virtual depth: tolerant pairing resolved above,
+							// null when the color frame had no depth warp. Near/far
+							// ride the sensor frustum so all D canvases agree.
 							if (virt_paired)
 							{
 								vol_in.virt_view = virt_view;
@@ -2569,8 +2672,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									};
 								}
 							}
-							if (any_vr)
-								vol_in.vr_draws = vr_draws;
+							vol_in.exact_draws = exact_draws;
+							vol_in.bias = soft_bias;
 							if (any_volume and *volume_query_pool)
 								vol_in.timestamp_pool = *volume_query_pool;
 						}
@@ -2594,13 +2697,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					volume_virt_ms += mstats.volume_virt_ms;
 					volume_compare_ms += mstats.volume_compare_ms;
 					volume_merge_ms += mstats.volume_merge_ms;
-					vr_raster_ms += mstats.vr_raster_ms;
-					vr_compare_ms += mstats.vr_compare_ms;
-					vr_merge_ms += mstats.vr_merge_ms;
-					if (virt_paired and (any_volume or any_vr))
+					cut_ms += mstats.cut_ms;
+					if (virt_paired and any_volume)
 						volume_frame_virt_paired = true;
-					if (any_vr and virt_paired)
-						vr_frame_virt_paired = true;
 					mask_draws += (int)mstats.draws;
 					if (any_volume)
 					{
@@ -2645,12 +2744,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// flag above; tier-0 has no scissored passes to report).
 					if (log_boxes and mstats.tier > 0)
 					{
-						if (any_vr)
-							spdlog::info("MaskBox: feather {}px box {:.0f}% tier {} draws {} vrbox {:.0f}%",
-							             f, mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws,
-							             mstats.vr_box_frac * 100.f);
-						else
-							spdlog::info("MaskBox: feather {}px box {:.0f}% tier {} draws {}",
+						spdlog::info("MaskBox: feather {}px box {:.0f}% tier {} draws {}",
 							             f, mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
 					}
 					if (not mask_split_written)
@@ -2728,6 +2822,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						volume_raster_ms += mstats.volume_raster_ms;
 						volume_compare_ms += mstats.volume_compare_ms;
 						volume_merge_ms += mstats.volume_merge_ms;
+					cut_ms += mstats.cut_ms;
 						mask_draws += (int)mstats.draws;
 					}
 				}
@@ -3783,10 +3878,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// The debug window cutout needs a live passthrough to reveal,
 		// map or not (it punches every live vote). The depth debug
 		// overlay and the passthrough effects demo need fullscreen
-		// passthrough underneath them.
+		// passthrough underneath them. The boundary veil (which the
+		// startup fade folds into) needs it too — including with an
+		// empty map, where have_fiducial_map is false but the fade
+		// still has to ride the flat layer.
 		bool want_debug_cutout = debug_overlays and debug_window_mm >= 0;
 		bool effects_full = session.effects_fullscreen_passthrough();
-		if (use_alpha or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough() or effects_full)
+		if (use_alpha or have_fiducial_map or want_debug_cutout or depth_fullscreen_passthrough() or effects_full or boundary_veil)
 			session.enable_passthrough(system);
 		else
 			session.disable_passthrough();

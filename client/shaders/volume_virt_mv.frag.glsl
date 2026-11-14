@@ -28,9 +28,9 @@
 // blend L/R eyes over ~1 texel — subsumed by the downstream feather,
 // no inset applied.
 //
-// keeps the hot compare pass in D space (sensor < min(volume, virtual))
-// and the compare push constants untouched (already at the 128B minimum
-// guarantee): meters->D runs here, where near/far ride a tiny push.
+// keeps the hot compare pass in D space (sensor < min(volume, virtual,
+// exact) with distance-scaled bias): meters->D runs here, where
+// near/far ride a tiny push.
 //
 // Sampling: green channel. The decoder's Y'CbCr sampler converts to RGB
 // (709 full-range here); with the server's neutral chroma (~0.5) all

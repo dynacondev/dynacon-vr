@@ -1071,7 +1071,7 @@ struct passthrough_object
 	// value so each object feathers independently. 0 disables feathering.
 	// Not accepted for 3d-passthrough-reversed, 3d-boundary(-reversed)
 	// and 3d-passthrough-hidden (warned + ignored on the server).
-	float feather_px = 24;
+	float feather_px = 12;
 	// Boundary fade width in meters (3d-boundary(-reversed) only):
 	// symmetric smoothstep over +/- this distance around the mesh
 	// surface (0.5 at the surface); 0 = hard step. Default 0.3.
@@ -1122,6 +1122,10 @@ struct fiducial_map
 	// Smoothstep fade from full passthrough to VR once the until-lock
 	// target latches, in seconds (default 2). 0 = instant release.
 	float passthrough_fade_time_s = 2.0f;
+	// Smoothstep fade from full passthrough to video whenever the
+	// video feed (re)starts after a gap, in seconds (default 2).
+	// 0 disables (instant cut). Re-arms after the kiosk holdoff.
+	float startup_fade_time_s = 2.0f;
 };
 
 struct fiducial_model_chunk
