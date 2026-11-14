@@ -2046,9 +2046,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// geometry only).
 		static const std::string soft_hand_left_key = "soft_hand_left";
 		static const std::string soft_hand_right_key = "soft_hand_right";
-		static passthrough_mesh::triangle_soup skin_hand_soup(
-		    const xr::hand_tracker::mesh_data & bind,
-		    const xr::hand_tracker::joint_array & joints)
+		auto skin_hand_soup = [](const xr::hand_tracker::mesh_data & bind,
+		    const xr::hand_tracker::joint_array & joints) -> passthrough_mesh::triangle_soup
 		{
 		        passthrough_mesh::triangle_soup out;
 		        const size_t nj = bind.joint_bind_poses.size();
