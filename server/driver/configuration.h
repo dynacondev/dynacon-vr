@@ -180,6 +180,14 @@ struct configuration
 	// Applies to the until-lock transition only, nothing else.
 	float passthrough_fade_time_s = 2.0f;
 
+	// Smoothstep fade from full passthrough to video whenever the video
+	// feed (re)starts after a gap, in seconds (default 2). 0 disables.
+	// Re-arms whenever video has been absent for the kiosk holdoff
+	// (~2s), independent of kiosk-mode. Min-combined with the
+	// boundary veil / until-lock fade, so a starting feed always
+	// wins while fading.
+	float startup_fade_time_s = 2.0f;
+
 	struct reprojection
 	{
 		// Master switch for server-side depth reprojection: every
