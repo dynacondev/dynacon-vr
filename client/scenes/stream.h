@@ -541,17 +541,19 @@ private:
 	XrTime volume_last_log = 0;
 	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
 	// Soft depth chain (single tier-1 3d-depth-passthrough only):
-	// warped-sensor + hands MIN, global window/occluder raster, alpha
-	// field (windows vs VR + reversed), dilated occluder, eye-space
-	// binary compare with distance-scaled bias (occluder only), verdict
-	// MAX into the tier seed ahead of the shared blur. >1 depth volume
-	// disables soft (error, exact-only fallback); non-tier-1 feather
-	// does the same, so no merge semantics are ever needed.
-	float soft_bias = 0.06f; // occLinear -= occLinear*bias (known geometry only)
-	// Occluder dilate radius in working-res (quarter) texels, ahead of
-	// the eye-space compare: larger blocks more sensor edge bleed,
-	// smaller reveals closer to the silhouette. 0 = off, 8 = tap max.
-	// Passthrough tab slider; default 2 preserves prior behavior.
+	// sensor-frame native clean (occluder + volume vs raw sensor) then
+	// warped-cleaned-sensor + hands MIN, alpha field (windows vs VR +
+	// reversed), eye-space cleaned-sensor-vs-virt compare, verdict
+	// MAX into the tier seed ahead of the shared blur. The
+	// distance-scaled bias (occluder only) is consumed in the
+	// sensor-space clean. >1 depth volume disables soft (error,
+	// exact-only fallback); non-tier-1 feather does the same, so no
+	// merge semantics are ever needed.
+	float soft_bias = 0.06f; // occLinear -= occLinear*bias (sensor-space clean, known geometry only)
+	// Occluder dilate radius in *sensor* texels, ahead of the native
+	// sensor clean: larger blocks more sensor edge bleed, smaller
+	// reveals closer to the silhouette. 0 = off, 8 = tap max.
+	// Passthrough tab slider; default 2.
 	int soft_dilate_texels = 2;
 	bool soft_multi_volume_error = false; // latched, logged once
 	bool soft_tier_error = false; // latched, logged once (depth feather not tier-1)

@@ -432,19 +432,21 @@ Each `passthrough` entry has:
   the silhouette, depth-tested against the windows covering each
   pixel). `"3d-depth-passthrough"` reveals the flat feed where the
   runtime depth map resolves *inside* the model volume (depth-tested
-  volume, feathered like a normal window). One chain at half of full
-  working size (= the tier-1 submit size, so seed and chain always
-  agree): the runtime sensor warps once per frame into working space
-  (rotation homography, capture <-> display, with a time-bias trim;
-  bilinear tap) with skinned hand depth MINed over it; global window
-  rasters build a crisp window-vs-VR (+reversed) alpha field; the
-  known-geometry occluder (windows + hidden, min-dilated by the Passthrough
-  tab Occluder dilate slider, working-res texels) gates a
-  binary eye-space sensor verdict — `sensor < volFar && sensor <
-  virt && sensor < (occluder - occluder*bias)` in linear meters, single
-  tap per pixel — MAXed onto the alpha field ahead of the shared
-  erode+blur. The distance-scaled bias (`occluder -=
-  occluder*bias`, Passthrough tab slider, default 0.06) applies to the
+  volume, feathered like a normal window). The known-geometry
+  occluder (windows + hidden) and the volume far wall raster at the
+  sensor extent/pose and blank the raw sensor natively (min-dilated by
+  the Passthrough tab Occluder dilate slider, sensor texels): a sensor
+  pixel behind `(occluder - occluder*bias)` or behind the volume far
+  wall reads back as far. The cleaned sensor warps once per frame into
+  half-of-full working space (= the tier-1 submit size, so seed and
+  display chain always agree; rotation homography, capture <-> display,
+  with a time-bias trim; bilinear tap) with skinned hand depth MINed
+  over it; a global window raster builds a crisp window-vs-VR
+  (+reversed) alpha field; a binary eye-space verdict — cleaned
+  `sensor < virt` in linear meters, single tap per pixel — MAXes onto
+  the alpha field ahead of the shared erode+blur. The distance-scaled
+  bias (`occluder -= occluder*bias`, Passthrough tab slider, default
+  0.06) is consumed in the sensor-space clean and applies to the
   known-geometry term only; volume-far and VR exact-cut. Only one
   `3d-depth-passthrough` object is supported (>1 disables the soft path
   with an error, exact-only fallback), and its feather must be tier-1

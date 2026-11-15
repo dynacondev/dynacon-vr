@@ -1849,24 +1849,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			volume_remap[3 * e + 1] = glm::vec4(0, -1, 0, 0);
 			volume_remap[3 * e + 2] = glm::vec4(0, 1, 1, 0);
 			}
-		if (have_depth_frame and need_volume_depth and mask_frame and volume_remap_enabled)
+		// Sensor-frame view-projection for the native clean (sensor
+		// extent/pose raster of the known-geometry occluder + volume):
+		// the trimmed depth pose below is the content-age-corrected
+		// capture pose; the warp H further below reuses it. Identity
+		// when no depth frame is wanted this frame.
+		std::array<glm::mat4, view_count> sensor_viewproj = {glm::mat4(1), glm::mat4(1)};
+		bool have_sensor_viewproj = false;
+		// Trimmed capture pose shared by the sensor raster (viewproj
+		// above) and the warp H below: single trim, one timebase.
+		std::array<XrPosef, 2> depth_pose_trimmed{shared_depth.pose[0], shared_depth.pose[1]};
+		if (have_depth_frame and need_volume_depth and mask_frame)
 		{
-			auto remap_t0 = std::chrono::steady_clock::now();
-			// E1 (UV->NDC): Vulkan NDC(-1,-1) is the top-left pixel
-			// (rasterizer truth, same as blur.vert; the old branch's eye
-			// mapping is v_uv*2-1 straight, no eye-side flip).
-			const glm::mat3 E1(glm::vec3(2, 0, 0), glm::vec3(0, 2, 0), glm::vec3(-1, -1, 1));
-			// Sensor UV<-NDC: the flip lives on the depth side only
-			// (anchored to validated direct sampling: overlay top samples
-			// depth row 1). Identity reproduces today's (u, 1-v) tap.
-			const glm::mat3 Suv(glm::vec3(0.5f, 0, 0), glm::vec3(0, -0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
-			bool h_ok = true;
 			// Time-bias trim: assume the depth content is bias_ms older than
 			// its pose claims (+bias = older = larger correction, the
 			// trailing direction). Extrapolate the reported depth pose
 			// backward along head motion; bias 0 leaves it untouched.
 			// Clamps (50mm, ~11deg) bound prediction glitches, not heads.
-			std::array<XrPosef, 2> depth_pose{shared_depth.pose[0], shared_depth.pose[1]};
+			depth_pose_trimmed = {shared_depth.pose[0], shared_depth.pose[1]};
 			if (volume_time_bias_ms != 0.f)
 			{
 				float ds = volume_time_bias_ms * 1e-3f;
@@ -1876,7 +1876,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					float shift_len = glm::length(shift);
 					if (shift_len > 0.05f)
 						shift *= 0.05f / shift_len;
-					auto & dp = depth_pose[view].position;
+					auto & dp = depth_pose_trimmed[view].position;
 					const auto & rp = shared_depth.pose[view].position;
 					dp.x = rp.x - shift.x;
 					dp.y = rp.y - shift.y;
@@ -1892,10 +1892,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						const auto & ro = shared_depth.pose[view].orientation;
 						glm::quat qr(ro.w, ro.x, ro.y, ro.z);
 						glm::quat qu = dq * qr;
-						depth_pose[view].orientation = {qu.x, qu.y, qu.z, qu.w};
+						depth_pose_trimmed[view].orientation = {qu.x, qu.y, qu.z, qu.w};
 					}
 				}
 			}
+			for (uint32_t view = 0; view < view_count; ++view)
+				sensor_viewproj[view] = scene::projection_matrix(shared_depth.fov[view]) * scene::view_matrix(depth_pose_trimmed[view]);
+			have_sensor_viewproj = true;
+		}
+		if (have_depth_frame and need_volume_depth and mask_frame and volume_remap_enabled)
+		{
+			auto remap_t0 = std::chrono::steady_clock::now();
+			// E1 (UV->NDC): Vulkan NDC(-1,-1) is the top-left pixel
+			// (rasterizer truth, same as blur.vert; the old branch's eye
+			// mapping is v_uv*2-1 straight, no eye-side flip).
+			const glm::mat3 E1(glm::vec3(2, 0, 0), glm::vec3(0, 2, 0), glm::vec3(-1, -1, 1));
+			// Sensor UV<-NDC: the flip lives on the depth side only
+			// (anchored to validated direct sampling: overlay top samples
+			// depth row 1). Identity reproduces today's (u, 1-v) tap.
+			const glm::mat3 Suv(glm::vec3(0.5f, 0, 0), glm::vec3(0, -0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
+			bool h_ok = true;
+			// Same trimmed capture pose as the sensor raster above
+			// (single trim, one timebase for H and the native clean).
+			const std::array<XrPosef, 2> & depth_pose = depth_pose_trimmed;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
 				// Q maps a camera-frame direction to [clip.x, clip.y,
@@ -2350,7 +2369,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Global depth geometry keys (built once per frame, before
 				// the stale-erase below): window + hidden + reversed ids
 				// the soft group must retain regardless of feather (its
-				// exactWin/exactOcc/revD rasters are global), plus the
+				// exactWin/revD (display) + sensorOcc/sensorVol (sensor)
+				// rasters are global), plus the
 				// skinned hand keys.
 				std::set<std::string> depth_retained{soft_hand_left_key, soft_hand_right_key};
 				for (auto & [oid, ost]: passthrough_objects)
@@ -2393,7 +2413,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						                (oit->second.def.type == "3d-passthrough" or oit->second.def.type == "3d-depth-passthrough")) or
 						         (soft_here and oit->second.def.type == "3d-passthrough-hidden"));
 						// Soft-group retention is feather-independent (the
-						// exactWin/exactOcc/revD rasters are global): keep
+						// exactWin/revD + sensorOcc/sensorVol rasters are global): keep
 						// depth meshes while soft, even on sensor-miss
 						// frames (no depth runs then, but evicting would
 						// force a waitIdle re-upload on return).
@@ -2507,6 +2527,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							return;
 						out.push_back({oid, mvp, op, reversed});
 					};
+					// Sensor-space draw (native clean, sensor extent/pose):
+					// same model matrix, sensor viewproj MVPs, no frustum
+					// cull (sensor frame differs from the display-frame
+					// cull above; sensor res is tiny so overdraw is cheap).
+					auto append_sensor_draw = [&](const std::string & oid, const passthrough_object_state & ost,
+					                                std::vector<feather_mask_renderer::instance_draw> & out) {
+						const auto & fu = ost.fused;
+						if (not fu.placed or not have_sensor_viewproj)
+							return;
+						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+						std::array<glm::mat4, 2> mvp;
+						for (uint32_t view = 0; view < view_count; ++view)
+							mvp[view] = sensor_viewproj[view] * model;
+						out.push_back({oid, mvp, 1, false});
+					};
 					for (auto & [oid, ost]: passthrough_objects)
 					{
 						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed or ost.def.feather_px != f)
@@ -2517,6 +2556,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// eye-space MVPs, no reversed polarity (the renderer
 					// MAXes them over the cuts instead of cutting).
 					std::vector<feather_mask_renderer::instance_draw> volume_draws;
+					std::vector<feather_mask_renderer::instance_draw> sensor_vol_draws;
 					bool any_volume = false;
 					if (have_volume_sensor)
 					{
@@ -2526,6 +2566,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							    ost.def.feather_px != f)
 								continue;
 							append_draw(oid, ost, false, volume_draws);
+							append_sensor_draw(oid, ost, sensor_vol_draws);
 						}
 						any_volume = not volume_draws.empty();
 					}
@@ -2619,12 +2660,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					// Soft-occlusion global known geometry (soft group only):
 					// every placed window (any feather) feeds exactWin
-					// (reveal source); windows + hidden feed exactOcc
-					// (occluder, never a reveal source); reversed feed
-					// revD (cut). Uploaded into this group renderer on hash
+					// (reveal source); windows + hidden feed the
+					// sensor-frame occluder (never a reveal source);
+					// reversed feed revD (cut). Uploaded into this group renderer on hash
 					// change (retained by the stale-erase above while soft).
 					std::vector<feather_mask_renderer::instance_draw> win_draws;
-					std::vector<feather_mask_renderer::instance_draw> occ_draws;
+					std::vector<feather_mask_renderer::instance_draw> sensor_occ_draws;
 					std::vector<feather_mask_renderer::instance_draw> rev_draws;
 					if (soft_group and have_volume_sensor)
 					{
@@ -2649,13 +2690,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							{
 								if (is_win)
 									append_draw(oid, ost, false, win_draws);
-								append_draw(oid, ost, false, occ_draws);
+								// Sensor-frame occluder (windows + hidden):
+								// reversed cuts stay alpha-side only.
+								append_sensor_draw(oid, ost, sensor_occ_draws);
 							}
 						}
 					}
 					// Soft-unpaired forensic: volume placed but the color frame
-					// carried no depth warp, so the compare falls back to
-					// sensor-vs-(volume+occluder) with no virtual term.
+					// carried no virtual depth, so the display-space compare
+					// falls back to the cleaned sensor alone (no virt term).
 			// Throttled (shared 5s depth-miss window; see common_frame):
 			// do not spam at refresh rate.
 					if (any_volume and not virt_paired)
@@ -2668,7 +2711,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							{
 								depth_miss_last_log = now;
 								uint64_t cidx = current_blit_handles[0] ? current_blit_handles[0]->feedback.frame_index : UINT64_MAX;
-								spdlog::info("Soft unpaired (sensor-vs-(volume+occluder) only): color frame {} feather {}px", cidx, f);
+								spdlog::info("Soft unpaired (cleaned-sensor only, no virt): color frame {} feather {}px", cidx, f);
 							}
 						}
 					}
@@ -2726,13 +2769,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						{
 							vol_in.draws = volume_draws;
 							vol_in.win_draws = win_draws;
-							vol_in.occ_draws = occ_draws;
+							vol_in.sensor_occ_draws = sensor_occ_draws;
+							vol_in.sensor_vol_draws = sensor_vol_draws;
 							vol_in.hand_draws = hand_draws;
 							vol_in.rev_draws = rev_draws;
 							vol_in.warp_cols = volume_remap;
 							// Null without a sensor view: use_volume stays
 							// false there, so the view is never sampled.
 							vol_in.sensor_view = volume_sensor;
+							if (env_depth)
+								vol_in.sensor_extent = {env_depth->depth_width(), env_depth->depth_height()};
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
 							// Virtual depth: tolerant pairing resolved above,
@@ -2759,6 +2805,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
 						                   true, f, cutouts, server_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
 						                   use_vol_in ? &vol_in : nullptr);
+						// A throw skips the timestamp writes below, so only
+						// a recorded group may validate the pool.
+						if (any_volume)
+							volume_ts_valid = true;
 					}
 					catch (std::exception & e)
 					{
@@ -2787,7 +2837,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						// Last-writer-wins: matches the GPU pool, and a
 						// single feather value is the baseline case anyway.
-						volume_ts_valid = true;
+						// (volume_ts_valid was set above only when the
+						// record did not throw.)
 						volume_last_tier = tier;
 						volume_last_feather = f;
 						volume_last_draws = (int)volume_draws.size();

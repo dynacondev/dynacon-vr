@@ -25,9 +25,9 @@ layout(location = 0) out vec4 out_color;
 
 // Window reveal field from crisp (undilated) depths: full passthrough
 // where a known window stands, VR is not strictly nearer, and no
-// reversed cut wins. This runs BEFORE the exactOcc dilation, so VR and
-// reversed cuts keep their full edge while the later sensor compare
-// uses the forgiving (dilated) occluder. Cut-before-add is structural:
+// reversed cut wins. The known-geometry occluder is dilated separately
+// in sensor space for the native clean; this display-space field keeps
+// the full edge for VR and reversed cuts. Cut-before-add is structural:
 // the sensor verdict MAXes onto this field afterwards.
 // Binary verdict; the shared group blur feathers the edge.
 // Empty exact (far clear, 1.0) yields 0: nothing to reveal (this differs

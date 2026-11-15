@@ -25,8 +25,8 @@ layout(location = 0) out vec4 out_color;
 
 // Sensor warp + upsample in one pass: the old-main rotation homography
 // (E1/Suv/Q rows/Rew/Rcw, capture<->display relative rotation) maps the
-// depth-stream (sync eye) UV to the runtime sensor UV. Bilinear tap of
-// the 320px sensor smooths the low-res input (fake intermediates at
+// depth-stream (sync eye) UV to the cleaned-sensor canvas UV. Bilinear
+// tap of the low-res sensor-frame input smooths it (fake intermediates at
 // discontinuities accepted; edge-aware upsampling is a later upgrade).
 // Off-canvas warp writes far (1.0): fail closed, never reveals.
 // Identity H reproduces the direct tap. Plain scalar math only (see

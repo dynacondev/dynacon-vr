@@ -1218,10 +1218,10 @@ void scenes::stream::gui_passthrough()
 	// Volume-far and VR exact-cut (no margin).
 	if (ImGui::SliderFloat(_S("Soft occlusion bias"), &soft_bias, 0, 0.25f, "%.3f"))
 		soft_bias = std::clamp(soft_bias, 0.f, 0.25f);
-	// Occluder dilate ahead of the sensor compare (working-res
-	// texels): min-dilates exactOcc into exactOccDil, so the
-	// distance-scaled bias above compares against a margin-grown
-	// known-geometry layer. 0 = off.
+	// Occluder dilate ahead of the native sensor clean (sensor
+	// texels): min-dilates the sensor-frame known-geometry occluder,
+	// so the distance-scaled bias above compares against a
+	// margin-grown layer. 0 = off.
 	if (ImGui::SliderInt(_S("Occluder dilate"), &soft_dilate_texels, 0, 8, "%d texels"))
 		soft_dilate_texels = std::clamp(soft_dilate_texels, 0, 8);
 	// Hand tracking frequency hint (session-wide, advisory): high is
