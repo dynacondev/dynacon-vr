@@ -622,10 +622,10 @@ private:
 	// (volume_virt_fb_mv) under volume_virt_renderpass (CLEAR R16 MV).
 	vk::raii::Framebuffer volume_virt_fb_mv{nullptr};
 	blur_target volume_bin; // R8 verdict canvas (working res, 2 layers):
-	// soft-occlusion binary output, MAX-merged straight into the seed
-	// (no presmooth: the shared blur chain feathers the edge).
+	// soft-occlusion binary output, MAX-merged into the alpha field
+	// (same res; no presmooth: the shared blur chain feathers the edge).
 	bool volume_targets_ready = false;
-	vk::Extent2D depth_working_extent{0, 0}; // the single soft-chain res (half)
+	vk::Extent2D depth_working_extent{0, 0}; // the single soft-chain res (quarter)
 	void ensure_depth_targets(vk::Extent2D working);
 	void update_source(vk::ImageView view, uint32_t set, bool nearest = false,
 	                     vk::ImageLayout layout = vk::ImageLayout::eShaderReadOnlyOptimal);
