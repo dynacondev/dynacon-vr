@@ -40,17 +40,13 @@ pc;
 
 void main()
 {
-	// Radius-sized loop: r is uniform per draw (push constant), so no
-	// thread divergence; out-of-range taps never iterate (the old
-	// -8..8 loop with continue skipped their fetches but paid 17
-	// iterations of branch overhead every pixel).
 	int r = int(pc.radius + 0.5);
 	vec3 duv = vec3(pc.dir * pc.texel, 0);
 	vec3 base_uv = vec3(uv, float(gl_ViewIndex));
 	float m = texture(src, base_uv).r;
-	for (int i = -r; i <= r; ++i)
+	for (int i = -8; i <= 8; ++i)
 	{
-		if (i == 0)
+		if (i == 0 || abs(i) > r)
 			continue;
 		m = min(m, texture(src, base_uv + duv * float(i)).r);
 	}
