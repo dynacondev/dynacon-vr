@@ -73,13 +73,7 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
 ## Depth chain v2: warp + hands, global exact, crisp alpha, dilated occluder (Nov 2026)
 
 - Single `3d-depth-passthrough`, tier-1 feather only (`(0,16]`px): `stream.cpp` latches `soft_multi_volume_error` on >1 volume and `soft_tier_error` on a non-tier-1 feather (server rejects those in `configuration.cpp` too); either falls back to exact-only so no resample semantics ever exist.
-- One working res W = quarter of full (compute economy for the
-  fullscreen passes): sensor warp+HANDS, exactWin/exactOcc raster, alpha
-  build, exactOcc dilate (2px min), volFar raster, virt decode,
-  eye-space compare, verdict MAX into the alpha field, then upscale MAX
-  into the tier-1 half-res seed (`target_a`), then the existing
-  erode+blur. Legacy silhouette raster is skipped in depth groups;
-  other groups untouched.
+- One working res W = half of full (= tier-1 submit size): sensor warp+HANDS, exactWin/exactOcc raster, alpha build, exactOcc dilate (2px min), volFar raster, virt decode, eye-space compare, verdict MAX into the tier seed (`target_a`), then the existing erode+blur. Legacy silhouette raster is skipped in depth groups; other groups untouched.
 - Warp is old-main rotation H (no B2) + time-bias trim (`volume_time_bias_ms` ±50ms + eye-velocity history); hands MIN over warped sensor every frame (min idempotent, `soft_hand_removal_on` branch deleted). Alpha = `win && !vrNearer && !revNearer` on crisp depths (replacing the VR-cut MIN pass); compare = `sensor < volFar && < virt && < (occDil - occDil*bias)` with the single bias on the occluder only.
 - Push sizes shrank: warp 96B, compare 16B (no more 144B/Adreno-256B requirement on the compare). Pool is 10 queries (warp/exact/virt/alpha/dilate/raster/compare/merge spans).
-- Tier-1-only is load-bearing (the seed is the half-res submit); the error latches. The chain runs at quarter with a linear upscale merge — the one sanctioned resample.
+- Tier-1-only is load-bearing for correctness (W == seed size); the error latches, don't "fix" by resampling.

@@ -480,10 +480,12 @@ private:
 	bool targets_has_intermediates = false;
 
 	// Soft depth chain (single 3d-depth-passthrough, tier-1 only).
-	// The chain runs at the working res W (quarter of full); the tier
-	// seed stays half (the tier-1 submit size), so the verdict upscales
-	// into the seed (linear, then the shared blur feathers it).
-	// Created on first use and rebuilt on extent change (format-fixed).
+	// One extent, driven per record, never fixed: everything (sensor
+	// warp, exactWin/exactOcc raster, alpha build, dilate, volFar
+	// raster, virt decode, compare, verdict merge) runs at the working
+	// res W (half of full = the tier-1 submit size), so the seed and
+	// the chain always agree. Created on first use and rebuilt on
+	// extent change (format-fixed).
 	static constexpr vk::Format volume_depth_format = vk::Format::eR16Unorm;
 	// Multiview volume raster (volume_mv.vert, 136B MVP-pair push):
 	// one draw broadcasts to both layers. Same CLEAR/STORE/OPTIMAL R16
@@ -530,13 +532,14 @@ private:
 	};
 	static_assert(sizeof(warp_push) == 96);
 	vk::raii::Pipeline warp_pipeline_mv{nullptr};
-	// Alpha field (R8 working-res canvas, 2 layers): window-vs-VR
-	// (+reversed) reveal verdict, built crisp ahead of the sensor
-	// MAX (cut-before-add is structural). Own MV framebuffer
-	// (blur_fb_mv) under compare_renderpass_mv (CLEAR R8 MV).
-	// The sensor verdict MAXes into it (LOAD, same res); the result
-	// upscales into the tier seed ahead of erode/blur.
-	blur_target alphaW;
+	// Alpha build (fullscreen _mv, 3 samplers: exactWin D + virt D +
+	// rev D, no push). Renders into target_a.blur_fb_mv (the tier-1
+	// seed, R8 MV) under compare_renderpass_mv below (same R8 MV
+	// shape; loadOp is not part of render-pass compatibility, so the
+	// framebuffer is shared). CLEAR, not DONT_CARE: any texel the
+	// alpha draw did not write must read back deterministic 0, never
+	// undefined tile garbage. The reversed test folds in here
+	// (cut-before-add is structural: alpha precedes the sensor MAX).
 	vk::raii::DescriptorSetLayout alpha_set_layout{nullptr};
 	vk::raii::PipelineLayout alpha_pipe_layout{nullptr};
 	vk::raii::DescriptorPool alpha_pool{nullptr};
@@ -594,15 +597,14 @@ private:
 	vk::raii::DescriptorSetLayout volume_virt_set_layout{nullptr};
 	vk::raii::DescriptorPool volume_virt_pool{nullptr};
 	vk::raii::DescriptorSet volume_virt_set{nullptr};
-	// Verdict MAX-merge (LOAD) in two stages, both under
-	// volume_max_r8_renderpass with the blur shaders at spread 0: the
-	// binary verdict MAXes into the alpha field at W (same res, set 1),
-	// then the alpha field upscales into the tier seed at half res
-	// (set 3; the linear sampler is the upscale). The shared blur
-	// feathers the edge after. Framebuffers are the canvases' own MV
-	// targets (loadOp is not part of compatibility). The RGBA8
-	// renderpass below serves tier-0 submits and the debug cutout
-	// punch (no MAX pipe needed there: tier-0 never merges).
+	// Verdict MAX-merge into the tier seed (LOAD, preserves the alpha
+	// field, sets 1 where the sensor is inside). Reuses the blur
+	// shaders with spread 0 (the linear sampler is the upscale) under
+	// MAX blending; framebuffers are the seed's own MV target (loadOp
+	// is not part of compatibility). The R8 variant serves tier-1 and
+	// tiered seeds; the RGBA8 renderpass below serves tier-0 submits
+	// and the debug cutout punch (no MAX pipe needed there: tier-0
+	// never merges).
 	vk::raii::RenderPass volume_max_r8_renderpass{nullptr};
 	vk::raii::Pipeline volume_max_r8_pipeline{nullptr};
 	vk::raii::RenderPass volume_max_rgb8_renderpass{nullptr};
