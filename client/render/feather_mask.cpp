@@ -1236,10 +1236,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		warp_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), warp_pipeline_info);
 	}
 	// Alpha build: fullscreen _mv window-vs-VR field (3 samplers:
-	// exactWin D + virt D + rev D, no push). Renders into
-	// alphaW.blur_fb_mv (quarter-res alpha field, R8 MV) under
-	// compare_renderpass_mv (same R8 MV CLEAR shape; loadOp is not
-	// part of render-pass compatibility).
+	// exactWin D + virt D + rev D, no push). Renders into target_a.blur_fb_mv
+	// (the tier-1 seed, R8 MV) under compare_renderpass_mv (same R8 MV
+	// CLEAR shape; loadOp is not part of render-pass compatibility).
 	{
 		auto alpha_frag = load_shader(device, "alpha_build_mv.frag");
 		vk::PipelineShaderStageCreateInfo alpha_stages[2] = {
@@ -1575,15 +1574,14 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		volume_sampler_linear = vk::raii::Sampler(device, volume_linear_info);
 	}
-	// Merge: two MAX stages under volume_max_r8_renderpass (LOAD),
-	// then a defining CLEAR upscale of the alpha field into the tier
-	// seed. Stage 1 merges the binary verdict into alphaW at W (same
-	// res); stage 2 (under compare_renderpass_mv, CLEAR) copies alphaW
-	// into the half-res seed; the linear sampler is the upscale in
-	// both. Reuses the blur shaders with spread 0 under the shared
-	// blur layout; canvases' own MV framebuffers are reused (loadOp is
-	// not part of render pass compatibility). The RGBA8 renderpass
-	// below serves tier-0 submits and the debug cutout punch.
+	// Merge: upscale the working-res binary canvas into the tier seed with MAX
+	// blending (LOAD preserves silhouettes + reversed cuts, 1s set where
+	// the sensor is inside). Reuses the blur shaders with spread 0 (the
+	// linear sampler is the upscale) under the shared blur layout; the
+	// seed's own MV framebuffer is reused (loadOp is not part of render
+	// pass compatibility). Two renderpasses: R8 intermediates (tier 1 +
+	// tiered seeds, COLOR_OPTIMAL) and RGBA8 submitted images (tier 0,
+	// COLOR_OPTIMAL).
 	{
 		uint32_t mv_view_mask = 0b11, mv_corr_mask = 0b11;
 		vk::RenderPassMultiviewCreateInfo volume_mv_rp_info{
@@ -3897,9 +3895,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.endRenderPass();
 			make_readable(*exactOccDil.image);
 		};
-		// Eye-space compare + verdict MAX into alphaW (same res),
-		// then a defining CLEAR upscale into the tier seed (target_a).
-		// Unpaired virt rebinds the dilated occluder (min no-op).
+		// Eye-space compare + verdict MAX into the tier seed (target_a,
+		// LOAD preserves the alpha field). Unpaired virt rebinds the
+		// dilated occluder (min no-op).
 		auto run_compare_merge = [&]() {
 			{
 				section_clock compare_clk(&ms_volume_compare);
@@ -4022,23 +4020,25 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 				make_readable(*alphaW.image);
-				// Stage 2 (upscale): defining CLEAR write of the alpha
-				// field into the tier seed at half res — no LOAD of the
-				// seed (the depth path never rasterized into it, so LOAD
-				// would MAX against last frame's triple output: ghosts).
-				// MAX-over-0 clear = copy; the linear sampler is the
-				// upscale, then the shared blur feathers.
+				// Stage 2 (upscale): alpha field MAXes into the tier
+				// seed at half res (LOAD preserves the seed); the linear
+				// sampler is the upscale, then the shared blur feathers.
+				vk::ImageMemoryBarrier seed_barrier = merge_barrier;
+				seed_barrier.image = *target_a.image;
+				cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				                    vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				                    {},
+				                    {},
+				                    {},
+				                    seed_barrier);
 				vk::Rect2D merge_box = pass_scissor(half_extent);
 				volume_box_frac = (float)merge_box.extent.width * (float)merge_box.extent.height /
 				                  ((float)half_extent.width * (float)half_extent.height);
-				vk::ClearValue seed_zero{};
-				seed_zero.color.float32.fill(0);
 				vk::RenderPassBeginInfo begin_max{
-				        .renderPass = *compare_renderpass_mv,
+				        .renderPass = *volume_max_r8_renderpass,
 				        .framebuffer = *target_a.blur_fb_mv,
-				        .renderArea = {.offset = {0, 0}, .extent = half_extent},
-				        .clearValueCount = 1,
-				        .pClearValues = &seed_zero,
+				        .renderArea = merge_box,
+				        .clearValueCount = 0,
 				};
 				cmd.beginRenderPass(begin_max, vk::SubpassContents::eInline);
 				set_full_viewport(half_extent);

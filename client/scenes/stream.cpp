@@ -1737,10 +1737,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		}
 		if (depth_volume_count <= 1 and depth_volume_count > 0 and soft_multi_volume_error)
 			soft_multi_volume_error = false; // recovered
-		// Tier-1-only scope: the seed is the half-res submit, so any
-		// other feather disables soft (error, exact-only fallback).
-		// The chain itself runs at quarter with one sanctioned linear
-		// upscale merge.
+		// Tier-1-only scope: the depth chain shares W with the tier-1
+		// submit size, so any other feather disables soft (error,
+		// exact-only fallback) instead of resampling across sizes.
 		bool soft_tier_ok = soft_feather < 0.f or feather_mask_renderer::tier_for_feather(soft_feather) == 1;
 		if (not soft_tier_ok and not soft_tier_error)
 		{
