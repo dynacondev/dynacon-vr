@@ -432,23 +432,27 @@ Each `passthrough` entry has:
   the silhouette, depth-tested against the windows covering each
   pixel). `"3d-depth-passthrough"` reveals the flat feed where the
   runtime depth map resolves *inside* the model volume (depth-tested
-  volume, feathered like a normal window). The known-geometry
-  occluder (windows + hidden) and the volume far wall raster at the
-  sensor extent/pose and blank the raw sensor natively (min-dilated by
-  the Passthrough tab Occluder dilate slider, sensor texels): a sensor
-  pixel behind `(occluder - occluder*bias)` or behind the volume far
-  wall reads back as far. The cleaned sensor warps once per frame into
-  half-of-full working space (= the tier-1 submit size, so seed and
-  display chain always agree; rotation homography, capture <-> display,
-  with a time-bias trim; bilinear tap) with skinned hand depth MINed
-  over it; a global window raster builds a crisp window-vs-VR
-  (+reversed) alpha field; a binary eye-space verdict — cleaned
-  `sensor < virt` in linear meters, single tap per pixel — MAXes onto
-  the alpha field ahead of the shared erode+blur. The distance-scaled
+  volume, feathered like a normal window). One common intermediate
+  at half-of-full working space (= the tier-1 submit size, so seed
+  and display chain always agree) holds R16F linear-meter depths,
+  cleared to a large-finite FAR: stage-0 MINs window depths, then
+  the sensor stage MINs hidden + the volume bounding box, then the
+  revealed sensor depths (kept out until they pass their own reveal
+  test, so hidden/debatable pixels stay VR). The raw sensor warps
+  once per frame into that space (rotation homography, capture <->
+  display, with a time-bias trim; bilinear tap) with skinned hand
+  depth MINed over it; warped-sensor vs min-dilated intermediate
+  (+ bias below) feeds the depth-group seed only. The final is an
+  exact `virt < virtDepth` compare against the common layer at
+  working res — no bias anywhere on the global path — whose binary
+  verdict (never the depths) bilinear-upsamples after, so no halos;
+  crisp occlusion edges are intentional, then the shared erode+blur.
+  Global VR occlusion applies to every group (windows + hidden +
+  depth); reversed cuts stay per-group. The distance-scaled
   bias (`occluder -= occluder*bias`, Passthrough tab Soft occlusion
-  bias slider, 0..0.25, default 0.06) is consumed in the sensor-space
-  clean and applies to the known-geometry term only; volume-far and
-  VR exact-cut. Only one `3d-depth-passthrough` object is supported
+  bias slider, 0..0.25, default 0.06) is consumed in the sensor
+  compare only and applies to the known-geometry term alone;
+  volume-far and VR exact-cut carry no margin. Only one `3d-depth-passthrough` object is supported
   (extras are rejected server-side with a warning; the client latch
   is a last resort: soft off, volume hidden, windows fall back to
   exact), and its feather must be tier-1
@@ -459,7 +463,7 @@ Each `passthrough` entry has:
   instead of double-revealing. Per-eye display MVPs keep it in sync
   with VR content. The headset Passthrough tab offers a Rotation warp
   toggle (default on, direct tap when off), a Depth time-bias trim
-  (±50ms, default 0), an Occluder dilate slider (0..8 sensor texels,
+  (±50ms, default 0), an Occluder dilate slider (0..8 half-res texels,
   default 2) and a hand-tracking frequency selector (high /
   default). Meshes
   should be **closed volumes** (far side is well-defined). `"3d-boundary"` shows
