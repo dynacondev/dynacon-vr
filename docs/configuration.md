@@ -432,28 +432,30 @@ Each `passthrough` entry has:
   the silhouette, depth-tested against the windows covering each
   pixel). `"3d-depth-passthrough"` reveals the flat feed where the
   runtime depth map resolves *inside* the model volume (depth-tested
-  volume, feathered like a normal window). Two chains share one blur:
-  the sensor path (quarter of full working size) tests `sensor <
-  min(volume far, virtual, exact)` in linear meters with a
-  distance-scaled bias (`virtual -= virtual*bias`, Passthrough tab
-  slider, default 0.06), single binary tap per pixel, then upscales+MAXes
-  over every layer — including reversed cutthroughs; and the VR cut
-  compares virtual depth against the rasterized known geometry per
-  layer pixel (at min(group submit, virtual eye) res) and MIN-cuts the
-  seed where VR wins, with no sensor involvement. `exact` is the
-  nearest depth of `3d-passthrough` windows plus every placed
-  `3d-passthrough-hidden` object plus tracked hand meshes (reversed
-  excluded); ties fall back to the exact cutout. Only one
+  volume, feathered like a normal window). One chain at half of full
+  working size (= the tier-1 submit size, so seed and chain always
+  agree): the runtime sensor warps once per frame into working space
+  (rotation homography, capture <-> display, with a time-bias trim;
+  bilinear tap) with skinned hand depth MINed over it; global window
+  rasters build a crisp window-vs-VR (+reversed) alpha field; the
+  known-geometry occluder (windows + hidden, dilated 2 texels) gates a
+  binary eye-space sensor verdict — `sensor < volFar && sensor <
+  virt && sensor < (occluder - occluder*bias)` in linear meters, single
+  tap per pixel — MAXed onto the alpha field ahead of the shared
+  erode+blur. The distance-scaled bias (`occluder -=
+  occluder*bias`, Passthrough tab slider, default 0.06) applies to the
+  known-geometry term only; volume-far and VR exact-cut. Only one
   `3d-depth-passthrough` object is supported (>1 disables the soft path
-  with an error, exact-only fallback). Hands are removed from the
+  with an error, exact-only fallback), and its feather must be tier-1
+  ((0,16]px, half-res; other feathers are rejected server-side and
+  skipped client-side with an error). Hands are removed from the
   sensor depth (where supported) and re-added as real skinned hand
-  meshes in the same group, so they occlude and are occluded exactly
-  like fixed geometry with the same feather. Per-eye display MVPs keep
-  it in sync with VR content. The headset Passthrough tab offers a
-  Rotation reprojection toggle (default on): the sensor tap is remapped
-  through the capture <-> display relative rotation plus a depth-dependent
-  lateral shift (sideways parallax; forward/radial and depth-value
-  terms excluded), falling back to the direct tap when off. Meshes
+  meshes MINed over the warped sensor, so sensor and mesh hands agree
+  instead of double-revealing. Per-eye display MVPs keep it in sync
+  with VR content. The headset Passthrough tab offers a Rotation warp
+  toggle (default on, direct tap when off), a Depth time-bias trim
+  (±50ms, default 0) and a hand-tracking frequency selector (high /
+  default). Meshes
   should be **closed volumes** (far side is well-defined). `"3d-boundary"` shows
   game video only *inside* the model volume and passthrough outside
   it — a Quest-guardian-style zone with adjustable size, shape and

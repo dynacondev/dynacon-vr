@@ -70,43 +70,10 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
 - Config + packet fields removed too (server dot-pitch/dot-color,
   packet members, session fill, docs): dev branch, no compat shims.
 
-## Soft-occlusion depth path replaces volume/VR compare (Nov 2026)
+## Depth chain v2: warp + hands, global exact, crisp alpha, dilated occluder (Nov 2026)
 
-- Single `3d-depth-passthrough` only: `stream.cpp` counts placed depth
-  volumes, `>1` latches `soft_multi_volume_error` + error log and sits
-  out (exact-only) so no merge semantics are needed. Feather default is
-  12px (packets + server config + docs), tier-1 half-res group.
-- Compare is `soft_occlude_mv.frag.glsl`: single center tap, binary
-  `sensorLin < mergedLin - mergedLin*bias` in linear meters (infinite-far
-  branch like `depth_viz`), merged = `min(volume far, virtual, exact)`.
-  144B push (`volume_homography` + `bias_near_far`) exceeds the 128B
-  Vulkan minimum — ctor throws loudly under 144B like the silhouette
-  (132B) and volume (136B) paths; Adreno 740 has 256B.
-- Two working resolutions, both extent-driven (no fixed 320 anywhere;
-  the only fixed size is the runtime depth texture, queried never
-  assumed): sensor path at quarter of full working size
-  (`extent/4`, one line to switch to half); VR cut at
-  `min(group submit, virt eye)` so it is per layer pixel, never
-  upscaled. `ensure_volume_targets(working, cut)` rebuilds on change.
-- Exact depth = passthrough + hidden + tracked hands nearest raster
-  (`exact_raster_pipeline_mv`, the renamed VR MIN pipe); empty set
-  rebinds the volume canvas. Reversed never rastered to depth.
-  VR cut (`vr_cut_mv.frag.glsl`, 2 bindings, no push) MIN-cuts the seed
-  where virt is strictly nearer, ahead of the soft MAX (cut-before-add);
-  `cut_min_*` pipes reuse the volume MAX renderpasses. Sensor never
-  involved in the cut (hands work with removal on).
-- Hands are real skinned Meta meshes: `skin_hand_soup` CPU-skins the
-  `hand_tracker::mesh` bind data with per-frame located joints
-  (palm-gated, palm-delta fallback for untracked joints), uploaded via
-  new `update_mesh_positions` (no waitIdle: buffers never replaced,
-  same frame-fenced pattern as `cutout_verts`; first sight still uses
-  `set_mesh`). `soft_hand_left/right` keys, retained while the soft
-  group is live. Untracked hands = no mesh, no draws (fail closed).
-- Deleted outright: `volume_compare_mv` / `vr_occlude_compare_mv`
-  shaders, VR eye-space path, presmooth (`volume_smooth`,
-  `volume_smooth_spread`), time-bias + eye-velocity history + slider
-  (bias slider replaces it), all `vr_*` stats/plots/heartbeat,
-  `ensure_vr_targets`, `volume_size = 320`. `vr_draws` field and
-  `use_vr` gating removed. `flush_upload` (declared, called, never
-  defined — link break) restored verbatim from the parent commit during
-  this work; audit caught it plus a stale 128B assert.
+- Single `3d-depth-passthrough`, tier-1 feather only (`(0,16]`px): `stream.cpp` latches `soft_multi_volume_error` on >1 volume and `soft_tier_error` on a non-tier-1 feather (server rejects those in `configuration.cpp` too); either falls back to exact-only so no resample semantics ever exist.
+- One working res W = half of full (= tier-1 submit size): sensor warp+HANDS, exactWin/exactOcc raster, alpha build, exactOcc dilate (2px min), volFar raster, virt decode, eye-space compare, verdict MAX into the tier seed (`target_a`), then the existing erode+blur. Legacy silhouette raster is skipped in depth groups; other groups untouched.
+- Warp is old-main rotation H (no B2) + time-bias trim (`volume_time_bias_ms` ±50ms + eye-velocity history); hands MIN over warped sensor every frame (min idempotent, `soft_hand_removal_on` branch deleted). Alpha = `win && !vrNearer && !revNearer` on crisp depths (replacing the VR-cut MIN pass); compare = `sensor < volFar && < virt && < (occDil - occDil*bias)` with the single bias on the occluder only.
+- Push sizes shrank: warp 96B, compare 16B (no more 144B/Adreno-256B requirement on the compare). Pool is 10 queries (warp/exact/virt/alpha/dilate/raster/compare/merge spans).
+- Tier-1-only is load-bearing for correctness (W == seed size); the error latches, don't "fix" by resampling.

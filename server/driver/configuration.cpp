@@ -564,6 +564,15 @@ configuration::configuration()
 					else
 						o.feather_px = item["feather-px"];
 				}
+				// Depth chain runs at the tier-1 submit size only (half-res,
+				// no cross-size resampling): reject other feathers here so
+				// a misconfigured volume can never reach the client.
+				if (is_depth and (o.feather_px <= 0 or o.feather_px > 16))
+				{
+					U_LOG_W("passthrough object \"%s\": 3d-depth-passthrough needs tier-1 feather-px in (0,16]px, got %.0fpx, skipping",
+					        o.id.c_str(), (double)o.feather_px);
+					continue;
+				}
 				if (item.contains("transition-distance"))
 				{
 					if (not is_boundary)
