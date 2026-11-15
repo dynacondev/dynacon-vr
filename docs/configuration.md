@@ -445,11 +445,13 @@ Each `passthrough` entry has:
   (+reversed) alpha field; a binary eye-space verdict — cleaned
   `sensor < virt` in linear meters, single tap per pixel — MAXes onto
   the alpha field ahead of the shared erode+blur. The distance-scaled
-  bias (`occluder -= occluder*bias`, Passthrough tab slider, default
-  0.06) is consumed in the sensor-space clean and applies to the
-  known-geometry term only; volume-far and VR exact-cut. Only one
-  `3d-depth-passthrough` object is supported (>1 disables the soft path
-  with an error, exact-only fallback), and its feather must be tier-1
+  bias (`occluder -= occluder*bias`, Passthrough tab Soft occlusion
+  bias slider, 0..0.25, default 0.06) is consumed in the sensor-space
+  clean and applies to the known-geometry term only; volume-far and
+  VR exact-cut. Only one `3d-depth-passthrough` object is supported
+  (extras are rejected server-side with a warning; the client latch
+  is a last resort: soft off, volume hidden, windows fall back to
+  exact), and its feather must be tier-1
   ((0,16]px, half-res; other feathers are rejected server-side and
   skipped client-side with an error). Hands are removed from the
   sensor depth (where supported) and re-added as real skinned hand
@@ -457,7 +459,8 @@ Each `passthrough` entry has:
   instead of double-revealing. Per-eye display MVPs keep it in sync
   with VR content. The headset Passthrough tab offers a Rotation warp
   toggle (default on, direct tap when off), a Depth time-bias trim
-  (±50ms, default 0) and a hand-tracking frequency selector (high /
+  (±50ms, default 0), an Occluder dilate slider (0..8 sensor texels,
+  default 2) and a hand-tracking frequency selector (high /
   default). Meshes
   should be **closed volumes** (far side is well-defined). `"3d-boundary"` shows
   game video only *inside* the model volume and passthrough outside
@@ -495,7 +498,9 @@ Each `passthrough` entry has:
 - `scale`: uniform object scale, number or single-element array
   (default `1`, applied last)
 - `feather-px`: passthrough window feather width in screen pixels
-  (default `12`; `0` disables feathering). Mask stacks group by this
+  (default `12`, intentionally down from `24`; `0` disables
+  feathering). Mixed-version pairs fail fast on the protocol hash, so
+  the default never silently straddles versions. Mask stacks group by this
   value so each object feathers independently; applied live. Depth
   volumes reuse their feather value and feather through the same
   erode/blur chain. Not accepted for `3d-passthrough-reversed`,

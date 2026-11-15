@@ -70,10 +70,9 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
 - Config + packet fields removed too (server dot-pitch/dot-color,
   packet members, session fill, docs): dev branch, no compat shims.
 
-## Depth chain v2: warp + hands, global exact, crisp alpha, dilated occluder (Nov 2026)
+## Depth chain v2: warp + hands, sensor clean, crisp alpha, dilated occluder (Nov 2026)
 
-- Single `3d-depth-passthrough`, tier-1 feather only (`(0,16]`px): `stream.cpp` latches `soft_multi_volume_error` on >1 volume and `soft_tier_error` on a non-tier-1 feather (server rejects those in `configuration.cpp` too); either falls back to exact-only so no resample semantics ever exist.
-- One working res W = half of full (= tier-1 submit size): sensor warp+HANDS, exactWin/exactOcc raster, alpha build, exactOcc dilate (2px min), volFar raster, virt decode, eye-space compare, verdict MAX into the tier seed (`target_a`), then the existing erode+blur. Legacy silhouette raster is skipped in depth groups; other groups untouched.
-- Warp is old-main rotation H (no B2) + time-bias trim (`volume_time_bias_ms` ±50ms + eye-velocity history); hands MIN over warped sensor every frame (min idempotent, `soft_hand_removal_on` branch deleted). Alpha = `win && !vrNearer && !revNearer` on crisp depths (replacing the VR-cut MIN pass); compare = `sensor < volFar && < virt && < (occDil - occDil*bias)` with the single bias on the occluder only.
-- Push sizes shrank: warp 96B, compare 16B (no more 144B/Adreno-256B requirement on the compare). Pool is 10 queries (warp/exact/virt/alpha/dilate/raster/compare/merge spans).
+- Single `3d-depth-passthrough`, tier-1 feather only (`(0,16]`px): the server rejects extras and non-tier-1 feathers in `configuration.cpp`; `stream.cpp` latches `soft_multi_volume_error` / `soft_tier_error` only as a last resort. Either kills soft (volume hidden, windows fall back to exact) so no resample semantics ever exist.
+- One working res W = half of full (= tier-1 submit size): sensorOcc + sensorVol raster at sensor extent/pose, then a clean pass blanks the raw sensor natively (`sensor < vol && sensor < occBiased`, bias occluder-only, occ min-dilated first: 0..8 sensor texels, default 2, Passthrough tab). Rotation-only warp H (no B2) + time-bias trim (±50ms + eye-velocity history) carries the cleaned sensor into W with skinned-hand depth MINed over it (MIN idempotent, always rasterized when tracked). ExactWin raster stays crisp; alpha = `win && !vrNearer && !revNearer`. Legacy silhouette raster is skipped in depth groups; other groups untouched.
+- Eye-space compare is cleaned-`sensor < virt` only (linear meters, single tap per pixel); the verdict MAXes into the tier seed (`target_a`), then the existing erode+blur. Pushes: warp 96B, clean/compare 16B. Query pool is 10 with dilate/raster slots retired to zeros.
 - Tier-1-only is load-bearing for correctness (W == seed size); the error latches, don't "fix" by resampling.

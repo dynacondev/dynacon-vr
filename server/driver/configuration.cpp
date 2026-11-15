@@ -573,6 +573,14 @@ configuration::configuration()
 					        o.id.c_str(), (double)o.feather_px);
 					continue;
 				}
+				// Single depth volume only: extras are rejected here so the
+				// server never sends >1 (the client multi-volume error
+				// latch stays a last resort).
+				if (is_depth and std::ranges::any_of(passthrough_objects, [](const passthrough_object & p) { return p.type == "3d-depth-passthrough"; }))
+				{
+					U_LOG_W("passthrough object \"%s\": only one 3d-depth-passthrough object is supported, skipping extras", o.id.c_str());
+					continue;
+				}
 				if (item.contains("transition-distance"))
 				{
 					if (not is_boundary)

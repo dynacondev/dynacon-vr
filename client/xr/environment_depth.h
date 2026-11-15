@@ -68,8 +68,10 @@ public:
 		XrTime capture_time = 0;
 	};
 
-	// Construct only when supported() (extension procs load in the
-	// init list and throw when absent, marker_tracker idiom).
+	// Construct only when supported() (core extension procs load in the
+	// init list and throw when absent, marker_tracker idiom; the optional
+	// hand-removal proc loads defensively in the body and stays null when
+	// missing, so construction never throws for it).
 	environment_depth(instance &, session &, system &, vk::raii::Device & device);
 
 	// Extension enabled AND runtime reports supportsEnvironmentDepth.

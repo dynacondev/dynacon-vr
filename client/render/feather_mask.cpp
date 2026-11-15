@@ -1520,10 +1520,10 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .layout = *blur_layout,
 		        .renderPass = *volume_raster_renderpass_mv,
 		};
-		// Subpass index is baked into the triple pipes, not these:
-		// the standalone erode fragment runs identically at subpass 0.
-		dilate_h_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), dilate_pipe_info);
-		dilate_v_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), dilate_pipe_info);
+		// Subpass index is baked into the triple pipes, not this one:
+		// the standalone erode fragment runs identically at subpass 0
+		// for both the H and V passes, so one pipeline serves both.
+		dilate_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), dilate_pipe_info);
 	}
 	// (meters->D with the volume near/far), so the compare stays in D
 	// space with untouched push constants. Renders into
@@ -1683,14 +1683,14 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		volume_sampler_linear = vk::raii::Sampler(device, volume_linear_info);
 	}
-	// Merge: upscale the working-res binary canvas into the tier seed with MAX
-	// blending (LOAD preserves silhouettes + reversed cuts, 1s set where
-	// the sensor is inside). Reuses the blur shaders with spread 0 (the
-	// linear sampler is the upscale) under the shared blur layout; the
-	// seed's own MV framebuffer is reused (loadOp is not part of render
-	// pass compatibility). Two renderpasses: R8 intermediates (tier 1 +
-	// tiered seeds, COLOR_OPTIMAL) and RGBA8 submitted images (tier 0,
-	// COLOR_OPTIMAL).
+	// Merge: 1:1 copy of the working-res binary canvas into the tier
+	// seed with MAX blending (LOAD preserves the alpha field, 1s set
+	// where the sensor is inside; W == seed size, so spread 0 is exact,
+	// not an upscale). Reuses the blur shaders under the shared blur
+	// layout; the seed's own MV framebuffer is reused (loadOp is not
+	// part of render pass compatibility). Two renderpasses exist: R8
+	// intermediates (tier-1 + tiered seeds, the only MAX pipe built)
+	// and RGBA8 submitted images (tier-0 never merges, no pipe).
 	{
 		uint32_t mv_view_mask = 0b11, mv_corr_mask = 0b11;
 		vk::RenderPassMultiviewCreateInfo volume_mv_rp_info{
@@ -1812,9 +1812,13 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 		return;
 	}
 
-	// Rare path (map change): make sure no in-flight frame still reads the
-	// old buffers before replacing them.
-	device.waitIdle();
+	// Replace path only (map change): make sure no in-flight frame
+	// still reads the old buffers before replacing them. New keys have
+	// no live buffers (in-flight draws miss the key and skip), so first
+	// sight pays no waitIdle hitch mid-session. Rare either way;
+	// render-thread only, no threading change.
+	if (meshes.find(key) != meshes.end())
+		device.waitIdle();
 
 	mesh_buffers & mesh = meshes[key];
 	vk::DeviceSize vertex_bytes = soup.vertices.size() * sizeof(XrVector3f);
@@ -1844,6 +1848,7 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
+	mesh.vertex_count = (uint32_t)soup.vertices.size();
 	// Model-space bounds for the stream-side frustum skip (upload-time
 	// only; per-frame tests transform the 8 corners by the draw MVP).
 	glm::vec3 lo{soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z};
@@ -1887,23 +1892,30 @@ void feather_mask_renderer::update_mesh_positions(const std::string & key, const
 		return;
 	auto & mesh = it->second;
 	vk::DeviceSize vertex_bytes = verts.size() * sizeof(XrVector3f);
-	vk::DeviceSize index_bytes = mesh.index_count * sizeof(uint32_t);
-	if (mesh.staging_size < vertex_bytes + index_bytes)
-		{
+	if (vertex_bytes == 0)
+		return;
+	// Topology is fixed (same count as the uploaded soup): the index
+	// buffer is never rewritten here. A count change is a caller bug —
+	// fall back to set_mesh. Staging was sized for vertex+index at
+	// upload, so vertex-only always fits unless the count changed.
+	// The vertex_count check catches a smaller-but-fitting size that
+	// would otherwise silently mismatch drawIndexed's stale index_count.
+	if (mesh.vertex_count != (uint32_t)verts.size() or mesh.staging_size < vertex_bytes)
+	{
 		static bool warned = false;
 		if (not warned)
 		{
-		warned = true;
-		spdlog::warn("update_mesh_positions: size changed, use set_mesh");
+			warned = true;
+			spdlog::warn("update_mesh_positions: size changed, use set_mesh");
 		}
 		return;
 	}
-	if (vertex_bytes == 0)
-		return;
-	void * mapped = mesh.staging_memory.mapMemory(0, vertex_bytes + index_bytes);
+	void * mapped = mesh.staging_memory.mapMemory(0, vertex_bytes);
 	std::memcpy(mapped, verts.data(), vertex_bytes);
 	mesh.staging_memory.unmapMemory();
-	mesh.pending_upload = {vertex_bytes, index_bytes};
+	// index_bytes = 0: flush_upload skips the index copy/barrier and
+	// reuses the live index buffer (no per-frame index re-upload).
+	mesh.pending_upload = {vertex_bytes, 0};
 	glm::vec3 lo{verts[0].x, verts[0].y, verts[0].z};
 	glm::vec3 hi = lo;
 	for (const auto & v: verts)
@@ -3023,39 +3035,48 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 	auto [vertex_bytes, index_bytes] = *mesh.pending_upload;
 	mesh.pending_upload.reset();
 
-	vk::BufferCopy vertex_copy{
-	        .srcOffset = 0,
-	        .dstOffset = 0,
-	        .size = vertex_bytes,
-	};
-	cmd.copyBuffer(*mesh.staging_buffer, *mesh.vertex_buffer, vertex_copy);
-	vk::BufferCopy index_copy{
-	        .srcOffset = vertex_bytes,
-	        .dstOffset = 0,
-	        .size = index_bytes,
-	};
-	cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
-
-	std::vector<vk::BufferMemoryBarrier> barriers = {
-	        vk::BufferMemoryBarrier{
-	                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-	                .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
-	                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .buffer = *mesh.vertex_buffer,
-	                .offset = 0,
-	                .size = vertex_bytes,
-	        },
-	        vk::BufferMemoryBarrier{
-	                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-	                .dstAccessMask = vk::AccessFlagBits::eIndexRead,
-	                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .buffer = *mesh.index_buffer,
-	                .offset = 0,
-	                .size = index_bytes,
-	        },
-	};
+	// Either span may be zero (update_mesh_positions rewrites vertices
+	// only): skip zero-size copies — a zero copy is a validation error.
+	std::vector<vk::BufferMemoryBarrier> barriers;
+	barriers.reserve(2);
+	if (vertex_bytes > 0)
+	{
+		vk::BufferCopy vertex_copy{
+		        .srcOffset = 0,
+		        .dstOffset = 0,
+		        .size = vertex_bytes,
+		};
+		cmd.copyBuffer(*mesh.staging_buffer, *mesh.vertex_buffer, vertex_copy);
+		barriers.push_back(vk::BufferMemoryBarrier{
+		        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
+		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .buffer = *mesh.vertex_buffer,
+		        .offset = 0,
+		        .size = vertex_bytes,
+		});
+	}
+	if (index_bytes > 0)
+	{
+		vk::BufferCopy index_copy{
+		        .srcOffset = vertex_bytes,
+		        .dstOffset = 0,
+		        .size = index_bytes,
+		};
+		cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
+		barriers.push_back(vk::BufferMemoryBarrier{
+		        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eIndexRead,
+		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .buffer = *mesh.index_buffer,
+		        .offset = 0,
+		        .size = index_bytes,
+		});
+	}
+	if (barriers.empty())
+		return;
 	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
 	                    vk::PipelineStageFlagBits::eVertexInput,
 	                    {},
@@ -3214,17 +3235,20 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
 	};
 
-	// Merged-triple framebuffer for this renderer's (src, tmp) image
-	// pair (fixed per group: tier is fixed per feather). Creation-only
+	// Merged-triple framebuffer for this renderer's (src, tmp, extent)
+	// triple (fixed per group: tier is fixed per feather). Creation-only
 	// on first record — the pair never changes mid-stream (extent
-	// changes rebuild the images themselves, hence new handles), so no
-	// waitIdle is needed. Both layers, triple renderpass.
+	// changes rebuild the images themselves, hence new handles), and the
+	// extent is keyed explicitly so a same-handle size change still
+	// rebuilds. Both layers, triple renderpass.
 	auto triple_fb_for = [&](vk::Image src_img, vk::Image tmp_img, vk::ImageView src_view, vk::ImageView tmp_view,
 	                          vk::Extent2D e) -> vk::Framebuffer {
-		if (triple_src != src_img or triple_tmp != tmp_img)
+		if (triple_src != src_img or triple_tmp != tmp_img or triple_extent.width != e.width or
+		    triple_extent.height != e.height)
 		{
 			triple_src = src_img;
 			triple_tmp = tmp_img;
+			triple_extent = e;
 			vk::ImageView attachments[2] = {src_view, tmp_view};
 			triple_fb = vk::raii::Framebuffer(device,
 			        vk::FramebufferCreateInfo{
@@ -3550,10 +3574,20 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			float fy0 = (uminy * 0.5f + 0.5f) * (float)extent.height - box_margin;
 			float fx1 = (umaxx * 0.5f + 0.5f) * (float)extent.width + box_margin;
 			float fy1 = (umaxy * 0.5f + 0.5f) * (float)extent.height + box_margin;
-			int32_t px0 = std::max<int32_t>(0, (int32_t)(fx0 * sx) - 2);
-			int32_t py0 = std::max<int32_t>(0, (int32_t)(fy0 * sy) - 2);
-			int32_t px1 = std::min<int32_t>((int32_t)pe.width, (int32_t)(fx1 * sx) + 2);
-			int32_t py1 = std::min<int32_t>((int32_t)pe.height, (int32_t)(fy1 * sy) + 2);
+			// Float-domain clamp first: NDC from a near-behind-w corner
+			// or a huge margin can push fx*/fy* far outside int32 range,
+			// and an out-of-range float->int cast is UB (x86 resolves to
+			// INT_MIN => wrongful skip => under-reveal, fail-unsafe).
+			// Clamped floats cast exactly, like field_union above
+			// (floor the mins / ceil the maxes to stay conservative).
+			float qx0 = std::min(std::max(fx0 * sx - 2.f, 0.f), (float)pe.width);
+			float qy0 = std::min(std::max(fy0 * sy - 2.f, 0.f), (float)pe.height);
+			float qx1 = std::min(std::max(fx1 * sx + 2.f, 0.f), (float)pe.width);
+			float qy1 = std::min(std::max(fy1 * sy + 2.f, 0.f), (float)pe.height);
+			int32_t px0 = (int32_t)std::floor(qx0);
+			int32_t py0 = (int32_t)std::floor(qy0);
+			int32_t px1 = (int32_t)std::ceil(qx1);
+			int32_t py1 = (int32_t)std::ceil(qy1);
 			if (px1 <= px0 or py1 <= py0)
 				return vk::Rect2D{{0, 0}, pe};
 			box_frac = std::min(box_frac, (float)(px1 - px0) * (float)(py1 - py0) / ((float)pe.width * (float)pe.height));
@@ -3651,7 +3685,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			};
 			cmd.beginRenderPass(begin_dh, vk::SubpassContents::eInline);
 			set_full_viewport(sensorE);
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *dilate_h_pipeline);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *dilate_pipeline);
 			std::array<vk::DescriptorSet, 1> sets_dh{*descriptor_sets[9]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_dh, no_offsets);
 			erode_push dh{{1.f / sensorE.width, 1.f / sensorE.height}, {1, 0}, dil_r, 0};
@@ -3676,7 +3710,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			};
 			cmd.beginRenderPass(begin_dv, vk::SubpassContents::eInline);
 			set_full_viewport(sensorE);
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *dilate_v_pipeline);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *dilate_pipeline);
 			std::array<vk::DescriptorSet, 1> sets_dv{*descriptor_sets[10]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_dv, no_offsets);
 			erode_push dv{{1.f / sensorE.width, 1.f / sensorE.height}, {0, 1}, dil_r, 0};
@@ -3836,6 +3870,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// and the eye-space compare). Descriptor set update once per
 		// record: the conversion binds the decoded view on first use
 		// (same-CB draws would otherwise all read the last update).
+		// The decoded view is stream-owned and legitimately changes per
+		// frame, so this write cannot be hoisted like the feather-owned
+		// sets (whose views are waitIdle-stable across records); it runs
+		// before submit and prior frames are fence-gated upstream.
 		// Unpaired frames clear the canvas to far without drawing
 		// (neutral: the cleaned sensor always passes the virt test).
 		auto convert_virt_canvas = [&]() {
@@ -3917,11 +3955,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        .imageView = *exactWin.view_array,
 			        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 			};
-			// Paired: virtual D canvas. Unpaired: the windows canvas
-			// again (vr test exact-neutral: (1-step(w,w)) = 0 cut).
+			// Always the virtual-D canvas, never toggled to exactWin:
+			// rewriting binding 1 with a different view per paired-ness
+			// races a prior async command buffer still reading this set.
+			// Far-clear (unpaired, see convert_virt_canvas) is neutral
+			// in-shader (v_present = 0 => no VR cut), same as compare.
 			vk::DescriptorImageInfo virt_info{
 			        .sampler = *sampler_nearest,
-			        .imageView = volume->virt_valid ? *volume_virt.view_array : *exactWin.view_array,
+			        .imageView = *volume_virt.view_array,
 			        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 			};
 			vk::DescriptorImageInfo rev_info{
@@ -4083,6 +4124,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// merge (9).
 		auto run_depth = [&]() {
 			ensure_depth_targets(workE, sensorE);
+			// Diagnostics-only pool, shared across the overlap: reset per
+			// record so several volume groups last-write-wins (matches
+			// the CPU last-wins reporting above). Prior frames are
+			// fence-gated upstream, so no redesign to per-frame pools.
 			if (volume_ts)
 				cmd.resetQueryPool(volume->timestamp_pool, 0, 10);
 			volume_stamp(0);

@@ -1205,6 +1205,7 @@ void scenes::stream::gui_passthrough()
 	ImGui::BeginDisabled(not volume_remap_enabled);
 	if (ImGui::SliderFloat(_S("Depth time bias"), &volume_time_bias_ms, -50, 50, "%.0fms"))
 	{
+		volume_time_bias_ms = std::clamp(volume_time_bias_ms, -50.f, 50.f);
 		int bias_ms = (int)std::round(volume_time_bias_ms);
 		if (bias_ms != volume_bias_logged_ms)
 		{
@@ -1222,7 +1223,7 @@ void scenes::stream::gui_passthrough()
 	// texels): min-dilates the sensor-frame known-geometry occluder,
 	// so the distance-scaled bias above compares against a
 	// margin-grown layer. 0 = off.
-	if (ImGui::SliderInt(_S("Occluder dilate"), &soft_dilate_texels, 0, 8, "%d texels"))
+	if (ImGui::SliderInt(_S("Occluder dilate"), &soft_dilate_texels, 0, 8, "%d sensor texels"))
 		soft_dilate_texels = std::clamp(soft_dilate_texels, 0, 8);
 	// Hand tracking frequency hint (session-wide, advisory): high is
 	// more responsive at higher jitter cost. Needs

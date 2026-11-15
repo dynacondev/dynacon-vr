@@ -1728,23 +1728,28 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				soft_feather = ost.def.feather_px;
 			}
 		}
-		// Single-volume scope for the soft-occlusion path: >1 disables
-		// soft (error, exact-only fallback) so no merge semantics apply.
+		// Single-volume scope for the soft-occlusion path: >1 kills soft
+		// (error, volume hidden — fail-closed) so no merge semantics
+		// apply. Windows fall back to exact-only; the depth volumes
+		// submit nothing.
 		if (depth_volume_count > 1 and not soft_multi_volume_error)
 		{
 			soft_multi_volume_error = true;
-			spdlog::error("Soft occlusion: {} depth volumes placed, expected <=1; soft off (exact-only)", depth_volume_count);
+			spdlog::error("Soft occlusion: {} depth volumes placed, expected <=1; soft off (volume hidden)", depth_volume_count);
 		}
-		if (depth_volume_count <= 1 and depth_volume_count > 0 and soft_multi_volume_error)
+		// Symmetric recovery: clear when back to 0 or 1 (a vanished map
+		// must not pin the latch).
+		if (depth_volume_count <= 1 and soft_multi_volume_error)
 			soft_multi_volume_error = false; // recovered
 		// Tier-1-only scope: the depth chain shares W with the tier-1
-		// submit size, so any other feather disables soft (error,
-		// exact-only fallback) instead of resampling across sizes.
+		// submit size, so any other feather kills soft (error,
+		// exact-only for windows, volume hidden) instead of resampling
+		// across sizes.
 		bool soft_tier_ok = soft_feather < 0.f or feather_mask_renderer::tier_for_feather(soft_feather) == 1;
 		if (not soft_tier_ok and not soft_tier_error)
 		{
 			soft_tier_error = true;
-			spdlog::error("Soft occlusion: depth volume feather {:.0f}px is not tier-1 (half-res); soft off (exact-only)", (double)soft_feather);
+			spdlog::error("Soft occlusion: depth volume feather {:.0f}px is not tier-1 (half-res); soft off (exact-only for windows, volume hidden)", (double)soft_feather);
 		}
 		if (soft_tier_ok and soft_tier_error)
 			soft_tier_error = false; // recovered
@@ -1867,7 +1872,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// backward along head motion; bias 0 leaves it untouched.
 			// Clamps (50mm, ~11deg) bound prediction glitches, not heads.
 			depth_pose_trimmed = {shared_depth.pose[0], shared_depth.pose[1]};
-			if (volume_time_bias_ms != 0.f)
+			// Time-bias trim rides the warp toggle: remap off is a direct
+			// tap, so the shift stays identity even with a stale slider value.
+			if (volume_remap_enabled and volume_time_bias_ms != 0.f)
 			{
 				float ds = volume_time_bias_ms * 1e-3f;
 				for (uint32_t view = 0; view < view_count; ++view)
@@ -2104,11 +2111,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Soft-occlusion hand meshes: real Meta hand geometry
 		// (hand_tracker::mesh bind data skinned on the CPU with per-frame
 		// located joints, same convention as the lobby GPU path: world =
-		// jointWorld * inverse(bind) per influence). Rasterized as seed
-		// silhouettes (reveal) and exact MIN depth (VR cut) in the soft
-		// group, so hands behave exactly like fixed known-location geometry
-		// with the shared feather. Skipped when untracked (sensor + known
-		// geometry only).
+		// jointWorld * inverse(bind) per influence). MINed over the warped
+		// sensor canvas only, so hands behave exactly like fixed
+		// known-location geometry with the shared feather. Skipped when
+		// untracked (sensor + known geometry only).
 		static const std::string soft_hand_left_key = "soft_hand_left";
 		static const std::string soft_hand_right_key = "soft_hand_right";
 		auto skin_hand_soup = [](const xr::hand_tracker::mesh_data & bind,
@@ -2129,7 +2135,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		                return glm::translate(glm::mat4(1), t) * glm::mat4_cast(q);
 		        };
 		        glm::mat4 palm_delta = to_mat(pj.pose) * glm::inverse(to_mat(bind.joint_bind_poses[(size_t)XR_HAND_JOINT_PALM_EXT]));
-		        std::vector<glm::mat4> world(nj), inv_bind(nj);
+		        // Scratch reuse: two skinned hands per frame would otherwise
+		        // heap-allocate these joint arrays twice per frame.
+		        thread_local std::vector<glm::mat4> skin_world, skin_inv_bind;
+		        skin_world.resize(nj);
+		        skin_inv_bind.resize(nj);
+		        auto & world = skin_world;
+		        auto & inv_bind = skin_inv_bind;
 		        for (size_t i = 0; i < nj; ++i)
 		        {
 		                glm::mat4 b = to_mat(bind.joint_bind_poses[i]);
@@ -2246,6 +2258,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Fresh cutouts punch camera with no geometry to map it
 				// onto: the flat feed must stay submitted (see submit).
 				cutouts_punched = not cutouts.empty();
+				// Per-frame shared hand locates: the soft hand-mesh path
+				// below and the hidden palm path both need joints at
+				// sync_display_time in world space — locate each side once
+				// per frame here and reuse, instead of one IPC per consumer
+				// (locate() is a full 26-joint IPC per call). Slots start
+				// empty every frame (fresh locals per record call).
+				std::optional<xr::hand_tracker::located_hand> cached_left_joints, cached_right_joints;
+				auto locate_hand_cached = [&](std::optional<xr::hand_tracker> & tracker)
+				        -> const std::optional<xr::hand_tracker::located_hand> & {
+					// Slot by identity: only the two member trackers pass here.
+					auto & slot = (&tracker == &left_hand) ? cached_left_joints : cached_right_joints;
+					if (not slot and tracker)
+						slot = tracker->locate(application::space(xr::spaces::world), sync_display_time);
+					return slot;
+				};
+				// Hand tracking frequency hint, applied once trackers exist
+				// (session-wide, advisory): shared by the soft path (which
+				// creates the trackers first) and the hidden path below.
+				auto apply_hand_freq_once = [&]() {
+					if (not hand_freq_applied and (left_hand or right_hand))
+					{
+						hand_freq_applied = true;
+						session.set_hand_tracking_frequency_hint(hand_freq_high);
+					}
+				};
 				// Claim groups + sync member soups (upload on hash change).
 				// Groups are keyed by feather-px; record order is
 				// feather-ascending.
@@ -2371,16 +2408,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// the soft group must retain regardless of feather (its
 				// exactWin/revD (display) + sensorOcc/sensorVol (sensor)
 				// rasters are global), plus the
-				// skinned hand keys.
-				std::set<std::string> depth_retained{soft_hand_left_key, soft_hand_right_key};
+				// skinned hand keys. Sorted vector (not a per-frame
+				// std::set): binary_search below, capacity reused.
+				static thread_local std::vector<std::string> depth_retained;
+				depth_retained.clear();
+				depth_retained.push_back(soft_hand_left_key);
+				depth_retained.push_back(soft_hand_right_key);
 				for (auto & [oid, ost]: passthrough_objects)
 				{
 					if (not ost.soup_ready or not ost.fused.placed)
 						continue;
 					if (ost.def.type == "3d-passthrough" or ost.def.type == "3d-passthrough-hidden" or
 					    ost.def.type == "3d-passthrough-reversed")
-						depth_retained.insert(oid);
+						depth_retained.push_back(oid);
 				}
+				std::sort(depth_retained.begin(), depth_retained.end());
+				depth_retained.erase(std::unique(depth_retained.begin(), depth_retained.end()), depth_retained.end());
 				// Drop stale groups + stale member meshes. Use-then-advance:
 				// touching git->second after ++git reads past end().
 				for (auto git = mask_groups.begin(); git != mask_groups.end();)
@@ -2417,7 +2460,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// depth meshes while soft, even on sensor-miss
 						// frames (no depth runs then, but evicting would
 						// force a waitIdle re-upload on return).
-						if (not member and soft_here and depth_retained.contains(hit->first))
+						if (not member and soft_here and
+						    std::binary_search(depth_retained.begin(), depth_retained.end(), hit->first))
 							member = true;
 						if (not member)
 						{
@@ -2599,17 +2643,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (not right_hand)
 							right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
 						// Session-wide hint rides tracker creation (rare):
-						// re-applied here once trackers exist.
-						if (not hand_freq_applied and (left_hand or right_hand))
-						{
-							hand_freq_applied = true;
-							session.set_hand_tracking_frequency_hint(hand_freq_high);
-						}
-						XrSpace wspace = application::space(xr::spaces::world);
+						// shared helper, also called from the hidden path.
+						apply_hand_freq_once();
 						auto push_hand = [&](std::optional<xr::hand_tracker> & tracker, const std::string & key) {
 							if (not tracker)
 								return;
-							auto located = tracker->locate(wspace, sync_display_time);
+							// Shared per-frame locate (see above): one IPC
+							// per side per frame, not one per consumer.
+							const auto & located = locate_hand_cached(tracker);
 							if (not located)
 								return;
 							const auto * hm = tracker->mesh();
@@ -2669,6 +2710,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					std::vector<feather_mask_renderer::instance_draw> rev_draws;
 					if (soft_group and have_volume_sensor)
 					{
+						// Tier-1-only seed (M7): the soft chain feathers at the
+						// soft width (tier-1 submit size), so other-tier windows
+						// would double-represent across seeds — they live in
+						// their own groups and stay out of this one. Hidden
+						// (featherless) and reversed (every-group cuts) are
+						// unaffected.
 						for (auto & [oid, ost]: passthrough_objects)
 						{
 							bool is_win = ost.def.type == "3d-passthrough";
@@ -2677,6 +2724,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							if (not is_win and not is_hidden and not is_rev)
 								continue;
 							if (not ost.soup_ready or not ost.fused.placed)
+								continue;
+							if (is_win and feather_mask_renderer::tier_for_feather(ost.def.feather_px) != 1)
 								continue;
 							auto mhit = g.mesh_hashes.find(oid);
 							if (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash)
@@ -2806,8 +2855,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						                   true, f, cutouts, server_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh},
 						                   use_vol_in ? &vol_in : nullptr);
 						// A throw skips the timestamp writes below, so only
-						// a recorded group may validate the pool.
-						if (any_volume)
+						// a recorded group may validate the pool. Mirror the
+						// renderer's use_volume gate (draws + sensor view +
+						// sensor extent + tier-1): polling on a group the
+						// chain skipped would read another group's stamps.
+						bool volume_ts_ok = use_vol_in and not sensor_vol_draws.empty() and
+						    volume_sensor != vk::ImageView{} and env_depth and
+						    env_depth->depth_width() > 0 and env_depth->depth_height() > 0 and
+						    feather_mask_renderer::tier_for_feather(f) == 1;
+						if (any_volume and volume_ts_ok)
 							volume_ts_valid = true;
 					}
 					catch (std::exception & e)
@@ -3112,16 +3168,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
 								if (not right_hand)
 									right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+								// Same once-only hint as the soft path above.
+								apply_hand_freq_once();
 							}
 							XrSpace prox_space = application::space(xr::spaces::world);
 							// Palm preferred, controller grip fallback, per
 							// side. Fail-closed: an untracked side contributes
 							// no sphere (the head sphere always remains).
+							// Joints come from the shared per-frame locate
+							// above (one IPC per side per frame, not one per
+							// consumer).
 							auto hand_pos = [&](std::optional<xr::hand_tracker> & tracker,
 							                    xr::spaces grip) -> std::optional<glm::vec3> {
 								if (tracker)
 								{
-									if (auto located = tracker->locate(prox_space, sync_display_time))
+									const auto & located = locate_hand_cached(tracker);
+									if (located)
 									{
 										const auto & palm = located->joints[XR_HAND_JOINT_PALM_EXT].first;
 										if (palm.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
@@ -3306,10 +3368,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										acquired_groups.pop_back();
 										g.active = false;
 										g.image_index = -1;
-										// Fail the frame: the command buffer
-										// may be half-open (inside a render
-										// pass) — never submit it.
-										throw;
+										// Degraded-frame, not failed-frame: all realistic
+										// throw sites (ensure_hidden waitIdle +
+										// allocations) precede the first
+										// beginRenderPass inside record_hidden, so the
+										// command buffer is not half-open in
+										// practice — same reasoning as the feather
+										// groups above, which continue. A mid-pass
+										// throw would corrupt subsequent passes, but
+										// that path has no known throw sites.
+										// Never rethrow: an uncaught throw here
+										// skips end_frame and poisons every later
+										// frame (CALL_ORDER_INVALID), and terminates
+										// the process on desktop (no catch in
+										// application::run loop).
 									}
 									mask_raster_ms += hstats.raster_ms;
 									mask_draws += (int)hstats.draws;
@@ -4075,17 +4147,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// cutouts punch the merged set, so the flat feed must stay
 			// submitted.
 			bool need_flat = cutouts_punched;
+			// Plain windows reveal the flat feed on placement: flat must
+			// stay submitted. Depth volumes pin only on submit activity
+			// (see below): an errored or culled volume reveals nothing.
+			bool depth_placed = false;
 			for (auto & [oid, ost]: passthrough_objects)
 			{
 				if (not ost.soup_ready or not ost.fused.placed)
 					continue;
-				// Windows and depth volumes reveal the flat feed: flat
-				// must stay submitted.
-				if (ost.def.type == "3d-depth-passthrough" or ost.def.type == "3d-passthrough")
+				if (ost.def.type == "3d-passthrough")
 				{
 					need_flat = true;
 					break;
 				}
+				if (ost.def.type == "3d-depth-passthrough")
+					depth_placed = true;
 			}
 			// Hidden objects reveal the flat feed (via the merged
 			// layer): only
@@ -4105,6 +4181,23 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				++active_count;
 				need_flat = true;
+			}
+			// Depth volumes reveal the flat feed (via their mask group)
+			// only while actually submitting (P1-style, like hidden
+			// above): a placed-but-errored (soft latches) or culled
+			// volume reveals nothing, so it must not pin the flat layer
+			// and its compositor cost.
+			if (depth_placed and not soft_multi_volume_error and not soft_tier_error)
+			{
+				for (auto & [feather_key, g]: mask_groups)
+				{
+					(void)feather_key;
+					if (g.active and g.feather_px == soft_feather)
+					{
+						need_flat = true;
+						break;
+					}
+				}
 			}
 			// Boundary veil (fresh values: update_fiducial_passthrough ran
 			// just above): lift the flat mask's floor by (1 - s) through

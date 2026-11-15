@@ -42,14 +42,27 @@ xr::environment_depth::environment_depth(instance & inst_, session & sess_, syst
         xrStartEnvironmentDepthProviderMETA(inst_.get_proc<PFN_xrStartEnvironmentDepthProviderMETA>("xrStartEnvironmentDepthProviderMETA")),
         xrStopEnvironmentDepthProviderMETA(inst_.get_proc<PFN_xrStopEnvironmentDepthProviderMETA>("xrStopEnvironmentDepthProviderMETA")),
         xrAcquireEnvironmentDepthImageMETA(inst_.get_proc<PFN_xrAcquireEnvironmentDepthImageMETA>("xrAcquireEnvironmentDepthImageMETA")),
-        xrSetEnvironmentDepthHandRemovalMETA(inst_.get_proc<PFN_xrSetEnvironmentDepthHandRemovalMETA>("xrSetEnvironmentDepthHandRemovalMETA")),
         provider(provider_handle{xrDestroyEnvironmentDepthProviderMETA}),
         swapchain(swapchain_handle{xrDestroyEnvironmentDepthSwapchainMETA})
 #endif
 {
-	// Extension procs load above (init list, marker_tracker idiom), so
-	// callers must gate construction on supported(): with the extension
-	// enabled and advertised, every proc must exist.
+	// Core extension procs load above (init list, marker_tracker idiom),
+	// so callers must gate construction on supported(): with the extension
+	// enabled and advertised, every core proc must exist. Hand removal is
+	// optional (v1 runtimes may lack the proc): it stays null unless the
+	// runtime reports supportsHandRemoval, and a missing proc never throws.
+#ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
+	try
+	{
+		if (supports_hand_removal(inst_, sys))
+			xrSetEnvironmentDepthHandRemovalMETA = inst_.get_proc<PFN_xrSetEnvironmentDepthHandRemovalMETA>("xrSetEnvironmentDepthHandRemovalMETA");
+	}
+	catch (const std::exception & e)
+	{
+		xrSetEnvironmentDepthHandRemovalMETA = nullptr;
+		spdlog::warn("environment_depth: hand removal proc missing: {}", e.what());
+	}
+#endif
 }
 
 #ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME

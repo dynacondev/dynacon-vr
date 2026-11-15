@@ -350,6 +350,13 @@ public:
 	{
 		targets.clear();
 		hidden_targets.clear();
+		// Drop the merged-triple framebuffer too: it bakes the (src,
+		// tmp, extent) triple above, so a stale entry would reuse a
+		// wrong-sized framebuffer. Creation-only (no waitIdle needed).
+		triple_fb.clear();
+		triple_src = VK_NULL_HANDLE;
+		triple_tmp = VK_NULL_HANDLE;
+		triple_extent = {0, 0};
 	}
 
 	// Ensure intermediates for an extent (idempotent, change-gated). Public
@@ -482,6 +489,9 @@ private:
 	vk::raii::Framebuffer triple_fb{nullptr};
 	vk::Image triple_src = VK_NULL_HANDLE;
 	vk::Image triple_tmp = VK_NULL_HANDLE;
+	// Triple framebuffer extent (width/height): the cached framebuffer
+	// binds a fixed size, so (src, tmp) alone is not a sufficient key.
+	vk::Extent2D triple_extent{0, 0};
 	// Downsample chain (D) and tier blur workspaces (E) at half, quarter
 	// and eighth mask resolution (index 0..2). Tier k blurs at 1/k size
 	// with the same fixed kernel, so tap density (and cost) stays flat
@@ -567,13 +577,13 @@ private:
 	// build. Always re-rasterized (CLEAR covers the no-draws case).
 	blur_target rev_depth;
 	// Standalone min-dilate H/V (sensorOcc -> sensorOccDil, adjustable
-	// radius in sensor texels): same erode fragment as the triple, own pipelines (the triple
-	// pipes bake their subpass index) under
+	// radius in sensor texels): same erode fragment as the triple, one
+	// pipeline serving both passes (identical create info, both run at
+	// subpass 0) under
 	// volume_raster_renderpass_mv (CLEAR R16 MV, fullscreen coverage).
 	// Own descriptor sets 9/10 (host writes are last-write-wins per
 	// CB, and the triple rewrites 7/8 later in the same CB).
-	vk::raii::Pipeline dilate_h_pipeline{nullptr};
-	vk::raii::Pipeline dilate_v_pipeline{nullptr};
+	vk::raii::Pipeline dilate_pipeline{nullptr};
 	// Sensor clean (fullscreen _mv, 3 samplers: raw sensor D16 +
 	// sensorOccDil + sensorVol). Dedicated 16B bias/near/far push
 	// (same shape as the compare push). Renders into sensorClean under
@@ -611,9 +621,9 @@ private:
 	};
 	static_assert(sizeof(compare_push) == 16);
 	vk::raii::Pipeline compare_pipeline_mv{nullptr};
-	// Linear sampler for the compare taps (sensor + volume + virtual +
-	// exact depth): bilinear upscale of the working-res canvases; the binary
-	// verdict is feathered by the shared blur chain below.
+	// Linear sampler for the compare taps (warped-cleaned sensor +
+	// virtual depth): bilinear upscale of the working-res canvases; the
+	// binary verdict is feathered by the shared blur chain below.
 	vk::raii::Sampler volume_sampler_linear{nullptr};
 	// Virtual-depth SBS -> sensor-compatible D canvas (fullscreen MV
 	// pass at the working res, meters->D with the volume near/far).
@@ -694,6 +704,7 @@ private:
 		vk::raii::Buffer index_buffer{nullptr};
 		vk::raii::DeviceMemory index_memory{nullptr};
 		uint32_t index_count = 0;
+		uint32_t vertex_count = 0;
 		vk::raii::Buffer staging_buffer{nullptr};
 		vk::raii::DeviceMemory staging_memory{nullptr};
 		vk::DeviceSize staging_size = 0;
