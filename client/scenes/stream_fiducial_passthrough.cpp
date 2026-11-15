@@ -1219,11 +1219,11 @@ void scenes::stream::gui_passthrough()
 	// Volume-far and VR exact-cut (no margin).
 	if (ImGui::SliderFloat(_S("Soft occlusion bias"), &soft_bias, 0, 0.25f, "%.3f"))
 		soft_bias = std::clamp(soft_bias, 0.f, 0.25f);
-	// Occluder dilate ahead of the native sensor clean (sensor
-	// texels): min-dilates the sensor-frame known-geometry occluder,
-	// so the distance-scaled bias above compares against a
-	// margin-grown layer. 0 = off.
-	if (ImGui::SliderInt(_S("Occluder dilate"), &soft_dilate_texels, 0, 8, "%d sensor texels"))
+	// Intermediate dilate ahead of the sensor compare (half-res
+	// texels): min-dilates the common-layer depths, so the
+	// distance-scaled bias below compares against a margin-grown
+	// layer. 0 = off.
+	if (ImGui::SliderInt(_S("Occluder dilate"), &soft_dilate_texels, 0, 8, "%d half-res texels"))
 		soft_dilate_texels = std::clamp(soft_dilate_texels, 0, 8);
 	// Hand tracking frequency hint (session-wide, advisory): high is
 	// more responsive at higher jitter cost. Needs

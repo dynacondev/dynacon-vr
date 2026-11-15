@@ -155,8 +155,6 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.stream_rx_r = stream_bandwidth_rx[1];
 	gm.stream_rx_a = stream_bandwidth_rx[2];
 	gm.stream_rx_d = stream_bandwidth_rx[3];
-	gm.volume_virt_ms = (float)(volume_virt_ms * 1e-3);
-	gm.volume_virt_gpu_ms = last_volume_gpu.virt;
 	gm.virt_paired = volume_win_frames ? (float)volume_win_virt_paired / (float)std::max<uint64_t>(volume_win_frames, 1) : 0;
 	gm.track_ms = (float)(fid_detect_ms * 1e-3);
 	gm.solve_ms = (float)(fid_solve_ms * 1e-3);
@@ -165,19 +163,21 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.mask_erode_ms = (float)(mask_erode_ms * 1e-3);
 	gm.mask_blur_ms = (float)(mask_blur_ms * 1e-3);
 	gm.volume_acquire_ms = (float)(volume_acquire_ms * 1e-3);
-	gm.volume_warp_ms = (float)(volume_warp_ms * 1e-3);
-	gm.volume_exact_ms = (float)(volume_exact_ms * 1e-3);
-	gm.volume_alpha_ms = (float)(volume_alpha_ms * 1e-3);
+	gm.volume_base_ms = (float)(volume_base_ms * 1e-3);
+	gm.volume_geom_ms = (float)(volume_geom_ms * 1e-3);
 	gm.volume_dilate_ms = (float)(volume_dilate_ms * 1e-3);
-	gm.volume_raster_ms = (float)(volume_raster_ms * 1e-3);
 	gm.volume_compare_ms = (float)(volume_compare_ms * 1e-3);
+	gm.volume_add_ms = (float)(volume_add_ms * 1e-3);
+	gm.volume_verdict_ms = (float)(volume_verdict_ms * 1e-3);
+	gm.volume_apply_ms = (float)(volume_apply_ms * 1e-3);
 	gm.volume_merge_ms = (float)(volume_merge_ms * 1e-3);
-	gm.volume_warp_gpu_ms = last_volume_gpu.warp;
-	gm.volume_exact_gpu_ms = last_volume_gpu.exact;
-	gm.volume_alpha_gpu_ms = last_volume_gpu.alpha;
+	gm.volume_base_gpu_ms = last_volume_gpu.base;
+	gm.volume_geom_gpu_ms = last_volume_gpu.geom;
 	gm.volume_dilate_gpu_ms = last_volume_gpu.dilate;
-	gm.volume_raster_gpu_ms = last_volume_gpu.raster;
 	gm.volume_compare_gpu_ms = last_volume_gpu.compare;
+	gm.volume_add_gpu_ms = last_volume_gpu.add;
+	gm.volume_verdict_gpu_ms = last_volume_gpu.verdict;
+	gm.volume_apply_gpu_ms = last_volume_gpu.apply;
 	gm.volume_merge_gpu_ms = last_volume_gpu.merge;
 	gm.gizmo_ms = (float)(mask_gizmo_ms * 1e-3);
 	gm.feat_votes = (float)fid_votes;
@@ -219,8 +219,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             gm.mask_raster_ms * 1e3f,
 			             gm.mask_erode_ms * 1e3f,
 			             gm.mask_blur_ms * 1e3f,
-			             (gm.volume_acquire_ms + gm.volume_warp_ms + gm.volume_exact_ms + gm.volume_virt_ms + gm.volume_alpha_ms + gm.volume_dilate_ms + gm.volume_raster_ms + gm.volume_compare_ms + gm.volume_merge_ms) * 1e3f,
-			             (gm.volume_warp_gpu_ms + gm.volume_exact_gpu_ms + gm.volume_virt_gpu_ms + gm.volume_alpha_gpu_ms + gm.volume_dilate_gpu_ms + gm.volume_raster_gpu_ms + gm.volume_compare_gpu_ms + gm.volume_merge_gpu_ms) * 1e3f,
+			             (gm.volume_acquire_ms + gm.volume_base_ms + gm.volume_geom_ms + gm.volume_dilate_ms + gm.volume_compare_ms + gm.volume_add_ms + gm.volume_verdict_ms + gm.volume_apply_ms + gm.volume_merge_ms) * 1e3f,
+			             (gm.volume_base_gpu_ms + gm.volume_geom_gpu_ms + gm.volume_dilate_gpu_ms + gm.volume_compare_gpu_ms + gm.volume_add_gpu_ms + gm.volume_verdict_gpu_ms + gm.volume_apply_gpu_ms + gm.volume_merge_gpu_ms) * 1e3f,
 			             gm.gizmo_ms * 1e3f,
 			             gm.feat_votes,
 			             gm.feat_tags,
@@ -253,8 +253,8 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             ring_max(&global_metric::mask_raster_ms) * 1e3f,
 			             ring_max(&global_metric::mask_erode_ms) * 1e3f,
 			             ring_max(&global_metric::mask_blur_ms) * 1e3f,
-			             (ring_max(&global_metric::volume_acquire_ms) + ring_max(&global_metric::volume_warp_ms) + ring_max(&global_metric::volume_exact_ms) + ring_max(&global_metric::volume_virt_ms) + ring_max(&global_metric::volume_alpha_ms) + ring_max(&global_metric::volume_dilate_ms) + ring_max(&global_metric::volume_raster_ms) + ring_max(&global_metric::volume_compare_ms) + ring_max(&global_metric::volume_merge_ms)) * 1e3f,
-			             (ring_max(&global_metric::volume_warp_gpu_ms) + ring_max(&global_metric::volume_exact_gpu_ms) + ring_max(&global_metric::volume_virt_gpu_ms) + ring_max(&global_metric::volume_alpha_gpu_ms) + ring_max(&global_metric::volume_dilate_gpu_ms) + ring_max(&global_metric::volume_raster_gpu_ms) + ring_max(&global_metric::volume_compare_gpu_ms) + ring_max(&global_metric::volume_merge_gpu_ms)) * 1e3f,
+			             (ring_max(&global_metric::volume_acquire_ms) + ring_max(&global_metric::volume_base_ms) + ring_max(&global_metric::volume_geom_ms) + ring_max(&global_metric::volume_dilate_ms) + ring_max(&global_metric::volume_compare_ms) + ring_max(&global_metric::volume_add_ms) + ring_max(&global_metric::volume_verdict_ms) + ring_max(&global_metric::volume_apply_ms) + ring_max(&global_metric::volume_merge_ms)) * 1e3f,
+			             (ring_max(&global_metric::volume_base_gpu_ms) + ring_max(&global_metric::volume_geom_gpu_ms) + ring_max(&global_metric::volume_dilate_gpu_ms) + ring_max(&global_metric::volume_compare_gpu_ms) + ring_max(&global_metric::volume_add_gpu_ms) + ring_max(&global_metric::volume_verdict_gpu_ms) + ring_max(&global_metric::volume_apply_gpu_ms) + ring_max(&global_metric::volume_merge_gpu_ms)) * 1e3f,
 			             ring_max(&global_metric::gizmo_ms) * 1e3f,
 			             ring_max(&global_metric::fence_wait_ms) * 1e3f,
 			             ring_max(&global_metric::gui_ms) * 1e3f,
@@ -272,7 +272,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	if (volume_want_frame)
 	{
 		++volume_win_frames;
-		if (volume_warp_ms > 0)
+		if (volume_ts_valid)
 			++volume_win_sensor;
 		if (volume_frame_virt_paired)
 			++volume_win_virt_paired;
@@ -283,21 +283,21 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		         blit_handles[0]->view_info.depth_expected)
 			++volume_win_virt_missing;
 		volume_win_acquire_ms += volume_acquire_ms;
-		volume_win_warp_ms += volume_warp_ms;
-		volume_win_exact_ms += volume_exact_ms;
-		volume_win_virt_ms += volume_virt_ms;
-		volume_win_alpha_ms += volume_alpha_ms;
+		volume_win_base_ms += volume_base_ms;
+		volume_win_geom_ms += volume_geom_ms;
 		volume_win_dilate_ms += volume_dilate_ms;
-		volume_win_raster_ms += volume_raster_ms;
 		volume_win_compare_ms += volume_compare_ms;
+		volume_win_add_ms += volume_add_ms;
+		volume_win_verdict_ms += volume_verdict_ms;
+		volume_win_apply_ms += volume_apply_ms;
 		volume_win_merge_ms += volume_merge_ms;
-		volume_win_warp_gpu += (double)last_volume_gpu.warp * 1e3;
-		volume_win_exact_gpu += (double)last_volume_gpu.exact * 1e3;
-		volume_win_virt_gpu += (double)last_volume_gpu.virt * 1e3;
-		volume_win_alpha_gpu += (double)last_volume_gpu.alpha * 1e3;
+		volume_win_base_gpu += (double)last_volume_gpu.base * 1e3;
+		volume_win_geom_gpu += (double)last_volume_gpu.geom * 1e3;
 		volume_win_dilate_gpu += (double)last_volume_gpu.dilate * 1e3;
-		volume_win_raster_gpu += (double)last_volume_gpu.raster * 1e3;
 		volume_win_compare_gpu += (double)last_volume_gpu.compare * 1e3;
+		volume_win_add_gpu += (double)last_volume_gpu.add * 1e3;
+		volume_win_verdict_gpu += (double)last_volume_gpu.verdict * 1e3;
+		volume_win_apply_gpu += (double)last_volume_gpu.apply * 1e3;
 		volume_win_merge_gpu += (double)last_volume_gpu.merge * 1e3;
 	}
 	if (volume_want_frame and predicted_display_time - volume_last_log > 5'000'000'000LL)
@@ -307,27 +307,25 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		double va = (double)std::max<uint64_t>(volume_win_acquired, 1);
 		double win_s = volume_win_t0 != 0 ? (double)(predicted_display_time - volume_win_t0) * 1e-9 : 5.0;
 		double win_hz = win_s > 0 ? (double)volume_win_new_content / win_s : 0;
-		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m box {:.0f}%% age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/wa/ex/vi/al/di/ra/co/me {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu wa/ex/vi/al/di/ra/co/me {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{} virt paired/missing/frames {}/{}/{}",
+		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/ba/ge/di/co/ad/ve/ap/me {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu ba/ge/di/co/ad/ve/ap/me {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{} virt paired/missing/frames {}/{}/{}",
 		             (double)volume_last_feather, volume_last_tier, volume_last_draws,
 		             volume_last_seed_w, volume_last_seed_h, volume_sensor_w, volume_sensor_h,
 		             (double)volume_sensor_near, (double)volume_sensor_far,
-		             (double)volume_last_box_pct,
 		             volume_win_age_sum / va, volume_win_age_max,
 		             volume_win_dpos_sum / va, volume_win_dang_sum / va,
 		             volume_last_index, win_hz,
-		             volume_win_acquire_ms / vf, volume_win_warp_ms / vf, volume_win_exact_ms / vf, volume_win_virt_ms / vf, volume_win_alpha_ms / vf, volume_win_dilate_ms / vf, volume_win_raster_ms / vf, volume_win_compare_ms / vf, volume_win_merge_ms / vf,
-		             volume_win_warp_gpu / vf, volume_win_exact_gpu / vf, volume_win_virt_gpu / vf, volume_win_alpha_gpu / vf, volume_win_dilate_gpu / vf, volume_win_raster_gpu / vf, volume_win_compare_gpu / vf, volume_win_merge_gpu / vf,
+		             volume_win_acquire_ms / vf, volume_win_base_ms / vf, volume_win_geom_ms / vf, volume_win_dilate_ms / vf, volume_win_compare_ms / vf, volume_win_add_ms / vf, volume_win_verdict_ms / vf, volume_win_apply_ms / vf, volume_win_merge_ms / vf,
+		             volume_win_base_gpu / vf, volume_win_geom_gpu / vf, volume_win_dilate_gpu / vf, volume_win_compare_gpu / vf, volume_win_add_gpu / vf, volume_win_verdict_gpu / vf, volume_win_apply_gpu / vf, volume_win_merge_gpu / vf,
 		             volume_win_sensor, volume_win_acquired, volume_win_frames,
 		             volume_win_virt_paired, volume_win_virt_missing, volume_win_frames);
 		volume_win_frames = volume_win_sensor = volume_win_acquired = 0;
 		volume_win_new_content = 0;
-		volume_win_acquire_ms = volume_win_warp_ms = volume_win_exact_ms = 0;
-		volume_win_virt_ms = volume_win_virt_gpu = 0;
-		volume_win_alpha_ms = volume_win_dilate_ms = volume_win_raster_ms = 0;
+		volume_win_acquire_ms = volume_win_base_ms = volume_win_geom_ms = 0;
+		volume_win_dilate_ms = volume_win_compare_ms = volume_win_add_ms = 0;
 		volume_win_virt_paired = volume_win_virt_missing = 0;
-		volume_win_compare_ms = volume_win_merge_ms = 0;
-		volume_win_warp_gpu = volume_win_exact_gpu = volume_win_alpha_gpu = volume_win_dilate_gpu = 0;
-		volume_win_raster_gpu = volume_win_compare_gpu = volume_win_merge_gpu = 0;
+		volume_win_verdict_ms = volume_win_apply_ms = volume_win_merge_ms = 0;
+		volume_win_base_gpu = volume_win_geom_gpu = volume_win_dilate_gpu = volume_win_compare_gpu = 0;
+		volume_win_add_gpu = volume_win_verdict_gpu = volume_win_apply_gpu = volume_win_merge_gpu = 0;
 		volume_win_age_sum = volume_win_age_max = 0;
 		volume_win_dpos_sum = volume_win_dang_sum = 0;
 		volume_win_t0 = predicted_display_time;
@@ -397,10 +395,14 @@ void scenes::stream::gui_performance_metrics()
 	                             {_("Mask 1st"),  &global_metric::mask_first_gpu_ms},
 	                             {_("Mask rest"), &global_metric::mask_rest_gpu_ms},
 	                             {_("Mask merge"), &global_metric::merge_gpu_ms},
-	                             {_("Vol R"),     &global_metric::volume_raster_gpu_ms},
-	                             {_("Vol V"),     &global_metric::volume_virt_gpu_ms},
-	                             {_("Vol C"),     &global_metric::volume_compare_gpu_ms},
-	                             {_("Vol M"),     &global_metric::volume_merge_gpu_ms}}, "s"),
+	                             {_("Vol base"),   &global_metric::volume_base_gpu_ms},
+	                             {_("Vol geom"),   &global_metric::volume_geom_gpu_ms},
+	                             {_("Vol dilate"), &global_metric::volume_dilate_gpu_ms},
+	                             {_("Vol comp"),   &global_metric::volume_compare_gpu_ms},
+	                             {_("Vol add"),    &global_metric::volume_add_gpu_ms},
+	                             {_("Vol verdict"), &global_metric::volume_verdict_gpu_ms},
+	                             {_("Vol apply"),  &global_metric::volume_apply_gpu_ms},
+	                             {_("Vol merge"),  &global_metric::volume_merge_gpu_ms}}, "s"),
 
 	        plot(_("Network"), {{_("Download"),  &global_metric::bandwidth_rx},
 	                            {_("Upload"),    &global_metric::bandwidth_tx}}, "bit/s"),
@@ -417,13 +419,13 @@ void scenes::stream::gui_performance_metrics()
 	                                {_("Mask erode"),   &global_metric::mask_erode_ms},
 	                                {_("Mask blur"),    &global_metric::mask_blur_ms},
 	                                {_("Vol acq"),     &global_metric::volume_acquire_ms},
-	                                {_("Vol warp"),    &global_metric::volume_warp_ms},
-	                                {_("Vol exact"),   &global_metric::volume_exact_ms},
-	                                {_("Vol virt"),    &global_metric::volume_virt_ms},
-	                                {_("Vol alpha"),   &global_metric::volume_alpha_ms},
+	                                {_("Vol base"),    &global_metric::volume_base_ms},
+	                                {_("Vol geom"),    &global_metric::volume_geom_ms},
 	                                {_("Vol dilate"),  &global_metric::volume_dilate_ms},
-	                                {_("Vol raster"),  &global_metric::volume_raster_ms},
-	                                {_("Vol compare"), &global_metric::volume_compare_ms},
+	                                {_("Vol comp"),    &global_metric::volume_compare_ms},
+	                                {_("Vol add"),     &global_metric::volume_add_ms},
+	                                {_("Vol verdict"), &global_metric::volume_verdict_ms},
+	                                {_("Vol apply"),   &global_metric::volume_apply_ms},
 	                                {_("Vol merge"),   &global_metric::volume_merge_ms},
 	                                {_("Vol paired"),  &global_metric::virt_paired},
 	                                {_("Gizmos"),       &global_metric::gizmo_ms}}, "s"),

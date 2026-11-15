@@ -485,8 +485,8 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	                .queryCount = 5,
 	        });
 
-	// Volume GPU brackets (warp/exact/virt/alpha/dilate/raster/
-	// compare/merge boundaries, 10 queries). Dedicated pool so the
+	// Volume GPU brackets (base/geom/dilate/compare/add/verdict/
+	// apply/merge boundaries, 10 queries). Dedicated pool so the
 	// main/mask read discipline (never wait on an unwritten query) is
 	// untouched; volume_ts_valid gates the poll.
 	self->volume_query_pool = vk::raii::QueryPool(
@@ -1187,10 +1187,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	// Mask-pool results (async path): q0 start, q1 after first group,
 	// q2 end, q3/q4 merge bracket. Read only when the last mask submission went async (else
 	// the pool holds older data); not-ready carries like the main pool.
-	// Volume-pool results: raster/virt/compare/merge boundaries from the
-	// last volume group. Same poll discipline (no eWait, carry over),
-	// plus the retiring fence for the recording path: mask fence on
-	// async frames, main fence (waited above) on inline frames.
+	// Volume-pool results: base/geom/dilate/compare/add/verdict/
+	// apply/merge boundaries (record_base, depth group, merge finish).
+	// Same poll discipline (no eWait, carry over), plus the retiring
+	// fence for the recording path: mask fence on async frames, main
+	// fence (waited above) on inline frames.
 	if (volume_ts_valid)
 	{
 		bool volume_pool_ready = not volume_ts_async or
@@ -1207,14 +1208,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if (vres == vk::Result::eSuccess)
 			{
 				float period = application::get_physical_device_properties().limits.timestampPeriod / 1e9f;
-				last_volume_gpu.warp = (vtimestamps[1] - vtimestamps[0]) * period;
-				last_volume_gpu.exact = (vtimestamps[3] - vtimestamps[1]) * period;
-				last_volume_gpu.virt = (vtimestamps[4] - vtimestamps[3]) * period;
-				last_volume_gpu.alpha = (vtimestamps[5] - vtimestamps[4]) * period;
-				last_volume_gpu.dilate = (vtimestamps[6] - vtimestamps[5]) * period;
-				last_volume_gpu.raster = (vtimestamps[7] - vtimestamps[6]) * period;
-				last_volume_gpu.compare = (vtimestamps[8] - vtimestamps[7]) * period;
-				last_volume_gpu.merge = (vtimestamps[9] - vtimestamps[8]) * period;
+				last_volume_gpu.base = (vtimestamps[1] - vtimestamps[0]) * period;
+				last_volume_gpu.geom = (vtimestamps[2] - vtimestamps[1]) * period;
+				last_volume_gpu.dilate = (vtimestamps[3] - vtimestamps[2]) * period;
+				last_volume_gpu.compare = (vtimestamps[4] - vtimestamps[3]) * period;
+				last_volume_gpu.add = (vtimestamps[5] - vtimestamps[4]) * period;
+				// Write order on the shared pool is 0,1 (base), 2..5
+				// (geom/dilate/compare/add), then 8 (merge), then 6,7,9:
+				// merge spans the contributor MAX, verdict spans the
+				// global compare only.
+				last_volume_gpu.verdict = (vtimestamps[6] - vtimestamps[8]) * period;
+				last_volume_gpu.apply = (vtimestamps[7] - vtimestamps[6]) * period;
+				last_volume_gpu.merge = (vtimestamps[8] - vtimestamps[5]) * period;
 			}
 		}
 	}
@@ -1826,8 +1831,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// above, so it is not reset here; gui_ms/submit_ms are
 		// measured after this point and reset for freshness.
 		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
-		volume_acquire_ms = volume_warp_ms = volume_exact_ms = volume_alpha_ms = volume_dilate_ms = 0;
-		volume_raster_ms = volume_virt_ms = volume_compare_ms = volume_merge_ms = 0;
+		volume_acquire_ms = volume_base_ms = volume_geom_ms = volume_dilate_ms = 0;
+		volume_compare_ms = volume_add_ms = volume_verdict_ms = volume_apply_ms = volume_merge_ms = 0;
 		volume_frame_virt_paired = false;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
@@ -1846,7 +1851,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// breaking.
 		// The Passthrough tab can disable the warp (direct tap);
 		// the defaults below are then what the shader receives, unchanged.
-		// Timed into the warp CPU (the warp's CPU cost lives there).
+		// Timed into the base CPU (the frame-level depth bucket: the warp
+		// feeds the sensor stage of the common layer).
 		std::array<glm::vec4, 6> volume_remap{};
 		for (int e = 0; e < 2; ++e)
 		{
@@ -1854,15 +1860,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			volume_remap[3 * e + 1] = glm::vec4(0, -1, 0, 0);
 			volume_remap[3 * e + 2] = glm::vec4(0, 1, 1, 0);
 			}
-		// Sensor-frame view-projection for the native clean (sensor
-		// extent/pose raster of the known-geometry occluder + volume):
-		// the trimmed depth pose below is the content-age-corrected
-		// capture pose; the warp H further below reuses it. Identity
-		// when no depth frame is wanted this frame.
-		std::array<glm::mat4, view_count> sensor_viewproj = {glm::mat4(1), glm::mat4(1)};
-		bool have_sensor_viewproj = false;
-		// Trimmed capture pose shared by the sensor raster (viewproj
-		// above) and the warp H below: single trim, one timebase.
+		// Sensor-frame view for the warp below is the runtime depth
+		// image itself (sampled by UV); the trimmed capture pose is
+		// shared by the warp H below: single trim, one timebase.
 		std::array<XrPosef, 2> depth_pose_trimmed{shared_depth.pose[0], shared_depth.pose[1]};
 		if (have_depth_frame and need_volume_depth and mask_frame)
 		{
@@ -1903,9 +1903,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				}
 			}
-			for (uint32_t view = 0; view < view_count; ++view)
-				sensor_viewproj[view] = scene::projection_matrix(shared_depth.fov[view]) * scene::view_matrix(depth_pose_trimmed[view]);
-			have_sensor_viewproj = true;
 		}
 		if (have_depth_frame and need_volume_depth and mask_frame and volume_remap_enabled)
 		{
@@ -1919,8 +1916,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// depth row 1). Identity reproduces today's (u, 1-v) tap.
 			const glm::mat3 Suv(glm::vec3(0.5f, 0, 0), glm::vec3(0, -0.5f, 0), glm::vec3(0.5f, 0.5f, 1));
 			bool h_ok = true;
-			// Same trimmed capture pose as the sensor raster above
-			// (single trim, one timebase for H and the native clean).
+			// Trimmed capture pose from above (single trim, one
+			// timebase for H and the sensor stage).
 			const std::array<XrPosef, 2> & depth_pose = depth_pose_trimmed;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
@@ -1962,7 +1959,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				             (double)volume_remap[2].x, (double)volume_remap[2].y, (double)volume_remap[2].z,
 				             (double)volume_time_bias_ms);
 				}
-			volume_warp_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - remap_t0).count();
+			volume_base_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - remap_t0).count();
 		}
 
 		// View-only transforms for the mask record below. Reference eye
@@ -2232,6 +2229,79 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				int hh = std::max(64, mh / 2);
 				int qw = std::max(64, mw / 4);
 				int qh = std::max(64, mh / 4);
+				// Common depth layer, stage-0 (v3): every placed
+				// 3d-passthrough window soup with server_mvp MVPs, MINed
+				// into the merge-owned half-res intermediate FIRST (before
+				// hidden/groups) so the depth-group sensor compare and
+				// the merge-finish final compare share one geometry
+				// source. Reversed/hidden/depth excluded here (reversed
+				// cuts stay per-group; hidden + the volume bbox join at
+				// the sensor stage via vol_in). W is half of full: the
+				// tier-1 submit size, matching the workE computation.
+				// Runs unconditionally on mask frames (cleared to FAR when
+				// empty) so the borrowed intermediate below is always
+				// valid and the pool stamps stay uniform.
+				if (not merge_renderer)
+					merge_renderer = std::make_unique<union_merge_renderer>(device);
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					auto lh = layer_hashes.find(oid);
+					if (lh == layer_hashes.end() or lh->second != ost.soup_hash)
+					{
+						merge_renderer->set_layer_mesh(oid, ost.soup);
+						layer_hashes[oid] = ost.soup_hash;
+					}
+				}
+				for (auto hit = layer_hashes.begin(); hit != layer_hashes.end();)
+				{
+					auto oit = passthrough_objects.find(hit->first);
+					bool member = oit != passthrough_objects.end() and
+					        oit->second.def.type == "3d-passthrough" and
+					        oit->second.soup_ready and oit->second.fused.placed and
+					        hit->second == oit->second.soup_hash;
+					if (not member)
+					{
+						merge_renderer->remove_layer_mesh(hit->first);
+						hit = layer_hashes.erase(hit);
+					}
+					else
+						++hit;
+				}
+				std::vector<feather_mask_renderer::instance_draw> layer_win_draws;
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					const auto & fu = ost.fused;
+					glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+					            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+					glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+					glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+					                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+					std::array<glm::mat4, 2> mvp;
+					for (uint32_t view = 0; view < view_count; ++view)
+						mvp[view] = server_mvp[view] * model;
+					layer_win_draws.push_back({oid, mvp, 1, false});
+				}
+				// Merge-side CPU for record_base/record/record_finish below
+				// (applied to the volume buckets after each call).
+				union_merge_renderer::cpu_stats mergestats{};
+				bool layer_valid = false;
+				rec_cmd.resetQueryPool(*volume_query_pool, 0, 10);
+				try
+				{
+					vk::Extent2D workE{(uint32_t)hw, (uint32_t)hh};
+					merge_renderer->record_base(rec_cmd, workE, layer_win_draws, *volume_query_pool, &mergestats);
+					layer_valid = merge_renderer->layer_view() != vk::ImageView{} and
+					        merge_renderer->layer_extent().width > 0 and merge_renderer->layer_extent().height > 0;
+				}
+				catch (std::exception & e)
+				{
+					spdlog::error("Common depth layer record failed, depth chain off this frame: {}", e.what());
+				}
+				volume_base_ms += mergestats.base_ms;
 				// Marker window cutouts: raw pose of every live vote,
 				// expanded by the debug window. Fully manual path (no blur):
 				// the punch below is hard-edged by construction. Fills
@@ -2403,13 +2473,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						spdlog::info("Feather mask groups order: {}", order);
 					}
 				}
-				// Global depth geometry keys (built once per frame, before
-				// the stale-erase below): window + hidden + reversed ids
-				// the soft group must retain regardless of feather (its
-				// exactWin/revD (display) + sensorOcc/sensorVol (sensor)
-				// rasters are global), plus the
-				// skinned hand keys. Sorted vector (not a per-frame
-				// std::set): binary_search below, capacity reused.
+				// Depth geometry keys (built once per frame, before
+				// the stale-erase below): hidden + depth-volume ids the
+				// soft group must retain (its hidden/bbox sensor-stage
+				// rasters), plus the skinned hand keys. Sorted vector
+				// (not a per-frame std::set): binary_search below,
+				// capacity reused.
 				static thread_local std::vector<std::string> depth_retained;
 				depth_retained.clear();
 				depth_retained.push_back(soft_hand_left_key);
@@ -2418,8 +2487,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					if (not ost.soup_ready or not ost.fused.placed)
 						continue;
-					if (ost.def.type == "3d-passthrough" or ost.def.type == "3d-passthrough-hidden" or
-					    ost.def.type == "3d-passthrough-reversed")
+					if (ost.def.type == "3d-passthrough-hidden" or ost.def.type == "3d-depth-passthrough")
 						depth_retained.push_back(oid);
 				}
 				std::sort(depth_retained.begin(), depth_retained.end());
@@ -2445,9 +2513,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// Reversed objects live in every group (no feather of
 						// their own): evict on removal/unready only, never on
 						// feather mismatch. Positives must match feather.
-					// Soft-occlusion retention: hidden objects live in the soft
-					// group (any feather) while placed, and the skinned hand
-					// meshes persist while a single depth volume is placed.
+					// Depth-group retention: hidden + depth-volume meshes
+					// live in the soft group while placed, and the skinned
+					// hand meshes persist while a single depth volume is
+					// placed.
 						bool soft_here = not soft_multi_volume_error and not soft_tier_error and soft_feather >= 0.f and g.feather_px == soft_feather;
 						bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
 						        oit->second.fused.placed and
@@ -2456,10 +2525,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						                (oit->second.def.type == "3d-passthrough" or oit->second.def.type == "3d-depth-passthrough")) or
 						         (soft_here and oit->second.def.type == "3d-passthrough-hidden"));
 						// Soft-group retention is feather-independent (the
-						// exactWin/revD + sensorOcc/sensorVol rasters are global): keep
-						// depth meshes while soft, even on sensor-miss
-						// frames (no depth runs then, but evicting would
-						// force a waitIdle re-upload on return).
+						// hidden/bbox sensor-stage rasters): keep depth
+						// meshes while soft, even on sensor-miss frames
+						// (no depth runs then, but evicting would force a
+						// waitIdle re-upload on return).
 						if (not member and soft_here and
 						    std::binary_search(depth_retained.begin(), depth_retained.end(), hit->first))
 							member = true;
@@ -2486,6 +2555,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					last_box_log = instance.now();
 					log_boxes = true;
 				}
+				// Set when any group sees the depth volume this frame
+				// (feeds the merge-finish virt forensic + paired flag).
+				bool soft_volume_seen = false;
 				for (auto f: live_groups)
 				{
 					auto & g = mask_groups[f];
@@ -2571,49 +2643,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							return;
 						out.push_back({oid, mvp, op, reversed});
 					};
-					// Sensor-space draw (native clean, sensor extent/pose):
-					// same model matrix, sensor viewproj MVPs, no frustum
-					// cull (sensor frame differs from the display-frame
-					// cull above; sensor res is tiny so overdraw is cheap).
-					auto append_sensor_draw = [&](const std::string & oid, const passthrough_object_state & ost,
-					                                std::vector<feather_mask_renderer::instance_draw> & out) {
-						const auto & fu = ost.fused;
-						if (not fu.placed or not have_sensor_viewproj)
-							return;
-						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
-						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
-						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
-						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
-						std::array<glm::mat4, 2> mvp;
-						for (uint32_t view = 0; view < view_count; ++view)
-							mvp[view] = sensor_viewproj[view] * model;
-						out.push_back({oid, mvp, 1, false});
-					};
 					for (auto & [oid, ost]: passthrough_objects)
 					{
 						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed or ost.def.feather_px != f)
 							continue;
 						append_draw(oid, ost, false, draws);
 					}
-					// Depth volumes for this feather's group: same
-					// eye-space MVPs, no reversed polarity (the renderer
-					// MAXes them over the cuts instead of cutting).
-					std::vector<feather_mask_renderer::instance_draw> volume_draws;
-					std::vector<feather_mask_renderer::instance_draw> sensor_vol_draws;
-					bool any_volume = false;
-					if (have_volume_sensor)
-					{
-						for (auto & [oid, ost]: passthrough_objects)
-						{
-							if (ost.def.type != "3d-depth-passthrough" or not ost.soup_ready or not ost.fused.placed or
-							    ost.def.feather_px != f)
-								continue;
-							append_draw(oid, ost, false, volume_draws);
-							append_sensor_draw(oid, ost, sensor_vol_draws);
-						}
-						any_volume = not volume_draws.empty();
-					}
+					// Depth-group candidacy (sensor-independent): the single
+					// placed volume's feather group, latches permitting.
+					// Sensor-dead + volume-placed still records geometry
+					// below but stays inactive (no flat pin, fail-closed).
+					bool soft_group = not soft_multi_volume_error and not soft_tier_error and
+					                  soft_feather >= 0.f and f == soft_feather;
 					// Reversed objects (negatives) cut every group:
 					// appended after all positives (the renderer
 					// resolves positives first, then depth-tested MIN cuts).
@@ -2627,9 +2668,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// Reversed-only draws rasterize to a provable no-op (MIN
 					// against clear 0 writes 0), so a group with no positive
 					// draws is skipped exactly like an empty one.
-					bool soft_group = have_volume_sensor and not soft_multi_volume_error and not soft_tier_error and
-					                  soft_feather >= 0.f and f == soft_feather;
-					// Soft-occlusion hands: real skinned hand meshes as
+					// Depth hands: real skinned hand meshes as sensor-stage
 					// sensor-chain depth (MINed over the warped sensor in
 					// the warp pass), sharing the group feather. Always
 					// rasterized: MIN is idempotent, so sensor hands and
@@ -2683,87 +2722,69 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						push_hand(right_hand, soft_hand_right_key);
 					}
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					// Tolerant virtual-depth pairing (soft compare input):
-					// null when the color frame had no depth warp.
-					bool virt_paired = false;
-					vk::ImageView virt_view = nullptr;
-					vk::Sampler virt_sampler = nullptr;
-					if (auto & dh = current_blit_handles[depth_stream_index])
-					{
-						// Decoder teardown races the hot path: a non-null
-						// handle with a torn-down decoder must not crash.
-						if (auto & dec = decoders[depth_stream_index].decoder)
-						{
-							virt_view = dh->image_view;
-							virt_sampler = dec->sampler();
-							virt_paired = true;
-						}
-					}
-					// Soft-occlusion global known geometry (soft group only):
-					// every placed window (any feather) feeds exactWin
-					// (reveal source); windows + hidden feed the
-					// sensor-frame occluder (never a reveal source);
-					// reversed feed revD (cut). Uploaded into this group renderer on hash
+					// Depth sensor-stage geometry (soft group only): every
+					// placed hidden soup (NO proximity gate — the sensor
+					// stage decides) plus the volume bbox. The bbox carries
+					// MVP pairs mapping the renderer's internal closed unit
+					// box ([-1,1]^3) onto the volume bounds (far-wall
+					// resolve); no soup upload needed for it.
+					// Hidden meshes upload into this group renderer on hash
 					// change (retained by the stale-erase above while soft).
-					std::vector<feather_mask_renderer::instance_draw> win_draws;
-					std::vector<feather_mask_renderer::instance_draw> sensor_occ_draws;
-					std::vector<feather_mask_renderer::instance_draw> rev_draws;
-					if (soft_group and have_volume_sensor)
+					std::vector<feather_mask_renderer::instance_draw> hidden_draws;
+					std::vector<std::array<glm::mat4, 2>> bbox_draws;
+					if (soft_group)
 					{
-						// Tier-1-only seed (M7): the soft chain feathers at the
-						// soft width (tier-1 submit size), so other-tier windows
-						// would double-represent across seeds — they live in
-						// their own groups and stay out of this one. Hidden
-						// (featherless) and reversed (every-group cuts) are
-						// unaffected.
 						for (auto & [oid, ost]: passthrough_objects)
 						{
-							bool is_win = ost.def.type == "3d-passthrough";
 							bool is_hidden = ost.def.type == "3d-passthrough-hidden";
-							bool is_rev = ost.def.type == "3d-passthrough-reversed";
-							if (not is_win and not is_hidden and not is_rev)
+							bool is_vol = ost.def.type == "3d-depth-passthrough" and ost.def.feather_px == f;
+							if (not is_hidden and not is_vol)
 								continue;
 							if (not ost.soup_ready or not ost.fused.placed)
 								continue;
-							if (is_win and feather_mask_renderer::tier_for_feather(ost.def.feather_px) != 1)
+							if (is_hidden)
+							{
+								auto mhit = g.mesh_hashes.find(oid);
+								if (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash)
+								{
+									g.renderer->set_mesh(oid, ost.soup);
+									g.mesh_hashes[oid] = ost.soup_hash;
+								}
+								append_draw(oid, ost, false, hidden_draws);
 								continue;
-							auto mhit = g.mesh_hashes.find(oid);
-							if (mhit == g.mesh_hashes.end() or mhit->second != ost.soup_hash)
-							{
-								g.renderer->set_mesh(oid, ost.soup);
-								g.mesh_hashes[oid] = ost.soup_hash;
 							}
-							if (is_rev)
-								append_draw(oid, ost, true, rev_draws);
-							else
-							{
-								if (is_win)
-									append_draw(oid, ost, false, win_draws);
-								// Sensor-frame occluder (windows + hidden):
-								// reversed cuts stay alpha-side only.
-								append_sensor_draw(oid, ost, sensor_occ_draws);
-							}
+							// Bbox MVP: unit box -> model AABB -> world ->
+							// clip. Bounds come from the claim-time soup
+							// upload above; unknown/degenerate bounds skip
+							// the box (fail-closed: bbox empty kills the
+							// geometry gate below).
+							auto bounds = g.renderer->mesh_bounds(oid);
+							if (not bounds)
+								continue;
+							glm::vec3 center = (bounds->first + bounds->second) * 0.5f;
+							glm::vec3 half = (bounds->second - bounds->first) * 0.5f;
+							if (half.x <= 0 or half.y <= 0 or half.z <= 0)
+								continue;
+							const auto & fu = ost.fused;
+							glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+							            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+							glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+							glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+							                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+							glm::mat4 box = model * glm::translate(glm::mat4(1), center) *
+							                glm::scale(glm::mat4(1), half);
+							std::array<glm::mat4, 2> bmvp;
+							for (uint32_t view = 0; view < view_count; ++view)
+								bmvp[view] = server_mvp[view] * box;
+							bbox_draws.push_back(bmvp);
 						}
 					}
-					// Soft-unpaired forensic: volume placed but the color frame
-					// carried no virtual depth, so the display-space compare
-					// falls back to the cleaned sensor alone (no virt term).
-			// Throttled (shared 5s depth-miss window; see common_frame):
-			// do not spam at refresh rate.
-					if (any_volume and not virt_paired)
-					{
-						bool expected = current_blit_handles[0] and current_blit_handles[0]->view_info.depth_expected;
-						if (expected)
-						{
-							XrTime now = instance.now();
-							if (now - depth_miss_last_log > 5'000'000'000LL)
-							{
-								depth_miss_last_log = now;
-								uint64_t cidx = current_blit_handles[0] ? current_blit_handles[0]->feedback.frame_index : UINT64_MAX;
-								spdlog::info("Soft unpaired (cleaned-sensor only, no virt): color frame {} feather {}px", cidx, f);
-							}
-						}
-					}
+					bool any_volume = soft_group and not bbox_draws.empty();
+					if (any_volume)
+						soft_volume_seen = true;
+					// Unpaired forensic moved to the merge-finish call
+					// (virt now pairs there): volume seen but no virtual
+					// depth paired.
 					if ((draws.empty() or not any_positive) and not any_volume)
 					{
 						g.active = false;
@@ -2812,43 +2833,35 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					feather_mask_renderer::mask_stage_cpu mstats{};
 					try
 					{
+						// Geometry gate: the volume's bbox is present, the
+						// group is tier-1 and the borrowed layer is live.
+						// Sensor gate adds the live sensor view + extent;
+						// only the sensor path reveals (g.active) and
+						// validates the pool.
+						bool use_vol_in = any_volume and
+						    feather_mask_renderer::tier_for_feather(f) == 1 and layer_valid;
+						bool sensor_ok = use_vol_in and have_volume_sensor and env_depth and
+						    env_depth->depth_width() > 0 and env_depth->depth_height() > 0;
 						feather_mask_renderer::volume_input vol_in;
-						bool use_vol_in = any_volume;
 						if (use_vol_in)
 						{
-							vol_in.draws = volume_draws;
-							vol_in.win_draws = win_draws;
-							vol_in.sensor_occ_draws = sensor_occ_draws;
-							vol_in.sensor_vol_draws = sensor_vol_draws;
+							vol_in.hidden_draws = hidden_draws;
+							vol_in.bbox_draws = bbox_draws;
 							vol_in.hand_draws = hand_draws;
-							vol_in.rev_draws = rev_draws;
 							vol_in.warp_cols = volume_remap;
-							// Null without a sensor view: use_volume stays
-							// false there, so the view is never sampled.
+							// Null without a sensor view: the sensor stage
+							// stays off there (geometry still records).
 							vol_in.sensor_view = volume_sensor;
 							if (env_depth)
 								vol_in.sensor_extent = {env_depth->depth_width(), env_depth->depth_height()};
 							vol_in.near_z = volume_near;
 							vol_in.far_z = volume_far;
-							// Virtual depth: tolerant pairing resolved above,
-							// null when the color frame had no depth warp. Near/far
-							// ride the sensor frustum so all D canvases agree.
-							if (virt_paired)
-							{
-								vol_in.virt_view = virt_view;
-								vol_in.virt_sampler = virt_sampler;
-								vol_in.virt_valid = true;
-								if (video_stream_description and video_stream_description->depth_width >= 2)
-								{
-									vol_in.virt_eye_extent = {
-									        uint32_t(video_stream_description->depth_width / 2),
-									        uint32_t(video_stream_description->depth_height),
-									};
-								}
-							}
 							vol_in.bias = soft_bias;
 							vol_in.dilate_texels = (float)std::clamp(soft_dilate_texels, 0, 8);
-							if (any_volume and *volume_query_pool)
+							vol_in.layer_image = merge_renderer->layer_image();
+							vol_in.layer_view = merge_renderer->layer_view();
+							vol_in.layer_extent = merge_renderer->layer_extent();
+							if (*volume_query_pool)
 								vol_in.timestamp_pool = *volume_query_pool;
 						}
 						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
@@ -2856,14 +2869,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						                   use_vol_in ? &vol_in : nullptr);
 						// A throw skips the timestamp writes below, so only
 						// a recorded group may validate the pool. Mirror the
-						// renderer's use_volume gate (draws + sensor view +
-						// sensor extent + tier-1): polling on a group the
-						// chain skipped would read another group's stamps.
-						bool volume_ts_ok = use_vol_in and not sensor_vol_draws.empty() and
-						    volume_sensor != vk::ImageView{} and env_depth and
-						    env_depth->depth_width() > 0 and env_depth->depth_height() > 0 and
-						    feather_mask_renderer::tier_for_feather(f) == 1;
-						if (any_volume and volume_ts_ok)
+						// renderer's sensor path (geometry + sensor view +
+						// sensor extent): polling on a group the chain
+						// skipped would read another group's stamps.
+						// Depth-group activity is the sensor reveal: a
+						// sensor-dead volume records geometry but stays
+						// inactive (no flat pin, fail-closed) — unless the
+						// group also carries exact windows, which reveal
+						// without the sensor (as before).
+						if (use_vol_in and draws.empty())
+							g.active = sensor_ok;
+						if (use_vol_in and sensor_ok)
 							volume_ts_valid = true;
 					}
 					catch (std::exception & e)
@@ -2878,16 +2894,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
 					mask_erode_ms += mstats.erode_ms;
 					mask_blur_ms += mstats.blur_ms;
-					volume_warp_ms += mstats.warp_ms;
-					volume_exact_ms += mstats.exact_ms;
-					volume_virt_ms += mstats.volume_virt_ms;
-					volume_alpha_ms += mstats.alpha_ms;
+					// Header fields warp/alpha have no own buckets: warp
+					// (sensor warp + hands section CPU) folds into the
+					// base foundation bucket, alpha (rev + alpha build
+					// section CPU) into the apply bucket.
+					volume_base_ms += mstats.warp_ms;
+					volume_geom_ms += mstats.geom_ms;
 					volume_dilate_ms += mstats.dilate_ms;
-					volume_raster_ms += mstats.volume_raster_ms;
-					volume_compare_ms += mstats.volume_compare_ms;
-					volume_merge_ms += mstats.volume_merge_ms;
-					if (virt_paired and any_volume)
-						volume_frame_virt_paired = true;
+					volume_compare_ms += mstats.compare_ms;
+					volume_add_ms += mstats.add_ms;
+					volume_apply_ms += mstats.alpha_ms;
 					mask_draws += (int)mstats.draws;
 					if (any_volume)
 					{
@@ -2897,15 +2913,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// record did not throw.)
 						volume_last_tier = tier;
 						volume_last_feather = f;
-						volume_last_draws = (int)volume_draws.size();
-						volume_last_box_pct = (float)(mstats.volume_box_frac * 100.0);
+						volume_last_draws = (int)bbox_draws.size();
 						volume_last_seed_w = (uint32_t)gw;
 						volume_last_seed_h = (uint32_t)gh;
 						// Depth-vs-eye pose divergence at record time: the
 						// time-difference the future delay compensation
 						// must absorb (eye 0; both eyes share the warp).
 						// Measured against the sync (server) eye the raster
-						// actually used.
+						// actually used. Sensor-dead frames hold no depth
+						// pose: skip (zeros would read as a perfect lock).
+						if (have_volume_sensor)
 						{
 							const auto & dp = shared_depth.pose[0];
 							const auto & mp = sync_pose[0];
@@ -3008,14 +3025,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
 						mask_erode_ms += mstats.erode_ms;
 						mask_blur_ms += mstats.blur_ms;
-						volume_warp_ms += mstats.warp_ms;
-						volume_exact_ms += mstats.exact_ms;
-						volume_virt_ms += mstats.volume_virt_ms;
-						volume_alpha_ms += mstats.alpha_ms;
+						volume_geom_ms += mstats.geom_ms;
 						volume_dilate_ms += mstats.dilate_ms;
-						volume_raster_ms += mstats.volume_raster_ms;
-						volume_compare_ms += mstats.volume_compare_ms;
-						volume_merge_ms += mstats.volume_merge_ms;
+						volume_compare_ms += mstats.compare_ms;
+						volume_add_ms += mstats.add_ms;
+						volume_base_ms += mstats.warp_ms;
+						volume_apply_ms += mstats.alpha_ms;
 						mask_draws += (int)mstats.draws;
 					}
 				}
@@ -3536,6 +3551,44 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 							if (merge_ok and not merge_inputs.empty())
 							{
+								// Tolerant virtual-depth pairing (final
+								// compare input): null when the color frame
+								// had no depth warp. Near/far ride the volume
+								// frustum so all D canvases agree.
+								union_merge_renderer::virt_input virt{};
+								if (auto & dh = current_blit_handles[depth_stream_index])
+								{
+									// Decoder teardown races the hot path: a
+									// non-null handle with a torn-down decoder
+									// must not crash.
+									if (auto & dec = decoders[depth_stream_index].decoder)
+									{
+										virt.view = dh->image_view;
+										virt.sampler = dec->sampler();
+										virt.valid = true;
+									}
+								}
+								virt.near_z = volume_near;
+								virt.far_z = volume_far;
+								if (soft_volume_seen)
+								{
+									volume_frame_virt_paired = virt.valid;
+									if (not virt.valid)
+									{
+										bool expected = current_blit_handles[0] and
+										        current_blit_handles[0]->view_info.depth_expected;
+										if (expected)
+										{
+											XrTime now = instance.now();
+											if (now - depth_miss_last_log > 5'000'000'000LL)
+											{
+												depth_miss_last_log = now;
+												uint64_t cidx = current_blit_handles[0] ? current_blit_handles[0]->feedback.frame_index : UINT64_MAX;
+												spdlog::info("Depth unpaired (no virt for final compare): color frame {}", cidx);
+											}
+										}
+									}
+								}
 								int merge_idx = -1;
 								try
 								{
@@ -3546,11 +3599,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									if (merge_idx >= 0)
 									{
 										vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
-										if (merge_renderer->record(rec_cmd, (size_t)merge_idx, merge_ext, merge_inputs))
+										// Merge records into the owned merged target;
+										// the finish applies the global verdict into
+										// the acquired submit image.
+										bool merged = merge_renderer->record(rec_cmd, merge_ext, merge_inputs,
+										                                    *volume_query_pool, &mergestats);
+										if (merged)
+											volume_merge_ms += mergestats.merge_ms;
+										bool finished = merged and
+										    merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext,
+										                                virt, *volume_query_pool,
+										                                &mergestats);
+										if (finished)
 										{
 											merge_image = merge_idx;
 											merge_this_frame = true;
 											merge_idx = -1; // owned by the submit phase now
+											volume_verdict_ms += mergestats.verdict_ms;
+											volume_apply_ms += mergestats.apply_ms;
 										}
 										else
 										{
@@ -3582,6 +3648,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 					}
 				}
+				// Dropped merge (hard-out, slot-unsafe, cap, record/finish
+				// false, throw): the finish never stamped slots 6/7/9, so
+				// the pool holds a partial frame — invalidate rather than
+				// poll another group's stamps.
+				if (not merge_this_frame)
+					volume_ts_valid = false;
 				rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qmerge + 1);
 			}
 		};
