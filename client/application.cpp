@@ -1418,6 +1418,12 @@ void application::initialize()
 
 	        XR_META_BODY_TRACKING_FIDELITY_EXTENSION_NAME,
 	        XR_META_BODY_TRACKING_FULL_BODY_EXTENSION_NAME,
+#ifndef XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME
+#define XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME "XR_META_hand_tracking_frequency_hint"
+#endif
+	        // Hand tracking frequency hint (Quest): probed like all opt
+	        // extensions; absent runtimes/headers are unaffected.
+	        XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME,
 	        XR_META_LOCAL_DIMMING_EXTENSION_NAME,
 	        XR_META_BOUNDARY_VISIBILITY_EXTENSION_NAME,
 #ifdef XR_META_PASSTHROUGH_COLOR_LUT_EXTENSION_NAME

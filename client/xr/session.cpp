@@ -70,6 +70,23 @@ xr::session::session(xr::instance & inst, xr::system & sys, vk::raii::Instance &
 
 	if (inst.has_extension(XR_META_BOUNDARY_VISIBILITY_EXTENSION_NAME) and sys.boundary_visibility_properties().supportsBoundaryVisibility)
 		xrRequestBoundaryVisibilityMETA = inst.get_proc<PFN_xrRequestBoundaryVisibilityMETA>("xrRequestBoundaryVisibilityMETA");
+
+	if (inst.has_extension(XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME))
+		xrSetHandTrackingFrequencyHintMETA = inst.get_proc<PFN_xrSetHandTrackingFrequencyHintMETA>("xrSetHandTrackingFrequencyHintMETA");
+}
+
+bool xr::session::set_hand_tracking_frequency_hint(bool high)
+{
+	if (!xrSetHandTrackingFrequencyHintMETA)
+		return false;
+	XrHandTrackingFrequencyHintMETA hint = high ? XR_HAND_TRACKING_FREQUENCY_HINT_HIGH_META : XR_HAND_TRACKING_FREQUENCY_HINT_DEFAULT_META;
+	if (XrResult res = xrSetHandTrackingFrequencyHintMETA(id, hint); res != XR_SUCCESS)
+	{
+		spdlog::warn("xrSetHandTrackingFrequencyHintMETA failed: {}", xr::to_string(res));
+		return false;
+	}
+	spdlog::info("Hand tracking frequency hint {}", high ? "high" : "default");
+	return true;
 }
 
 std::vector<XrReferenceSpaceType> xr::session::get_reference_spaces() const

@@ -502,7 +502,7 @@ private:
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
 	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
 	double volume_raster_ms = 0, volume_virt_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
-	double cut_ms = 0; // VR-cut raster + compare + MIN merge (cut res)
+	double volume_warp_ms = 0, volume_exact_ms = 0, volume_alpha_ms = 0, volume_dilate_ms = 0; // soft chain CPU
 	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
 	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
 	// never read unwritten queries). volume_ts_async selects the fence
@@ -512,7 +512,7 @@ private:
 	bool volume_ts_async = false;
 	struct volume_gpu_spans
 	{
-		float raster = 0, virt = 0, compare = 0, merge = 0;
+		float warp = 0, exact = 0, virt = 0, alpha = 0, dilate = 0, raster = 0, compare = 0, merge = 0;
 	};
 	volume_gpu_spans last_volume_gpu;
 	// Volume heartbeat snapshot (last volume group) + 5s window sums for
@@ -526,6 +526,7 @@ private:
 	float volume_sensor_near = 0, volume_sensor_far = 0;
 	uint64_t volume_win_frames = 0, volume_win_sensor = 0;
 	double volume_win_acquire_ms = 0, volume_win_raster_ms = 0;
+	double volume_win_warp_ms = 0, volume_win_exact_ms = 0, volume_win_alpha_ms = 0, volume_win_dilate_ms = 0;
 	double volume_win_virt_ms = 0, volume_win_virt_gpu = 0;
 	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
 	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
@@ -535,20 +536,44 @@ private:
 	// sustained outages don't spam at 90Hz).
 	XrTime depth_miss_last_log = 0;
 	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
+	double volume_win_warp_gpu = 0, volume_win_exact_gpu = 0, volume_win_alpha_gpu = 0, volume_win_dilate_gpu = 0;
 	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
 	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
-	// Soft-occlusion replacement (single 3d-depth-passthrough only):
-	// binary sensor<merged with distance-scaled bias, half-res, one
-	// shared blur via the feather group. >1 depth volume disables soft
-	// (error, exact-only fallback) so no merge semantics are needed.
-	float soft_bias = 0.06f; // virtualLinear -= virtualLinear*bias
+	// Soft depth chain (single tier-1 3d-depth-passthrough only):
+	// warped-sensor + hands MIN, global window/occluder raster, alpha
+	// field (windows vs VR + reversed), dilated occluder, eye-space
+	// binary compare with distance-scaled bias (occluder only), verdict
+	// MAX into the tier seed ahead of the shared blur. >1 depth volume
+	// disables soft (error, exact-only fallback); non-tier-1 feather
+	// does the same, so no merge semantics are ever needed.
+	float soft_bias = 0.06f; // occLinear -= occLinear*bias (known geometry only)
 	bool soft_multi_volume_error = false; // latched, logged once
-	bool soft_hand_removal_on = false; // removal active (depth hands fallback otherwise)
+	bool soft_tier_error = false; // latched, logged once (depth feather not tier-1)
 	bool hand_removal_probed = false; // supports_hand_removal cached (system props query once)
 	bool hand_removal_supported = false;
-	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
+	bool volume_remap_enabled = true; // sensor warp rotation (Passthrough tab); off = direct tap
 	bool volume_remap_logged = false; // one-shot H log for convention validation
+	// Depth time-bias trim (Passthrough tab): shifts the assumed sensor
+	// content age to hunt a constant sensor lag (+ = content older =
+	// larger correction, the trailing direction). 0 = unshifted. Log
+	// debounced per integer ms.
+	float volume_time_bias_ms = 0.f;
+	int volume_bias_logged_ms = 0;
+	// Eye velocity history for the time-bias trim: finite difference
+	// of consecutive predicted mask poses (world frame). Unconditional
+	// per frame so history exists when depth needs it.
+	bool volume_have_prev_mask = false;
+	XrTime volume_prev_mask_time = 0;
+	std::array<XrPosef, view_count> volume_prev_mask_pose{};
+	std::array<glm::vec3, view_count> volume_eye_lin_vel{};
+	std::array<glm::vec3, view_count> volume_eye_ang_vel{};
+	// Hand tracking frequency hint (Passthrough tab): high = responsive
+	// at higher jitter cost, low = default power-efficient tracking.
+	// Advisory only; honored when XR_META_hand_tracking_frequency_hint
+	// exists, otherwise a no-op.
+	bool hand_freq_high = true;
+	bool hand_freq_applied = false; // applied once trackers exist
 	// Sensor-mapping forensics (Volume heartbeat): content age from the
 	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
 	// divergence at record time, swapchain index for the effective Hz.
@@ -630,11 +655,18 @@ private:
 		float mask_erode_ms = 0;
 		float mask_blur_ms = 0;
 		float volume_acquire_ms = 0;
+		float volume_warp_ms = 0;
+		float volume_exact_ms = 0;
+		float volume_alpha_ms = 0;
+		float volume_dilate_ms = 0;
 		float volume_raster_ms = 0;
 		float volume_virt_ms = 0;
 		float volume_compare_ms = 0;
 		float volume_merge_ms = 0;
-		float cut_ms = 0;
+		float volume_warp_gpu_ms = 0;
+		float volume_exact_gpu_ms = 0;
+		float volume_alpha_gpu_ms = 0;
+		float volume_dilate_gpu_ms = 0;
 		float volume_raster_gpu_ms = 0;
 		float volume_virt_gpu_ms = 0;
 		float volume_compare_gpu_ms = 0;

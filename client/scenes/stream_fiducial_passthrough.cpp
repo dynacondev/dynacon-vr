@@ -1193,15 +1193,41 @@ void scenes::stream::gui_passthrough()
 	ImGui::EndDisabled();
 	if (not depth_status.empty())
 		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
-	// Depth-volume rotation reprojection (remap through the capture <->
+	// Depth-volume rotation warp (remap through the capture <->
 	// display relative rotation). Off = direct tap: the flip default
 	// above is what the shader receives, unchanged.
-	if (ImGui::Checkbox(_S("Rotation reprojection"), &volume_remap_enabled))
-		spdlog::info("Depth rotation reprojection {}", volume_remap_enabled ? "on" : "off");
-	// Soft-occlusion depth bias: virtualLinear -= virtualLinear*bias.
+	if (ImGui::Checkbox(_S("Rotation warp"), &volume_remap_enabled))
+		spdlog::info("Depth rotation warp {}", volume_remap_enabled ? "on" : "off");
+	// Depth time-bias trim: shifts the assumed sensor content age to
+	// hunt a constant sensor lag (+ = content older = larger
+	// correction, the trailing direction). 0 = unshifted. Log
+	// debounced per integer ms.
+	ImGui::BeginDisabled(not volume_remap_enabled);
+	if (ImGui::SliderFloat(_S("Depth time bias"), &volume_time_bias_ms, -50, 50, "%.0fms"))
+	{
+		int bias_ms = (int)std::round(volume_time_bias_ms);
+		if (bias_ms != volume_bias_logged_ms)
+		{
+			volume_bias_logged_ms = bias_ms;
+			spdlog::info("Depth time bias {}ms", bias_ms);
+		}
+	}
+	ImGui::EndDisabled();
+	// Soft-occlusion known-geometry margin: occLinear -= occLinear*bias.
 	// Distance-scaled (sensor error grows with distance); start 0.06.
+	// Volume-far and VR exact-cut (no margin).
 	if (ImGui::SliderFloat(_S("Soft occlusion bias"), &soft_bias, 0, 0.25f, "%.3f"))
 		soft_bias = std::clamp(soft_bias, 0.f, 0.25f);
+	// Hand tracking frequency hint (session-wide, advisory): high is
+	// more responsive at higher jitter cost. Needs
+	// XR_META_hand_tracking_frequency_hint; otherwise a no-op.
+	bool freq_supported = session.hand_tracking_frequency_hint_supported();
+	ImGui::BeginDisabled(not freq_supported);
+	if (ImGui::Checkbox(_S("High-frequency hand tracking"), &hand_freq_high))
+		session.set_hand_tracking_frequency_hint(hand_freq_high);
+	ImGui::EndDisabled();
+	if (not freq_supported)
+		ImGui::Text("%s", _S("Hand frequency hint not supported by this runtime"));
 
 	ImGui::SeparatorText(_S("Passthrough effects demo"));
 	{
