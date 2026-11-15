@@ -23,27 +23,29 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Soft-occlusion binary flatten, eye space: both inputs already live
-// in the depth-stream (sync eye) frame at the working res, so the
-// compare is a same-UV single tap with no reprojection. sensorW carries
-// the warped *cleaned* sensor depth (known geometry + volume far wall
-// already blanked to far in sensor space, off-canvas warp baked to
-// far) with skinned hand depth MINed over it; virt is the server SBS
-// depth (far-cleared when unpaired, i.e. neutral). The known-geometry
-// bias lives in the sensor-space clean pass, not here: VR exact-cut,
-// no margin. Empty volume never reveals via the clean (sensor already
-// far there); empty virt (far clear) never blocks.
+// Sensor reveal vs the min-dilated common layer, display space at W.
+// sensor_tex: warped sensor D (hands MINed over it, D domain);
+// layer_tex: R16F linear meters (MIN of windows + hidden + bbox, then
+// the revealed sensor depths MINed back in by the add pass).
+// keep = sensorPresent && sensLin < layer*(1-bias): distance-scaled
+// bias, layer-only (sensor noise margin lives here now, not in a
+// retired clean pass). Feeds the depth-group seed only — never the
+// global path (that compare is the exact, bias-free merge verdict).
+// The layer FAR clear (65504) reads as far: an absent sensor
+// linearizes to near*1e6, still beyond it for near_z >= ~0.066, but
+// the explicit present gate keeps fail-closed for any frustum.
+// Plain scalar math only (no mat3/ternary on this driver path).
 
 layout(push_constant) uniform Push
 {
-	// x unused (must be 0; the occluder bias lives in the sensor-space
-	// clean), y = near (m), z = far (m, may be inf), w unused.
-	vec4 bias_near_far;
+	// x = near (m), y = far (m, may be inf), z = bias (0..0.25,
+	// layer only), w = pad. Mirrors the retired clean_push shape.
+	vec4 near_far_bias;
 }
 pc;
 
 layout(set = 0, binding = 0) uniform sampler2DArray sensor_tex;
-layout(set = 0, binding = 1) uniform sampler2DArray virt_tex;
+layout(set = 0, binding = 1) uniform sampler2DArray layer_tex;
 
 float linearize_depth(float d_norm, float n, float f)
 {
@@ -60,14 +62,14 @@ void main()
 	float vi = float(gl_ViewIndex);
 	vec3 buv = vec3(uv, vi);
 	float d = texture(sensor_tex, buv).r;
-	float w = texture(virt_tex, buv).r;
+	float l = texture(layer_tex, buv).r;
 
-	float n = pc.bias_near_far.y;
-	float f = pc.bias_near_far.z;
+	float n = pc.near_far_bias.x;
+	float f = pc.near_far_bias.y;
+	float b = pc.near_far_bias.z;
 
 	float sensor_present = 1.0 - step(0.9999, d);
-	float sensor_lin = linearize_depth(d, n, f);
-	float virt_lin = linearize_depth(w, n, f);
-	float reveal = (1.0 - step(virt_lin, sensor_lin)) * sensor_present;
-	out_color = vec4(reveal);
+	float sens_lin = linearize_depth(d, n, f);
+	float keep = (1.0 - step(l * (1.0 - b), sens_lin)) * sensor_present;
+	out_color = vec4(keep);
 }

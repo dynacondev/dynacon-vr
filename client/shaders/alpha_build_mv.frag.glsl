@@ -23,33 +23,27 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Window reveal field from crisp (undilated) depths: full passthrough
-// where a known window stands, VR is not strictly nearer, and no
-// reversed cut wins. The known-geometry occluder is dilated separately
-// in sensor space for the native clean; this display-space field keeps
-// the full edge for VR and reversed cuts. Cut-before-add is structural:
-// the sensor verdict MAXes onto this field afterwards.
-// Binary verdict; the shared group blur feathers the edge.
-// Empty exact (far clear, 1.0) yields 0: nothing to reveal (this differs
-// from the retired vr_cut keep field, whose seed already held
-// silhouettes). No reversed draws rasterizes to far everywhere, so the
-// reversed test is a no-op then.
+// Window reveal field: sensor verdict (binding 0, R8 at W) minus the
+// per-group reversed cut (binding 1, R16F linear meters). Binary verdict;
+// the shared group blur feathers the edge.
+// Cut-before-add is structural: the sensor verdict only ever adds
+// coverage, and the global virt verdict (merge side) gates everything by
+// VR depth afterwards — reversed cuts stay per-group here.
+// The rev cut is presence-based (no nearer-test: the old window-depth
+// term no longer exists in the depth group). Empty rev (far clear)
+// never cuts. Tie-keeps-window is structural: a binary win has no depth
+// race to break.
 
 layout(set = 0, binding = 0) uniform sampler2DArray win_tex;
-layout(set = 0, binding = 1) uniform sampler2DArray virt_tex;
-layout(set = 0, binding = 2) uniform sampler2DArray rev_tex;
+layout(set = 0, binding = 1) uniform sampler2DArray rev_tex;
 
 void main()
 {
 	float vi = float(gl_ViewIndex);
 	vec3 buv = vec3(uv, vi);
 	float w = texture(win_tex, buv).r;
-	float v = texture(virt_tex, buv).r;
 	float r = texture(rev_tex, buv).r;
-	float w_present = 1.0 - step(0.9999, w);
-	float v_present = 1.0 - step(0.9999, v);
-	float r_present = 1.0 - step(0.9999, r);
-	float vr_wins = (1.0 - step(w, v)) * v_present * w_present;
-	float rev_wins = (1.0 - step(w, r)) * r_present * w_present;
-	out_color = vec4(w_present * (1.0 - vr_wins) * (1.0 - rev_wins));
+	float w_on = step(0.5, w);
+	float rev_on = 1.0 - step(65000.0, r);
+	out_color = vec4(w_on * (1.0 - rev_on));
 }
