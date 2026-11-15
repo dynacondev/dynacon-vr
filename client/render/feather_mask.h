@@ -202,8 +202,9 @@ public:
 	// decoded SBS view converts to a sensor-compatible D canvas and
 	// the compare tests sensor < volFar && sensor < virt &&
 	// sensor < (occDilated - bias) in linear meters. Null/invalid
-	// rebinds the dilated occluder (min no-op: strict, no stale
-	// virtual). GPU timestamps cover the soft chain (timestamp_pool,
+	// rebinds an exact-neutral canvas (alpha: exactWin, compare:
+	// dilated occluder — both min no-ops): strict, no stale
+	// virtual. GPU timestamps cover the soft chain (timestamp_pool,
 	// 10 queries).
 	struct volume_input
 	{
@@ -238,8 +239,7 @@ public:
 		vk::Sampler virt_sampler = nullptr;
 		bool virt_valid = false;
 		// Per-eye virtual-depth resolution (SBS width/2 x height), from
-		// the stream description (forensics only; the soft compare runs
-		// at the working res; its size also drives the VR-cut res).
+		// the stream description (forensics only).
 		vk::Extent2D virt_eye_extent{0, 0};
 		// Rotation warp: per-eye homography columns (eye e uses
 		// [3*e .. 3*e+2]) mapping eye UV to sensor UV (old-main
@@ -594,11 +594,13 @@ private:
 	// field, sets 1 where the sensor is inside). Reuses the blur
 	// shaders with spread 0 (the linear sampler is the upscale) under
 	// MAX blending; framebuffers are the seed's own MV target (loadOp
-	// is not part of compatibility).
+	// is not part of compatibility). The R8 variant serves tier-1 and
+	// tiered seeds; the RGBA8 renderpass below serves tier-0 submits
+	// and the debug cutout punch (no MAX pipe needed there: tier-0
+	// never merges).
 	vk::raii::RenderPass volume_max_r8_renderpass{nullptr};
 	vk::raii::Pipeline volume_max_r8_pipeline{nullptr};
 	vk::raii::RenderPass volume_max_rgb8_renderpass{nullptr};
-	vk::raii::Pipeline volume_max_rgb8_pipeline{nullptr};
 	blur_target sensorW; // R16 warped-sensor canvas (working res, 2 layers):
 	// rotation-warped runtime depth (off-canvas baked to far) with
 	// skinned hand depth MINed over it in the same pass. Own MV

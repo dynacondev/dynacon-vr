@@ -1235,8 +1235,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		warp_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), warp_pipeline_info);
 	}
-	// Alpha build: fullscreen _mv window-vs-VR field (2 samplers:
-	// exactWin D + virt D, no push). Renders into target_a.blur_fb_mv
+	// Alpha build: fullscreen _mv window-vs-VR field (3 samplers:
+	// exactWin D + virt D + rev D, no push). Renders into target_a.blur_fb_mv
 	// (the tier-1 seed, R8 MV) under compare_renderpass_mv (same R8 MV
 	// CLEAR shape; loadOp is not part of render-pass compatibility).
 	{
@@ -1672,7 +1672,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 			return vk::raii::Pipeline(device, *pipeline_cache(device), max_pipe_info);
 		};
 		volume_max_r8_pipeline = make_max_pipe(volume_max_r8_renderpass);
-		volume_max_rgb8_pipeline = make_max_pipe(volume_max_rgb8_renderpass);
 	}
 }
 
@@ -3121,9 +3120,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// MAXes onto — never the legacy silhouette seed.
 	bool use_volume = volume && !volume->draws.empty() && volume->sensor_view != vk::ImageView{} &&
 	                     tier_for_feather(feather_px) == 1; // belt-and-braces: upstream only sends tier-1
-	// Single working res (half of full, floored at 64px): the tier-1
-	// submit size, so seed and chain always agree.
-	vk::Extent2D workE{std::max(64u, extent.width / 2), std::max(64u, extent.height / 2)};
+	// Single working res W: level 1 of full (half), floored like the
+	// tier intermediates. Identical to the tier-1 submit size by
+	// construction, so seed and chain always agree.
+	vk::Extent2D workE = level_extent(extent, 1);
 	if (use_volume)
 	        ensure_depth_targets(workE);
 	float box_frac = 1;

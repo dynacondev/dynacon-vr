@@ -167,7 +167,6 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.volume_acquire_ms = (float)(volume_acquire_ms * 1e-3);
 	gm.volume_warp_ms = (float)(volume_warp_ms * 1e-3);
 	gm.volume_exact_ms = (float)(volume_exact_ms * 1e-3);
-	gm.volume_virt_ms = (float)(volume_virt_ms * 1e-3);
 	gm.volume_alpha_ms = (float)(volume_alpha_ms * 1e-3);
 	gm.volume_dilate_ms = (float)(volume_dilate_ms * 1e-3);
 	gm.volume_raster_ms = (float)(volume_raster_ms * 1e-3);
@@ -324,7 +323,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		volume_win_new_content = 0;
 		volume_win_acquire_ms = volume_win_warp_ms = volume_win_exact_ms = 0;
 		volume_win_virt_ms = volume_win_virt_gpu = 0;
-		volume_win_alpha_ms = volume_win_dilate_ms = 0;
+		volume_win_alpha_ms = volume_win_dilate_ms = volume_win_raster_ms = 0;
 		volume_win_virt_paired = volume_win_virt_missing = 0;
 		volume_win_compare_ms = volume_win_merge_ms = 0;
 		volume_win_warp_gpu = volume_win_exact_gpu = volume_win_alpha_gpu = volume_win_dilate_gpu = 0;

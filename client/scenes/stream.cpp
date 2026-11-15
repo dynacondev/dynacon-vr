@@ -2392,7 +2392,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						         (oit->second.def.feather_px == g.feather_px and
 						                (oit->second.def.type == "3d-passthrough" or oit->second.def.type == "3d-depth-passthrough")) or
 						         (soft_here and oit->second.def.type == "3d-passthrough-hidden"));
-						if (not member and soft_here and have_volume_sensor and depth_retained.contains(hit->first))
+						// Soft-group retention is feather-independent (the
+						// exactWin/exactOcc/revD rasters are global): keep
+						// depth meshes while soft, even on sensor-miss
+						// frames (no depth runs then, but evicting would
+						// force a waitIdle re-upload on return).
+						if (not member and soft_here and depth_retained.contains(hit->first))
 							member = true;
 						if (not member)
 						{
