@@ -1348,7 +1348,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		alpha_pipeline_mv = vk::raii::Pipeline(device, *pipeline_cache(device), alpha_pipeline_info);
 	}
-	// Standalone min-dilate H/V (exactOcc -> exactOccDil, radius 2):
+	// Standalone min-dilate H/V (exactOcc -> exactOccDil, adjustable radius):
 	// same erode fragment as the triple, own pipelines (the triple
 	// pipes bake their subpass index) under volume_raster_renderpass_mv
 	// (R16 CLEAR MV; fullscreen coverage makes CLEAR deterministic).
@@ -3844,11 +3844,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.draw(3, 1, 0, 0);
 			cmd.endRenderPass();
 		};
-		// Standalone min-dilate H+V (radius 2 texels at W): exactOcc ->
-		// exactOccDil. Fullscreen (every texel written, so CLEAR is
-		// deterministic); nearest sampling like the erode passes.
+		// Standalone min-dilate H+V (adjustable radius in W texels):
+		// exactOcc -> exactOccDil. Fullscreen (every texel written, so
+		// CLEAR is deterministic); nearest sampling like the erode passes.
 		auto run_dilate = [&]() {
 			section_clock dil_clk(&ms_dilate);
+			float dil_r = std::clamp(volume->dilate_texels, 0.f, 8.f);
 			update_source(*exactOcc.view_array, 9, true);
 			vk::ClearValue far1{};
 			const float far1v[4] = {1.0f, 1.0f, 1.0f, 1.0f};
@@ -3865,7 +3866,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *dilate_h_pipeline);
 			std::array<vk::DescriptorSet, 1> sets_dh{*descriptor_sets[9]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_dh, no_offsets);
-			erode_push dh{{1.f / workE.width, 1.f / workE.height}, {1, 0}, 2.0f, 0};
+			erode_push dh{{1.f / workE.width, 1.f / workE.height}, {1, 0}, dil_r, 0};
 			cmd.pushConstants<erode_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, dh);
 			cmd.draw(3, 1, 0, 0);
 			cmd.endRenderPass();
@@ -3890,7 +3891,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *dilate_v_pipeline);
 			std::array<vk::DescriptorSet, 1> sets_dv{*descriptor_sets[10]};
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, sets_dv, no_offsets);
-			erode_push dv{{1.f / workE.width, 1.f / workE.height}, {0, 1}, 2.0f, 0};
+			erode_push dv{{1.f / workE.width, 1.f / workE.height}, {0, 1}, dil_r, 0};
 			cmd.pushConstants<erode_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, dv);
 			cmd.draw(3, 1, 0, 0);
 			cmd.endRenderPass();

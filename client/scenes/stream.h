@@ -548,6 +548,11 @@ private:
 	// disables soft (error, exact-only fallback); non-tier-1 feather
 	// does the same, so no merge semantics are ever needed.
 	float soft_bias = 0.06f; // occLinear -= occLinear*bias (known geometry only)
+	// Occluder dilate radius in working-res (quarter) texels, ahead of
+	// the eye-space compare: larger blocks more sensor edge bleed,
+	// smaller reveals closer to the silhouette. 0 = off, 8 = tap max.
+	// Passthrough tab slider; default 2 preserves prior behavior.
+	int soft_dilate_texels = 2;
 	bool soft_multi_volume_error = false; // latched, logged once
 	bool soft_tier_error = false; // latched, logged once (depth feather not tier-1)
 	bool hand_removal_probed = false; // supports_hand_removal cached (system props query once)

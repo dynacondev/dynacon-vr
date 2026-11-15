@@ -225,6 +225,13 @@ public:
 		// ahead of the sensor MAX (cut-before-add). May be empty.
 		std::vector<instance_draw> rev_draws;
 		float bias = 0.06f;
+		// Occluder min-dilate radius in working-res texels (exactOcc ->
+		// exactOccDil, H+V box-min): expands the known-geometry
+		// occluder before the eye-space compare, so depth-sensor edge
+		// noise just outside a window/hidden silhouette still reads as
+		// blocked. 0 = off, 8 = shader tap max. Tuned live from the
+		// Passthrough tab.
+		float dilate_texels = 2.f;
 		vk::ImageView sensor_view = nullptr; // runtime D16 2-layer array
 		float near_z = 0.1f; // depth frustum the raster must match
 		float far_z = 10.f;
@@ -540,8 +547,8 @@ private:
 	// cull-nothing via exact_raster_pipeline_mv) ahead of the alpha
 	// build. Always re-rasterized (CLEAR covers the no-draws case).
 	blur_target rev_depth;
-	// Standalone min-dilate H/V (exactOcc -> exactOccDil, radius 2):
-	// same erode fragment as the triple, own pipelines (the triple
+	// Standalone min-dilate H/V (exactOcc -> exactOccDil, adjustable
+	// radius in working-res texels): same erode fragment as the triple, own pipelines (the triple
 	// pipes bake their subpass index) under
 	// volume_raster_renderpass_mv (CLEAR R16 MV, fullscreen coverage).
 	// Own descriptor sets 9/10 (host writes are last-write-wins per
@@ -611,7 +618,7 @@ private:
 	// windows + every placed 3d-passthrough-hidden object. Far (1.0)
 	// clear, MIN blend, cull-nothing. Dilated before the compare.
 	blur_target exactOccDil; // R16 dilated occluder (working res, 2 layers):
-	// standalone min-dilate H+V (radius 2) output, sampled by the
+	// standalone min-dilate H+V (adjustable radius) output, sampled by the
 	// eye-space compare. H renders into blur_fb_mv, V back into
 	// raster_fb_mv, both under volume_raster_renderpass_mv (CLEAR R16
 	// MV; fullscreen coverage makes CLEAR deterministic).

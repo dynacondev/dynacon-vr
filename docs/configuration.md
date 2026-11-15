@@ -438,7 +438,8 @@ Each `passthrough` entry has:
   (rotation homography, capture <-> display, with a time-bias trim;
   bilinear tap) with skinned hand depth MINed over it; global window
   rasters build a crisp window-vs-VR (+reversed) alpha field; the
-  known-geometry occluder (windows + hidden, dilated 2 texels) gates a
+  known-geometry occluder (windows + hidden, min-dilated by the Passthrough
+  tab Occluder dilate slider, working-res texels) gates a
   binary eye-space sensor verdict — `sensor < volFar && sensor <
   virt && sensor < (occluder - occluder*bias)` in linear meters, single
   tap per pixel — MAXed onto the alpha field ahead of the shared

@@ -2753,6 +2753,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								}
 							}
 							vol_in.bias = soft_bias;
+							vol_in.dilate_texels = (float)std::clamp(soft_dilate_texels, 0, 8);
 							if (any_volume and *volume_query_pool)
 								vol_in.timestamp_pool = *volume_query_pool;
 						}
