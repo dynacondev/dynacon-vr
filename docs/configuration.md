@@ -432,9 +432,9 @@ Each `passthrough` entry has:
   the silhouette, depth-tested against the windows covering each
   pixel). `"3d-depth-passthrough"` reveals the flat feed where the
   runtime depth map resolves *inside* the model volume (depth-tested
-  volume, feathered like a normal window). One chain at half of full
-  working size (= the tier-1 submit size, so seed and chain always
-  agree): the runtime sensor warps once per frame into working space
+  volume, feathered like a normal window). One chain at quarter of full
+  working size upscales its verdict into the tier-1 (half-res) seed:
+  the runtime sensor warps once per frame into working space
   (rotation homography, capture <-> display, with a time-bias trim;
   bilinear tap) with skinned hand depth MINed over it; global window
   rasters build a crisp window-vs-VR (+reversed) alpha field; the

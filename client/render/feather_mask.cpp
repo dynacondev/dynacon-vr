@@ -2870,8 +2870,9 @@ void feather_mask_renderer::ensure_depth_targets(vk::Extent2D working)
 	        });
 
 	// Binary verdict canvas (R8): compare renders MV into blur_fb_mv
-	// under the shared CLEAR R8 pass; merge samples the array view
-	// with LINEAR.
+	// under the shared CLEAR R8 pass; the verdict MAXes into the
+	// alpha field (same res) and the alpha field upscales into the
+	// tier seed. Both merges sample with LINEAR.
 	std::tie(volume_bin.image, volume_bin.memory) = make_target_image(blur_format, ve);
 	volume_bin.view_array = vk::raii::ImageView(device,
 	        vk::ImageViewCreateInfo{
@@ -2892,6 +2893,35 @@ void feather_mask_renderer::ensure_depth_targets(vk::Extent2D working)
 	                .renderPass = *compare_renderpass_mv,
 	                .attachmentCount = 1,
 	                .pAttachments = &raw_bin_array,
+	                .width = ve.width,
+	                .height = ve.height,
+	                .layers = 2,
+	        });
+
+	// Alpha field canvas (R8): crisp window-vs-VR (+reversed) reveal,
+	// built CLEAR; verdict MAXes into it (LOAD, same res); the result
+	// upscales into the tier seed. Own MV framebuffer under the shared
+	// CLEAR R8 pass.
+	std::tie(alphaW.image, alphaW.memory) = make_target_image(blur_format, ve);
+	alphaW.view_array = vk::raii::ImageView(device,
+	        vk::ImageViewCreateInfo{
+	                .image = *alphaW.image,
+	                .viewType = vk::ImageViewType::e2DArray,
+	                .format = blur_format,
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .baseMipLevel = 0,
+	                        .levelCount = 1,
+	                        .baseArrayLayer = 0,
+	                        .layerCount = 2,
+	                },
+	        });
+	vk::ImageView raw_alpha_array = *alphaW.view_array;
+	alphaW.blur_fb_mv = vk::raii::Framebuffer(device,
+	        vk::FramebufferCreateInfo{
+	                .renderPass = *compare_renderpass_mv,
+	                .attachmentCount = 1,
+	                .pAttachments = &raw_alpha_array,
 	                .width = ve.width,
 	                .height = ve.height,
 	                .layers = 2,
@@ -3113,17 +3143,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	double ms_warp = 0, ms_exact = 0, ms_alpha = 0, ms_dilate = 0;
 	double ms_volume_raster = 0, ms_volume_virt = 0, ms_volume_compare = 0, ms_volume_merge = 0;
 	// Depth engages exactly when the group carries the depth volume
-	// with a valid sensor view (tier-1 only, enforced upstream: the
-	// seed and the chain share W = half of full). The volume raster
-	// is a plain MAX accumulation; the alpha field (windows vs VR +
-	// reversed, built crisp) is the merge target the sensor verdict
-	// MAXes onto — never the legacy silhouette seed.
+	// with a valid sensor view (tier-1 only, enforced upstream). The
+	// volume raster is a plain MAX accumulation; the alpha field
+	// (windows vs VR + reversed, built crisp) is the merge target the
+	// sensor verdict MAXes onto — never the legacy silhouette seed.
 	bool use_volume = volume && !volume->draws.empty() && volume->sensor_view != vk::ImageView{} &&
 	                     tier_for_feather(feather_px) == 1; // belt-and-braces: upstream only sends tier-1
-	// Single working res W: level 1 of full (half), floored like the
-	// tier intermediates. Identical to the tier-1 submit size by
-	// construction, so seed and chain always agree.
-	vk::Extent2D workE = level_extent(extent, 1);
+	// Single working res W (quarter of full, floored at 64px): compute
+	// economy for the fullscreen chain. The tier-1 seed stays half, so
+	// the alpha field upscales into it (linear, then the shared blur
+	// feathers the edge).
+	vk::Extent2D workE{std::max(64u, extent.width / 4), std::max(64u, extent.height / 4)};
 	if (use_volume)
 	        ensure_depth_targets(workE);
 	float box_frac = 1;
@@ -3572,7 +3602,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// Depth chain (soft group, tier-1 only): sensor warp + hands
 		// MIN, exactWin/exactOcc raster, virt decode, alpha build,
 		// exactOcc dilate, volFar raster, eye-space compare, verdict
-		// MAX into the seed (target_a). All at W = half of full.
+		// MAX into alphaW, upscale MAX into the seed (target_a). All
+		// chain canvases at W = quarter of full.
 		// GPU brackets (TopOfPipe discipline: a late producer inflates
 		// the following span). Null pool = no stamping (zero GPU cost).
 		// Reset per record() call: with several volume groups the pool
@@ -3747,8 +3778,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			make_readable(*volume_virt.image);
 		};
 		// Alpha build: crisp window-vs-VR (+reversed) reveal field into
-		// the tier seed (target_a, CLEAR). Runs after the virt decode
-		// (paired frames) and stays OPTIMAL for the verdict MAX below.
+		// the alpha canvas (CLEAR). Runs after the virt decode (paired
+		// frames) and stays OPTIMAL for the verdict MAX below.
 		auto build_alpha = [&]() {
 			section_clock alpha_clk(&ms_alpha);
 			raster_d(rev_depth, volume->rev_draws, *exact_raster_pipeline_mv, 1.0f, &ms_alpha);
@@ -3798,7 +3829,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			azero.color.float32.fill(0);
 			vk::RenderPassBeginInfo begin_alpha{
 			        .renderPass = *compare_renderpass_mv,
-			        .framebuffer = *target_a.blur_fb_mv,
+			        .framebuffer = *alphaW.blur_fb_mv,
 			        .renderArea = {.offset = {0, 0}, .extent = workE},
 			        .clearValueCount = 1,
 			        .pClearValues = &azero,
@@ -3947,13 +3978,13 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			{
 				section_clock merge_clk(&ms_volume_merge);
 				// LOAD-after-write ordering: without it a tile GPU may
-				// MAX against stale seed tiles.
+				// MAX against stale tiles.
 				vk::ImageMemoryBarrier merge_barrier{
 				        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 				        .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead | vk::AccessFlagBits::eColorAttachmentWrite,
 				        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
 				        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
-				        .image = *target_a.image,
+				        .image = *alphaW.image,
 				        .subresourceRange = {
 				                .aspectMask = vk::ImageAspectFlagBits::eColor,
 				                .levelCount = 1,
@@ -3966,8 +3997,39 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				                    {},
 				                    {},
 				                    merge_barrier);
-				// Box-sized render area: LOAD/STORE skip tiles outside it, so
-				// merge bandwidth scales with object area instead of seed area.
+				// Stage 1 (same W res): binary verdict MAXes into the
+				// alpha field. Box-sized render area keeps tiles
+				// outside the object unloaded.
+				vk::Rect2D verdict_box = pass_scissor(workE);
+				vk::RenderPassBeginInfo begin_verdict_max{
+				        .renderPass = *volume_max_r8_renderpass,
+				        .framebuffer = *alphaW.blur_fb_mv,
+				        .renderArea = verdict_box,
+				        .clearValueCount = 0,
+				};
+				cmd.beginRenderPass(begin_verdict_max, vk::SubpassContents::eInline);
+				set_full_viewport(workE);
+				cmd.setScissor(0, verdict_box);
+				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *volume_max_r8_pipeline);
+				update_source(*volume_bin.view_array, 1);
+				std::array<vk::DescriptorSet, 1> max_sets{*descriptor_sets[1]};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, max_sets, no_offsets);
+				blur_push verdict_push{{1.f / workE.width, 1.f / workE.height}, {0, 1}, 0, 0};
+				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, verdict_push);
+				cmd.draw(3, 1, 0, 0);
+				cmd.endRenderPass();
+				make_readable(*alphaW.image);
+				// Stage 2 (upscale): alpha field MAXes into the tier
+				// seed at half res (LOAD preserves the seed); the linear
+				// sampler is the upscale, then the shared blur feathers.
+				vk::ImageMemoryBarrier seed_barrier = merge_barrier;
+				seed_barrier.image = *target_a.image;
+				cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				                    vk::PipelineStageFlagBits::eColorAttachmentOutput,
+				                    {},
+				                    {},
+				                    {},
+				                    seed_barrier);
 				vk::Rect2D merge_box = pass_scissor(half_extent);
 				volume_box_frac = (float)merge_box.extent.width * (float)merge_box.extent.height /
 				                  ((float)half_extent.width * (float)half_extent.height);
@@ -3981,11 +4043,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				set_full_viewport(half_extent);
 				cmd.setScissor(0, merge_box);
 				cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *volume_max_r8_pipeline);
-				// Spread-0 plain upscale under MAX blend (source texel =
-				// W == seed res here); the shared blur chain feathers.
-				update_source(*volume_bin.view_array, 1);
-				std::array<vk::DescriptorSet, 1> max_sets{*descriptor_sets[1]};
-				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, max_sets, no_offsets);
+				// Source texel = W (quarter); the linear upscale lands it
+				// on the half-res seed. Distinct set from the verdict
+				// merge (host writes are last-write-wins per CB).
+				update_source(*alphaW.view_array, 3);
+				std::array<vk::DescriptorSet, 1> seed_sets{*descriptor_sets[3]};
+				cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *blur_layout, 0, seed_sets, no_offsets);
 				blur_push max_push{{1.f / workE.width, 1.f / workE.height}, {0, 1}, 0, 0};
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, max_push);
 				cmd.draw(3, 1, 0, 0);
