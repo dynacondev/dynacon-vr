@@ -357,16 +357,36 @@ void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, Xr
 			spdlog::info("passthrough-until-lock: fade complete");
 		}
 	}
+	// Startup fade: fullscreen passthrough on video (re)start, fading
+	// out over startup-fade-time (smoothstep 0->1). Overrides
+	// everything via min(): a starting feed always demands fullscreen
+	// while fading, zones / until-lock still hold it independently
+	// afterwards. Runs underneath (video below, flat on top via the
+	// same floor lift as the veil).
+	bool fading_startup = false;
+	if (startup_fading)
+	{
+		double elapsed = (now - startup_time) * 1e-9;
+		double t = startup_fade_s > 0 ? std::clamp(elapsed / startup_fade_s, 0.0, 1.0) : 1.0;
+		float s_startup = (float)(t * t * (3 - 2 * t));
+		s = std::min(s, s_startup);
+		fading_startup = t < 1.0;
+		if (not fading_startup)
+		{
+			startup_fading = false;
+			spdlog::info("startup fade: complete");
+		}
+	}
 	boundary_any = any_placed;
 	boundary_s = s;
-	bool veil = waiting_lock or fading_lock or (any_valid and s < 0.999f);
+	bool veil = waiting_lock or fading_lock or fading_startup or (any_valid and s < 0.999f);
 	// Transition edges always log (a swimming cutout is the felt
 	// defect); steady state gets a 5s heartbeat while zones are placed.
 	bool was_veil = boundary_veil;
 	boundary_veil = veil;
 	if (veil != was_veil)
 		spdlog::info("boundary veil: {} (s {:.3f})", veil ? "active" : "released", (double)s);
-	if ((any_placed or waiting_lock or fading_lock) and (veil != was_veil or now - last_boundary_log > 5'000'000'000LL))
+	if ((any_placed or waiting_lock or fading_lock or fading_startup) and (veil != was_veil or now - last_boundary_log > 5'000'000'000LL))
 	{
 		last_boundary_log = now;
 		spdlog::info("boundary fade: s {:.3f} veil {} head ({:.2f},{:.2f},{:.2f})", (double)s, veil,
@@ -739,6 +759,18 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 			}
 			spdlog::info("board config: fid \"{}\" {} markers{}",
 			             f.id, f.is_static ? "static" : "moving", cfg);
+		}
+	}
+
+	// Startup fade duration: live-applied every frame (deliberately
+	// outside the map_key fingerprint above: a duration edit must not
+	// reset tracking).
+	{
+		float want = std::max(0.f, map->startup_fade_time_s);
+		if (want != startup_fade_s)
+		{
+			spdlog::info("startup fade time: {:.1f}s", (double)want);
+			startup_fade_s = want;
 		}
 	}
 
@@ -1161,17 +1193,19 @@ void scenes::stream::gui_passthrough()
 	ImGui::EndDisabled();
 	if (not depth_status.empty())
 		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
-	// Depth-volume rotation reprojection (remap through the capture <->
+	// Depth-volume rotation warp (remap through the capture <->
 	// display relative rotation). Off = direct tap: the flip default
 	// above is what the shader receives, unchanged.
-	if (ImGui::Checkbox(_S("Rotation reprojection"), &volume_remap_enabled))
-		spdlog::info("Depth rotation reprojection {}", volume_remap_enabled ? "on" : "off");
-	// Depth time-bias test: shifts the assumed content age to hunt a
-	// constant sensor lag (+ = content older = larger correction, the
-	// trailing direction). 0 = unshifted. Log debounced per integer ms.
+	if (ImGui::Checkbox(_S("Rotation warp"), &volume_remap_enabled))
+		spdlog::info("Depth rotation warp {}", volume_remap_enabled ? "on" : "off");
+	// Depth time-bias trim: shifts the assumed sensor content age to
+	// hunt a constant sensor lag (+ = content older = larger
+	// correction, the trailing direction). 0 = unshifted. Log
+	// debounced per integer ms.
 	ImGui::BeginDisabled(not volume_remap_enabled);
 	if (ImGui::SliderFloat(_S("Depth time bias"), &volume_time_bias_ms, -50, 50, "%.0fms"))
 	{
+		volume_time_bias_ms = std::clamp(volume_time_bias_ms, -50.f, 50.f);
 		int bias_ms = (int)std::round(volume_time_bias_ms);
 		if (bias_ms != volume_bias_logged_ms)
 		{
@@ -1180,6 +1214,27 @@ void scenes::stream::gui_passthrough()
 		}
 	}
 	ImGui::EndDisabled();
+	// Soft-occlusion known-geometry margin: occLinear -= occLinear*bias.
+	// Distance-scaled (sensor error grows with distance); start 0.06.
+	// Volume-far and VR exact-cut (no margin).
+	if (ImGui::SliderFloat(_S("Soft occlusion bias"), &soft_bias, 0, 0.25f, "%.3f"))
+		soft_bias = std::clamp(soft_bias, 0.f, 0.25f);
+	// Intermediate dilate ahead of the sensor compare (half-res
+	// texels): min-dilates the common-layer depths, so the
+	// distance-scaled bias below compares against a margin-grown
+	// layer. 0 = off.
+	if (ImGui::SliderInt(_S("Occluder dilate"), &soft_dilate_texels, 0, 8, "%d half-res texels"))
+		soft_dilate_texels = std::clamp(soft_dilate_texels, 0, 8);
+	// Hand tracking frequency hint (session-wide, advisory): high is
+	// more responsive at higher jitter cost. Needs
+	// XR_META_hand_tracking_frequency_hint; otherwise a no-op.
+	bool freq_supported = session.hand_tracking_frequency_hint_supported();
+	ImGui::BeginDisabled(not freq_supported);
+	if (ImGui::Checkbox(_S("High-frequency hand tracking"), &hand_freq_high))
+		session.set_hand_tracking_frequency_hint(hand_freq_high);
+	ImGui::EndDisabled();
+	if (not freq_supported)
+		ImGui::Text("%s", _S("Hand frequency hint not supported by this runtime"));
 
 	ImGui::SeparatorText(_S("Passthrough effects demo"));
 	{

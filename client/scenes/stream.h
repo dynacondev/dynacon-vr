@@ -271,6 +271,10 @@ private:
 	// predictedDisplayTime of the last frame that took the video path (both
 	// decoder queues non-empty); the kiosk returns 2s after this goes stale
 	XrTime last_video_t = 0;
+	// Video-absent gap that re-shows the kiosk and re-arms the startup
+	// fade (shared: the fade mirrors the kiosk signal but ignores
+	// kiosk-mode / GUI state so it works with the kiosk off).
+	static constexpr XrDuration video_gap_holdoff = 2'000'000'000LL; // 2s
 	XrTime last_stream_kiosk_toggle = 0;
 	bool stream_chord_held = false;
 	std::optional<wivrn::kiosk_planes> kiosk_planes_;
@@ -497,8 +501,8 @@ private:
 	int fid_votes = 0, fid_tags = 0;
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
 	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
-	double volume_raster_ms = 0, volume_virt_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
-	double vr_raster_ms = 0, vr_compare_ms = 0, vr_merge_ms = 0; // VR-occlusion chain CPU (eye-space virt<object MIN-cut)
+	double volume_base_ms = 0, volume_geom_ms = 0, volume_dilate_ms = 0, volume_compare_ms = 0; // depth chain CPU
+	double volume_add_ms = 0, volume_verdict_ms = 0, volume_apply_ms = 0, volume_merge_ms = 0; // depth chain CPU
 	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
 	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
 	// never read unwritten queries). volume_ts_async selects the fence
@@ -508,7 +512,7 @@ private:
 	bool volume_ts_async = false;
 	struct volume_gpu_spans
 	{
-		float raster = 0, virt = 0, compare = 0, merge = 0;
+		float base = 0, geom = 0, dilate = 0, compare = 0, add = 0, verdict = 0, apply = 0, merge = 0;
 	};
 	volume_gpu_spans last_volume_gpu;
 	// Volume heartbeat snapshot (last volume group) + 5s window sums for
@@ -516,53 +520,67 @@ private:
 	int volume_last_tier = -1;
 	float volume_last_feather = 0;
 	int volume_last_draws = 0;
-	float volume_last_box_pct = 100; // merge-box % of seed (last group)
 	uint32_t volume_last_seed_w = 0, volume_last_seed_h = 0;
 	uint32_t volume_sensor_w = 0, volume_sensor_h = 0;
 	float volume_sensor_near = 0, volume_sensor_far = 0;
 	uint64_t volume_win_frames = 0, volume_win_sensor = 0;
-	double volume_win_acquire_ms = 0, volume_win_raster_ms = 0;
-	double volume_win_virt_ms = 0, volume_win_virt_gpu = 0;
+	double volume_win_acquire_ms = 0, volume_win_base_ms = 0;
+	double volume_win_geom_ms = 0, volume_win_dilate_ms = 0, volume_win_compare_ms = 0, volume_win_add_ms = 0;
+	double volume_win_verdict_ms = 0, volume_win_apply_ms = 0;
 	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
 	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
 	uint64_t volume_win_virt_missing = 0; // color expected depth (view_info flag) but none paired
-	// VR-occlusion diagnostics (unconditional: unlike the Volume block
-	// above, VR cut candidates in 3d-passthrough windows count even when
-	// no 3d-depth-passthrough volume is placed). wanted = any feather
-	// group carried window positives this frame; paired/missing split
-	// that by tolerant (±1) depth pairing (missing only when depth_expected).
-	// Windowed + 5s heartbeat in accumulate_metrics ("VRoccl:" line).
-	bool vr_frame_wanted = false; // set by the mask record loop (any group, any_positive)
-	bool vr_frame_virt_paired = false; // set alongside volume_frame_virt_paired when any_vr ran
-	uint64_t vr_win_frames = 0, vr_win_paired = 0, vr_win_missing = 0;
-	XrTime vr_win_t0 = 0;
-	XrTime vr_last_log = 0;
 	// Throttles for the per-event pairing forensics in common_frame and
 	// the mask record loop (1s: isolated single-frame misses each log,
 	// sustained outages don't spam at 90Hz).
 	XrTime depth_miss_last_log = 0;
-	XrTime vr_cut_skip_last_log = 0;
-	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
-	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
+	double volume_win_merge_ms = 0;
+	double volume_win_base_gpu = 0, volume_win_geom_gpu = 0, volume_win_dilate_gpu = 0, volume_win_compare_gpu = 0;
+	double volume_win_add_gpu = 0, volume_win_verdict_gpu = 0, volume_win_apply_gpu = 0, volume_win_merge_gpu = 0;
 	XrTime volume_last_log = 0;
 	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
-	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
+	// Depth chain v3 (single tier-1 3d-depth-passthrough only): one
+	// common layer at half-of-full holds R16F linear-meter depths
+	// (stage-0 MINs windows, sensor stage MINs hidden + the volume
+	// bbox, then revealed sensor depths); warped-sensor vs
+	// min-dilated intermediate (+ bias, known-geometry term only)
+	// feeds the depth-group seed, and the merge-finish exact
+	// `virt < virtDepth` compare against the layer is global (no bias
+	// anywhere global). >1 depth volume disables the chain (error,
+	// exact-only fallback); non-tier-1 feather does the same, so no
+	// resample semantics are ever needed.
+	float soft_bias = 0.06f; // warped-sensor vs dilated-intermediate compare only, known geometry only
+	// Intermediate min-dilate radius in *half-res* texels, ahead of the
+	// sensor compare: larger blocks more edge bleed, smaller reveals
+	// closer to the silhouette. 0 = off, 8 = tap max.
+	// Passthrough tab slider; default 2.
+	int soft_dilate_texels = 2;
+	bool soft_multi_volume_error = false; // latched, logged once
+	bool soft_tier_error = false; // latched, logged once (depth feather not tier-1)
+	bool hand_removal_probed = false; // supports_hand_removal cached (system props query once)
+	bool hand_removal_supported = false;
+	bool volume_remap_enabled = true; // sensor warp rotation (Passthrough tab); off = direct tap
 	bool volume_remap_logged = false; // one-shot H log for convention validation
-	// Depth time-bias test (Passthrough tab slider, ms, +/-50): assumes
-	// the depth content is bias_ms older than its pose claims (+ = older
-	// = larger correction, the trailing-lag direction). Extrapolates the
-	// reported depth pose backward along head motion; 0 = today's
-	// behavior bit-identically. Render thread only.
-	float volume_time_bias_ms = 0;
-	int volume_bias_logged_ms = 999; // debounced slider log (int ms)
-	// Eye velocity history (world frame, per-eye finite difference of
-	// consecutive predicted mask poses) feeding the bias above. Rigid
-	// head => per-eye differencing, no lever-arm approximation.
-	std::array<XrPosef, 2> volume_prev_mask_pose{};
-	XrTime volume_prev_mask_time = 0;
+	// Depth time-bias trim (Passthrough tab): shifts the assumed sensor
+	// content age to hunt a constant sensor lag (+ = content older =
+	// larger correction, the trailing direction). 0 = unshifted. Log
+	// debounced per integer ms.
+	float volume_time_bias_ms = 0.f;
+	int volume_bias_logged_ms = 0;
+	// Eye velocity history for the time-bias trim: finite difference
+	// of consecutive predicted mask poses (world frame). Unconditional
+	// per frame so history exists when depth needs it.
 	bool volume_have_prev_mask = false;
-	std::array<glm::vec3, 2> volume_eye_lin_vel{};
-	std::array<glm::vec3, 2> volume_eye_ang_vel{}; // axis * rate (rad/s)
+	XrTime volume_prev_mask_time = 0;
+	std::array<XrPosef, view_count> volume_prev_mask_pose{};
+	std::array<glm::vec3, view_count> volume_eye_lin_vel{};
+	std::array<glm::vec3, view_count> volume_eye_ang_vel{};
+	// Hand tracking frequency hint (Passthrough tab): high = responsive
+	// at higher jitter cost, low = default power-efficient tracking.
+	// Advisory only; honored when XR_META_hand_tracking_frequency_hint
+	// exists, otherwise a no-op.
+	bool hand_freq_high = true;
+	bool hand_freq_applied = false; // applied once trackers exist
 	// Sensor-mapping forensics (Volume heartbeat): content age from the
 	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
 	// divergence at record time, swapchain index for the effective Hz.
@@ -644,16 +662,21 @@ private:
 		float mask_erode_ms = 0;
 		float mask_blur_ms = 0;
 		float volume_acquire_ms = 0;
-		float volume_raster_ms = 0;
-		float volume_virt_ms = 0;
+		float volume_base_ms = 0;
+		float volume_geom_ms = 0;
+		float volume_dilate_ms = 0;
 		float volume_compare_ms = 0;
+		float volume_add_ms = 0;
+		float volume_verdict_ms = 0;
+		float volume_apply_ms = 0;
 		float volume_merge_ms = 0;
-		float vr_raster_ms = 0;
-		float vr_compare_ms = 0;
-		float vr_merge_ms = 0;
-		float volume_raster_gpu_ms = 0;
-		float volume_virt_gpu_ms = 0;
+		float volume_base_gpu_ms = 0;
+		float volume_geom_gpu_ms = 0;
+		float volume_dilate_gpu_ms = 0;
 		float volume_compare_gpu_ms = 0;
+		float volume_add_gpu_ms = 0;
+		float volume_verdict_gpu_ms = 0;
+		float volume_apply_gpu_ms = 0;
 		float volume_merge_gpu_ms = 0;
 		float virt_paired = 0; // depth frames paired / volume frames (windowed below)
 		float gizmo_ms = 0;
@@ -780,6 +803,11 @@ private:
 	std::unique_ptr<union_merge_renderer> merge_renderer;
 	int merge_image = -1;
 	bool merge_this_frame = false;
+	// Uploaded window soups for the common depth layer (object id ->
+	// soup hash, retained across frames, stale-erased in the mask
+	// phase; mirrors the feather groups' mesh_hashes). Render thread
+	// only.
+	std::map<std::string, std::string> layer_hashes;
 	// Per-frame hidden working buffers (filled by the shared silhouette
 	// build in the mask phase; capacity survives clear()). Render thread
 	// only.
@@ -839,6 +867,16 @@ private:
 	float until_lock_fade_s = 2.0f;
 	XrTime until_lock_time = 0; // latch time; 0 = not fading
 	bool until_lock_fading = false;
+	// Video (re)start fade: fullscreen passthrough whenever the feed
+	// resumes after a gap, fading to normal over startup-fade-time
+	// (smoothstep, min-combined into boundary_s so a starting feed
+	// always wins while fading). Re-arms on the same gap as the
+	// waiting kiosk (video absent > holdoff) but independent of
+	// kiosk-mode, so first connect and stop->start both fade with
+	// the kiosk off. Render thread only.
+	float startup_fade_s = 2.0f;
+	XrTime startup_time = 0; // fade start; 0 = never
+	bool startup_fading = false;
 	// Origin alignment (alignment -> local-origin): render thread derives
 	// the correction from the resolved board pose every frame, tracking
 	// thread applies it to outgoing poses. configured = map carries a

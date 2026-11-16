@@ -65,6 +65,20 @@ class session : public utils::handle<XrSession, xrDestroySession>
 
 	PFN_xrPerfSettingsSetPerformanceLevelEXT xrPerfSettingsSetPerformanceLevelEXT = nullptr;
 
+	// XR_META_hand_tracking_frequency_hint (may predate the vendored
+	// headers: declare locally when missing, load by name, call only
+	// when the runtime enumerates the extension).
+#ifndef XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME
+#define XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME "XR_META_hand_tracking_frequency_hint"
+typedef enum XrHandTrackingFrequencyHintMETA {
+	XR_HAND_TRACKING_FREQUENCY_HINT_DEFAULT_META = 1,
+	XR_HAND_TRACKING_FREQUENCY_HINT_HIGH_META = 2,
+	XR_HAND_TRACKING_FREQUENCY_HINT_MAX_ENUM_META = 0x7FFFFFFF
+} XrHandTrackingFrequencyHintMETA;
+typedef XrResult(XRAPI_PTR * PFN_xrSetHandTrackingFrequencyHintMETA)(XrSession session, XrHandTrackingFrequencyHintMETA frequencyHint);
+#endif
+	PFN_xrSetHandTrackingFrequencyHintMETA xrSetHandTrackingFrequencyHintMETA = nullptr;
+
 	PFN_xrRequestBoundaryVisibilityMETA xrRequestBoundaryVisibilityMETA = nullptr;
 	XrBoundaryVisibilityMETA runtime_boundary_visibility = XR_BOUNDARY_VISIBILITY_NOT_SUPPRESSED_META;
 	bool passthrough_boundary_enabled = true;
@@ -137,6 +151,15 @@ public:
 	}
 
 	void set_performance_level(XrPerfSettingsDomainEXT, XrPerfSettingsLevelEXT);
+
+	// XR_META_hand_tracking_frequency_hint: advisory session-wide hint
+	// (high = responsive at higher jitter cost). False when unsupported
+	// (no-op) or rejected; never throws.
+	bool hand_tracking_frequency_hint_supported() const
+	{
+		return (bool)xrSetHandTrackingFrequencyHintMETA;
+	}
+	bool set_hand_tracking_frequency_hint(bool high);
 
 	bool boundary_visibility_supported() const
 	{

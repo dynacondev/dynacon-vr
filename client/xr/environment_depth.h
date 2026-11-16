@@ -68,8 +68,10 @@ public:
 		XrTime capture_time = 0;
 	};
 
-	// Construct only when supported() (extension procs load in the
-	// init list and throw when absent, marker_tracker idiom).
+	// Construct only when supported() (core extension procs load in the
+	// init list and throw when absent, marker_tracker idiom; the optional
+	// hand-removal proc loads defensively in the body and stays null when
+	// missing, so construction never throws for it).
 	environment_depth(instance &, session &, system &, vk::raii::Device & device);
 
 	// Extension enabled AND runtime reports supportsEnvironmentDepth.
@@ -87,6 +89,13 @@ public:
 	{
 		return provider_started;
 	}
+
+	// Hand removal (XR_META_environment_depth ext v1+ where
+	// supportsHandRemoval): replaces hand pixels with estimated
+	// background so tracked meshes give crisp boundaries. No-op
+	// (false) when unsupported or not ready. Render thread only.
+	static bool supports_hand_removal(instance &, system &);
+	bool set_hand_removal(bool enabled);
 
 	// Lock the latest depth image for this frame. Must be called between
 	// begin_frame/end_frame, at most once per frame. Returns false with
@@ -116,6 +125,7 @@ private:
 	uint32_t ext_version = 0;
 	bool logged_unsupported = false;
 	bool provider_started = false;
+	bool hand_removal_enabled = false;
 	// Set on start: the runtime needs a frame to spin up, so the first
 	// acquire would transiently fail. The start frame skips acquire
 	// silently instead of logging it.
@@ -131,6 +141,7 @@ private:
 	PFN_xrStartEnvironmentDepthProviderMETA xrStartEnvironmentDepthProviderMETA{};
 	PFN_xrStopEnvironmentDepthProviderMETA xrStopEnvironmentDepthProviderMETA{};
 	PFN_xrAcquireEnvironmentDepthImageMETA xrAcquireEnvironmentDepthImageMETA{};
+	PFN_xrSetEnvironmentDepthHandRemovalMETA xrSetEnvironmentDepthHandRemovalMETA{};
 
 	using provider_handle = utils::handle<XrEnvironmentDepthProviderMETA>;
 	using swapchain_handle = utils::handle<XrEnvironmentDepthSwapchainMETA>;

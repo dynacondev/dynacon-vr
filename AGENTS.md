@@ -69,3 +69,12 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   without a video tap); binary hole-punch was discussed but not shipped.
 - Config + packet fields removed too (server dot-pitch/dot-color,
   packet members, session fill, docs): dev branch, no compat shims.
+
+## Depth chain v3: common depth layer, exact final compare (Nov 2026)
+
+- Single `3d-depth-passthrough`, tier-1 feather only (`(0,16]`px): the server rejects extras and non-tier-1 feathers in `configuration.cpp`; `stream.cpp` latches `soft_multi_volume_error` / `soft_tier_error` only as a last resort. Either kills soft (volume hidden, windows fall back to exact) so no resample semantics ever exist.
+- One common intermediate at W = half of full (= tier-1 submit size): R16F linear meters, cleared to large-finite FAR. Stage-0 MINs window depths; the sensor stage MINs hidden + volume bbox, then revealed sensor depths (sensor stays out until it passes its own reveal test, so hidden/debatable pixels stay VR). MIN is idempotent and order-independent within each stage.
+- Sensor compare is warped-sensor vs min-dilated intermediate + bias, feeding the depth-group seed only — never the global path. Dilate is half-res texels now (0..8, default 2, Passthrough tab); bias stays sensor-only.
+- Final is an exact `virt < virtDepth` compare against the common layer at W, no bias anywhere global — crisp occlusion edges are intentional. The binary verdict (never the depths) bilinear-upsamples after, so no halos; then the existing erode+blur+merge unchanged. Global VR occlusion applies to all groups (windows + hidden + depth); reversed cuts stay per-group.
+- Pushes: geom 128B VERT / compare 16B / add 8B / verdict 8B. Query pool is 10: base / geom / dilate / compare / add / verdict / apply / merge spans (see feather code for the slot map).
+- Tier-1-only is load-bearing for correctness (W == seed size); the error latches, don't "fix" by resampling.

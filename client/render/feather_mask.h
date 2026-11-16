@@ -81,6 +81,12 @@ public:
 	// per frame. Empty soup erases the entry.
 	void set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
 	void remove_mesh(const std::string & key);
+	// In-place vertex rewrite for dynamic meshes (skinned hands): same
+	// vertex/index counts as the uploaded soup (topology is fixed),
+	// new positions only. No waitIdle (buffers are never replaced),
+	// flushed by the normal per-draw flush_upload path. No-op on
+	// unknown key or size mismatch (caller falls back to set_mesh).
+	void update_mesh_positions(const std::string & key, const std::vector<XrVector3f> & verts);
 	// Model-space AABB for frustum skip (nullopt = unknown key: keep the
 	// draw). Computed once at upload; the draws filter in stream.cpp
 	// consults it before acquire, so fully-culled groups cost nothing.
@@ -152,33 +158,21 @@ public:
 		double total_ms = 0;  // whole record() body, incl. target setup
 		int tier = -1;        // selected tier, -1 = bypass/clear-only/empty
 		size_t draws = 0;   // drawIndexed calls: silhouettes (one per MV
-		                      // broadcast) plus VR-occlusion and volume draws
+		                      // broadcast) plus exact-depth and volume draws
 		float box_frac = 1;   // scissor-box area fraction (0-1) at working
 		                      // res; 1 = fullscreen fallback. Diagnostic for
 		                      // cull effectiveness (log only, no plot).
-		// Depth-volume stages (3d-depth-passthrough objects in this
-		// group): furthest-point raster at 320px, virtual-depth SBS->D
-		// conversion at 320px (when paired), strict sensor<min(volume,
-		// virtual) flatten, upscale+MAX merge into the seed ahead of erode.
-		// Zero when the group carries no volume draws.
-		double volume_raster_ms = 0;
-		double volume_virt_ms = 0;
-		double volume_compare_ms = 0;
-		double volume_merge_ms = 0;
-		float volume_box_frac = 1; // merge-box area fraction of the seed
-		// (0-1); drives the renderArea scissor economics, logged.
-		// VR-occlusion stages (3d-passthrough windows in this group):
-		// nearest-point object raster at depth resolution, eye-space
-		// virt<object flatten, upscale+MIN merge into the seed ahead of
-		// erode (and ahead of the volume MAX above, so a real reveal
-		// there can still win where the sensor is nearer than VR).
-		// Zero when the group carries no VR draws (no paired virtual
-		// depth).
-		double vr_raster_ms = 0;
-		double vr_compare_ms = 0;
-		double vr_merge_ms = 0;
-		float vr_box_frac = 1; // merge-box area fraction of the seed
-		// (0-1), same scissor economics as the volume box above.
+		// Common-layer depth stages (single 3d-depth-passthrough, tier-1
+		// group only): geometry raster (hidden + bbox into the borrowed
+		// merge intermediate), warp + hands MIN, rev raster + alpha build,
+		// intermediate min-dilate, sensor compare write, layer add.
+		// Zero when no depth in group.
+		double warp_ms = 0;     // sensor warp + hands MIN (D domain)
+		double geom_ms = 0;     // hidden + bbox geometry raster (linear)
+		double alpha_ms = 0;    // rev raster + alpha build (win && !rev)
+		double dilate_ms = 0;   // intermediate min-dilate H+V (half-res texels)
+		double compare_ms = 0;  // sensor compare write (warped D vs dilated layer)
+		double add_ms = 0;      // layer add (linearized sensor MIN into the layer)
 	};
 
 	// Record silhouettes + blur chain for both eyes into the layers of an
@@ -192,65 +186,70 @@ public:
 	// Cutouts are world-space quads (two triangles each) punched crisp
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP.
-	// Depth-volume layer (3d-depth-passthrough): furthest-point draws in
-	// display-eye MVP space plus the runtime D16 sensor view they test
-	// against (strict sensor < render, far hidden). Null = no volume in
-	// this group: the seed passes through untouched. Non-null with draws
-	// and a valid sensor view rasterizes at 320px, flattens to binary R8,
-	// and upscales+MAXes into the tier seed AFTER the reversed MIN cuts
-	// (the volume overlays everything, including VR cutthroughs) and
-	// BEFORE erode/blur, so it feathers exactly like silhouettes.
-	// Virtual depth (stream 3, half-res SBS luma): when valid, the decoded
-	// SBS view converts to a sensor-compatible D canvas (per-eye halves,
-	// meters->D with near_z/far_z) and the compare tests
-	// sensor < min(volume, virtual) in D space. Null/invalid = legacy
-	// sensor < volume behavior for that frame (strict: no stale virtual).
-	// The VR-occlusion path below samples its own high-res conversion,
-	// so one SBS decode feeds two D canvases (320px sensor + high-res VR).
-	// The VR-occlusion path converts the same SBS in eye space
-	// (virt < object, no sensor remap) into its own high-res canvas.
-	// GPU timestamps cover the volume chain only (timestamp_pool); VR
-	// stages report CPU timings, their GPU cost folds into the mask span.
+	// Depth-volume layer (3d-depth-passthrough, tier-1 groups only):
+	// the hidden proximity shapes and the volume bounding box raster
+	// into the merge-owned common intermediate (R16F linear meters,
+	// MIN accumulation) at the working res W; the warped sensor
+	// (rotation warp H + time-bias trim, skinned hand depth MINed over
+	// it, D domain) is tested against the min-dilated layer natively
+	// (bias on the layer only) and writes the seed the group blurs;
+	// the linearized sensor depth MINs back into the raw intermediate
+	// (ungated: where the test failed sens >= layer, a no-op). Null =
+	// no volume in this group: legacy silhouette raster runs instead.
+	// GPU timestamps cover the depth chain on the shared pool
+	// (stream-owned, 10 queries: base/geom/dilate/compare/add in the
+	// merge + this record, verdict/apply/merge in the merge finish).
 	struct volume_input
 	{
-		std::vector<instance_draw> draws; // depth objects, eye MVP space
-		// VR occluders: 3d-passthrough positives in this group, eye MVP
-		// space (same MVPs as the silhouette draws, reversed excluded).
-		// Rasterized nearest-point at depth resolution and tested
-		// eye-space virt < object; the seed MIN-cuts where VR wins.
-		// Empty (or no paired virtual depth) = no VR occlusion in this
-		// group.
-		std::vector<instance_draw> vr_draws;
+		// Hidden proximity objects, server-MVP space at W (eye frame):
+		// nearest linear into the borrowed intermediate (CULL_BACK).
+		// Mesh keys must be uploaded (set_mesh); reverse/opacity ignored.
+		std::vector<instance_draw> hidden_draws;
+		// Volume bounding boxes, one MVP pair per depth volume at W
+		// (server MVP mapping the renderer's internal closed unit box
+		// [-1,1]^3 onto the volume bounds): far-wall linear into the
+		// borrowed intermediate (CULL_FRONT). A dedicated closed box is
+		// rasterized, never the object soup: soups are arbitrary glTF
+		// (not guaranteed closed), which would break the far-wall trick.
+		std::vector<std::array<glm::mat4, 2>> bbox_draws;
+		// Borrowed common intermediate (merge-owned, R16F linear meters
+		// at W): geometry MINs into it under LOAD after the merge base
+		// write earlier in the same command buffer (pipeline barrier
+		// between). May be null: geometry_ok is false then. The
+		// renderer bakes its own framebuffer on the borrowed image
+		// (keyed on the handle: a merge rebuild waitIdles upstream, so
+		// a handle change safely rebuilds); reset_targets() drops it.
+		vk::Image layer_image = nullptr;
+		vk::ImageView layer_view = nullptr;
+		vk::Extent2D layer_extent{0, 0};
+		// Skinned hand draws, eye MVP space (display/sync frame): MINed over the warped
+		// sensor canvas in the same pass (same near/far D encoding).
+		// Always rastered: MIN is idempotent with sensor hands.
+		std::vector<instance_draw> hand_draws;
+		float bias = 0.06f; // sensor-space compare only: layer -= layer*bias
+		// Intermediate min-dilate radius in *half-res* texels
+		// (intermediate -> dilTemp, H+V box-min): expands the
+		// known-geometry layer before the native sensor test, so
+		// depth-sensor edge noise just outside a window/hidden
+		// silhouette still reads as blocked. 0 = off, 8 = shader tap
+		// max. Tuned live from the Passthrough tab (default 2).
+		float dilate_texels = 2.f;
 		vk::ImageView sensor_view = nullptr; // runtime D16 2-layer array
+		// Sensor frame for the warp source: extent of the depth-camera
+		// images (from the environment-depth provider).
+		vk::Extent2D sensor_extent{0, 0};
 		float near_z = 0.1f; // depth frustum the raster must match
 		float far_z = 10.f;
-		// Virtual depth SBS (decoded stream 3): single image holding both
-		// eyes side by side, left eye x[0..w/2), right eye x[w/2..w),
-		// 10-bit 2mm/LSB luma clamped at 2.040m (code 1020, so
-		// beyond-range VR reads as near and occludes); 1021+ decodes
-		// as far (lossy-overshoot guard only). Sampled with the
-		// decoder's own sampler (Y'CbCr); green channel (least chroma
-		// crosstalk under 709) carries luma.
-		vk::ImageView virt_view = nullptr;
-		vk::Sampler virt_sampler = nullptr;
-		bool virt_valid = false;
-		// Per-eye virtual-depth resolution (SBS width/2 x height), from
-		// the stream description. Sizes the high-res VR-occlusion
-		// canvases; the sensor path stays at volume_size below.
-		vk::Extent2D virt_eye_extent{0, 0};
-		// Rotation reprojection: per-eye homography columns (eye e uses
-		// [3*e .. 3*e+2], w unused) mapping eye UV to sensor UV. Identity
-		// reproduces the direct tap; computed once per frame on the CPU.
-		std::array<glm::vec4, 6> remap_cols{};
-		// B2 lateral correction: per-eye (T.xy, a, b) with
-		// 1/depth = a*D + b (a, b duplicated per eye for vec4 packing).
-		// T maps 1/depth (1/m) to sensor-UV shift; forward/radial +
-		// depth-value terms excluded.
-		std::array<glm::vec4, 2> remap_corr{};
-		// GPU timestamp sink (stream-owned, 5 queries: raster/virt/
-		// compare/merge boundaries). Null disables stamping. Reset per
-		// record() call, so with several volume groups the pool holds the
-		// LAST group only.
+		// Rotation warp: per-eye homography columns (eye e uses
+		// [3*e .. 3*e+2]) mapping eye UV to sensor UV (old-main
+		// rotation method + time-bias trim). Identity reproduces
+		// the direct tap. Built once per frame on the CPU.
+		std::array<glm::vec4, 6> warp_cols{};
+		// GPU timestamp sink (stream-owned, 10 queries, shared with the
+		// merge base/finish: this record stamps geom/dilate/compare/add
+		// slots). Null disables stamping. Reset by the scene once per
+		// frame before record_base(), so with several volume groups
+		// the pool holds the LAST group only.
 		vk::QueryPool timestamp_pool = nullptr;
 	};
 	void record(vk::raii::CommandBuffer & cmd,
@@ -325,11 +324,23 @@ public:
 
 	// Drop cached framebuffers/views (swapchain recreated: old image
 	// handles are dead and driver handle recycling could otherwise alias
-	// a stale framebuffer onto a new image).
+	// a stale framebuffer onto a new image). Also drops the borrowed
+	// common-layer framebuffer (merge-owned image: the merge rebuild
+	// waitIdles upstream, and run_depth re-bakes on handle change).
 	void reset_targets()
 	{
 		targets.clear();
 		hidden_targets.clear();
+		layer_fb.clear();
+		layer_fb_image = VK_NULL_HANDLE;
+		layer_fb_extent = {0, 0};
+		// Drop the merged-triple framebuffer too: it bakes the (src,
+		// tmp, extent) triple above, so a stale entry would reuse a
+		// wrong-sized framebuffer. Creation-only (no waitIdle needed).
+		triple_fb.clear();
+		triple_src = VK_NULL_HANDLE;
+		triple_tmp = VK_NULL_HANDLE;
+		triple_extent = {0, 0};
 	}
 
 	// Ensure intermediates for an extent (idempotent, change-gated). Public
@@ -368,7 +379,7 @@ private:
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
 	// cutout re-begins the submit framebuffer_mv under
-	// volume_max_rgb8_renderpass (LOAD twin of the V-upscale pass) with
+	// punch_load_renderpass (LOAD twin of the V-upscale pass) with
 	// pipeline_mv at opacity 1.
 
 	// Separable Gaussian blur (fullscreen triangle, sampled input).
@@ -409,11 +420,11 @@ private:
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
 	// Index: 0 = blur-H, 1 = upscale merges (volume MAX — triple never
-	// touches it), 2 = blur-V upscale; 3 = volume presmooth-H (must NOT
-	// be 0, which the triple blur-H overwrites); 4,5 = downsample levels
-	// 2,3; 6 = VR MIN-merge upscale (split from 1: the VR chain samples
-	// a different high-res image than the volume chain in the same
-	// command buffer). 7 = erode-H, 8 = erode-V.
+	// touches it), 2 = blur-V upscale; 4,5 = downsample levels
+	// 2,3; 7 = erode-H, 8 = erode-V; 9 = standalone dilate-H,
+	// 10 = standalone dilate-V. (3 and 6 are retired: the VR-cut MIN
+	// merge and the removed VR slot — the alpha field needs no merge
+	// set of its own.)
 	// One set per pass (not
 	// per eye): the multiview passes sample the array view, so no
 	// per-eye slots exist. Erosion needs two sets because its H and V
@@ -462,6 +473,9 @@ private:
 	vk::raii::Framebuffer triple_fb{nullptr};
 	vk::Image triple_src = VK_NULL_HANDLE;
 	vk::Image triple_tmp = VK_NULL_HANDLE;
+	// Triple framebuffer extent (width/height): the cached framebuffer
+	// binds a fixed size, so (src, tmp) alone is not a sufficient key.
+	vk::Extent2D triple_extent{0, 0};
 	// Downsample chain (D) and tier blur workspaces (E) at half, quarter
 	// and eighth mask resolution (index 0..2). Tier k blurs at 1/k size
 	// with the same fixed kernel, so tap density (and cost) stays flat
@@ -473,21 +487,73 @@ private:
 	// skip them — see ensure_targets; part of the rebuild gate).
 	bool targets_has_intermediates = false;
 
-	// Depth-volume chain (3d-depth-passthrough, fixed 320px working
-	// size regardless of mask extent). Raster outputs R16 sensor-D,
-	// compare flattens to 4-level coverage R8, presmooth H blurs at 320
-	// with V folded into the merge upscale, merge upscales+MAXes into
-	// the tier seed. Created once in the constructor (format-fixed);
-	// targets are extent-fixed, so no rebuilds ever (unlike the mask
-	// intermediates).
-	static constexpr uint32_t volume_size = 320;
-	static constexpr vk::Format volume_depth_format = vk::Format::eR16Unorm;
-	// Presmooth radius (blur-spread units = texels at 320): stairs
-	// smaller than ~2x this (~3px at 320) vanish into a stable gradient.
-	static constexpr float volume_smooth_spread = 1.4f;
-	// Multiview volume/VR raster (volume_mv.vert, 136B MVP-pair push):
-	// one draw broadcasts to both layers. Same CLEAR/STORE/OPTIMAL R16
-	// attachments plus viewMask=both.
+	// Common depth layer (single 3d-depth-passthrough, tier-1 only).
+	// The merge owns the R16F linear-meters intermediate at W (half of
+	// full): stage-0 MINs window depths (merge record_base), the sensor
+	// stage MINs hidden + volume bbox, then revealed sensor depths. MIN
+	// is idempotent and order-independent within each stage. The sensor
+	// test reads the min-dilated layer natively (bias on the layer
+	// only); the exact, bias-free global compare against virt runs
+	// merge-side afterwards (record_finish verdict + apply).
+	// R16F linear meters, large-finite FAR clear (65504.0): the layer
+	// carries meters, never D — no resample semantics ever exist.
+	static constexpr vk::Format linear_depth_format = vk::Format::eR16Sfloat;
+	// Layer FAR clear (large-finite: compares stay ordered, nothing
+	// reads as absent-geometry except the explicit verdict gate).
+	static constexpr float layer_far_clear = 65504.f;
+	// Multiview geometry raster (geom_depth_mv.vert/frag, 128B MVP-pair
+	// push): one draw broadcasts to both layers. Same CLEAR/STORE/
+	// OPTIMAL R16F attachment as the warp/exact passes below (shared
+	// renderpass, viewMask=both).
+	struct geom_depth_push
+	{
+		std::array<glm::mat4, 2> mvp;
+	};
+	// Geometry raster: nearest linear (hidden, rev) or far-wall linear
+	// (bbox) depending on cull mode; MIN blend over the FAR clear, so
+	// the nearest surface wins order-independently. Cull-BACK keeps
+	// single-sided windows correct from outside; closed meshes resolve
+	// to the front wall either way. The bbox uses CULL_FRONT on the
+	// internal closed unit box (see below) to resolve the far wall;
+	// rev uses cull-NOTHING (legacy revD coverage: a cut counts from
+	// either side).
+	vk::raii::RenderPass geom_load_renderpass_mv{nullptr};
+	vk::raii::PipelineLayout geom_raster_layout_mv{nullptr};
+	vk::raii::Pipeline geom_back_pipeline_mv{nullptr};
+	vk::raii::Pipeline geom_front_pipeline_mv{nullptr};
+	vk::raii::Pipeline geom_none_pipeline_mv{nullptr};
+	// Layer add (fullscreen _mv, 1 sampler: warped-sensor D): linearizes
+	// the sample for the MIN-blend LOAD back into the raw intermediate.
+	// Own 8B near/far push (no bias: UNGATED by design). Renders under
+	// geom_load_renderpass_mv (same R16F LOAD/STORE/OPTIMAL MV shape).
+	struct layer_add_push
+	{
+		float near_z = 0.1f;
+		float far_z = 10.f;
+	};
+	static_assert(sizeof(layer_add_push) == 8);
+	vk::raii::DescriptorSetLayout add_set_layout{nullptr};
+	vk::raii::PipelineLayout add_pipe_layout{nullptr};
+	vk::raii::DescriptorPool add_pool{nullptr};
+	vk::raii::DescriptorSet add_set{nullptr};
+	vk::raii::Pipeline add_pipeline_mv{nullptr};
+	// Exact-depth raster: same shaders as the legacy volume path
+	// (volume_mv.vert + volume_raster_mv.frag encode eye depth as
+	// sensor-compatible D), nearest-point state (shared
+	// exact_raster_pipeline_mv): cull-nothing + MIN blend over a far
+	// (1.0) clear, so the closest surface wins order-independently.
+	// Serves the hand MIN draws over the warped sensor canvas (same
+	// pass, same pipe). Cull-nothing keeps single-sided hands visible
+	// from either side; closed meshes still resolve to the front wall.
+	// Sensor warp (fullscreen _mv, 1 sampler: warped sensor source).
+	// Dedicated R16F CLEAR renderpass? No — reuses
+	// volume_raster_renderpass_mv (same R16F CLEAR/STORE/OPTIMAL MV
+	// shape). The pass CLEARs to far, draws the warp fullscreen,
+	// then MIN-blends the skinned hand draws in the same pass
+	// (exact_raster_pipeline_mv is renderpass-compatible).
+	// Hands raster push (volume_mv.vert D-encoding, 136B MVP-pair +
+	// near/far): same >128B note as the silhouette MV pushes; the ctor
+	// throws loudly below when the device reports less.
 	struct volume_mv_push
 	{
 		std::array<glm::mat4, 2> mvp;
@@ -496,123 +562,111 @@ private:
 	};
 	vk::raii::RenderPass volume_raster_renderpass_mv{nullptr};
 	vk::raii::PipelineLayout volume_raster_layout_mv{nullptr};
-	vk::raii::Pipeline volume_raster_pipeline_mv{nullptr};
-	vk::raii::Pipeline vr_raster_pipeline_mv{nullptr};
-	// VR-occlusion object raster: same shaders (volume_mv.vert +
-	// volume_raster_mv.frag encode eye depth as sensor-compatible D),
-	// nearest-point state: cull-nothing + MIN blend over a far (1.0)
-	// clear, so the closest surface wins order-independently.
-	// Cull-nothing (not back) keeps single-sided windows visible from
-	// either side; closed meshes still resolve to the front wall. The
-	// compare gates on <0.9999, so the far clear reads back as empty,
-	// never as geometry.
-	// Compare (fullscreen _mv, 2 samplers: sensor D16 + volume R16).
-	// Dedicated CLEAR renderpass over volume_bin.blur_fb_mv (same R8 MV
-	// shape as the blur intermediates; loadOp is not part of render-pass
-	// compatibility, so the framebuffer is shared). CLEAR, not DONT_CARE:
-	// the merge LINEAR-upscales the whole 320 canvas, and any texel the
-	// compare draw did not write must read back deterministic 0, never
-	// undefined tile garbage.
+	vk::raii::Pipeline exact_raster_pipeline_mv{nullptr};
+	vk::raii::DescriptorSetLayout warp_set_layout{nullptr};
+	vk::raii::PipelineLayout warp_pipe_layout{nullptr};
+	vk::raii::DescriptorPool warp_pool{nullptr};
+	vk::raii::DescriptorSet warp_set{nullptr};
+	// Warp homography: per-eye 3x3 columns as 6 vec4s, 96B total
+	// (under the 128B Vulkan minimum: no >128B throw needed),
+	// pushed per warp from volume_input and pushed (named members,
+	// never an array: push-constant arrays have driver-defined
+	// packing). Layout matches mat4 columns exactly.
+	struct warp_push
+	{
+		glm::vec4 col[6]{};
+	};
+	static_assert(sizeof(warp_push) == 96);
+	vk::raii::Pipeline warp_pipeline_mv{nullptr};
+	// Alpha build (fullscreen _mv, 2 samplers: sensor-verdict R8 +
+	// rev linear R16F, no push). Renders into target_a.blur_fb_mv (the
+	// tier-1 seed, R8 MV) under compare_renderpass_mv below (same R8 MV
+	// shape; loadOp is not part of render-pass compatibility, so the
+	// framebuffer is shared). CLEAR, not DONT_CARE: any texel the
+	// alpha draw did not write must read back deterministic 0, never
+	// undefined tile garbage. alpha = win && !revPresent (presence cut:
+	// no nearer-test; the global virt verdict gates by depth later).
+	vk::raii::DescriptorSetLayout alpha_set_layout{nullptr};
+	vk::raii::PipelineLayout alpha_pipe_layout{nullptr};
+	vk::raii::DescriptorPool alpha_pool{nullptr};
+	vk::raii::DescriptorSet alpha_set{nullptr};
+	vk::raii::Pipeline alpha_pipeline_mv{nullptr};
+	// Reversed-depth scratch (R16F linear meters at W, 2 layers): the
+	// group's own reversed draws rasterized nearest (far clear, MIN
+	// blend, cull-nothing geom pipe), sampled by the alpha build.
+	// Always re-rasterized (CLEAR covers the no-draws case).
+	blur_target rev_depth;
+	// Standalone min-dilate H/V (intermediate -> dilTemp, adjustable
+	// radius in half-res texels): same erode fragment as the triple, one
+	// pipeline serving both passes (identical create info, both run at
+	// subpass 0) under
+	// volume_raster_renderpass_mv (CLEAR R16F MV, fullscreen coverage).
+	// Own descriptor sets 9/10 (host writes are last-write-wins per
+	// CB, and the triple rewrites 7/8 later in the same CB).
+	vk::raii::Pipeline dilate_pipeline{nullptr};
+	// Sensor compare (fullscreen _mv, 2 samplers: warped sensor D +
+	// dilated layer linear). Dedicated 16B near/far/bias push (bias on
+	// the layer only now). Renders into volume_bin under
+	// compare_renderpass_mv (same R8 CLEAR/STORE/OPTIMAL MV shape).
+	// CLEAR, not DONT_CARE: unwritten texels read back 0.
 	vk::raii::RenderPass compare_renderpass_mv{nullptr};
 	vk::raii::DescriptorSetLayout compare_set_layout{nullptr};
 	vk::raii::PipelineLayout compare_pipe_layout{nullptr};
 	vk::raii::DescriptorPool compare_pool{nullptr};
 	vk::raii::DescriptorSet compare_set{nullptr};
-	// Compare homography + B2 lateral correction: per-eye 3x3 columns as
-	// 6 vec4s plus per-eye corr (T.xy, a, b), 8 vec4s / 128B total,
-	// filled per volume record from volume_input and pushed (named
-	// members, never an array: push-constant arrays have driver-defined
-	// packing). Layout matches mat4 columns exactly.
-	struct volume_homography
+	// Compare push: near/far/bias, 16B total (named members, never an
+	// array). Bias applies to the layer (distance-scaled).
+	struct compare_push
 	{
-		glm::vec4 col[6]{};
-		glm::vec4 corr[2]{};
+		// x = near (m), y = far (m, may be inf), z = bias (0..0.25),
+		// w unused.
+		glm::vec4 near_far_bias{0.1f, 10.f, 0.06f, 0.f};
 	};
+	static_assert(sizeof(compare_push) == 16);
 	vk::raii::Pipeline compare_pipeline_mv{nullptr};
-	// VR-occlusion compare (fullscreen _mv, 2 samplers: object R16 +
-	// virtual D canvas). Eye-space virt < object, no sensor remap, no
-	// push constants (both inputs are already D). Renders into
-	// vr_bin.blur_fb_mv under the shared R8 MV CLEAR pass (the volume
-	// compare uses the separate 320px volume_bin), then MIN-merges
-	// straight into the seed (spread-0 upscale, no presmooth: smoothing
-	// would bleed keep back up at the dilated rim).
-	vk::raii::DescriptorSetLayout vr_compare_set_layout{nullptr};
-	vk::raii::PipelineLayout vr_compare_pipe_layout{nullptr};
-	vk::raii::DescriptorPool vr_compare_pool{nullptr};
-	vk::raii::DescriptorSet vr_compare_set{nullptr};
-	vk::raii::Pipeline vr_compare_pipeline_mv{nullptr};
-	// Linear sampler for the compare taps (sensor + volume depth):
-	// deliberate coverage-AA. Bilinear ramps the depth across edge texels
-	// so the d<v crossing slides sub-texel instead of stepping on the
-	// 320-grid; the upscale+blur feather then smooths an already-smooth
-	// outline. Transition verdicts stay within ~1 texel + feather.
+	// Linear sampler for the warp + add + compare sensor taps (warped
+	// sensor D): bilinear upscale of the working-res canvas; the binary
+	// verdict is feathered by the shared blur chain below. The layer
+	// tap in the compare uses the NEAREST sampler instead (exact min
+	// values, no invented intermediates).
 	vk::raii::Sampler volume_sampler_linear{nullptr};
-	// Virtual-depth SBS -> sensor-compatible D canvas (fullscreen MV
-	// pass at 320px, meters->D with the volume near/far). Comparison
-	// stays in D space (sensor < min(volume, virtual)), so the compare
-	// push constants (already at the 128B minimum guarantee) are
-	// untouched. Canvas cleared to far (1.0): unpaired frames leave the
-	// min() a no-op. Written with plain STORE (every texel covered).
-	// The VR path below renders the same conversion at depth resolution
-	// into vr_virt; both share the pipeline/renderpass (size-independent),
-	// only the framebuffer + target differ.
-	struct volume_virt_push
-	{
-		float near_z = 0.1f;
-		float far_z = 10.f;
-	};
-	vk::raii::RenderPass volume_virt_renderpass{nullptr};
-	vk::raii::PipelineLayout volume_virt_layout{nullptr};
-	vk::raii::Pipeline volume_virt_pipeline{nullptr};
-	vk::raii::DescriptorSetLayout volume_virt_set_layout{nullptr};
-	vk::raii::DescriptorPool volume_virt_pool{nullptr};
-	vk::raii::DescriptorSet volume_virt_set{nullptr};
-	// Upscale+MAX merge into the tier seed (LOAD, preserves the
-	// silhouette + reversed-cut result, sets 1 where the sensor is
-	// inside). Reuses the blur shaders with spread 0 (the linear
-	// sampler is the upscale) under MAX blending; framebuffers are the
-	// seed's own MV target (loadOp is not part of compatibility).
-	vk::raii::RenderPass volume_max_r8_renderpass{nullptr};
-	vk::raii::Pipeline volume_max_r8_pipeline{nullptr};
-	vk::raii::RenderPass volume_max_rgb8_renderpass{nullptr};
-	vk::raii::Pipeline volume_max_rgb8_pipeline{nullptr};
-	// Upscale+MIN merge for VR occlusion (LOAD, preserves the silhouette
-	// + reversed-cut result, clears where VR wins). Same blur shaders
-	// with spread 0 and same renderpasses as the MAX merges above (loadOp
-	// is not part of compatibility); only the blend op differs.
-	vk::raii::Pipeline vr_min_r8_pipeline{nullptr};
-	vk::raii::Pipeline vr_min_rgb8_pipeline{nullptr};
-	blur_target volume_depth; // R16 furthest-D canvas (320, 2 layers)
-	blur_target vr_depth; // R16 nearest-D canvas (depth-res, 2 layers):
-	// object depth for the VR-occlusion compare above. Far (1.0) clear,
-	// MIN blend, cull-nothing (see vr_raster_pipeline_mv).
-	blur_target volume_virt; // R16 virtual-depth D canvas (320, 2 layers):
-	// SBS meters->D conversion output, cleared to far, sampled by the
-	// volume compare pass alongside volume_depth. Own MV framebuffer
-	// (volume_virt_fb_mv) under volume_virt_renderpass (CLEAR R16 MV).
-	vk::raii::Framebuffer volume_virt_fb_mv{nullptr};
-	blur_target volume_bin; // R8 coverage canvas (320, 2 layers):
-	// compare output, H-presmoothed out-of-place into volume_smooth
-	// before the merge upscale
-	blur_target volume_smooth; // R8 presmooth workspace (320, 2 layers):
-	// H destination, read directly by the merge upscale (V folded in)
+	// RGBA8 LOAD twin of the submit pass: serves the debug cutout
+	// punch only (re-begins the finished swapchain framebuffer; loadOp
+	// is not part of render-pass compatibility). Tier-0 never merges,
+	// so no MAX pipe exists here.
+	vk::raii::RenderPass punch_load_renderpass{nullptr};
+	blur_target sensorW; // R16F warped-sensor canvas (working res, 2 layers):
+	// rotation-warped sensor (off-canvas baked to far, D domain) with
+	// skinned hand depth MINed over it in the same pass. Own MV
+	// framebuffer (raster_fb_mv) under volume_raster_renderpass_mv
+	// (CLEAR R16F MV; the hands pipe is renderpass-compatible).
+	blur_target dilTemp; // R16F min-dilated layer (working res, 2 layers):
+	// intermediate H+V box-min (adjustable radius, half-res texels),
+	// sampled by the sensor compare. H renders into blur_fb_mv, V back
+	// into raster_fb_mv, both under volume_raster_renderpass_mv (CLEAR
+	// R16F MV; fullscreen coverage makes CLEAR deterministic).
+	blur_target volume_bin; // R8 verdict canvas (working res, 2 layers):
+	// sensor-compare binary output, combined with the rev cut by the
+	// alpha build into the seed (no presmooth: the shared blur chain
+	// feathers the edge).
 	bool volume_targets_ready = false;
-	void ensure_volume_targets();
-	// High-res VR-occlusion chain (3d-passthrough windows): same shapes
-	// as the 320px volume chain above, sized at the per-eye depth
-	// resolution (virt_eye_extent) and rebuilt if it changes. vr_depth
-	// rasterizes the object nearest-D, vr_virt converts the SBS depth,
-	// vr_bin holds the 4-level keep field merged straight (spread-0
-	// upscale) into the seed — no presmooth: any VR smoothing would
-	// bleed keep back up at the dilated rim, and feathering is the
-	// seed chain's job. Created once per depth size (format-fixed).
-	blur_target vr_virt; // R16 virtual-depth D canvas (depth-res, 2 layers)
-	vk::raii::Framebuffer vr_virt_fb_mv{nullptr};
-	blur_target vr_bin; // R8 coverage canvas (depth-res, 2 layers):
-	// compare output, MIN-merged straight into the seed
-	vk::Extent2D vr_extent{0, 0};
-	bool vr_targets_ready = false;
-	void ensure_vr_targets(vk::Extent2D eye);
+	vk::Extent2D depth_working_extent{0, 0}; // display-space chain res (half of full)
+	vk::Extent2D depth_sensor_extent{0, 0}; // sensor extent (warp source)
+	// Closed unit-box mesh ([-1,1]^3, outward-CCW, non-indexed) baked
+	// once for the far-wall bbox raster: the bbox draws carry MVP pairs
+	// mapping this box onto the volume bounds (scene-built). Rasterized
+	// CULL_FRONT so the far wall wins (dedicated path: object soups are
+	// arbitrary glTF, never assumed closed).
+	buffer_allocation bbox_verts;
+	// Borrowed common-layer framebuffer (baked on the merge-owned image
+	// above, keyed by handle): geometry + add re-begin it under LOAD.
+	// Dropped in reset_targets() and rebuilt on handle change (the merge
+	// rebuild waitIdles upstream, so a stale entry can never alias a
+	// live image).
+	vk::raii::Framebuffer layer_fb{nullptr};
+	vk::Image layer_fb_image = VK_NULL_HANDLE;
+	vk::Extent2D layer_fb_extent{0, 0};
+	void ensure_depth_targets(vk::Extent2D working, vk::Extent2D sensor);
 	void update_source(vk::ImageView view, uint32_t set, bool nearest = false,
 	                     vk::ImageLayout layout = vk::ImageLayout::eShaderReadOnlyOptimal);
 
@@ -626,6 +680,7 @@ private:
 		vk::raii::Buffer index_buffer{nullptr};
 		vk::raii::DeviceMemory index_memory{nullptr};
 		uint32_t index_count = 0;
+		uint32_t vertex_count = 0;
 		vk::raii::Buffer staging_buffer{nullptr};
 		vk::raii::DeviceMemory staging_memory{nullptr};
 		vk::DeviceSize staging_size = 0;
@@ -691,9 +746,9 @@ private:
 		vk::Extent2D extent;
 		// Multiview submit target: array view (both layers) + layers=2
 		// framebuffer under blur_renderpass_mv. All output is multiview
-		// (raster, V upscale, VR/volume merges, cutout punch — the
+		// (raster, V upscale, cutout punch — the
 		// cutout re-begins this framebuffer under
-		// volume_max_rgb8_renderpass).
+		// punch_load_renderpass).
 		vk::raii::ImageView view_array{nullptr};
 		vk::raii::Framebuffer framebuffer_mv{nullptr};
 		// Depth-tested raster companion for tier-0 direct raster (color +

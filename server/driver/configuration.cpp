@@ -564,6 +564,23 @@ configuration::configuration()
 					else
 						o.feather_px = item["feather-px"];
 				}
+				// Depth chain runs at the tier-1 submit size only (half-res,
+				// no cross-size resampling): reject other feathers here so
+				// a misconfigured volume can never reach the client.
+				if (is_depth and (o.feather_px <= 0 or o.feather_px > 16))
+				{
+					U_LOG_W("passthrough object \"%s\": 3d-depth-passthrough needs tier-1 feather-px in (0,16]px, got %.0fpx, skipping",
+					        o.id.c_str(), (double)o.feather_px);
+					continue;
+				}
+				// Single depth volume only: extras are rejected here so the
+				// server never sends >1 (the client multi-volume error
+				// latch stays a last resort).
+				if (is_depth and std::ranges::any_of(passthrough_objects, [](const passthrough_object & p) { return p.type == "3d-depth-passthrough"; }))
+				{
+					U_LOG_W("passthrough object \"%s\": only one 3d-depth-passthrough object is supported, skipping extras", o.id.c_str());
+					continue;
+				}
 				if (item.contains("transition-distance"))
 				{
 					if (not is_boundary)
@@ -662,6 +679,21 @@ configuration::configuration()
 				{
 					U_LOG_W("passthrough-fade-time negative, clamping to 0");
 					passthrough_fade_time_s = 0;
+				}
+			}
+		}
+
+		if (auto it = json.find("startup-fade-time"); it != json.end())
+		{
+			if (not it->is_number())
+				U_LOG_W("startup-fade-time must be a number of seconds, ignoring");
+			else
+			{
+				startup_fade_time_s = it->get<float>();
+				if (startup_fade_time_s < 0)
+				{
+					U_LOG_W("startup-fade-time negative, clamping to 0");
+					startup_fade_time_s = 0;
 				}
 			}
 		}
