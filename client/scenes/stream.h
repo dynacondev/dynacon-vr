@@ -685,14 +685,24 @@ private:
 	mask_group hidden_group;
 	// Merge (single submitted alpha layer for the flat feed):
 	// MAX-combines every active contributor (feather groups +
-	// debug + hidden) into one full-res image, submitted once with
-	// REPLACE. merge_image is the acquired target (-1 = none);
-	// merge_this_frame is evaluated ONCE at record time (contributor
-	// activity, not submit_flat/cutouts_punched) and read back at
-	// submit, so record and submit cannot disagree. Render thread only.
+	// debug + hidden) into the owned merged target, then the VR
+	// verdict gates it (common depth layer vs virtual depth) into the
+	// acquired submit image. merge_image is the acquired target
+	// (-1 = none); merge_this_frame is evaluated ONCE at record time
+	// (contributor activity, not submit_flat/cutouts_punched) and read
+	// back at submit, so record and submit cannot disagree. Render
+	// thread only.
 	std::unique_ptr<union_merge_renderer> merge_renderer;
 	int merge_image = -1;
 	bool merge_this_frame = false;
+	// Common depth-layer working buffers (positives only, rebuilt every
+	// mask frame): per-object MVPs on the server color-eye timebase +
+	// upload hashes for the merge-owned mesh store. Capacity survives
+	// clear(). Render thread only.
+	std::vector<union_merge_renderer::geom_draw> layer_draws;
+	std::map<std::string, std::string> layer_mesh_hashes;
+	// One-shot log when the VR verdict first engages (virt paired).
+	bool vr_occlusion_logged = false;
 	// Per-frame hidden working buffers (filled by the shared silhouette
 	// build in the mask phase; capacity survives clear()). Render thread
 	// only.
