@@ -155,25 +155,12 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.stream_rx_r = stream_bandwidth_rx[1];
 	gm.stream_rx_a = stream_bandwidth_rx[2];
 	gm.stream_rx_d = stream_bandwidth_rx[3];
-	gm.volume_virt_ms = (float)(volume_virt_ms * 1e-3);
-	gm.volume_virt_gpu_ms = last_volume_gpu.virt;
-	gm.virt_paired = volume_win_frames ? (float)volume_win_virt_paired / (float)std::max<uint64_t>(volume_win_frames, 1) : 0;
 	gm.track_ms = (float)(fid_detect_ms * 1e-3);
 	gm.solve_ms = (float)(fid_solve_ms * 1e-3);
 	gm.place_ms = (float)(fid_place_ms * 1e-3);
 	gm.mask_raster_ms = (float)(mask_raster_ms * 1e-3);
 	gm.mask_erode_ms = (float)(mask_erode_ms * 1e-3);
 	gm.mask_blur_ms = (float)(mask_blur_ms * 1e-3);
-	gm.volume_acquire_ms = (float)(volume_acquire_ms * 1e-3);
-	gm.volume_raster_ms = (float)(volume_raster_ms * 1e-3);
-	gm.volume_compare_ms = (float)(volume_compare_ms * 1e-3);
-	gm.volume_merge_ms = (float)(volume_merge_ms * 1e-3);
-	gm.vr_raster_ms = (float)(vr_raster_ms * 1e-3);
-	gm.vr_compare_ms = (float)(vr_compare_ms * 1e-3);
-	gm.vr_merge_ms = (float)(vr_merge_ms * 1e-3);
-	gm.volume_raster_gpu_ms = last_volume_gpu.raster;
-	gm.volume_compare_gpu_ms = last_volume_gpu.compare;
-	gm.volume_merge_gpu_ms = last_volume_gpu.merge;
 	gm.gizmo_ms = (float)(mask_gizmo_ms * 1e-3);
 	gm.feat_votes = (float)fid_votes;
 	gm.feat_tags = (float)fid_tags;
@@ -194,7 +181,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		if (predicted_display_time - last_stats_log > 5'000'000'000LL)
 		{
 			last_stats_log = predicted_display_time;
-			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f} merge {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s (l/r/a/d {:.1f}/{:.1f}/{:.1f}/{:.1f}) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms vol={:.2f}ms volg={:.2f}ms vr={:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
+			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f} merge {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s (l/r/a/d {:.1f}/{:.1f}/{:.1f}/{:.1f}) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
 			             gm.cpu_time * 1e3f,
 			             gm.gpu_time * 1e3f,
 			             gm.defoveate_gpu_ms * 1e3f,
@@ -214,9 +201,6 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             gm.mask_raster_ms * 1e3f,
 			             gm.mask_erode_ms * 1e3f,
 			             gm.mask_blur_ms * 1e3f,
-			             (gm.volume_acquire_ms + gm.volume_raster_ms + gm.volume_virt_ms + gm.volume_compare_ms + gm.volume_merge_ms) * 1e3f,
-			             (gm.volume_raster_gpu_ms + gm.volume_virt_gpu_ms + gm.volume_compare_gpu_ms + gm.volume_merge_gpu_ms) * 1e3f,
-			             (gm.vr_raster_ms + gm.vr_compare_ms + gm.vr_merge_ms) * 1e3f,
 			             gm.gizmo_ms * 1e3f,
 			             gm.feat_votes,
 			             gm.feat_tags,
@@ -235,7 +219,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 					m = std::max(m, g.*field);
 				return m;
 			};
-			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f} merge {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms vol={:.2f}ms volg={:.2f}ms vr={:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
+			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f} merge {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
 			             ring_max(&global_metric::cpu_time) * 1e3f,
 			             ring_max(&global_metric::gpu_time) * 1e3f,
 			             ring_max(&global_metric::defoveate_gpu_ms) * 1e3f,
@@ -249,9 +233,6 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             ring_max(&global_metric::mask_raster_ms) * 1e3f,
 			             ring_max(&global_metric::mask_erode_ms) * 1e3f,
 			             ring_max(&global_metric::mask_blur_ms) * 1e3f,
-			             (ring_max(&global_metric::volume_acquire_ms) + ring_max(&global_metric::volume_raster_ms) + ring_max(&global_metric::volume_virt_ms) + ring_max(&global_metric::volume_compare_ms) + ring_max(&global_metric::volume_merge_ms)) * 1e3f,
-			             (ring_max(&global_metric::volume_raster_gpu_ms) + ring_max(&global_metric::volume_virt_gpu_ms) + ring_max(&global_metric::volume_compare_gpu_ms) + ring_max(&global_metric::volume_merge_gpu_ms)) * 1e3f,
-			             (ring_max(&global_metric::vr_raster_ms) + ring_max(&global_metric::vr_compare_ms) + ring_max(&global_metric::vr_merge_ms)) * 1e3f,
 			             ring_max(&global_metric::gizmo_ms) * 1e3f,
 			             ring_max(&global_metric::fence_wait_ms) * 1e3f,
 			             ring_max(&global_metric::gui_ms) * 1e3f,
@@ -259,93 +240,6 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             ring_max(&global_metric::gui_build_ms) * 1e3f,
 			             ring_max(&global_metric::gui_submit_ms) * 1e3f);
 		}
-	}
-
-	// Depth-volume heartbeat (adb): per-stage CPU/GPU window averages,
-	// last group shape, sensor frustum + hit rate. 5s throttle, only
-	// while depth objects are placed. Frustum-culled frames read as
-	// misses (no draws, no raster), which is the honest signal for
-	// coverage work anyway.
-	if (volume_want_frame)
-	{
-		++volume_win_frames;
-		if (volume_raster_ms > 0)
-			++volume_win_sensor;
-		if (volume_frame_virt_paired)
-			++volume_win_virt_paired;
-		// Expected-but-missing: the color frame's view_info says the
-		// server packed depth for this frame_idx, yet tolerant (±1)
-		// pairing found none — wire loss or pairing miss, never by-design.
-		else if (blit_handles.size() > depth_stream_index and blit_handles[0] and not blit_handles[depth_stream_index] and
-		         blit_handles[0]->view_info.depth_expected)
-			++volume_win_virt_missing;
-		volume_win_acquire_ms += volume_acquire_ms;
-		volume_win_raster_ms += volume_raster_ms;
-		volume_win_virt_ms += volume_virt_ms;
-		volume_win_compare_ms += volume_compare_ms;
-		volume_win_merge_ms += volume_merge_ms;
-		volume_win_raster_gpu += (double)last_volume_gpu.raster * 1e3;
-		volume_win_virt_gpu += (double)last_volume_gpu.virt * 1e3;
-		volume_win_compare_gpu += (double)last_volume_gpu.compare * 1e3;
-		volume_win_merge_gpu += (double)last_volume_gpu.merge * 1e3;
-	}
-	if (volume_want_frame and predicted_display_time - volume_last_log > 5'000'000'000LL)
-	{
-		volume_last_log = predicted_display_time;
-		double vf = (double)std::max<uint64_t>(volume_win_frames, 1);
-		double va = (double)std::max<uint64_t>(volume_win_acquired, 1);
-		double win_s = volume_win_t0 != 0 ? (double)(predicted_display_time - volume_win_t0) * 1e-9 : 5.0;
-		double win_hz = win_s > 0 ? (double)volume_win_new_content / win_s : 0;
-		spdlog::info("Volume: feather {:.0f}px tier {} draws {} seed {}x{} sensor {}x{} near {:.2f}m far {:.2f}m box {:.0f}%% age {:.1f}/{:.1f}ms pose {:.1f}mm/{:.2f}deg idx {} {:.1f}Hz acq/r/v/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}/{:.2f}ms gpu r/v/c/m {:.2f}/{:.2f}/{:.2f}/{:.2f}ms sensor {}/{}/{} virt paired/missing/frames {}/{}/{}",
-		             (double)volume_last_feather, volume_last_tier, volume_last_draws,
-		             volume_last_seed_w, volume_last_seed_h, volume_sensor_w, volume_sensor_h,
-		             (double)volume_sensor_near, (double)volume_sensor_far,
-		             (double)volume_last_box_pct,
-		             volume_win_age_sum / va, volume_win_age_max,
-		             volume_win_dpos_sum / va, volume_win_dang_sum / va,
-		             volume_last_index, win_hz,
-		             volume_win_acquire_ms / vf, volume_win_raster_ms / vf, volume_win_virt_ms / vf, volume_win_compare_ms / vf, volume_win_merge_ms / vf,
-		             volume_win_raster_gpu / vf, volume_win_virt_gpu / vf, volume_win_compare_gpu / vf, volume_win_merge_gpu / vf,
-		             volume_win_sensor, volume_win_acquired, volume_win_frames,
-		             volume_win_virt_paired, volume_win_virt_missing, volume_win_frames);
-		volume_win_frames = volume_win_sensor = volume_win_acquired = 0;
-		volume_win_new_content = 0;
-		volume_win_acquire_ms = volume_win_raster_ms = 0;
-		volume_win_virt_ms = volume_win_virt_gpu = 0;
-		volume_win_virt_paired = volume_win_virt_missing = 0;
-		volume_win_compare_ms = volume_win_merge_ms = 0;
-		volume_win_raster_gpu = volume_win_compare_gpu = volume_win_merge_gpu = 0;
-		volume_win_age_sum = volume_win_age_max = 0;
-		volume_win_dpos_sum = volume_win_dang_sum = 0;
-		volume_win_t0 = predicted_display_time;
-	}
-
-	// VR-occlusion heartbeat (unconditional: counts 3d-passthrough window
-	// frames even when no depth volume is placed, where the Volume block
-	// above stays silent). wanted = any group carried window positives;
-	// paired = the VR cut ran; missing = wanted but depth_expected with
-	// no tolerant (±1) pairing (the flicker frame: mask stays passthrough).
-	if (vr_frame_wanted)
-	{
-		++vr_win_frames;
-		if (vr_frame_virt_paired)
-			++vr_win_paired;
-		else if (blit_handles.size() > depth_stream_index and blit_handles[0] and not blit_handles[depth_stream_index] and
-		         blit_handles[0]->view_info.depth_expected)
-			++vr_win_missing;
-		if (vr_win_t0 == 0)
-			vr_win_t0 = predicted_display_time;
-	}
-	if (vr_win_frames > 0 and predicted_display_time - vr_last_log > 5'000'000'000LL)
-	{
-		vr_last_log = predicted_display_time;
-		double vf = (double)std::max<uint64_t>(vr_win_frames, 1);
-		double win_s = vr_win_t0 != 0 ? (double)(predicted_display_time - vr_win_t0) * 1e-9 : 5.0;
-		spdlog::info("VRoccl: wanted/paired/missing/frames {}/{}/{}/{} ({:.1f}% paired, {:.1f}% missing) over {:.1f}s", vr_win_frames,
-		             vr_win_paired, vr_win_missing, vr_win_frames, 100.0 * (double)vr_win_paired / vf,
-		             100.0 * (double)vr_win_missing / vf, win_s);
-		vr_win_frames = vr_win_paired = vr_win_missing = 0;
-		vr_win_t0 = predicted_display_time;
 	}
 
 	std::vector<shard_accumulator::blit_handle *> active_handles;
@@ -410,11 +304,7 @@ void scenes::stream::gui_performance_metrics()
 	                             {_("Mask"),      &global_metric::mask_gpu_ms},
 	                             {_("Mask 1st"),  &global_metric::mask_first_gpu_ms},
 	                             {_("Mask rest"), &global_metric::mask_rest_gpu_ms},
-	                             {_("Mask merge"), &global_metric::merge_gpu_ms},
-	                             {_("Vol R"),     &global_metric::volume_raster_gpu_ms},
-	                             {_("Vol V"),     &global_metric::volume_virt_gpu_ms},
-	                             {_("Vol C"),     &global_metric::volume_compare_gpu_ms},
-	                             {_("Vol M"),     &global_metric::volume_merge_gpu_ms}}, "s"),
+	                             {_("Mask merge"), &global_metric::merge_gpu_ms}}, "s"),
 
 	        plot(_("Network"), {{_("Download"),  &global_metric::bandwidth_rx},
 	                            {_("Upload"),    &global_metric::bandwidth_tx}}, "bit/s"),
@@ -430,15 +320,6 @@ void scenes::stream::gui_performance_metrics()
 	                                {_("Mask raster"), &global_metric::mask_raster_ms},
 	                                {_("Mask erode"),   &global_metric::mask_erode_ms},
 	                                {_("Mask blur"),    &global_metric::mask_blur_ms},
-	                                {_("Vol acq"),     &global_metric::volume_acquire_ms},
-	                                {_("Vol raster"),  &global_metric::volume_raster_ms},
-	                                {_("Vol virt"),    &global_metric::volume_virt_ms},
-	                                {_("Vol compare"), &global_metric::volume_compare_ms},
-	                                {_("Vol merge"),   &global_metric::volume_merge_ms},
-	                                {_("VR raster"),  &global_metric::vr_raster_ms},
-	                                {_("VR compare"), &global_metric::vr_compare_ms},
-	                                {_("VR merge"),    &global_metric::vr_merge_ms},
-	                                {_("Vol paired"),  &global_metric::virt_paired},
 	                                {_("Gizmos"),       &global_metric::gizmo_ms}}, "s"),
 
 	        plot(_("Features"), {{_("Votes"), &global_metric::feat_votes},
