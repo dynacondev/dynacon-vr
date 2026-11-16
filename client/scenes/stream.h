@@ -500,84 +500,6 @@ private:
 	double fid_detect_ms = 0, fid_solve_ms = 0, fid_place_ms = 0;
 	int fid_votes = 0, fid_tags = 0;
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
-	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
-	double volume_raster_ms = 0, volume_virt_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
-	double vr_raster_ms = 0, vr_compare_ms = 0, vr_merge_ms = 0; // VR-occlusion chain CPU (eye-space virt<object MIN-cut)
-	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
-	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
-	// never read unwritten queries). volume_ts_async selects the fence
-	// that retires the writing command buffer (mask vs main).
-	vk::raii::QueryPool volume_query_pool = nullptr;
-	bool volume_ts_valid = false;
-	bool volume_ts_async = false;
-	struct volume_gpu_spans
-	{
-		float raster = 0, virt = 0, compare = 0, merge = 0;
-	};
-	volume_gpu_spans last_volume_gpu;
-	// Volume heartbeat snapshot (last volume group) + 5s window sums for
-	// the adb Volume: line (stable numbers under jitter).
-	int volume_last_tier = -1;
-	float volume_last_feather = 0;
-	int volume_last_draws = 0;
-	float volume_last_box_pct = 100; // merge-box % of seed (last group)
-	uint32_t volume_last_seed_w = 0, volume_last_seed_h = 0;
-	uint32_t volume_sensor_w = 0, volume_sensor_h = 0;
-	float volume_sensor_near = 0, volume_sensor_far = 0;
-	uint64_t volume_win_frames = 0, volume_win_sensor = 0;
-	double volume_win_acquire_ms = 0, volume_win_raster_ms = 0;
-	double volume_win_virt_ms = 0, volume_win_virt_gpu = 0;
-	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
-	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
-	uint64_t volume_win_virt_missing = 0; // color expected depth (view_info flag) but none paired
-	// VR-occlusion diagnostics (unconditional: unlike the Volume block
-	// above, VR cut candidates in 3d-passthrough windows count even when
-	// no 3d-depth-passthrough volume is placed). wanted = any feather
-	// group carried window positives this frame; paired/missing split
-	// that by tolerant (±1) depth pairing (missing only when depth_expected).
-	// Windowed + 5s heartbeat in accumulate_metrics ("VRoccl:" line).
-	bool vr_frame_wanted = false; // set by the mask record loop (any group, any_positive)
-	bool vr_frame_virt_paired = false; // set alongside volume_frame_virt_paired when any_vr ran
-	uint64_t vr_win_frames = 0, vr_win_paired = 0, vr_win_missing = 0;
-	XrTime vr_win_t0 = 0;
-	XrTime vr_last_log = 0;
-	// Throttles for the per-event pairing forensics in common_frame and
-	// the mask record loop (1s: isolated single-frame misses each log,
-	// sustained outages don't spam at 90Hz).
-	XrTime depth_miss_last_log = 0;
-	XrTime vr_cut_skip_last_log = 0;
-	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
-	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
-	XrTime volume_last_log = 0;
-	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
-	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
-	bool volume_remap_logged = false; // one-shot H log for convention validation
-	// Depth time-bias test (Passthrough tab slider, ms, +/-50): assumes
-	// the depth content is bias_ms older than its pose claims (+ = older
-	// = larger correction, the trailing-lag direction). Extrapolates the
-	// reported depth pose backward along head motion; 0 = today's
-	// behavior bit-identically. Render thread only.
-	float volume_time_bias_ms = 0;
-	int volume_bias_logged_ms = 999; // debounced slider log (int ms)
-	// Eye velocity history (world frame, per-eye finite difference of
-	// consecutive predicted mask poses) feeding the bias above. Rigid
-	// head => per-eye differencing, no lever-arm approximation.
-	std::array<XrPosef, 2> volume_prev_mask_pose{};
-	XrTime volume_prev_mask_time = 0;
-	bool volume_have_prev_mask = false;
-	std::array<glm::vec3, 2> volume_eye_lin_vel{};
-	std::array<glm::vec3, 2> volume_eye_ang_vel{}; // axis * rate (rad/s)
-	// Sensor-mapping forensics (Volume heartbeat): content age from the
-	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
-	// divergence at record time, swapchain index for the effective Hz.
-	float volume_last_age_ms = 0;
-	double volume_win_age_sum = 0, volume_win_age_max = 0;
-	uint64_t volume_win_acquired = 0;
-	uint32_t volume_last_index = 0xFFFFFFFF;
-	uint64_t volume_win_new_content = 0;
-	float volume_last_dpos_mm = 0, volume_last_dang_deg = 0;
-	double volume_win_dpos_sum = 0, volume_win_dang_sum = 0;
-	XrTime volume_win_t0 = 0;
 	int mask_draws = 0;
 	// Frame-phase waits (milliseconds): fence wait at frame top,
 	// draw_gui, and render_end (end_frame IPC). Assigned
@@ -647,19 +569,6 @@ private:
 		float mask_raster_ms = 0;
 		float mask_erode_ms = 0;
 		float mask_blur_ms = 0;
-		float volume_acquire_ms = 0;
-		float volume_raster_ms = 0;
-		float volume_virt_ms = 0;
-		float volume_compare_ms = 0;
-		float volume_merge_ms = 0;
-		float vr_raster_ms = 0;
-		float vr_compare_ms = 0;
-		float vr_merge_ms = 0;
-		float volume_raster_gpu_ms = 0;
-		float volume_virt_gpu_ms = 0;
-		float volume_compare_gpu_ms = 0;
-		float volume_merge_gpu_ms = 0;
-		float virt_paired = 0; // depth frames paired / volume frames (windowed below)
 		float gizmo_ms = 0;
 		float mask_gpu_ms = 0;
 		float defoveate_gpu_ms = 0;

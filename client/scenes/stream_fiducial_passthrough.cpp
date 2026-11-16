@@ -1090,9 +1090,10 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		// Boundary zones place identically too (fused pose + mesh for
 		// the distance query); only the veil submit uses them.
 		bool is_boundary = def.type == "3d-boundary" or def.type == "3d-boundary-reversed";
-		bool is_depth = def.type == "3d-depth-passthrough";
 		bool is_hidden = def.type == "3d-passthrough-hidden";
-		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_depth and not is_hidden)
+		if (def.type == "3d-depth-passthrough")
+			continue;
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_hidden)
 		{
 			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
 			continue;
@@ -1193,25 +1194,6 @@ void scenes::stream::gui_passthrough()
 	ImGui::EndDisabled();
 	if (not depth_status.empty())
 		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
-	// Depth-volume rotation reprojection (remap through the capture <->
-	// display relative rotation). Off = direct tap: the flip default
-	// above is what the shader receives, unchanged.
-	if (ImGui::Checkbox(_S("Rotation reprojection"), &volume_remap_enabled))
-		spdlog::info("Depth rotation reprojection {}", volume_remap_enabled ? "on" : "off");
-	// Depth time-bias test: shifts the assumed content age to hunt a
-	// constant sensor lag (+ = content older = larger correction, the
-	// trailing direction). 0 = unshifted. Log debounced per integer ms.
-	ImGui::BeginDisabled(not volume_remap_enabled);
-	if (ImGui::SliderFloat(_S("Depth time bias"), &volume_time_bias_ms, -50, 50, "%.0fms"))
-	{
-		int bias_ms = (int)std::round(volume_time_bias_ms);
-		if (bias_ms != volume_bias_logged_ms)
-		{
-			volume_bias_logged_ms = bias_ms;
-			spdlog::info("Depth time bias {}ms", bias_ms);
-		}
-	}
-	ImGui::EndDisabled();
 
 	ImGui::SeparatorText(_S("Passthrough effects demo"));
 	{
@@ -1580,7 +1562,7 @@ void scenes::stream::gui_fiducial_status()
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
 		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed" and
 		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed" and
-		    ost.def.type != "3d-depth-passthrough" and ost.def.type != "3d-passthrough-hidden")
+		    ost.def.type != "3d-passthrough-hidden")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
@@ -1612,10 +1594,9 @@ void scenes::stream::gui_fiducial_status()
 				            _S("Object"), label.c_str(), _S("zone, no solution"), stale_s);
 			continue;
 		}
-		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
 		std::string hidden_tag = (ost.def.type == "3d-passthrough-hidden") ? _S(" (hidden)") : "";
 		ImGui::Text("%s %.40s%s%s%s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", depth_tag.c_str(), hidden_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", "", hidden_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}
 	if (fiducial_trackers.empty())
 	{

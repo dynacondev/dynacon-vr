@@ -425,10 +425,9 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_in
 	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set, {});
-	// Active input count for the uniform tap early-out (volume_virt
-	// FRAG-only precedent): identical for every invocation in the
-	// draw, so skipped taps never execute. inputs.size() is 1..8
-	// (checked on entry).
+	// Active input count for the uniform tap early-out: identical for
+	// every invocation in the draw, so skipped taps never execute.
+	// inputs.size() is 1..8 (checked on entry).
 	cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, push{.count = (int32_t)inputs.size()});
 	// Fullscreen triangle (blur.vert: 3 verts, no vertex buffers).
 	cmd.draw(3, 1, 0, 0);
