@@ -703,6 +703,15 @@ private:
 	std::map<std::string, std::string> layer_mesh_hashes;
 	// One-shot log when the VR verdict first engages (virt paired).
 	bool vr_occlusion_logged = false;
+	// Layout gate for the async verdict sample (see depth block): the
+	// fused verdict samples the decoder SBS image as GENERAL. The
+	// frame-top transition executes on the main command buffer, which
+	// the async mask submission can precede — so the verdict only
+	// samples when the image was already GENERAL before this frame's
+	// transition (steady state), or on the inline path where the
+	// barrier executes first in the same command buffer. Transition
+	// frames submit merged directly (neutral, fail-open).
+	bool depth_verdict_safe = false;
 	// Per-frame hidden working buffers (filled by the shared silhouette
 	// build in the mask phase; capacity survives clear()). Render thread
 	// only.
