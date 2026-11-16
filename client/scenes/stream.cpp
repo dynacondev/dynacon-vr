@@ -2292,6 +2292,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				rec_cmd.resetQueryPool(*volume_query_pool, 0, 10);
 				try
 				{
+					// Lifecycle: record_base needs the layer renderpasses /
+					// pipelines, which are built in init_pipelines via
+					// ensure(). The merge-section ensure below runs later
+					// the same frame, so without this the FIRST mask frame
+					// records into null handles and segfaults the driver
+					// in vkCreateFramebuffer. ensure() early-outs when
+					// ready; the later call is a harmless retry path.
+					merge_renderer->ensure(instance, session, swapchain.format(), mw, mh);
 					vk::Extent2D workE{(uint32_t)hw, (uint32_t)hh};
 					merge_renderer->record_base(rec_cmd, workE, layer_win_draws, *volume_query_pool, &mergestats);
 					layer_valid = merge_renderer->layer_view() != vk::ImageView{} and
