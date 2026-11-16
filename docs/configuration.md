@@ -426,7 +426,11 @@ Each `passthrough` entry has:
 
 - `type`: behavior type (required). `"3d-passthrough"` renders the
   model as a flat-feed passthrough cutout through the single merged
-  alpha layer; unknown types are
+  alpha layer; where a virtual-depth frame pairs with the color frame,
+  VR content in front of the window occludes the cutout (exact
+  eye-space test of virtual depth against the rasterized window
+  depth, nearer VR wins, ties keep the window; unpaired frames
+  submit un-cut). Unknown types are
   skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each

@@ -1770,6 +1770,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				int hh = std::max(64, mh / 2);
 				int qw = std::max(64, mw / 4);
 				int qh = std::max(64, mh / 4);
+				// Merge + common depth layer storage (owned targets, not
+				// per-group): created once here so the layer mesh sync,
+				// record_base and the merge below all share it. ensure()
+				// is idempotent (no-op when size/format unchanged).
+				if (not merge_renderer)
+					merge_renderer = std::make_unique<union_merge_renderer>(device, physical_device);
+				merge_renderer->ensure(instance, session, swapchain.format(), mw, mh);
 				// Marker window cutouts: raw pose of every live vote,
 				// expanded by the debug window. Fully manual path (no blur):
 				// the punch below is hard-edged by construction. Fills
@@ -1876,6 +1883,91 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							g.renderer->set_mesh(oid, ost.soup);
 							g.mesh_hashes[oid] = ost.soup_hash;
 						}
+					}
+				}
+				// Common depth-layer mesh sync (positives only): the merge
+				// renderer owns one soup per window object, synced on
+				// hash change like the group stores. Reversed/hidden
+				// never write the layer (see header).
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+						continue;
+					auto mh = layer_mesh_hashes.find(oid);
+					if (mh == layer_mesh_hashes.end() or mh->second != ost.soup_hash)
+					{
+						merge_renderer->set_layer_mesh(oid, ost.soup);
+						layer_mesh_hashes[oid] = ost.soup_hash;
+					}
+				}
+				// Drop stale layer meshes (same use-then-advance idiom as
+				// the groups above).
+				for (auto hit = layer_mesh_hashes.begin(); hit != layer_mesh_hashes.end();)
+				{
+					auto oit = passthrough_objects.find(hit->first);
+					bool member = oit != passthrough_objects.end() and oit->second.soup_ready and
+					        oit->second.fused.placed and oit->second.def.type == "3d-passthrough";
+					if (not member)
+					{
+						merge_renderer->remove_layer_mesh(hit->first);
+						hit = layer_mesh_hashes.erase(hit);
+					}
+					else
+						++hit;
+				}
+				// Common depth-layer draws: one per placed positive, model
+				// matrix from the fused placement, per-eye server MVPs
+				// (same timebase as the silhouettes). Conservative
+				// frustum skip with a 1px margin (no feather bleed: the
+				// layer is crisp, the feather band lives in the alpha).
+				layer_draws.clear();
+				{
+					float lm_x = 1.f / ((float)mw * 0.5f);
+					float lm_y = 1.f / ((float)mh * 0.5f);
+					auto layer_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & mvp) {
+						auto bounds = merge_renderer->layer_mesh_bounds(mesh);
+						if (not bounds)
+							return true;
+						for (uint32_t view = 0; view < 2; ++view)
+						{
+							bool any_front = false, any_behind = false, any_inside = false;
+							for (int corner = 0; corner < 8; ++corner)
+							{
+								glm::vec4 c((corner & 1) ? bounds->second.x : bounds->first.x,
+								            (corner & 2) ? bounds->second.y : bounds->first.y,
+								            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+								glm::vec4 q = mvp[view] * c;
+								if (q.w < 0)
+								{
+									any_behind = true;
+									continue;
+								}
+								any_front = true;
+								if (glm::abs(q.x) <= q.w * (1.f + lm_x) and
+								    glm::abs(q.y) <= q.w * (1.f + lm_y) and q.z >= 0 and q.z <= q.w)
+									any_inside = true;
+							}
+							if (any_front and (any_behind or any_inside))
+								return true;
+						}
+						return false;
+					};
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+							continue;
+						const auto & fu = ost.fused;
+						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
+						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
+						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
+						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+						std::array<glm::mat4, 2> mvp;
+						for (uint32_t view = 0; view < view_count; ++view)
+							mvp[view] = server_mvp[view] * model;
+						if (not layer_visible(oid, mvp))
+							continue;
+						layer_draws.push_back({oid, mvp});
 					}
 				}
 				// Debug-only cutout group (no objects): lets the marker
@@ -2713,27 +2805,54 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 							if (merge_ok and not merge_inputs.empty())
 							{
+								// Common depth layer first (stage 0): CLEAR +
+								// near-wins raster of every positive window
+								// into the half-res layer. Skipped only when
+								// the merge sits out (nothing consumes it).
+								merge_renderer->record_base(rec_cmd, layer_draws);
 								int merge_idx = -1;
 								try
 								{
-									if (not merge_renderer)
-										merge_renderer = std::make_unique<union_merge_renderer>(device);
-									merge_renderer->ensure(instance, session, swapchain.format(), mw, mh);
 									merge_idx = merge_renderer->acquire();
+									bool finished = false;
 									if (merge_idx >= 0)
 									{
 										vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
-										if (merge_renderer->record(rec_cmd, (size_t)merge_idx, merge_ext, merge_inputs))
+										if (merge_renderer->record(rec_cmd, merge_ext, merge_inputs))
 										{
-											merge_image = merge_idx;
-											merge_this_frame = true;
-											merge_idx = -1; // owned by the submit phase now
+											// Virtual depth for the global
+											// verdict: the paired stream-3
+											// frame (SBS, decoder-owned view
+											// + sampler). Unpaired (not
+											// expected, decoder dead, ±1
+											// miss) submits merged directly
+											// — today's neutral parity.
+											union_merge_renderer::virt_input virt{};
+											if (auto & dh = current_blit_handles[depth_stream_index];
+											    dh and dh->image_view)
+											{
+												virt.view = dh->image_view;
+												virt.sampler = decoders[depth_stream_index].decoder->sampler();
+												virt.valid = true;
+											}
+											if (merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt))
+											{
+												merge_image = merge_idx;
+												merge_this_frame = true;
+												merge_idx = -1; // owned by the submit phase now
+												finished = true;
+												if (virt.valid and not vr_occlusion_logged)
+												{
+													vr_occlusion_logged = true;
+													spdlog::info("VR occlusion engaged: common depth layer + fused verdict active");
+												}
+											}
 										}
-										else
-										{
-											merge_renderer->release();
-											merge_idx = -1;
-										}
+									}
+									if (not finished)
+									{
+										merge_renderer->release();
+										merge_idx = -1;
 									}
 								}
 								catch (std::exception & e)
@@ -3717,7 +3836,7 @@ void scenes::stream::setup_reprojection_swapchain(uint32_t swapchain_width, uint
 	feather_mask_renderer::warm_pipelines(device, physical_device, swapchain.format());
 	// Same for the merge (one fullscreen pipeline): first
 	// revealing frames must only rasterize, not driver-compile.
-	union_merge_renderer::warm_pipelines(device, swapchain.format());
+	union_merge_renderer::warm_pipelines(device, physical_device, swapchain.format());
 }
 
 scene::meta & scenes::stream::get_meta_scene()
