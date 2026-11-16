@@ -116,8 +116,6 @@ public:
 
 	explicit union_merge_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
 
-	explicit union_merge_renderer(vk::raii::Device & device);
-
 	// Shared driver pipeline cache (one per device, same object the
 	// feather mask renderer uses). Render-thread only.
 	static std::shared_ptr<vk::raii::PipelineCache> pipeline_cache(vk::raii::Device & device);

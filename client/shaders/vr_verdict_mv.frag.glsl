@@ -54,9 +54,10 @@ layout(location = 0) out vec4 out_color;
 //
 // Layout note: the decoder image is normalized to GENERAL at frame
 // top on the main command buffer and sampled read-only here under
-// the same steady-state discipline as the video path. The very first
-// depth frame can race the transition on the async mask path (one
-// self-healing frame); steady state has no hazard.
+// the same steady-state discipline as the video path. Transition
+// frames sit the verdict out scene-side (depth_verdict_safe: neutral
+// merged submit, fail-open), so this pass only ever samples
+// steady-state GENERAL — including on the async mask path.
 //
 // Plain scalar math only (no mat3/ternary on this driver path).
 layout(set = 0, binding = 0) uniform sampler2DArray layer_tex;

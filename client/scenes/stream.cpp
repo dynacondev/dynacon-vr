@@ -1357,6 +1357,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		++depth_handle->feedback.times_displayed;
 		depth_handle->feedback.displayed = frame_state.predictedDisplayTime;
 
+		// Verdict layout gate: safe to sample as GENERAL on the async
+		// mask path only when no transition is recorded this frame
+		// (steady state — a prior submit already transitioned it). The
+		// inline path records into this same command buffer after the
+		// barrier below, so it is always safe there.
+		depth_verdict_safe = depth_handle->current_layout == vk::ImageLayout::eGeneral or not use_async_masks;
 		bool depth_undefined = depth_handle->current_layout == vk::ImageLayout::eUndefined;
 #if WIVRN_USE_V4L2
 		if (depth_handle->foreign_queue_family != vk::QueueFamilyIgnored)
@@ -1410,6 +1416,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			depth_handle->current_layout = vk::ImageLayout::eGeneral;
 		}
 	}
+	else
+		depth_verdict_safe = false;
 
 	// Mask record/submit views: server eye timebase, not live predicted.
 	// The mask alpha composites with server video, so raster + submit
@@ -2829,7 +2837,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											// — today's neutral parity.
 											union_merge_renderer::virt_input virt{};
 											if (auto & dh = current_blit_handles[depth_stream_index];
-											    dh and dh->image_view)
+											    dh and dh->image_view and depth_verdict_safe)
 											{
 												virt.view = dh->image_view;
 												virt.sampler = decoders[depth_stream_index].decoder->sampler();
@@ -2849,8 +2857,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											}
 										}
 									}
-									if (not finished)
+									if (not finished and merge_idx >= 0)
 									{
+										// Guarded: acquire() already
+										// releases internally on
+										// wait-timeout (returns -1), so
+										// an unguarded release here
+										// double-releases into
+										// CALL_ORDER_INVALID.
 										merge_renderer->release();
 										merge_idx = -1;
 									}
