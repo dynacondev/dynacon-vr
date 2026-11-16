@@ -971,23 +971,23 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 		        .imageView = virt_in.view,
 		        .imageLayout = vk::ImageLayout::eGeneral,
 		};
-		vk::WriteDescriptorSet writes[2] = {
-		        {
-		                .dstSet = vset,
-		                .dstBinding = 0,
-		                .descriptorCount = 1,
-		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-		                .pImageInfo = &layer_info,
-		        },
-		        {
-		                .dstSet = vset,
-		                .dstBinding = 1,
-		                .descriptorCount = 1,
-		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-		                .pImageInfo = &virt_info,
-		        },
-		};
-		device->updateDescriptorSets(2, writes, 0, nullptr);
+		std::vector<vk::WriteDescriptorSet> vwrites;
+		vwrites.reserve(2);
+		vwrites.push_back(vk::WriteDescriptorSet{
+		        .dstSet = vset,
+		        .dstBinding = 0,
+		        .descriptorCount = 1,
+		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		        .pImageInfo = &layer_info,
+		});
+		vwrites.push_back(vk::WriteDescriptorSet{
+		        .dstSet = vset,
+		        .dstBinding = 1,
+		        .descriptorCount = 1,
+		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		        .pImageInfo = &virt_info,
+		});
+		device->updateDescriptorSets(vwrites, {});
 		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *verdict_pipeline);
 		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *verdict_layout, 0, vset, {});
 		cmd.draw(3, 1, 0, 0);
@@ -1029,23 +1029,23 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	        .imageView = *verdict_.view_array,
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
-	vk::WriteDescriptorSet apply_writes[2] = {
-	        {
-	                .dstSet = aset,
-	                .dstBinding = 0,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .pImageInfo = &merged_info,
-	        },
-	        {
-	                .dstSet = aset,
-	                .dstBinding = 1,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .pImageInfo = &apply_verdict_info,
-	        },
-	};
-	device->updateDescriptorSets(2, apply_writes, 0, nullptr);
+	std::vector<vk::WriteDescriptorSet> apply_writes;
+	apply_writes.reserve(2);
+	apply_writes.push_back(vk::WriteDescriptorSet{
+	        .dstSet = aset,
+	        .dstBinding = 0,
+	        .descriptorCount = 1,
+	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	        .pImageInfo = &merged_info,
+	});
+	apply_writes.push_back(vk::WriteDescriptorSet{
+	        .dstSet = aset,
+	        .dstBinding = 1,
+	        .descriptorCount = 1,
+	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	        .pImageInfo = &apply_verdict_info,
+	});
+	device->updateDescriptorSets(apply_writes, {});
 	auto & tgt = targets[image_index];
 	cmd.setViewport(0, vk::Viewport{
 	                        .x = 0,
