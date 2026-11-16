@@ -257,6 +257,32 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// hidden init.
 	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(silhouette_mv_push))
 		throw std::runtime_error("feather silhouette multiview needs 132B push constants");
+	// One-shot forensic for the v3 depth chain (H2): it MIN-blends and
+	// linearly samples R16F (intermediate/dilTemp/sensorW/rev_depth)
+	// and linearly samples the runtime D16 sensor in the warp. If this
+	// driver exposes R16F without BLEND or LINEAR_FILTER (or D16
+	// without LINEAR_FILTER), those passes produce undefined values —
+	// bilateral layer corruption. Logged once per renderer
+	// construction; no behavior change (fallbacks, if needed, are a
+	// separate change once run.log gives the verdict).
+	{
+		auto feat = [&](vk::Format f) { return physical_device.getFormatProperties(f).optimalTilingFeatures; };
+		auto has = [](vk::FormatFeatureFlags fs, vk::FormatFeatureFlagBits b) { return (fs & b) == b; };
+		using F = vk::FormatFeatureFlagBits;
+		vk::FormatFeatureFlags r16 = feat(vk::Format::eR16Sfloat);
+		vk::FormatFeatureFlags r8 = feat(vk::Format::eR8Unorm);
+		vk::FormatFeatureFlags d16 = feat(vk::Format::eD16Unorm);
+		spdlog::info("Depth layer formats (optimal tiling): R16F attach={} blend={} sampled={} linear={}; R8 attach={} blend={} sampled={} linear={}; D16 sampled={} linear={}",
+		             has(r16, F::eColorAttachment), has(r16, F::eColorAttachmentBlend), has(r16, F::eSampledImage),
+		             has(r16, F::eSampledImageFilterLinear), has(r8, F::eColorAttachment), has(r8, F::eColorAttachmentBlend),
+		             has(r8, F::eSampledImage), has(r8, F::eSampledImageFilterLinear), has(d16, F::eSampledImage),
+		             has(d16, F::eSampledImageFilterLinear));
+		if (not has(r16, F::eColorAttachmentBlend) or not has(r16, F::eSampledImageFilterLinear))
+			spdlog::error("Depth layer formats: R16F lacks {} — MIN-blend/linear taps on the common layer are UNDEFINED on this driver",
+			              not has(r16, F::eColorAttachmentBlend) ? "BLEND" : "LINEAR_FILTER");
+		if (not has(d16, F::eSampledImageFilterLinear))
+			spdlog::error("Depth layer formats: D16 lacks LINEAR_FILTER — warp sensor taps are UNDEFINED on this driver");
+	}
 	{
 		vk::PushConstantRange mv_push_range{
 		        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
