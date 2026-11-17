@@ -59,6 +59,7 @@
 
 #include <vulkan/vulkan_raii.hpp>
 
+#include "decoder/decoder.h"
 #include "render/passthrough_mesh.h"
 #include "xr/swapchain.h"
 
@@ -106,12 +107,16 @@ public:
 	// (single image, left eye x[0..w/2)), decoder-owned view +
 	// sampler, set every frame from the paired blit handle. valid=false
 	// clears the verdict to 1 and applies merged directly (today's
-	// neutral parity, pixel-identical).
+	// neutral parity, pixel-identical). ycbcr carries the view's
+	// conversion definition (Android AHB depth); the verdict layout
+	// bakes an identically defined immutable sampler from it
+	// (VUID-VkWriteDescriptorSet-descriptorType-02738).
 	struct virt_input
 	{
 		vk::ImageView view = nullptr;
 		vk::Sampler sampler = nullptr;
 		bool valid = false;
+		wivrn::decoder::ycbcr_definition ycbcr{};
 	};
 
 	explicit union_merge_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
@@ -261,6 +266,28 @@ private:
 	// verdict): fullscreen passes, no push, static sampler2DArray
 	// bindings (Adreno rule, same as the merge shader).
 	vk::raii::RenderPass verdict_renderpass{nullptr};
+	// Verdict YCbCr immutable-sampler state (VUID-...-02738): the depth
+	// SBS view carries a conversion, so binding 1 needs an immutable
+	// sampler baked into the layout. The baked sampler is the decoder's
+	// live sampler (defoveator pattern): a separately built conversion
+	// proved unidentifiable to validation despite matching parameters,
+	// so the layout shares the decoder's object instead of owning one.
+	// Rebuilt when the incoming definition OR the decoder sampler handle
+	// changes (recreation hands out a new object; waitIdle'd like
+	// ensure()). Plain views (has_conversion=false) keep the mutable
+	// layout. Declaration order matters: layout outlives sets (reverse
+	// destruction). Non-owning alias: refreshed on every rebuild before
+	// any bind.
+	vk::Sampler verdict_immutable_src{nullptr};
+	wivrn::decoder::ycbcr_definition verdict_ycbcr_built{};
+	// (Re)build the full verdict state for a conversion definition:
+	// descriptor set layout (binding 1 immutable iff converted) +
+	// ping-pong sets + pipeline layout + pipeline (a pipeline bakes
+	// its set layout, so the two are never rebuilt apart).
+	// Caller guarantees no in-flight readers: fresh object, or a
+	// waitIdle'd rebuild.
+	void create_verdict_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void ensure_verdict_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
 	vk::raii::DescriptorSetLayout verdict_descriptor_layout{nullptr};
 	vk::raii::DescriptorPool verdict_descriptor_pool{nullptr};
 	std::vector<vk::raii::DescriptorSet> verdict_descriptor_sets;

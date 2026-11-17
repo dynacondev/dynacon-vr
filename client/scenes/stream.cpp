@@ -2841,6 +2841,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											{
 												virt.view = dh->image_view;
 												virt.sampler = decoders[depth_stream_index].decoder->sampler();
+												virt.ycbcr = dh->ycbcr;
 												virt.valid = true;
 											}
 											if (merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt))
