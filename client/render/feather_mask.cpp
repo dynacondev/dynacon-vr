@@ -775,6 +775,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .descriptorCount = 9,
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
+	        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
 	        .maxSets = 9,
 	        .poolSizeCount = 1,
 	        .pPoolSizes = &pool_size,
@@ -1302,8 +1303,9 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 	{
 		hidden_frame_targets tgt;
 		tgt.extent = extent;
-		// One multiview target: array color view (both layers) + layers=2
-		// framebuffers; one draw broadcasts to both eyes. The proximity
+		// One multiview target: array color view (both layers) +
+		// layers=1 framebuffers (view mask routes both eyes); one draw
+		// broadcasts to both eyes. The proximity
 		// framebuffer bakes the feather-owned proximity field ARRAY view
 		// (see ensure_hidden_field); reset_targets() on field rebuild.
 		// Extent agreement is the scene's job — one quarter-res for
@@ -1330,7 +1332,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		        .pAttachments = color_atts,
 		        .width = extent.width,
 		        .height = extent.height,
-		        .layers = 2,
+		        .layers = 1,
 		};
 		tgt.framebuffer = vk::raii::Framebuffer(device, color_fb);
 		vk::FramebufferCreateInfo sphere_fb{
@@ -1339,7 +1341,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		        .pAttachments = &sphere_view,
 		        .width = extent.width,
 		        .height = extent.height,
-		        .layers = 2,
+		        .layers = 1,
 		};
 		tgt.sphere_framebuffer = vk::raii::Framebuffer(device, sphere_fb);
 		hidden_targets[image] = std::move(tgt);
@@ -1501,7 +1503,8 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		return true;
 	};
 	// RP1: proximity field (sphere/cylinder exits, LESS over a
-	// near-clear). One multiview begin over the layers=2 framebuffer.
+	// near-clear). One multiview begin over the layers=1 framebuffer
+	// (view mask routes both eyes).
 	vk::ClearValue sphere_clear{};
 	sphere_clear.depthStencil = vk::ClearDepthStencilValue{1.f, 0};
 	vk::RenderPassBeginInfo sphere_begin{
@@ -1562,7 +1565,8 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 
 	// RP2: silhouettes, kept only where nearer than the proximity exit
 	// (GREATER, no depth write). Hard near-field edge by design. One
-	// multiview begin over the layers=2 framebuffer. Per-draw scissor is
+	// multiview begin over the layers=1 framebuffer (view mask routes
+	// both eyes). Per-draw scissor is
 	// the both-eyes union (submitted full-rect image: renderArea stays
 	// full, correctness).
 	vk::ClearValue hidden_clear{};
@@ -1674,7 +1678,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 		target->memory = vk::raii::DeviceMemory(device, alloc_info);
 		target->image.bindMemory(*target->memory, 0);
 		// Multiview sampling + render target: array view over both
-		// layers, plus one layers=2 framebuffer per begun pass for the
+		// layers, plus one layers=1 framebuffer per begun pass for the
 		// raster source only (A). Target B is triple scratch: written via
 		// the shared triple FB and sampled via its view_array, never
 		// begun on its own, so it keeps no framebuffers (null FBs are
@@ -1702,7 +1706,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			                .pAttachments = &raw_array,
 			                .width = half_targets.width,
 			                .height = half_targets.height,
-			                .layers = 2,
+			                .layers = 1,
 			        });
 			target->raster_fb_mv = vk::raii::Framebuffer(device,
 			        vk::FramebufferCreateInfo{
@@ -1711,13 +1715,13 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			                .pAttachments = &raw_array,
 			                .width = half_targets.width,
 			                .height = half_targets.height,
-			                .layers = 2,
+			                .layers = 1,
 			        });
 		}
 		if (needs_depth)
 		{
 			// Depth-tested seed-raster companion: D16 image + array views
-			// + one layers=2 color+depth framebuffer (MV raster pass).
+			// + one layers=1 color+depth framebuffer (MV raster pass).
 			depth_entry depth = make_depth_entry(half_targets);
 			target->depth_image = std::move(depth.image);
 			target->depth_memory = std::move(depth.memory);
@@ -1743,7 +1747,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 				                .pAttachments = mv_atts,
 				                .width = half_targets.width,
 				                .height = half_targets.height,
-				                .layers = 2,
+				                .layers = 1,
 				        });
 			}
 		}
@@ -1810,7 +1814,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 				                .pAttachments = &raw_array,
 				                .width = le.width,
 				                .height = le.height,
-				                .layers = 2,
+				                .layers = 1,
 				        });
 				target->raster_fb_mv = vk::raii::Framebuffer(device,
 				        vk::FramebufferCreateInfo{
@@ -1819,7 +1823,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 				                .pAttachments = &raw_array,
 				                .width = le.width,
 				                .height = le.height,
-				                .layers = 2,
+				                .layers = 1,
 				        });
 			}
 			if (needs_depth)
@@ -1852,7 +1856,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 					                .pAttachments = mv_atts,
 					                .width = le.width,
 					                .height = le.height,
-					                .layers = 2,
+					                .layers = 1,
 					        });
 				}
 			}
@@ -2044,7 +2048,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			                .pAttachments = attachments,
 			                .width = e.width,
 			                .height = e.height,
-			                .layers = 2,
+			                .layers = 1,
 			        });
 		}
 		return *triple_fb;
@@ -2075,7 +2079,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// temporary: freed stack read as an image view, GPU fault, silent
 		// fence hang. That exact bug froze the first mask frame.)
 		// Multiview submit target: array view over both layers plus
-		// one layers=2 framebuffer under blur_renderpass_mv. All mask
+		// one layers=1 framebuffer under blur_renderpass_mv. All mask
 		// output (raster, V upscale, cutout punch)
 		// is multiview: no per-eye framebuffers remain.
 		vk::raii::ImageView mv_array_view(device,
@@ -2099,10 +2103,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                .pAttachments = &mv_raw_array,
 		                .width = out_extent.width,
 		                .height = out_extent.height,
-		                .layers = 2,
+		                .layers = 1,
 		        });
 		// Depth-tested raster companion for tier-0 direct raster: one
-		// layers=2 color+depth FB under depth_renderpass_mv, built lazily
+		// layers=1 color+depth FB under depth_renderpass_mv, built lazily
 		// on first reversed use (has_depth); positive-only targets stay
 		// lean.
 		bool has_depth = false;
@@ -2118,7 +2122,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			                .pAttachments = mv_depth_atts,
 			                .width = out_extent.width,
 			                .height = out_extent.height,
-			                .layers = 2,
+			                .layers = 1,
 			        });
 			has_depth = true;
 		}

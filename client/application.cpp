@@ -919,6 +919,16 @@ void application::initialize_vulkan()
 	vk_device_extensions.push_back(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
 	instance_extensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
 	instance_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+	// The runtime enables VK_KHR_surface_protected_capabilities without
+	// its required VK_KHR_get_surface_capabilities2
+	// (VUID-vkCreateInstance-ppEnabledExtensionNames-01388): satisfy the
+	// dependency ourselves when present. Enabling an available instance
+	// extension we never call is side-effect-free.
+	for (const auto & e: extensions)
+	{
+		if (e.first == VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)
+			instance_extensions.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+	}
 #endif
 
 	std::ranges::sort(extensions);

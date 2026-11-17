@@ -230,7 +230,8 @@ private:
 	std::vector<target> targets;
 
 	// Common depth layer (R16F linear meters, half merge res): one
-	// owned 2-layer image + array view + layers=2 framebuffer, rebuilt
+	// owned 2-layer image + array view + layers=1 framebuffer (view mask
+	// routes both eyes), rebuilt
 	// in ensure() alongside the swapchain targets above. MIN-blended
 	// by record_base, sampled by the verdict.
 	struct layer_target

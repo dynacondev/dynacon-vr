@@ -180,11 +180,16 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 	};
 	set_layout = vk::raii::DescriptorSetLayout(*device, set_layout_info);
 
+	// Free the old set while its pool is still alive: the pool
+	// assignment below destroys the old pool, which would strand it
+	// (union_merge ensure() precedent).
+	descriptor_set.clear();
 	vk::DescriptorPoolSize pool_sizes[2] = {
 	        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 8},
 	        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 4},
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
+	        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
 	        .maxSets = 4,
 	        .poolSizeCount = 2,
 	        .pPoolSizes = pool_sizes,

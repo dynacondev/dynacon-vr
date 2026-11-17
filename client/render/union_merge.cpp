@@ -117,7 +117,9 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	spdlog::info("Union merge swapchain: {}x{} ({} images)", w, h, swapchain_.image_count());
 	init_pipelines(new_format);
 	// One multiview target per swapchain image: array color view +
-	// layers=2 framebuffer; one draw broadcasts to both eyes.
+	// layers=1 framebuffer (the 2-layer routing comes from the
+	// multiview view mask, not the framebuffer); one draw broadcasts
+	// to both eyes.
 	targets.clear();
 	for (vk::Image image: swapchain_.images())
 	{
@@ -142,7 +144,7 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        .pAttachments = &color_view,
 		        .width = new_extent.width,
 		        .height = new_extent.height,
-		        .layers = 2,
+		        .layers = 1,
 		};
 		targets.back().framebuffer = vk::raii::Framebuffer(*device, fb_info);
 	}
@@ -151,7 +153,7 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	// Rebuilt under the same waitIdle above; the mesh buffers survive
 	// (extent-independent).
 	vk::Extent2D half{(uint32_t)std::max(8u, new_extent.width / 2), (uint32_t)std::max(8u, new_extent.height / 2)};
-	auto make_owned = [&](vk::Format fmt, vk::Extent2D e, vk::ImageUsageFlags usage, vk::raii::RenderPass & rp) {
+	auto make_owned = [&](const char * name, vk::Format fmt, vk::Extent2D e, vk::ImageUsageFlags usage, vk::raii::RenderPass & rp) {
 		layer_target t;
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
@@ -173,6 +175,7 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		};
 		t.memory = vk::raii::DeviceMemory(*device, alloc_info);
 		t.image.bindMemory(*t.memory, 0);
+		spdlog::info("Union merge target '{}': {}x{} fmt={} alloc={}B", name, e.width, e.height, (int)fmt, requirements.size);
 		vk::ImageViewCreateInfo iv_info{
 		        .image = *t.image,
 		        .viewType = vk::ImageViewType::e2DArray,
@@ -193,14 +196,14 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        .pAttachments = &view,
 		        .width = e.width,
 		        .height = e.height,
-		        .layers = 2,
+		        .layers = 1,
 		};
 		t.framebuffer = vk::raii::Framebuffer(*device, fb_info);
 		return t;
 	};
-	layer_ = make_owned(layer_format, half, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, geom_renderpass);
-	merged_ = make_owned(new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, renderpass);
-	verdict_ = make_owned(verdict_format, half, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, verdict_renderpass);
+	layer_ = make_owned("layer", layer_format, half, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, geom_renderpass);
+	merged_ = make_owned("merged", new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, renderpass);
+	verdict_ = make_owned("verdict", verdict_format, half, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, verdict_renderpass);
 	layer_extent_ = half;
 	spdlog::info("Union merge layer targets: layer {}x{} merged {}x{} verdict {}x{}",
 	             half.width, half.height, new_extent.width, new_extent.height, half.width, half.height);
