@@ -348,7 +348,8 @@ private:
 		vk::raii::Image image{nullptr};
 		vk::raii::DeviceMemory memory{nullptr};
 		// Multiview sampling + render target: 2D-array view over both
-		// layers and one layers=2 framebuffer. The _mv fullscreen
+		// layers and one layers=1 framebuffer (view mask routes both
+		// eyes). The _mv fullscreen
 		// passes read via view_array (sampler2DArray indexed by
 		// gl_ViewIndex) and render into blur_fb_mv.
 		vk::raii::ImageView view_array{nullptr};
@@ -362,7 +363,7 @@ private:
 		vk::raii::Image depth_image{nullptr};
 		vk::raii::DeviceMemory depth_memory{nullptr};
 		vk::raii::ImageView depth_view_array{nullptr};
-		// Multiview depth companion: one layers=2 color+depth FB under the raster MV depth pass.
+		// Multiview depth companion: one layers=1 color+depth FB under the raster MV depth pass.
 		vk::raii::Framebuffer raster_depth_fb_mv{nullptr};
 	};
 	blur_target target_a;
@@ -447,15 +448,16 @@ private:
 	vk::raii::ImageView hidden_sphere_view_array_{nullptr};
 	vk::Extent2D hidden_sphere_extent_{0, 0};
 	// Per-swapchain-image multiview framebuffers for the two hidden
-	// passes (color + proximity-depth, layers=2 each); dropped by
+	// passes (color + proximity-depth, layers=1 each, view mask routes
+	// both eyes); dropped by
 	// reset_targets() with the rest (swapchain recreate = waitIdle'd
 	// upstream).
 	struct hidden_frame_targets
 	{
 		vk::Extent2D extent{0, 0};
 		vk::raii::ImageView view_array{nullptr}; // color, both layers
-		vk::raii::Framebuffer framebuffer{nullptr}; // color MV, layers=2
-		vk::raii::Framebuffer sphere_framebuffer{nullptr}; // sphere MV, layers=2
+		vk::raii::Framebuffer framebuffer{nullptr}; // color MV, layers=1
+		vk::raii::Framebuffer sphere_framebuffer{nullptr}; // sphere MV, layers=1
 	};
 	std::unordered_map<VkImage, hidden_frame_targets> hidden_targets;
 	void ensure_hidden(vk::Image image, vk::Extent2D extent);
@@ -466,7 +468,7 @@ private:
 	struct frame_targets
 	{
 		vk::Extent2D extent;
-		// Multiview submit target: array view (both layers) + layers=2
+		// Multiview submit target: array view (both layers) + layers=1
 		// framebuffer under blur_renderpass_mv. All output is multiview
 		// (raster, V upscale, cutout punch — the
 		// cutout re-begins this framebuffer under
@@ -474,7 +476,7 @@ private:
 		vk::raii::ImageView view_array{nullptr};
 		vk::raii::Framebuffer framebuffer_mv{nullptr};
 		// Depth-tested raster companion for tier-0 direct raster (color +
-		// depth): one layers=2 color+depth FB under depth_renderpass_mv,
+		// depth): one layers=1 color+depth FB under depth_renderpass_mv,
 		// built lazily on first reversed use (has_depth); positive-only
 		// targets stay lean.
 		vk::raii::Framebuffer depth_framebuffer_mv{nullptr};
