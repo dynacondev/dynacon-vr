@@ -95,6 +95,11 @@ public:
 	// hand-as-controller emulation (pinch driving controller input).
 	bool hands_emulate_controllers = false;
 
+	// Show tracked hand meshes in the lobby. Off (default): meshes are
+	// hidden; hand pointing still works and controller hide/show behaviour
+	// is unchanged.
+	bool show_hand_meshes_in_lobby = false;
+
 	std::underlying_type_t<wivrn::from_headset::body_part_mask> body_part_mask = ~0;
 
 	bool enable_stream_gui = true;

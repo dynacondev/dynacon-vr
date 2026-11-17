@@ -711,6 +711,19 @@ bool settings_tracking(const settings_context & ctx)
 		        .disabled_tooltip = disconnect_tip,
 		});
 
+	// lobby-only cosmetic, hidden in-stream (connection-time settings use
+	// the disabled-row pattern instead, but this has no in-stream effect)
+	if (ctx.system.hand_tracking_supported() and not ctx.in_game)
+		list.push_back({
+		        .id = "##show_hand_meshes_in_lobby",
+		        .label = _C("setting name", "Show hand meshes in lobby"),
+		        .description = _("Show tracked hand meshes in the lobby. Off hides the meshes; hand pointing still works."),
+		        .ui = ui_kind::toggle,
+		        .get_bool = [&config] { return config.show_hand_meshes_in_lobby; },
+		        .set_bool = [&config](bool v) { config.show_hand_meshes_in_lobby = v; config.save(); },
+		        .default_bool = default_config.show_hand_meshes_in_lobby,
+		});
+
 	if (application::get_eye_gaze_supported())
 		feature_toggle("##eye", _C("setting name", "Eye tracking"), _("Used by foveated encoding to focus quality where you look."), feature::eye_gaze);
 

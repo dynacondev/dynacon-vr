@@ -1156,7 +1156,10 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 			hide_right_controller = true;
 		}
 
-		hand_model::apply(world, left ? &left->joints : nullptr, right ? &right->joints : nullptr);
+		const bool show_hand_meshes = application::get_config().show_hand_meshes_in_lobby;
+		hand_model::apply(world,
+		                (show_hand_meshes and left) ? &left->joints : nullptr,
+		                (show_hand_meshes and right) ? &right->joints : nullptr);
 
 		if (not new_gui_position and head_position and left and left->is_input_source())
 			new_gui_position = check_recenter_gesture(xr::spaces::palm_left, left->joints, *head_position);
