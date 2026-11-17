@@ -38,6 +38,35 @@ class shard_accumulator;
 class decoder
 {
 public:
+	// YCbCr conversion definition for an image view created with
+	// VkSamplerYcbcrConversionInfo in its pNext chain (hardware decoder
+	// imports: Android AHB, v4l2 DMA-buf, raw multi-planar). Consumers
+	// that sample such a view through a combined image sampler MUST use
+	// immutable samplers baked with an identically defined conversion
+	// (VUID-VkWriteDescriptorSet-descriptorType-02738); this struct is
+	// the comparable definition they build from. Populated per blit
+	// handle at map time and immutable afterwards, so the definition
+	// always agrees with its view — even across buffer slot reuse and
+	// format changes (each handle carries the definition its view was
+	// mapped under). has_conversion=false means a plain view: any
+	// compatible sampler works.
+	struct ycbcr_definition
+	{
+		bool has_conversion = false;
+		// External format for Android AHB imports (0 = explicit format
+		// in `format`, raw/v4l2 style).
+		uint64_t external_format = 0;
+		vk::Format format = vk::Format::eUndefined;
+		vk::SamplerYcbcrModelConversion ycbcr_model = vk::SamplerYcbcrModelConversion::eYcbcr709;
+		vk::SamplerYcbcrRange ycbcr_range = vk::SamplerYcbcrRange::eItuFull;
+		vk::ComponentMapping components{};
+		vk::ChromaLocation x_chroma_offset = vk::ChromaLocation::eMidpoint;
+		vk::ChromaLocation y_chroma_offset = vk::ChromaLocation::eMidpoint;
+		vk::Filter chroma_filter = vk::Filter::eNearest;
+
+		bool operator==(const ycbcr_definition &) const = default;
+	};
+
 	struct blit_handle
 	{
 		wivrn::from_headset::feedback feedback;
@@ -53,6 +82,10 @@ public:
 		// transfers between Vulkan and external engine
 		uint32_t foreign_queue_family = vk::QueueFamilyIgnored;
 #endif
+		// Conversion definition for image_view, set by the producing
+		// decoder at map time (see above). Value-initialized here,
+		// assigned once before the handle is published.
+		ycbcr_definition ycbcr{};
 	};
 
 public:

@@ -643,44 +643,27 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 			sets.emplace_back(std::move(device->allocateDescriptorSets(set_alloc)[0]));
 		}
 	};
-	make_dual_cis(verdict_descriptor_layout, verdict_descriptor_pool, verdict_descriptor_sets);
+	// Verdict pool (sets/layout/pipeline built by create_verdict_state
+	// below so rebuilds share one path; the pool itself is
+	// format-agnostic and never changes).
+	{
+		vk::DescriptorPoolSize pool_size{
+		        .type = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 4,
+		};
+		vk::DescriptorPoolCreateInfo pool_info{
+		        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+		        .maxSets = 2,
+		        .poolSizeCount = 1,
+		        .pPoolSizes = &pool_size,
+		};
+		verdict_descriptor_pool = vk::raii::DescriptorPool(*device, pool_info);
+	}
 	make_dual_cis(apply_descriptor_layout, apply_descriptor_pool, apply_descriptor_sets);
 
-	auto verdict_frag = load_shader(*device, "vr_verdict_mv.frag");
-	vk::PipelineShaderStageCreateInfo verdict_stages[2] = {
-	        {
-	                .stage = vk::ShaderStageFlagBits::eVertex,
-	                .module = **vert,
-	                .pName = "main",
-	        },
-	        {
-	                .stage = vk::ShaderStageFlagBits::eFragment,
-	                .module = **verdict_frag,
-	                .pName = "main",
-	        },
-	};
-	vk::PipelineLayoutCreateInfo verdict_layout_info{
-	        .setLayoutCount = 1,
-	        .pSetLayouts = &*verdict_descriptor_layout,
-	        .pushConstantRangeCount = 0,
-	        .pPushConstantRanges = nullptr,
-	};
-	verdict_layout = vk::raii::PipelineLayout(*device, verdict_layout_info);
-	vk::GraphicsPipelineCreateInfo verdict_pipeline_info{
-	        .stageCount = 2,
-	        .pStages = verdict_stages,
-	        .pVertexInputState = &vertex_input,
-	        .pInputAssemblyState = &input_assembly,
-	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &rasterization,
-	        .pMultisampleState = &multisample,
-	        .pDepthStencilState = &depth_stencil,
-	        .pColorBlendState = &blend,
-	        .pDynamicState = &dynamic,
-	        .layout = *verdict_layout,
-	        .renderPass = *verdict_renderpass,
-	};
-	verdict_pipeline = vk::raii::Pipeline(*device, *pipe_cache, verdict_pipeline_info);
+	// Initial plain verdict state (also resets verdict_ycbcr_built after
+	// a swapchain rebuild, so a stale YCbCr build can never persist).
+	create_verdict_state(wivrn::decoder::ycbcr_definition{}, vk::Sampler{});
 
 	auto apply_frag = load_shader(*device, "vr_apply_mv.frag");
 	vk::PipelineShaderStageCreateInfo apply_stages[2] = {
@@ -928,6 +911,148 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	                    barrier);
 }
 
+void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
+{
+	// Full teardown in dependency order: sets reference pool + set
+	// layout, pipeline references pipeline layout, pipeline layout
+	// references the set layout. Caller guarantees no in-flight readers
+	// (fresh object, or a waitIdle'd rebuild).
+	verdict_descriptor_sets.clear();
+	verdict_pipeline.clear();
+	verdict_layout.clear();
+	verdict_descriptor_layout.clear();
+	// Bake the decoder's live sampler as the immutable sampler
+	// (defoveator pattern): a separately built conversion proved
+	// unidentifiable to validation despite matching parameters, so the
+	// layout shares the decoder's object. verdict_immutable_src tracks
+	// what the layout was baked with; a decoder-side sampler change
+	// rebuilds before the next bind.
+	verdict_immutable_src = def.has_conversion ? decoder_sampler : vk::Sampler{};
+	// Binding 0 (common layer, plain view) stays mutable; binding 1
+	// (virt) is immutable exactly when the view carries a conversion.
+	// The immutable handle is copied by layout creation (defoveator
+	// precedent: pointer to a local is fine).
+	vk::Sampler immutable = verdict_immutable_src;
+	vk::DescriptorSetLayoutBinding bindings[2] = {
+	        {
+	                .binding = 0,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	        },
+	        {
+	                .binding = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	                .pImmutableSamplers = def.has_conversion ? &immutable : nullptr,
+	        },
+	};
+	verdict_descriptor_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
+	                                                                                 .bindingCount = 2,
+	                                                                                 .pBindings = bindings,
+	                                                                         });
+	for (int i = 0; i < 2; ++i)
+	{
+		vk::DescriptorSetAllocateInfo set_alloc{
+		        .descriptorPool = *verdict_descriptor_pool,
+		        .descriptorSetCount = 1,
+		        .pSetLayouts = &*verdict_descriptor_layout,
+		};
+		verdict_descriptor_sets.emplace_back(std::move(device->allocateDescriptorSets(set_alloc)[0]));
+	}
+	// Pipeline bakes the set layout: rebuilt alongside it, never apart
+	// (binding fresh sets with a stale pipeline is a use error).
+	vk::PipelineLayoutCreateInfo verdict_layout_info{
+	        .setLayoutCount = 1,
+	        .pSetLayouts = &*verdict_descriptor_layout,
+	        .pushConstantRangeCount = 0,
+	        .pPushConstantRanges = nullptr,
+	};
+	verdict_layout = vk::raii::PipelineLayout(*device, verdict_layout_info);
+	auto vert = load_shader(*device, "blur.vert");
+	auto verdict_frag = load_shader(*device, "vr_verdict_mv.frag");
+	vk::PipelineShaderStageCreateInfo verdict_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **verdict_frag,
+	                .pName = "main",
+	        },
+	};
+	// Static fullscreen state, identical to the shared init block.
+	vk::PipelineVertexInputStateCreateInfo vertex_input{};
+	vk::PipelineInputAssemblyStateCreateInfo input_assembly{
+	        .topology = vk::PrimitiveTopology::eTriangleList,
+	};
+	vk::PipelineViewportStateCreateInfo viewport_state{
+	        .viewportCount = 1,
+	        .scissorCount = 1,
+	};
+	vk::PipelineRasterizationStateCreateInfo rasterization{
+	        .polygonMode = vk::PolygonMode::eFill,
+	        .cullMode = vk::CullModeFlagBits::eNone,
+	        .frontFace = vk::FrontFace::eCounterClockwise,
+	        .lineWidth = 1,
+	};
+	vk::PipelineMultisampleStateCreateInfo multisample{
+	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+	};
+	vk::PipelineDepthStencilStateCreateInfo depth_stencil{
+	        .depthTestEnable = VK_FALSE,
+	        .depthWriteEnable = VK_FALSE,
+	};
+	vk::PipelineColorBlendAttachmentState blend_attachment{
+	        .blendEnable = VK_FALSE,
+	        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+	                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+	};
+	vk::PipelineColorBlendStateCreateInfo blend{
+	        .attachmentCount = 1,
+	        .pAttachments = &blend_attachment,
+	};
+	vk::DynamicState dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo dynamic{
+	        .dynamicStateCount = 2,
+	        .pDynamicStates = dynamics,
+	};
+	vk::GraphicsPipelineCreateInfo verdict_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = verdict_stages,
+	        .pVertexInputState = &vertex_input,
+	        .pInputAssemblyState = &input_assembly,
+	        .pViewportState = &viewport_state,
+	        .pRasterizationState = &rasterization,
+	        .pMultisampleState = &multisample,
+	        .pDepthStencilState = &depth_stencil,
+	        .pColorBlendState = &blend,
+	        .pDynamicState = &dynamic,
+	        .layout = *verdict_layout,
+	        .renderPass = *verdict_renderpass,
+	};
+	verdict_pipeline = vk::raii::Pipeline(*device, *pipe_cache, verdict_pipeline_info);
+	verdict_ycbcr_built = def;
+}
+
+void union_merge_renderer::ensure_verdict_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
+{
+	// Rebuild when the definition changes OR the decoder sampler was
+	// recreated (same params, new object: the baked immutable handle
+	// must track the live object). Plain layouts don't bake a sampler,
+	// so only converted state compares handles.
+	if (verdict_ycbcr_built == def and (not def.has_conversion or verdict_immutable_src == decoder_sampler))
+		return;
+	// Depth format change (rare: renegotiation only): retire in-flight
+	// async mask submissions before rebuilding what they may read.
+	device->waitIdle();
+	create_verdict_state(def, decoder_sampler);
+	spdlog::info("Union merge verdict layout rebuilt (YCbCr {}, decoder-shared immutable sampler)", def.has_conversion ? "immutable" : "plain");
+}
+
 bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
                                          size_t image_index,
                                          vk::Extent2D extent,
@@ -960,6 +1085,10 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
 	if (virt_in.valid and virt_in.view and virt_in.sampler)
 	{
+		// YCbCr immutable-sampler layout (VUID-02738): rebuild when the
+		// view's conversion definition or the decoder sampler handle
+		// changes. waitIdle'd, rare.
+		ensure_verdict_layout(virt_in.ycbcr, virt_in.sampler);
 		verdict_set_parity = !verdict_set_parity;
 		vk::DescriptorSet vset = *verdict_descriptor_sets[verdict_set_parity ? 1 : 0];
 		vk::DescriptorImageInfo layer_info{
@@ -968,7 +1097,9 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		};
 		// Decoder SBS image: GENERAL layout at frame top (same
-		// steady-state discipline as the video path).
+		// steady-state discipline as the video path). The write sampler
+		// is ignored when the layout baked an immutable one (defoveator
+		// pattern); pass the live decoder sampler either way.
 		vk::DescriptorImageInfo virt_info{
 		        .sampler = virt_in.sampler,
 		        .imageView = virt_in.view,

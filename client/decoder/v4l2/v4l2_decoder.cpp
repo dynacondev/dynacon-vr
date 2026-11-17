@@ -896,6 +896,18 @@ void decoder::submit_capture(unsigned int capture_index, uint64_t timestamp)
 
 	auto handle = std::make_shared<v4l2_blit_handle>(
 	        pending.feedback, pending.view_info, *capture.image_view, *capture.image, vk::Extent2D{capture_width, capture_height}, capture.current_layout, capture_index, this);
+	// Conversion definition for VUID-02738 consumers: capture views
+	// always carry one (import_capture_buffer), parameters mirror
+	// setup_ycbcr_sampler exactly (omitted fields are defaults).
+	handle->ycbcr.has_conversion = true;
+	handle->ycbcr.external_format = 0;
+	handle->ycbcr.format = capture_vk_format;
+	handle->ycbcr.ycbcr_model = vk::SamplerYcbcrModelConversion::eYcbcr709;
+	handle->ycbcr.ycbcr_range = vk::SamplerYcbcrRange::eItuFull;
+	handle->ycbcr.components = vk::ComponentMapping{};
+	handle->ycbcr.x_chroma_offset = vk::ChromaLocation::eCositedEven;
+	handle->ycbcr.y_chroma_offset = vk::ChromaLocation::eCositedEven;
+	handle->ycbcr.chroma_filter = vk::Filter::eNearest;
 	if (auto scene = weak_scene.lock())
 		scene->push_blit_handle(accumulator, std::move(handle));
 }
