@@ -207,6 +207,7 @@ android {
         }
 
         debug {
+            signingConfig = signingConfigs.release
             applicationIdSuffix = project.hasProperty('suffix') ? suffix: ".local"
             manifestPlaceholders.ComOculusSupportedDevices = "all"
         }
