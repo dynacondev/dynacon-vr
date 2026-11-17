@@ -486,7 +486,6 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 	vk::raii::DeviceMemory memory(device, mem_info.get());
 
 	vimage.bindMemory(*memory, 0);
-	spdlog::info("mapped hardware buffer: {}x{} alloc={}B", buffer_desc.width, buffer_desc.height, properties.allocationSize);
 
 	vk::StructureChain iv_info{
 	        vk::ImageViewCreateInfo{
