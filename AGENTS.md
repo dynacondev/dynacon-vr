@@ -69,3 +69,103 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   without a video tap); binary hole-punch was discussed but not shipped.
 - Config + packet fields removed too (server dot-pitch/dot-color,
   packet members, session fill, docs): dev branch, no compat shims.
+
+## Validation-layer workflow (Quest 3, Nov 2026)
+
+- `assembleDebugWithValidationLayer` downloads VVL 1.4.321.0 android
+  binaries, bundles the `.so`, and the app auto-enables
+  `VK_LAYER_KHRONOS_validation` in non-NDEBUG builds
+  (`application.cpp`). The debug callback aborts on error-level
+  messages — each validation abort masks every later bug, so expect
+  fix-and-rerun iterations (this branch needed four: pool flags,
+  framebuffer layers, then two YCbCr rounds). Release builds run the
+  same code silently: validation hits are UB that Adreno tolerates
+  until it doesn't (GPU page fault → CP opcode errors → DeviceLost
+  surfacing as `vk::DeviceLostError` in a later `waitIdle` — the abort
+  message names the symptom, never the cause).
+- `vk_layer_settings.txt` (`DEBUG_ACTION_LOG_MSG,BREAK`, thread-safety
+  validation) is written but only takes effect if packaged; a bare
+  SIGTRAP with no message means BREAK fired without the log path.
+- Startup `VUID-vkCreateInstance-ppEnabledExtensionNames-01388`
+  (runtime enables `surface_protected_capabilities` without
+  `get_surface_capabilities2`): satisfied by requesting the latter
+  ourselves when enumerated — harmless if the runtime stops needing it.
+
+## YCbCr immutable samplers (Quest 3 AHB imports, Nov 2026)
+
+- Any fragment sampling of an AHB-imported YCbCr view through a
+  combined image sampler MUST use immutable samplers:
+  mutable layout + converted view = VUID-02738; immutable layout +
+  mismatched conversion = VUID-01948. Both abort debug builds and are
+  silent GPU-fault/undefined reads in release.
+- Proven pattern (defoveator + verdict): bake the DECODER's live
+  sampler as the immutable sampler, rebuild the full verdict state
+  (set layout + sets + pipeline layout + pipeline — a pipeline bakes
+  its set layout, never one without the other) when the conversion
+  definition OR the decoder sampler handle changes, waitIdle'd (rare).
+- Failed pattern (do NOT retry without new evidence): building a
+  separate conversion from copied AHB format params (format/model/range/
+  components/offsets/filter/external all matched on paper, chain built
+  per headers) still tripped 01948 against the decoder's view
+  conversion. Cause undetermined — params vs chain-construction quirk
+  vs VVL external-format strictness.
+- Every backend's converted views must feed the definition plumbing:
+  Android AHB (per-handle, always converted), raw 420 streams
+  (explicit format, no external node — the external node must NOT ride
+  along when format != Undefined), v4l2 capture (capture format).
+  ffmpeg/plain views stay mutable. The definition rides the blit handle
+  (immutable after map), never a shared decoder object (recreated on
+  format change — a shared reference would strand).
+- Pre-existing quirk (out of scope, noted not fixed): the defoveator
+  bakes the decoder sampler once and never rebuilds on mid-session
+  decoder recreation — same staleness class the verdict now handles.
+
+## Multiview framebuffers: layers=1 (spec, Nov 2026)
+
+- `VUID-VkFramebufferCreateInfo-renderPass-02531`: a render pass with
+  non-zero view masks requires framebuffer `layers == 1`. The eye
+  routing comes from the view mask into the 2-layer image views, not
+  from the framebuffer — `.layers = 2` (13 sites: merge + feather +
+  hidden + submit targets) was spec-invalid but Adreno-tolerated, which
+  is why stereo worked for years with zero signal until validation ran.
+- Fix is behavior-identical on a conformant driver (same pixels, same
+  layers) but touches every stereo pass: verify both-eyes-distinct on
+  device after any change here. `arrayLayers = 2` / `layerCount = 2` /
+  view/correlation masks / render areas are the actual 2-layer
+  machinery and must NOT change. Non-multiview passes (defoveator,
+  gizmo, imgui, depth overlay: per-eye loops, no MV pNext) correctly
+  keep their own values.
+
+## Descriptor pools: FREE flag or whole-pool reset (Nov 2026)
+
+- `vk::raii::DescriptorSet` destruction calls `vkFreeDescriptorSets` —
+  any pool whose sets die individually needs
+  `eFreeDescriptorSet`, or validation aborts (silent UB in release).
+  Fixed: feather pool, depth-overlay pool (plus clear-before-recreate:
+  destroying the pool first strands the live set). Pattern precedent:
+  union_merge pools already had it.
+- Alternative discipline (defoveator `ds_pool`): sets are raw handles
+  never freed individually — legal without the flag ONLY with
+  whole-pool destruction, plus an explicit `pool.reset()` in
+  `reset_pipelines` (abandoned sets otherwise leak the 4-set pool into
+  `OutOfPoolMemory` on re-ensure). Declared member order must destroy
+  sets before their pool. Comment the discipline where it applies or
+  the next reader will regress it.
+
+## GPU crash forensics (Adreno, Nov 2026)
+
+- Signature of a bad GPU read: `kgsl-3d0: GPU PAGE FAULT: addr = ...`
+  (deterministic low bits across runs = real overrun of a real
+  allocation, not a wild pointer), then `adreno-gen7-gmu: CP opcode
+  error` repeats, `gpu fault threshold exceeded`, `ErrorDeviceLost`,
+  abort in the next `waitIdle`. Triage order: faults first (they name
+  the victim allocation), CP errors second (wedged context), the abort
+  last (never the cause).
+- Victim identification: log `requirements.size` (and extents/format)
+  at every owned-image creation (merge targets, decoder AHB maps);
+  match against the kernel's fault-adjacent `vk_devicememory` ranges in
+  the same run (cross-run sizes vary ~24KB — same-run pairing only).
+- Validation aborts (debug) pre-empt DeviceLost runs: a crash that moves
+  earlier under validation is usually the validator catching the bug
+  upstream, not a new bug — compare write sites (01948 names the
+  binding), not just timestamps.
