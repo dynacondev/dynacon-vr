@@ -200,25 +200,25 @@ public:
 	// execution barrier on the async path (same-queue ordering).
 	vk::Image layer_image() const
 	{
-		if ((bool)layer_.image)
+		if (*layer_.image != vk::Image{})
 			return *layer_.image;
 		return {};
 	}
 	vk::ImageView layer_view_array() const
 	{
-		if ((bool)layer_.view_array)
+		if (*layer_.view_array != vk::ImageView{})
 			return *layer_.view_array;
 		return {};
 	}
 	vk::Image verdict_image() const
 	{
-		if ((bool)verdict_.image)
+		if (*verdict_.image != vk::Image{})
 			return *verdict_.image;
 		return {};
 	}
 	vk::ImageView verdict_view_array() const
 	{
-		if ((bool)verdict_.view_array)
+		if (*verdict_.view_array != vk::ImageView{})
 			return *verdict_.view_array;
 		return {};
 	}
