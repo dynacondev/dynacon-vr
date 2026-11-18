@@ -3352,9 +3352,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						params.far_z = shared_depth.far_z;
 						depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
 						                      env_depth->depth_view(shared_depth.swapchain_index), params);
-						depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
-						                           env_depth->depth_width(), env_depth->depth_height(),
-						                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+						// Capture age forensics: which timebase this frame
+						// rode (v1 runtimes report no timestamp: gated).
+						if (shared_depth.capture_time != 0)
+							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms",
+							                           env_depth->depth_width(), env_depth->depth_height(),
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
+							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6);
+						else
+							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
+							                           env_depth->depth_width(), env_depth->depth_height(),
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
 						break;
 					}
 					case debug_viz_mode::vr_depth:
@@ -3751,15 +3759,30 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// gizmos and below the GUI quads (submitted here, before
 		// draw_gui). Same discipline as the debug lines: standard
 		// alpha blend, no FB extensions.
+		// Submit timebase: the runtime warps this layer from the
+		// submitted pose, so it must ride the timebase the viz content
+		// was generated in — not the live head pose. VR depth / layer
+		// / verdict are server-timebased (same warp as the video and
+		// mask layers, including sync's per-eye live fallback);
+		// the sensor viz rides the depth frame's own capture pose.
+		// Submitting live would present stale pixels as fresh
+		// (swim/misalign under head motion).
 		if (depth_image >= 0 and depth_overlay)
 		{
+			const XrPosef * viz_pose = sync_pose.data();
+			const XrFovf * viz_fov = sync_fov.data();
+			if (debug_viz == debug_viz_mode::sensor)
+			{
+				viz_pose = shared_depth.pose;
+				viz_fov = shared_depth.fov;
+			}
 			std::array<XrCompositionLayerProjectionView, view_count> depth_views;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
 				depth_views[view] = {
 				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-				        .pose = mask_pose[view],
-				        .fov = mask_fov[view],
+				        .pose = viz_pose[view],
+				        .fov = viz_fov[view],
 				        .subImage = {
 				                .swapchain = depth_overlay->swapchain(),
 				                .imageRect = {
