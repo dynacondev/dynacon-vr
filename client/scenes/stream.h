@@ -821,25 +821,35 @@ private:
 	size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts
 	std::unique_ptr<debug_lines_renderer> gizmo_lines;
 
-	// Environment-depth debug overlay (Quest 3/3S, Passthrough tab,
-	// session-scoped, render thread only): fullscreen false-color of the
-	// runtime D16 (green = nearZ, red = farZ) with a global opacity.
-	// Provider cost is bound to the toggle (off = zero cost).
+	// Debug visualization selector (Passthrough tab, session-scoped,
+	// render thread only): fullscreen false-color viz as ONE transparent
+	// projection layer above passthrough/video, below the GUI. Sensor =
+	// runtime D16 (green = nearZ, red = farZ). The VR/layer/verdict modes
+	// isolate the occlusion comparison (green->red over 0..2.046m,
+	// empty black; verdict red = VR wins, green = passthrough). All modes
+	// share the opacity below. Sensor provider cost is bound to its mode
+	// (off = zero cost).
 	std::unique_ptr<depth_overlay_renderer> depth_overlay;
 	std::unique_ptr<xr::environment_depth> env_depth;
 	bool env_depth_probed = false;   // supported() queried once, cached below
 	bool env_depth_supported = false;
-	bool debug_depth_overlay = false; // master toggle (starts the provider)
-	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1
+	debug_viz_mode debug_viz = debug_viz_mode::none;
+	bool debug_viz_show_vr = false; // viz background: VR video instead of passthrough
+	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1 (all modes)
 	std::string depth_status;         // UI status line, refreshed per frame
-	// Fullscreen flat passthrough while depth debugging: the mask floor
-	// lifts to full alpha under the viz (same lift as the boundary
-	// veil). True from the toggle frame (pre-probe optimistic) so the
-	// canvas exists when the probe lands; runtimes without depth support
-	// drop out once probing reports unsupported.
+	// Fullscreen flat passthrough under the viz (same lift as the
+	// boundary veil). True from the toggle frame for sensor (pre-probe
+	// optimistic so the canvas exists when the probe lands; runtimes
+	// without depth support drop out once probing reports unsupported)
+	// and whenever a VR/layer/verdict viz is active. Show-VR suppresses
+	// the viz-forced part only (boundary/effects veils still hold).
 	bool depth_fullscreen_passthrough() const
 	{
-		return debug_depth_overlay and (not env_depth_probed or env_depth_supported);
+		if (debug_viz == debug_viz_mode::none or debug_viz_show_vr)
+			return false;
+		if (debug_viz == debug_viz_mode::sensor)
+			return not env_depth_probed or env_depth_supported;
+		return true;
 	}
 
 	// Stale-hold multiplier for debug visuals: full presence on fresh

@@ -193,6 +193,32 @@ public:
 		return swapchain_;
 	}
 
+	// Borrowed debug-viz views of the owned common-layer and verdict
+	// targets (2-layer arrays, half merge res). Raw handles, same-frame
+	// use only; null when never built. Images end SHADER_READ_ONLY
+	// after the mask-phase barriers, so the viz pass needs only an
+	// execution barrier on the async path (same-queue ordering).
+	vk::Image layer_image() const
+	{
+		return layer_.image ? *layer_.image : nullptr;
+	}
+	vk::ImageView layer_view_array() const
+	{
+		return layer_.view_array ? *layer_.view_array : nullptr;
+	}
+	vk::Image verdict_image() const
+	{
+		return verdict_.image ? *verdict_.image : nullptr;
+	}
+	vk::ImageView verdict_view_array() const
+	{
+		return verdict_.view_array ? *verdict_.view_array : nullptr;
+	}
+	vk::Extent2D debug_layer_extent() const
+	{
+		return layer_extent_;
+	}
+
 private:
 	std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> make_buffer(vk::DeviceSize size,
 	                                                                vk::BufferUsageFlags usage,

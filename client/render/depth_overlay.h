@@ -27,6 +27,7 @@
 
 #include "vk/allocation.h"
 #include "xr/swapchain.h"
+#include "decoder/decoder.h"
 
 // Fullscreen environment-depth visualizer: samples the runtime's D16
 // depth array texture and false-colors it green (nearZ) to red (farZ).
@@ -40,6 +41,42 @@ namespace xr
 class instance;
 class session;
 } // namespace xr
+
+// Debug visualization selector (Passthrough tab, session-scoped,
+// render thread only). None = off. Sensor = existing runtime D16
+// false-color. Vr_depth = VR depth stream (SBS, green->red over
+// 0..2.046m, empty black). Layer = composited common depth layer of
+// placed passthrough objects before the verdict (same 0..2.046m ramp,
+// FAR black). Verdict = final VR-vs-passthrough comparison (red = VR
+// wins, green = passthrough, no-window black). All modes share the
+// global opacity below.
+enum class debug_viz_mode
+{
+	none = 0,
+	sensor,
+	vr_depth,
+	layer,
+	verdict,
+};
+
+inline const char *
+debug_viz_mode_name(debug_viz_mode m)
+{
+	switch (m)
+	{
+		case debug_viz_mode::none:
+			return "None";
+		case debug_viz_mode::sensor:
+			return "Depth Sensor";
+		case debug_viz_mode::vr_depth:
+			return "VR Depth";
+		case debug_viz_mode::layer:
+			return "Composited Depth";
+		case debug_viz_mode::verdict:
+			return "VR vs Passthrough";
+	}
+	return "None";
+}
 
 class depth_overlay_renderer
 {
@@ -76,6 +113,33 @@ public:
 	            vk::ImageView depth_view,
 	            const frame_params & params);
 
+	// Composited-layer viz (R16F linear meters, 2-layer array, half
+	// merge res): green->red over 0..2.046m to match VR depth, FAR
+	// (>=65000) black. Null view records opaque black (no merge yet).
+	void record_layer(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                  const std::array<vk::Extent2D, 2> & extents,
+	                  vk::Image layer_image, vk::ImageView layer_view,
+	                  const frame_params & params);
+
+	// Verdict viz (R8 binary + R16F layer for the no-window mask):
+	// red = VR wins, green = passthrough, layer FAR black. Null views
+	// record opaque black.
+	void record_verdict(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                    const std::array<vk::Extent2D, 2> & extents,
+	                    vk::Image verdict_image, vk::ImageView verdict_view,
+	                    vk::Image layer_image, vk::ImageView layer_view,
+	                    const frame_params & params);
+
+	// VR-depth viz (decoder SBS, single image, GENERAL): green->red
+	// over 0..2.046m, lossy guard band black. Null view records opaque
+	// black. YCbCr views ride the immutable-sampler path (verdict
+	// pattern: decoder-shared sampler, waitIdle'd rebuild).
+	void record_virt(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                 const std::array<vk::Extent2D, 2> & extents,
+	                 vk::ImageView virt_view, vk::Sampler virt_sampler,
+	                 const wivrn::decoder::ycbcr_definition & ycbcr,
+	                 const frame_params & params);
+
 	// Release the acquired image (after submit, before endFrame).
 	void release();
 
@@ -91,12 +155,33 @@ private:
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::RenderPass renderpass{nullptr};
-	vk::raii::Pipeline pipeline{nullptr}; // fullscreen triangle, blended
+	vk::raii::Pipeline pipeline{nullptr}; // sensor viz (D16 false-color)
+	vk::raii::Pipeline layer_pipeline{nullptr}; // composited R16F viz
+	vk::raii::Pipeline verdict_pipeline{nullptr}; // VR-vs-passthrough viz
 	vk::raii::DescriptorSetLayout set_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	vk::raii::DescriptorSet descriptor_set{nullptr};
 	vk::raii::Sampler sampler{nullptr};
 	buffer_allocation ubo;
+	// Verdict-viz state (verdict R8 + layer R16F + UBO): own layout
+	// (two image bindings), pool and set; shares pipeline_layout push
+	// shape (eye) and renderpass/targets above.
+	vk::raii::DescriptorSetLayout verdict_viz_layout{nullptr};
+	vk::raii::DescriptorPool verdict_viz_pool{nullptr};
+	vk::raii::DescriptorSet verdict_viz_set{nullptr};
+	// VR-depth viz state (decoder SBS sampler2D + UBO): own layout +
+	// pool + set + pipeline. Converted views bake the decoder's live
+	// sampler as immutable (VUID-02738, verdict pattern); plain views
+	// keep the mutable layout. waitIdle'd rebuild, rare.
+	vk::Sampler virt_immutable_src{nullptr};
+	wivrn::decoder::ycbcr_definition virt_ycbcr_built{};
+	void create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	vk::raii::DescriptorSetLayout virt_layout{nullptr};
+	vk::raii::DescriptorPool virt_pool{nullptr};
+	vk::raii::DescriptorSet virt_set{nullptr};
+	vk::raii::PipelineLayout virt_pipeline_layout{nullptr};
+	vk::raii::Pipeline virt_pipeline{nullptr};
 
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;
