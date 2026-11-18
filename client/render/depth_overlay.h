@@ -150,6 +150,7 @@ public:
 
 private:
 	void init_pipelines(vk::Format format);
+	void upload_viz_params(const frame_params & params);
 
 	vk::raii::Device * device = nullptr;
 
@@ -169,6 +170,7 @@ private:
 	vk::raii::DescriptorSetLayout verdict_viz_layout{nullptr};
 	vk::raii::DescriptorPool verdict_viz_pool{nullptr};
 	vk::raii::DescriptorSet verdict_viz_set{nullptr};
+	vk::raii::PipelineLayout verdict_viz_pipeline_layout{nullptr};
 	// VR-depth viz state (decoder SBS sampler2D + UBO): own layout +
 	// pool + set + pipeline. Converted views bake the decoder's live
 	// sampler as immutable (VUID-02738, verdict pattern); plain views
