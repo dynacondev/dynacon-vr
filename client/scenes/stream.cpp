@@ -3287,7 +3287,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// frames it also opens the mask span (closed by query 1 after
 		// the phase); on async frames the mask spans live in the mask
 		// pool and this just measures submit prep. Unconditional so no
-		// validity tracking is needed.
+		// validity tracking is needed. Note: the debug-viz record below
+		// runs inside the same q3..q1 span on inline frames, so an
+		// active viz mode inflates the inline "mask" time (async mask
+		// spans are unaffected).
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *query_pool, 3);
 		if (!mask_async_submitted)
 		{
@@ -3316,7 +3319,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// already-acquired frames. Sensor provider cost is bound to its
 		// mode: the shared acquire site above stops it below.
 		int depth_image = -1;
-		if (debug_viz != debug_viz_mode::none)
+		if (debug_viz == debug_viz_mode::none)
+			depth_status.clear();
+		else
 		{
 			if (not depth_overlay)
 				depth_overlay = std::make_unique<depth_overlay_renderer>(device);
@@ -3331,6 +3336,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				depth_overlay_renderer::frame_params params;
 				params.opacity = debug_depth_opacity;
+				// near_z/far_z ride along at defaults: only the sensor
+				// shader reads them (the isolation ramps are hardcoded
+				// 0..2.046m in-shader).
 				std::array<vk::Extent2D, 2> depth_ext;
 				for (uint32_t view = 0; view < view_count; ++view)
 					depth_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
@@ -3591,6 +3599,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			bool merge_covering = merge_this_frame and merge_image >= 0;
 			bool submit_flat = (need_flat or ((boundary_veil or full_passthrough_demo) and composition_layer_color_scale_bias_supported and composition_layer_alpha_blend_supported) or veil_hard_out) and
 			        (veil_hard_out or (active_count > 0 and merge_covering));
+			// Debug viz Show-VR: suppress the flat camera layer so the
+			// background is full VR video instead of passthrough. The
+			// opaque hard-out path (no blend support) still wins: with
+			// no alpha control there is no VR-composite alternative.
+			bool viz_show_vr = debug_viz != debug_viz_mode::none and debug_viz_show_vr;
+			if (viz_show_vr and not veil_hard_out)
+				submit_flat = false;
 			if (active_count > 0 and not veil_hard_out and not merge_covering)
 			{
 				// Coverage loss (the merge dropped this frame): error,
@@ -3615,14 +3630,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				{
 					last_submit_flat = submit_flat;
 					last_hidden = hidden_on;
-					spdlog::info("Camera submit: {} (need_flat={} groups={} H={} cutouts={} depth_full={} effects_full={})",
+					spdlog::info("Camera submit: {} (need_flat={} groups={} H={} cutouts={} depth_full={} effects_full={} show_vr={})",
 					             submit_flat ? "flat" : "video-only",
 					             need_flat,
 					             active_count,
 					             hidden_on ? "on" : "off",
 					             cutouts_punched,
 					             depth_full,
-					             effects_full_inner);
+					             effects_full_inner,
+					             viz_show_vr);
 				}
 			}
 			// Opaque hard-outside flat needs no masks at all.

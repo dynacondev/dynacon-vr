@@ -181,12 +181,12 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 	        .bindingCount = 2,
 	        .pBindings = bindings,
 	};
-	set_layout = vk::raii::DescriptorSetLayout(*device, set_layout_info);
-
-	// Free the old set while its pool is still alive: the pool
-	// assignment below destroys the old pool, which would strand it
+	// Free the old set before its layout and pool are retired: the set
+	// references both, so destroying either first would strand it
 	// (union_merge ensure() precedent).
 	descriptor_set.clear();
+	pipeline.clear();
+	set_layout = vk::raii::DescriptorSetLayout(*device, set_layout_info);
 	vk::DescriptorPoolSize pool_sizes[2] = {
 	        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 8},
 	        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 4},
@@ -717,9 +717,16 @@ void depth_overlay_renderer::record_layer(vk::raii::CommandBuffer & cmd, size_t 
 		return;
 
 	upload_viz_params(params);
-	viz_read_barrier(cmd, std::span<const vk::Image>(&layer_image, (bool)layer_view ? 1 : 0));
+	{
+		// Pack valid images front for the cross-CB read barrier.
+		vk::Image packed[1];
+		size_t m = 0;
+		if ((bool)layer_view and layer_image != vk::Image{})
+			packed[m++] = layer_image;
+		viz_read_barrier(cmd, std::span<const vk::Image>(packed, m));
+	}
 
-	bool have_data = (bool)layer_view;
+	bool have_data = (bool)layer_view and layer_image != vk::Image{};
 	if (have_data)
 	{
 		vk::DescriptorImageInfo image_info{
