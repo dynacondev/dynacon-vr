@@ -1565,12 +1565,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 		}
 
-		// Once-per-frame depth acquire for the debug viz. The spec allows
-		// a single acquire per frame (XR_ERROR_LIMIT_REACHED beyond
-		// that). Runs ahead of both record paths (async + inline).
+		// Once-per-frame sensor-depth acquire for the sensor viz mode.
+		// The spec allows a single acquire per frame
+		// (XR_ERROR_LIMIT_REACHED beyond that). Runs ahead of both
+		// record paths (async + inline). Other viz modes (VR depth,
+		// layer, verdict) sample already-acquired frames, no provider.
 		bool have_depth_frame = false;
 		xr::environment_depth::frame shared_depth{};
-		bool want_depth = debug_depth_overlay;
+		bool want_depth = debug_viz == debug_viz_mode::sensor;
 		if (want_depth)
 		{
 			if (not env_depth_probed)
@@ -1595,12 +1597,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, shared_depth);
 					if (got_depth)
 						have_depth_frame = true;
-					else if (debug_depth_overlay)
+					else
 						depth_status = "waiting for depth data";
 				}
-				else if (debug_depth_overlay)
+				else
 					depth_status = "depth provider unavailable";
-				}
+			}
 		}
 		else if (env_depth and env_depth->started())
 		{
@@ -1985,8 +1987,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Promoted to the boundary-veil carrier while the veil is
 				// active: claimed whenever veiled so a canvas always
 				// exists to lift to the uniform floor (boundary-only /
-				// all-culled configs). The depth debug
-				// fullscreen and the passthrough effects demo claim it
+				// all-culled configs). The viz fullscreen (unless Show-VR)
+				// and the passthrough effects demo claim it
 				// the same way. Empty draws (clear-only record); the
 				// submit-time bias lifts it.
 				bool need_debug = (live.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough();
@@ -3278,38 +3280,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_gizmo_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gizmo_t0).count();
 		}
 
-		// Environment-depth debug overlay: records the fullscreen
-		// false-color viz from the shared frame (acquired once above) into
-		// its own transparent swapchain. Provider cost is bound to the
-		// toggle + volume need: the shared site above stops it below.
-		int depth_image = -1;
-		if (debug_depth_overlay and have_depth_frame)
-		{
-			if (not depth_overlay)
-				depth_overlay = std::make_unique<depth_overlay_renderer>(device);
-			depth_overlay->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
-			depth_image = depth_overlay->acquire();
-			if (depth_image >= 0)
-			{
-				depth_overlay_renderer::frame_params params;
-				params.near_z = shared_depth.near_z;
-				params.far_z = shared_depth.far_z;
-				params.opacity = debug_depth_opacity;
-				std::array<vk::Extent2D, 2> depth_ext;
-				for (uint32_t view = 0; view < view_count; ++view)
-					depth_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
-				depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
-				                      env_depth->depth_view(shared_depth.swapchain_index), params);
-				depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
-				                           env_depth->depth_width(), env_depth->depth_height(),
-				                           (double)shared_depth.near_z, (double)shared_depth.far_z);
-			}
-			else
-				depth_status = "overlay swapchain busy, skipped frame";
-		}
-		// else: status already set by the shared acquire site above
-		// (unsupported / unavailable / waiting).
-
 		// Debug mask record: the local debug group carries the
 		// marker-window cutouts. No silhouette raster yet (no objects):
 		// clear + hard cutout punch at full alpha.
@@ -3336,6 +3306,106 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			record_masks_phase(command_buffer, query_pool, 4, 5);
 			mask_results_in_mask_pool = false;
+		}
+
+		// Debug visualization: records the fullscreen false-color viz
+		// into its own transparent swapchain. Runs AFTER the mask phase
+		// (inline or async) so the layer/verdict modes sample this
+		// frame's merge results; the read barrier inside the record
+		// orders the async path. Sensor and VR-depth modes sample
+		// already-acquired frames. Sensor provider cost is bound to its
+		// mode: the shared acquire site above stops it below.
+		int depth_image = -1;
+		if (debug_viz != debug_viz_mode::none)
+		{
+			if (not depth_overlay)
+				depth_overlay = std::make_unique<depth_overlay_renderer>(device);
+			depth_overlay->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+			if (debug_viz == debug_viz_mode::sensor and not have_depth_frame)
+			{
+				// No overlay this frame (status already set by the
+				// shared acquire site above: unsupported / unavailable
+				// / waiting).
+			}
+			else if ((depth_image = depth_overlay->acquire()) >= 0)
+			{
+				depth_overlay_renderer::frame_params params;
+				params.opacity = debug_depth_opacity;
+				std::array<vk::Extent2D, 2> depth_ext;
+				for (uint32_t view = 0; view < view_count; ++view)
+					depth_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+				switch (debug_viz)
+				{
+					case debug_viz_mode::none:
+						break;
+					case debug_viz_mode::sensor:
+					{
+						params.near_z = shared_depth.near_z;
+						params.far_z = shared_depth.far_z;
+						depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
+						                      env_depth->depth_view(shared_depth.swapchain_index), params);
+						depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
+						                           env_depth->depth_width(), env_depth->depth_height(),
+						                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+						break;
+					}
+					case debug_viz_mode::vr_depth:
+					{
+						auto & dh = current_blit_handles[depth_stream_index];
+						vk::Sampler samp = decoders[depth_stream_index].decoder ? decoders[depth_stream_index].decoder->sampler() : nullptr;
+						if (dh and dh->image_view and samp)
+						{
+							depth_overlay->record_virt(command_buffer, (size_t)depth_image, depth_ext,
+							                           dh->image_view, samp, dh->ycbcr, params);
+							depth_status = fmt::format("VR depth live {}x{}", dh->extent.width, dh->extent.height);
+						}
+						else
+						{
+							depth_overlay->record_virt(command_buffer, (size_t)depth_image, depth_ext,
+							                           nullptr, nullptr, wivrn::decoder::ycbcr_definition{}, params);
+							depth_status = "waiting for VR depth stream";
+						}
+						break;
+					}
+					case debug_viz_mode::layer:
+					{
+						if (merge_renderer and merge_this_frame)
+						{
+							depth_overlay->record_layer(command_buffer, (size_t)depth_image, depth_ext,
+							                            merge_renderer->layer_image(), merge_renderer->layer_view_array(), params);
+							auto le = merge_renderer->debug_layer_extent();
+							depth_status = fmt::format("composited layer live {}x{}", le.width, le.height);
+						}
+						else
+						{
+							depth_overlay->record_layer(command_buffer, (size_t)depth_image, depth_ext,
+							                            nullptr, nullptr, params);
+							depth_status = "waiting for merge (no windows placed or merge sat out)";
+						}
+						break;
+					}
+					case debug_viz_mode::verdict:
+					{
+						if (merge_renderer and merge_this_frame)
+						{
+							depth_overlay->record_verdict(command_buffer, (size_t)depth_image, depth_ext,
+							                              merge_renderer->verdict_image(), merge_renderer->verdict_view_array(),
+							                              merge_renderer->layer_image(), merge_renderer->layer_view_array(), params);
+							auto le = merge_renderer->debug_layer_extent();
+							depth_status = fmt::format("verdict live {}x{}", le.width, le.height);
+						}
+						else
+						{
+							depth_overlay->record_verdict(command_buffer, (size_t)depth_image, depth_ext,
+							                              nullptr, nullptr, nullptr, nullptr, params);
+							depth_status = "waiting for merge (no windows placed or merge sat out)";
+						}
+						break;
+					}
+				}
+			}
+			else
+				depth_status = "overlay swapchain busy, skipped frame";
 		}
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
@@ -3394,8 +3464,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			have_fiducial_map = not map->fiducials.empty() or not map->objects.empty();
 		}
 		// The debug window cutout needs a live passthrough to reveal,
-		// map or not (it punches every live vote). The depth debug
-		// overlay and the passthrough effects demo need fullscreen
+		// map or not (it punches every live vote). The debug viz (unless
+		// Show-VR) and the passthrough effects demo need fullscreen
 		// passthrough underneath them. The boundary veil (which the
 		// startup fade folds into) needs it too — including with an
 		// empty map, where have_fiducial_map is false but the fade
@@ -3496,7 +3566,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// degrades to a hard switch at s = 0.5 (opaque fullscreen flat
 			// when outside, no masks needed).
 			float veil_s = std::clamp(boundary_s, 0.f, 1.f);
-			// Depth debug fullscreen + effects demo fullscreen: full
+			// Viz fullscreen (unless Show-VR) + effects demo fullscreen: full
 			// passthrough under the viz via the same floor lift
 			// (scale 0 + bias 1), no geometry.
 			bool depth_full = depth_fullscreen_passthrough();
