@@ -1183,17 +1183,53 @@ void scenes::stream::gui_passthrough()
 	if (ImGui::Button(_S("Run boundary self-test")))
 		xr::boundary_selftest();
 
-	ImGui::SeparatorText(_S("Depth overlay"));
-	if (env_depth_probed and not env_depth_supported)
+	ImGui::SeparatorText(_S("Debug visualization"));
+	ImGui::Text("%s", _S("Isolation views for the VR/passthrough comparison."));
+	{
+		int viz = (int)debug_viz;
+		bool viz_changed = false;
+		if (ImGui::RadioButton(_S("None"), viz == (int)debug_viz_mode::none))
+		{
+			viz = (int)debug_viz_mode::none;
+			viz_changed = true;
+		}
+		if (ImGui::RadioButton(_S("Depth Sensor"), viz == (int)debug_viz_mode::sensor))
+		{
+			viz = (int)debug_viz_mode::sensor;
+			viz_changed = true;
+		}
+		if (ImGui::RadioButton(_S("VR Depth"), viz == (int)debug_viz_mode::vr_depth))
+		{
+			viz = (int)debug_viz_mode::vr_depth;
+			viz_changed = true;
+		}
+		if (ImGui::RadioButton(_S("Composited Depth"), viz == (int)debug_viz_mode::layer))
+		{
+			viz = (int)debug_viz_mode::layer;
+			viz_changed = true;
+		}
+		if (ImGui::RadioButton(_S("VR vs Passthrough"), viz == (int)debug_viz_mode::verdict))
+		{
+			viz = (int)debug_viz_mode::verdict;
+			viz_changed = true;
+		}
+		if (viz_changed)
+		{
+			debug_viz = (debug_viz_mode)viz;
+			spdlog::info("Debug viz: {}", debug_viz_mode_name(debug_viz));
+		}
+	}
+	if (env_depth_probed and not env_depth_supported and debug_viz == debug_viz_mode::sensor)
 		ImGui::Text("%s", _S("Environment depth not supported on this headset"));
-	ImGui::Checkbox(_S("Depth overlay"), &debug_depth_overlay);
-	ImGui::BeginDisabled(not debug_depth_overlay or (env_depth_probed and not env_depth_supported));
+	ImGui::BeginDisabled(debug_viz == debug_viz_mode::none);
+	if (ImGui::Checkbox(_S("Show VR underneath (instead of passthrough)"), &debug_viz_show_vr))
+		spdlog::info("Debug viz background: {}", debug_viz_show_vr ? "VR" : "passthrough");
 	float depth_pct = debug_depth_opacity * 100;
 	if (ImGui::SliderFloat(_S("Overlay opacity"), &depth_pct, 0, 100, "%.0f%%"))
 		debug_depth_opacity = std::clamp(depth_pct / 100, 0.f, 1.f);
 	ImGui::EndDisabled();
-	if (not depth_status.empty())
-		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
+	if (not depth_status.empty() and debug_viz != debug_viz_mode::none)
+		ImGui::Text("%s: %s", _S("Viz status"), depth_status.c_str());
 
 	ImGui::SeparatorText(_S("Passthrough effects demo"));
 	{
