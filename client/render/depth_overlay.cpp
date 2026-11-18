@@ -671,7 +671,7 @@ void viz_read_barrier(vk::raii::CommandBuffer & cmd, std::span<const vk::Image> 
 	barriers.reserve(images.size());
 	for (vk::Image image: images)
 	{
-		if (not image)
+		if (image == vk::Image{})
 			continue;
 		barriers.push_back(vk::ImageMemoryBarrier{
 		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
@@ -717,9 +717,9 @@ void depth_overlay_renderer::record_layer(vk::raii::CommandBuffer & cmd, size_t 
 		return;
 
 	upload_viz_params(params);
-	viz_read_barrier(cmd, std::span<const vk::Image>(&layer_image, layer_view ? 1 : 0));
+	viz_read_barrier(cmd, std::span<const vk::Image>(&layer_image, (bool)layer_view ? 1 : 0));
 
-	bool have_data = layer_view != nullptr;
+	bool have_data = (bool)layer_view;
 	if (have_data)
 	{
 		vk::DescriptorImageInfo image_info{
@@ -798,14 +798,14 @@ void depth_overlay_renderer::record_verdict(vk::raii::CommandBuffer & cmd, size_
 		// Pack valid images front for the cross-CB read barrier.
 		vk::Image packed[2];
 		size_t m = 0;
-		if (verdict_view and verdict_image)
+		if ((bool)verdict_view and verdict_image != vk::Image{})
 			packed[m++] = verdict_image;
-		if (layer_view and layer_image)
+		if ((bool)layer_view and layer_image != vk::Image{})
 			packed[m++] = layer_image;
 		viz_read_barrier(cmd, std::span<const vk::Image>(packed, m));
 	}
 
-	bool have_data = verdict_view != nullptr and layer_view != nullptr;
+	bool have_data = (bool)verdict_view and (bool)layer_view;
 	if (have_data)
 	{
 		vk::DescriptorImageInfo verdict_info{
@@ -893,7 +893,7 @@ void depth_overlay_renderer::record_virt(vk::raii::CommandBuffer & cmd, size_t i
 
 	upload_viz_params(params);
 
-	bool have_data = virt_view != nullptr and virt_sampler != nullptr;
+	bool have_data = (bool)virt_view and (bool)virt_sampler;
 	if (have_data)
 	{
 		// YCbCr immutable-sampler layout (VUID-02738): rebuild when the

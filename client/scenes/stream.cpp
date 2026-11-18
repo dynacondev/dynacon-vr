@@ -3352,7 +3352,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					case debug_viz_mode::vr_depth:
 					{
 						auto & dh = current_blit_handles[depth_stream_index];
-						vk::Sampler samp = decoders[depth_stream_index].decoder ? decoders[depth_stream_index].decoder->sampler() : nullptr;
+						vk::Sampler samp = decoders[depth_stream_index].decoder ? decoders[depth_stream_index].decoder->sampler() : vk::Sampler{};
 						if (dh and dh->image_view and samp)
 						{
 							depth_overlay->record_virt(command_buffer, (size_t)depth_image, depth_ext,
@@ -3362,7 +3362,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						else
 						{
 							depth_overlay->record_virt(command_buffer, (size_t)depth_image, depth_ext,
-							                           nullptr, nullptr, wivrn::decoder::ycbcr_definition{}, params);
+							                           vk::ImageView{}, vk::Sampler{}, wivrn::decoder::ycbcr_definition{}, params);
 							depth_status = "waiting for VR depth stream";
 						}
 						break;
@@ -3379,7 +3379,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						else
 						{
 							depth_overlay->record_layer(command_buffer, (size_t)depth_image, depth_ext,
-							                            nullptr, nullptr, params);
+							                            vk::Image{}, vk::ImageView{}, params);
 							depth_status = "waiting for merge (no windows placed or merge sat out)";
 						}
 						break;
@@ -3397,7 +3397,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						else
 						{
 							depth_overlay->record_verdict(command_buffer, (size_t)depth_image, depth_ext,
-							                              nullptr, nullptr, nullptr, nullptr, params);
+							                              vk::Image{}, vk::ImageView{}, vk::Image{}, vk::ImageView{}, params);
 							depth_status = "waiting for merge (no windows placed or merge sat out)";
 						}
 						break;
