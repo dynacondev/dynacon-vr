@@ -1188,27 +1188,27 @@ void scenes::stream::gui_passthrough()
 	{
 		int viz = (int)debug_viz;
 		bool viz_changed = false;
-		if (ImGui::RadioButton(_S("None"), viz == (int)debug_viz_mode::none))
+		if (ImGui::RadioButton(_S("None"), viz == (int)debug_viz_mode::none) and viz != (int)debug_viz_mode::none)
 		{
 			viz = (int)debug_viz_mode::none;
 			viz_changed = true;
 		}
-		if (ImGui::RadioButton(_S("Depth Sensor"), viz == (int)debug_viz_mode::sensor))
+		if (ImGui::RadioButton(_S("Depth Sensor"), viz == (int)debug_viz_mode::sensor) and viz != (int)debug_viz_mode::sensor)
 		{
 			viz = (int)debug_viz_mode::sensor;
 			viz_changed = true;
 		}
-		if (ImGui::RadioButton(_S("VR Depth"), viz == (int)debug_viz_mode::vr_depth))
+		if (ImGui::RadioButton(_S("VR Depth"), viz == (int)debug_viz_mode::vr_depth) and viz != (int)debug_viz_mode::vr_depth)
 		{
 			viz = (int)debug_viz_mode::vr_depth;
 			viz_changed = true;
 		}
-		if (ImGui::RadioButton(_S("Composited Depth"), viz == (int)debug_viz_mode::layer))
+		if (ImGui::RadioButton(_S("Composited Depth"), viz == (int)debug_viz_mode::layer) and viz != (int)debug_viz_mode::layer)
 		{
 			viz = (int)debug_viz_mode::layer;
 			viz_changed = true;
 		}
-		if (ImGui::RadioButton(_S("VR vs Passthrough"), viz == (int)debug_viz_mode::verdict))
+		if (ImGui::RadioButton(_S("VR vs Passthrough"), viz == (int)debug_viz_mode::verdict) and viz != (int)debug_viz_mode::verdict)
 		{
 			viz = (int)debug_viz_mode::verdict;
 			viz_changed = true;

@@ -174,7 +174,11 @@ private:
 	// VR-depth viz state (decoder SBS sampler2D + UBO): own layout +
 	// pool + set + pipeline. Converted views bake the decoder's live
 	// sampler as immutable (VUID-02738, verdict pattern); plain views
-	// keep the mutable layout. waitIdle'd rebuild, rare.
+	// keep the mutable layout. waitIdle'd rebuild, rare. Declaration
+	// order matters: layout outlives sets (reverse destruction).
+	// Non-owning alias: refreshed on every rebuild before any bind;
+	// a decoder-side sampler recreation rebuilds before the next bind
+	// (handle comparison in ensure_virt_layout).
 	vk::Sampler virt_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition virt_ycbcr_built{};
 	void create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
