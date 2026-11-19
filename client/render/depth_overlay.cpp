@@ -1056,7 +1056,7 @@ bool depth_overlay_renderer::record_depth_range(vk::raii::CommandBuffer & cmd,
 	        .offset = 0,
 	        .size = sizeof(uint32_t) * 8,
 	};
-	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eComputeShader, {}, host_to_compute, {}, {});
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eComputeShader, {}, {}, host_to_compute, {});
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *minmax_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *minmax_pipeline_layout, 0, *minmax_set, {});
 	cmd.dispatch((extent.width + 15) / 16, (extent.height + 15) / 16, 1);
@@ -1070,7 +1070,7 @@ bool depth_overlay_renderer::record_depth_range(vk::raii::CommandBuffer & cmd,
 	        .offset = 0,
 	        .size = sizeof(uint32_t) * 8,
 	};
-	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, compute_to_host, {}, {});
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, {}, compute_to_host, {});
 	minmax_pending = true;
 	minmax_extent = extent;
 	minmax_frame = depth_frame;
