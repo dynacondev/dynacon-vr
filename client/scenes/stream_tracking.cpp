@@ -619,17 +619,20 @@ void scenes::stream::tracking()
 				locate_spaces.resolve(session, tracking.timestamp, tracking.device_poses);
 
 				// Controller rotation offset, hands emulating controllers only:
-				// rotate streamed grip/aim orientations controller-locally
-				// (position untouched). Gated on the runtime's current profile
-				// per hand path - ground truth for who drives - with a hold so
-				// flaps and transient nulls can not strobe it. Palm/pinch/poke
-				// stay untouched (hand-space, no controller equivalent).
+				// rotate streamed grip/aim orientations as one rigid body per side
+				// (position untouched). The world-frame delta is derived from that
+				// side's grip pose (aim fallback), so grip<->aim stay rigid; the user
+				// offset is specified controller-locally (X then Y then Z). Gated on
+				// the runtime's current profile per hand path - ground truth for who
+				// drives - with a hold so flaps and transient nulls can not strobe
+				// it. Palm/pinch/poke stay untouched (hand-space, no controller
+				// equivalent).
 				if (config.hand_mode != hand_controller_mode::off)
 				{
 					auto drive_state = [&](int side, rotation_offset_latch & latch) {
 						const auto profile = tracking.interaction_profiles[side];
 						if (profile == interaction_profile::none)
-							return latch.rotated; // transition artifact: hold
+							return latch.rotated; // transition artifact: hold decision and timer
 						const bool want = profile == interaction_profile::ext_hand_interaction_ext;
 						if (want == latch.rotated)
 							latch.pending_since = 0;
@@ -644,31 +647,57 @@ void scenes::stream::tracking()
 					};
 					const bool rotate_left = drive_state(0, rotation_latch_left);
 					const bool rotate_right = drive_state(1, rotation_latch_right);
+					const bool offset_identity = config.hand_controller_rotation_offset_x == 0 and config.hand_controller_rotation_offset_y == 0 and config.hand_controller_rotation_offset_z == 0;
 
-					if (rotate_left or rotate_right)
+					if ((rotate_left or rotate_right) and not offset_identity)
 					{
 						const glm::quat q_user =
 							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_x), glm::vec3{1, 0, 0}) *
 							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_y), glm::vec3{0, 1, 0}) *
 							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_z), glm::vec3{0, 0, 1});
-						for (auto & dp: tracking.device_poses)
-						{
-							const bool left_side = dp.device == device_id::LEFT_GRIP or dp.device == device_id::LEFT_AIM;
-							const bool right_side = dp.device == device_id::RIGHT_GRIP or dp.device == device_id::RIGHT_AIM;
-							if ((left_side and rotate_left) or (right_side and rotate_right))
+						auto world_delta = [&](device_id grip, device_id aim) -> std::optional<glm::quat> {
+							for (device_id id : {grip, aim}) // grip anchors the delta; fall back to aim
 							{
-								if (dp.flags & static_cast<uint8_t>(from_headset::pose_flags::orientation_valid))
+								for (auto & dp: tracking.device_poses)
+								{
+									if (dp.device == id and (dp.flags & from_headset::pose_flags::orientation_valid))
+									{
+										glm::quat q(dp.pose.orientation.w, dp.pose.orientation.x, dp.pose.orientation.y, dp.pose.orientation.z);
+										return glm::normalize(q * q_user * glm::conjugate(q));
+									}
+								}
+							}
+							return std::nullopt;
+						};
+						auto apply_side = [&](device_id grip, device_id aim, bool rotate) {
+							if (not rotate)
+								return;
+							auto delta = world_delta(grip, aim);
+							if (not delta)
+								return;
+							for (auto & dp: tracking.device_poses)
+							{
+								if ((dp.device == grip or dp.device == aim) and (dp.flags & from_headset::pose_flags::orientation_valid))
 								{
 									glm::quat q(dp.pose.orientation.w, dp.pose.orientation.x, dp.pose.orientation.y, dp.pose.orientation.z);
-									q = glm::normalize(q * q_user);
+									q = glm::normalize(*delta * q);
 									dp.pose.orientation.x = q.x;
 									dp.pose.orientation.y = q.y;
 									dp.pose.orientation.z = q.z;
 									dp.pose.orientation.w = q.w;
 								}
 							}
-						}
+						};
+						apply_side(device_id::LEFT_GRIP, device_id::LEFT_AIM, rotate_left);
+						apply_side(device_id::RIGHT_GRIP, device_id::RIGHT_AIM, rotate_right);
 					}
+				}
+				else
+				{
+					// Gate off: clear latched state so re-enabling always re-arms
+					// the hold with fresh data.
+					rotation_latch_left = {};
+					rotation_latch_right = {};
 				}
 
 				// Origin alignment: re-base outgoing poses so the PC

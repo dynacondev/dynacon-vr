@@ -770,7 +770,7 @@ bool settings_tracking(const settings_context & ctx)
 	// steps. Takes effect live, no restart.
 	if (ctx.system.hand_tracking_supported() and config.hand_mode != hand_controller_mode::off)
 	{
-		auto rotation_row = [&](const char * id, std::string label, float configuration::* member, float default_value) {
+		auto rotation_row = [&](const char * id, std::string label, float configuration::* member) {
 			list.push_back({
 			        .id = id,
 			        .label = std::move(label),
@@ -781,12 +781,11 @@ bool settings_tracking(const settings_context & ctx)
 			        .v_min = -180,
 			        .v_max = 180,
 			        .v_step = 45,
-			        .default_int = int(std::lround(default_value)),
 			});
 		};
-		rotation_row("##hand_rotation_x", _C("setting name", "Hand rotation offset X"), &configuration::hand_controller_rotation_offset_x, default_config.hand_controller_rotation_offset_x);
-		rotation_row("##hand_rotation_y", _C("setting name", "Hand rotation offset Y"), &configuration::hand_controller_rotation_offset_y, default_config.hand_controller_rotation_offset_y);
-		rotation_row("##hand_rotation_z", _C("setting name", "Hand rotation offset Z"), &configuration::hand_controller_rotation_offset_z, default_config.hand_controller_rotation_offset_z);
+		rotation_row("##hand_rotation_x", _C("setting name", "Hand rotation offset X"), &configuration::hand_controller_rotation_offset_x);
+		rotation_row("##hand_rotation_y", _C("setting name", "Hand rotation offset Y"), &configuration::hand_controller_rotation_offset_y);
+		rotation_row("##hand_rotation_z", _C("setting name", "Hand rotation offset Z"), &configuration::hand_controller_rotation_offset_z);
 	}
 
 	// lobby-only cosmetic, hidden in-stream (connection-time settings use
