@@ -718,6 +718,28 @@ bool settings_tracking(const settings_context & ctx)
 		        .disabled_tooltip = disconnect_tip,
 		});
 
+	if (ctx.system.hand_tracking_supported())
+		list.push_back({
+		        .id = "##hand_frequency",
+		        .label = _C("setting name", "Hand tracking frequency"),
+		        .description = _("How often the headset tracks your hands. High is more responsive, low saves power. Advisory only: the runtime may ignore the request, and headsets without Meta's frequency hint ignore this setting."),
+		        .ui = ui_kind::combo,
+		        .get_int = [&config] { return static_cast<int>(config.hand_tracking_frequency); },
+		        .set_int = [&config](int v) {
+			        config.hand_tracking_frequency = static_cast<hand_frequency>(std::clamp(v, 0, 2));
+			        config.save();
+			        application::apply_hand_tracking_frequency(); },
+		        .options = [] {
+			        return std::vector<std::string>{
+			                _C("hand tracking frequency", "Unspecified"),
+			                _C("hand tracking frequency", "Low"),
+			                _C("hand tracking frequency", "High"),
+			        };
+		        },
+		        .title = _C("setting name", "Hand tracking frequency"),
+		        .default_int = static_cast<int>(default_config.hand_tracking_frequency),
+		});
+
 	// Live threshold for the extended-mode binary pinch: visible only
 	// when extended is selected, adjustable in-stream (takes effect on the
 	// next sampled frame, no restart needed).

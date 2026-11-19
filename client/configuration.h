@@ -63,6 +63,13 @@ enum class hand_controller_mode
 	extended = 2,
 };
 
+enum class hand_frequency
+{
+	unspecified = 0,
+	low = 1,
+	high = 2,
+};
+
 class configuration
 {
 public:
@@ -105,6 +112,11 @@ public:
 	// Extended hand mode: combined pinch/fist closure (0..1) at which the
 	// binary pinch fires.
 	float pinch_emit_threshold = 0.9f;
+
+	// Preferred hand tracking update rate (Meta
+	// XR_META_hand_tracking_frequency_hint). Advisory only; runtimes
+	// without the extension ignore it. High is the default.
+	hand_frequency hand_tracking_frequency = hand_frequency::high;
 
 	// Show tracked hand meshes in the lobby. Off (default): meshes are
 	// hidden; hand pointing still works and controller hide/show behaviour
