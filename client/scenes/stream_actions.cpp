@@ -27,15 +27,12 @@ void scenes::stream::read_actions()
 	from_headset::inputs inputs;
 
 	// Extended hand mode: pinch and grasp analogs are never forwarded.
-	// Instead their max feeds a single per-hand latch whose snapped binary
-	// output goes out on the pinch value channel (driving select downstream
-	// exactly as pinch does, but thresholded). 10% release hysteresis.
+	// Instead their max feeds a single snapped binary output on the pinch
+	// value channel (driving select downstream exactly as pinch does, but
+	// thresholded). Debounce is left to the runtime.
 	const auto & config = application::get_config();
 	const bool extended = config.hand_mode == hand_controller_mode::extended;
-	constexpr float release_band = 0.10f;
-	// Floor at the release band so the release point stays reachable;
-	// without this a threshold <= 10% would latch the pinch on forever.
-	const float threshold = std::clamp(config.pinch_emit_threshold, release_band, 1.0f);
+	const float threshold = std::clamp(config.pinch_emit_threshold, 0.0f, 1.0f);
 
 	struct pinch_accum
 	{
@@ -101,20 +98,13 @@ void scenes::stream::read_actions()
 
 		if (extended)
 		{
-			auto emit = [&](const pinch_accum & accum, bool & latched, device_id pinch_id) {
+			auto emit = [&](const pinch_accum & accum, device_id pinch_id) {
 				if (not accum.seen)
 					return;
-				if (latched)
-				{
-					if (accum.best < threshold - release_band)
-						latched = false;
-				}
-				else if (accum.best >= threshold)
-					latched = true;
-				inputs.values.push_back({pinch_id, latched ? 1.0f : 0.0f, accum.timestamp});
+				inputs.values.push_back({pinch_id, accum.best >= threshold ? 1.0f : 0.0f, accum.timestamp});
 			};
-			emit(accum_left, pinch_emit_left, device_id::LEFT_PINCH_VALUE);
-			emit(accum_right, pinch_emit_right, device_id::RIGHT_PINCH_VALUE);
+			emit(accum_left, device_id::LEFT_PINCH_VALUE);
+			emit(accum_right, device_id::RIGHT_PINCH_VALUE);
 		}
 	}
 

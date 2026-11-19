@@ -104,7 +104,7 @@ public:
 	hand_controller_mode hand_mode = hand_controller_mode::off;
 
 	// Extended hand mode: combined pinch/fist closure (0..1) at which the
-	// binary pinch fires. Release point sits 10% below this (hysteresis).
+	// binary pinch fires.
 	float pinch_emit_threshold = 0.5f;
 
 	// Show tracked hand meshes in the lobby. Off (default): meshes are
