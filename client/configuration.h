@@ -102,9 +102,9 @@ public:
 	// Extended additionally mirrors grasp onto the trigger channels.
 	hand_controller_mode hand_mode = hand_controller_mode::off;
 
-	// Extended hand mode: fist closure (0..1) at which the emulated trigger
-	// clicks. Release point sits 10% below this (hysteresis).
-	float grasp_trigger_threshold = 0.5f;
+	// Extended hand mode: combined pinch/fist closure (0..1) at which the
+	// binary pinch fires. Release point sits 10% below this (hysteresis).
+	float pinch_emit_threshold = 0.5f;
 
 	// Show tracked hand meshes in the lobby. Off (default): meshes are
 	// hidden; hand pointing still works and controller hide/show behaviour

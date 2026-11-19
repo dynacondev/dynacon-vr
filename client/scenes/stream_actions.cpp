@@ -26,17 +26,24 @@ void scenes::stream::read_actions()
 {
 	from_headset::inputs inputs;
 
-	// Extended mode: a fist also drives the trigger. The analog grasp value
-	// is forwarded as-is onto the trigger value channel, while the trigger
-	// click uses a custom threshold (not the runtime's ready signal) with a
-	// 10% release hysteresis band. Otherwise silent: hand_interaction
-	// defines no trigger inputs.
+	// Extended hand mode: pinch and grasp analogs are never forwarded.
+	// Instead their max feeds a single per-hand latch whose snapped binary
+	// output goes out on the pinch value channel (driving select downstream
+	// exactly as pinch does, but thresholded). 10% release hysteresis.
 	const auto & config = application::get_config();
-	const bool grasp_drives_trigger = config.hand_mode == hand_controller_mode::extended;
-	constexpr float grasp_release_band = 0.10f;
+	const bool extended = config.hand_mode == hand_controller_mode::extended;
+	constexpr float release_band = 0.10f;
 	// Floor at the release band so the release point stays reachable;
-	// without this a threshold <= 10% would latch the trigger on forever.
-	const float grasp_threshold = std::clamp(config.grasp_trigger_threshold, grasp_release_band, 1.0f);
+	// without this a threshold <= 10% would latch the pinch on forever.
+	const float threshold = std::clamp(config.pinch_emit_threshold, release_band, 1.0f);
+
+	struct pinch_accum
+	{
+		float best = 0;
+		XrTime timestamp = 0;
+		bool seen = false;
+	};
+	pinch_accum accum_left, accum_right;
 
 	if (not is_gui_interactable())
 	{
@@ -46,43 +53,33 @@ void scenes::stream::read_actions()
 			{
 				case XR_ACTION_TYPE_BOOLEAN_INPUT: {
 					auto value = application::read_action_bool(action);
-					if (value)
+					if (value and not (extended and (id == device_id::LEFT_PINCH_READY or id == device_id::RIGHT_PINCH_READY or id == device_id::LEFT_GRASP_READY or id == device_id::RIGHT_GRASP_READY)))
 						inputs.values.push_back({id, (float)value->second, value->first});
 				}
 				break;
 
 				case XR_ACTION_TYPE_FLOAT_INPUT: {
 					auto value = application::read_action_float(action);
-					if (value)
+					if (not value)
+						break;
+					pinch_accum * accum = nullptr;
+					if (id == device_id::LEFT_PINCH_VALUE or id == device_id::LEFT_GRASP_VALUE)
+						accum = &accum_left;
+					else if (id == device_id::RIGHT_PINCH_VALUE or id == device_id::RIGHT_GRASP_VALUE)
+						accum = &accum_right;
+					if (extended and accum)
 					{
-						inputs.values.push_back({id, value->second, value->first});
-						bool * latched = nullptr;
-						device_id trigger_value = device_id::LEFT_TRIGGER_VALUE;
-						device_id trigger_click = device_id::LEFT_TRIGGER_CLICK;
-						if (grasp_drives_trigger and id == device_id::LEFT_GRASP_VALUE)
-							latched = &grasp_trigger_left;
-						else if (grasp_drives_trigger and id == device_id::RIGHT_GRASP_VALUE)
+						// Order is not guaranteed (unordered source map):
+						// accumulate the max, emit once after the loop.
+						if (not accum->seen or value->second > accum->best)
 						{
-							latched = &grasp_trigger_right;
-							trigger_value = device_id::RIGHT_TRIGGER_VALUE;
-							trigger_click = device_id::RIGHT_TRIGGER_CLICK;
+							accum->best = value->second;
+							accum->timestamp = value->first;
 						}
-						if (latched)
-						{
-							if (*latched)
-							{
-								if (value->second < grasp_threshold - grasp_release_band)
-									*latched = false;
-							}
-							else if (value->second >= grasp_threshold)
-								*latched = true;
-							// Snap the emulated trigger to full pull / released:
-							// apps see a clean digital-style trigger.
-							const float pulled = *latched ? 1.0f : 0.0f;
-							inputs.values.push_back({trigger_value, pulled, value->first});
-							inputs.values.push_back({trigger_click, pulled, value->first});
-						}
+						accum->seen = true;
+						break;
 					}
+					inputs.values.push_back({id, value->second, value->first});
 				}
 				break;
 
@@ -100,6 +97,24 @@ void scenes::stream::read_actions()
 				default:
 					break;
 			}
+		}
+
+		if (extended)
+		{
+			auto emit = [&](const pinch_accum & accum, bool & latched, device_id pinch_id) {
+				if (not accum.seen)
+					return;
+				if (latched)
+				{
+					if (accum.best < threshold - release_band)
+						latched = false;
+				}
+				else if (accum.best >= threshold)
+					latched = true;
+				inputs.values.push_back({pinch_id, latched ? 1.0f : 0.0f, accum.timestamp});
+			};
+			emit(accum_left, pinch_emit_left, device_id::LEFT_PINCH_VALUE);
+			emit(accum_right, pinch_emit_right, device_id::RIGHT_PINCH_VALUE);
 		}
 	}
 

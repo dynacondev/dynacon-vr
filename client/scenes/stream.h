@@ -145,10 +145,10 @@ private:
 	std::unordered_multimap<device_id, haptics_action> haptics_actions;
 	std::vector<std::tuple<device_id, XrAction, XrActionType>> input_actions;
 
-	// Extended hand mode: latched emulated-trigger state per hand, with the
-	// release point 10% below the configured threshold (hysteresis).
-	bool grasp_trigger_left = false;
-	bool grasp_trigger_right = false;
+	// Extended hand mode: latched binary-pinch state per hand, fed by the
+	// max of pinch/grasp analogs. Release point sits 10% below threshold.
+	bool pinch_emit_left = false;
+	bool pinch_emit_right = false;
 
 	std::atomic<state> state_ = state::initializing;
 

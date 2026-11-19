@@ -702,7 +702,7 @@ bool settings_tracking(const settings_context & ctx)
 		list.push_back({
 		        .id = "##hand_controller_mode",
 		        .label = _C("setting name", "Hands emulate controllers"),
-		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. Standard: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles). Extended: standard inputs, plus grasp also drives the trigger. Takes effect after restarting the client."),
+		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. Standard: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles). Extended: pinch and fist feed a single thresholded binary pinch, no analog hand inputs. Takes effect after restarting the client."),
 		        .ui = ui_kind::segmented,
 		        .get_int = [&config] { return static_cast<int>(config.hand_mode); },
 		        .set_int = [&config](int v) { config.hand_mode = static_cast<hand_controller_mode>(std::clamp(v, static_cast<int>(hand_controller_mode::off), static_cast<int>(hand_controller_mode::extended))); config.save(); },
@@ -723,16 +723,16 @@ bool settings_tracking(const settings_context & ctx)
 	// next sampled frame, no restart needed).
 	if (ctx.system.hand_tracking_supported() and config.hand_mode == hand_controller_mode::extended)
 		list.push_back({
-		        .id = "##grasp_trigger_threshold",
-		        .label = _C("setting name", "Trigger threshold"),
-		        .description = _("Fist closure at which the emulated trigger clicks in Extended mode. Releases 10% below this."),
+		        .id = "##pinch_emit_threshold",
+		        .label = _C("setting name", "Pinch threshold"),
+		        .description = _("Combined pinch and fist closure at which the binary pinch fires in Extended mode. Releases 10% below this."),
 		        .ui = ui_kind::slider,
-		        .get_int = [&config] { return int(std::lround(config.grasp_trigger_threshold * 100)); },
-		        .set_int = [&config](int v) { config.grasp_trigger_threshold = std::clamp(v, 10, 100) / 100.f; config.save(); },
+		        .get_int = [&config] { return int(std::lround(config.pinch_emit_threshold * 100)); },
+		        .set_int = [&config](int v) { config.pinch_emit_threshold = std::clamp(v, 10, 100) / 100.f; config.save(); },
 		        .v_min = 10,
 		        .v_max = 100,
 		        .fmt = "%d%%",
-		        .default_int = int(std::lround(default_config.grasp_trigger_threshold * 100)),
+		        .default_int = int(std::lround(default_config.pinch_emit_threshold * 100)),
 		});
 
 	// lobby-only cosmetic, hidden in-stream (connection-time settings use
