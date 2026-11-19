@@ -25,6 +25,13 @@ void scenes::stream::read_actions()
 {
 	from_headset::inputs inputs;
 
+	// Extended mode: a fist also drives the trigger. The runtime reports
+	// grasp as analog value + its own ready threshold, mirroring the
+	// trigger's value/click split, so forward both onto the existing
+	// trigger channels (otherwise silent: hand_interaction defines no
+	// trigger inputs, and no packet/server change is needed).
+	const bool grasp_drives_trigger = application::get_config().hand_controller_mode == hand_controller_mode::extended;
+
 	if (not is_gui_interactable())
 	{
 		for (const auto & [id, action, action_type]: input_actions)
@@ -34,14 +41,32 @@ void scenes::stream::read_actions()
 				case XR_ACTION_TYPE_BOOLEAN_INPUT: {
 					auto value = application::read_action_bool(action);
 					if (value)
+					{
 						inputs.values.push_back({id, (float)value->second, value->first});
+						if (grasp_drives_trigger)
+						{
+							if (id == device_id::LEFT_GRASP_READY)
+								inputs.values.push_back({device_id::LEFT_TRIGGER_CLICK, (float)value->second, value->first});
+							else if (id == device_id::RIGHT_GRASP_READY)
+								inputs.values.push_back({device_id::RIGHT_TRIGGER_CLICK, (float)value->second, value->first});
+						}
+					}
 				}
 				break;
 
 				case XR_ACTION_TYPE_FLOAT_INPUT: {
 					auto value = application::read_action_float(action);
 					if (value)
+					{
 						inputs.values.push_back({id, value->second, value->first});
+						if (grasp_drives_trigger)
+						{
+							if (id == device_id::LEFT_GRASP_VALUE)
+								inputs.values.push_back({device_id::LEFT_TRIGGER_VALUE, value->second, value->first});
+							else if (id == device_id::RIGHT_GRASP_VALUE)
+								inputs.values.push_back({device_id::RIGHT_TRIGGER_VALUE, value->second, value->first});
+						}
+					}
 				}
 				break;
 
