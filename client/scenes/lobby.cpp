@@ -1141,18 +1141,16 @@ void scenes::lobby::render(const XrFrameState & frame_state)
 		auto windows = imgui_ctx->windows();
 
 		auto left = left_hand->locate(world_space, frame_state.predictedDisplayTime);
-		if (left)
+		if (left and left->is_input_source())
 		{
-			if (left->is_input_source())
-				stick_finger_to_gui(left->joints, windows);
+			stick_finger_to_gui(left->joints, windows);
 			hide_left_controller = true;
 		}
 
 		auto right = right_hand->locate(world_space, frame_state.predictedDisplayTime);
-		if (right)
+		if (right and right->is_input_source())
 		{
-			if (right->is_input_source())
-				stick_finger_to_gui(right->joints, windows);
+			stick_finger_to_gui(right->joints, windows);
 			hide_right_controller = true;
 		}
 

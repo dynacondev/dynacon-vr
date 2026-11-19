@@ -114,9 +114,24 @@ std::optional<xr::hand_tracker::located_hand> xr::hand_tracker::locate(XrSpace s
 		// returned joints are not valid
 		return std::nullopt;
 
-	// bail if any of the joint is invalid
-	if (std::ranges::any_of(joints_pos, [](const auto & loc) { return loc.locationFlags == 0; }))
-		return std::nullopt;
+	// bail if any joint the consumers need is invalid: wrist (mesh root),
+	// palm and the full index chain (poke pointer, kiosk swatters). Other
+	// fingers may be curled/occluded without discarding the whole hand.
+	static constexpr XrHandJointEXT required_joints[] = {
+	        XR_HAND_JOINT_WRIST_EXT,
+	        XR_HAND_JOINT_PALM_EXT,
+	        XR_HAND_JOINT_INDEX_METACARPAL_EXT,
+	        XR_HAND_JOINT_INDEX_PROXIMAL_EXT,
+	        XR_HAND_JOINT_INDEX_INTERMEDIATE_EXT,
+	        XR_HAND_JOINT_INDEX_DISTAL_EXT,
+	        XR_HAND_JOINT_INDEX_TIP_EXT,
+	};
+	constexpr XrSpaceLocationFlags want = XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+	for (XrHandJointEXT joint: required_joints)
+	{
+		if ((joints_pos[joint].locationFlags & want) != want)
+			return std::nullopt;
+	}
 
 	joint_array joints;
 	for (int i = 0; i < XR_HAND_JOINT_COUNT_EXT; i++)

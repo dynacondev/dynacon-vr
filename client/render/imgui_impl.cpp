@@ -598,7 +598,10 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 				}
 				if (ctrl.scroll)
 				{
-					if (auto v = application::read_action_vec2(ctrl.scroll); v and glm::length(glm::vec2(v->second.x, v->second.y)) > constants::gui::scroll_value_thd)
+					// Deliberate deadzone: worn sticks drift well above the
+					// 0.01 GUI-scroll threshold, and drift must not veto poke.
+					constexpr float stick_active_thd = 0.2f;
+					if (auto v = application::read_action_vec2(ctrl.scroll); v and glm::length(glm::vec2(v->second.x, v->second.y)) > stick_active_thd)
 						return true;
 				}
 				return false;
@@ -616,10 +619,11 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 
 			if (hands_drive != bool(last_hands_drive[controller_index]))
 			{
-				spdlog::info("imgui hand input {}: located={} input_source={} buttons={} -> {}",
+				spdlog::info("imgui hand input {}: located={} input_source={} data_source={} buttons={} -> {}",
 				             controller_index,
 				             located,
 				             input_source,
+				             hand and hand->data_source ? int(*hand->data_source) : -1,
 				             buttons,
 				             hands_drive ? "poke" : "aim");
 				last_hands_drive[controller_index] = hands_drive;
