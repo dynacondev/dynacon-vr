@@ -825,10 +825,11 @@ private:
 	// render thread only): fullscreen false-color viz as ONE transparent
 	// projection layer above passthrough/video, below the GUI. Sensor =
 	// runtime D16 (green = nearZ, red = farZ). The VR/layer/verdict modes
-	// isolate the occlusion comparison (green->red over 0..2.046m,
-	// empty black; verdict red = VR wins, green = passthrough). All modes
-	// share the opacity below. Sensor provider cost is bound to its mode
-	// (off = zero cost).
+	// isolate the occlusion comparison (green->red over 0..2.046m, virt
+	// far past 1020 black, layer far saturates red, absent black;
+	// verdict red = VR wins incl. far-vs-far, green = passthrough). All
+	// modes share the opacity below. Sensor provider cost is bound to
+	// its mode (off = zero cost).
 	std::unique_ptr<depth_overlay_renderer> depth_overlay;
 	std::unique_ptr<xr::environment_depth> env_depth;
 	bool env_depth_probed = false;   // supported() queried once, cached below

@@ -43,13 +43,14 @@ layout(location = 0) out vec4 out_color;
 // band absorbing lossy wobble. Anything past 1020 decodes as far. No
 // near/far push: SBS codes are already meters (code * 0.002), so
 // neither side needs a frustum to agree. The raster layer uses the
-// same cut: l > 2.041m (1020.5 * 0.002) is far.
+// same cut: l >= 2.041m (1020.5 * 0.002) is far.
 //
 // verdict: absent (FAR clear) keeps merged; far-vs-far is a VR win
 // (reveal 0); virt-far alone keeps the window (reveal 1); otherwise
 // reveal = !(virt strictly nearer). Exact, no bias anywhere — crisp
-// occlusion edges are intentional. Tie keeps the window. Geometry-free pixels (reversed-only cuts, hidden,
-// debug cutouts never write the layer) read FAR and keep whatever
+// occlusion edges are intentional. Tie keeps the window.
+// Geometry-free pixels (reversed-only cuts, hidden, debug cutouts
+// never write the layer) read FAR and keep whatever
 // the merged union says. Global: applies to every group at once,
 // after all alpha is combined; reversed cuts stay per-group feather
 // alpha and are unaffected here.
