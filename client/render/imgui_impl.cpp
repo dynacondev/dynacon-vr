@@ -569,7 +569,12 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 
 	aim_interaction = {1, 1};
 
+	static std::vector<char> last_hands_drive;
+	if (last_hands_drive.size() != controllers.size())
+		last_hands_drive.assign(controllers.size(), false);
+
 	// Get the hand/controller state from OpenXR
+	size_t controller_index = 0;
 	for (const auto & [controller, state, current_aim_interaction]: std::ranges::zip_view(controllers, new_states, aim_interaction))
 	{
 		const auto & ctrl = controller.first;
@@ -580,11 +585,47 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 		current_aim_interaction = 1;
 		if (ctrl.hand)
 		{
-			// Hands-active means joints locate, full stop: no data-source
-			// check, no waiting on the controller signal. Gripping
-			// controllers invalidates the joints, so hands die the frame
-			// joints stop and controllers take over immediately.
-			if (auto hand = ctrl.hand->locate(world, display_time); hand)
+			// Controller-exclusive inputs: the lobby binds squeeze/scroll
+			// for controller profiles only. The shared trigger action is
+			// deliberately excluded: under the hand profile it carries the
+			// aim-activate gesture, and counting it would kill poke the
+			// moment a user pinches to click.
+			auto controller_button_active = [&ctrl] {
+				if (ctrl.squeeze)
+				{
+					if (auto s = application::read_action_float(ctrl.squeeze); s and s->second > 0.05f)
+						return true;
+				}
+				if (ctrl.scroll)
+				{
+					if (auto v = application::read_action_vec2(ctrl.scroll); v and glm::length(v->second) > constants::gui::scroll_value_thd)
+						return true;
+				}
+				return false;
+			};
+
+			// Hands drive only with located, input-source joints and no
+			// controller buttons: gripping kills joints (fast path),
+			// pressing kills poke instantly (override path). Either side
+			// is decided independently.
+			auto hand = ctrl.hand->locate(world, display_time);
+			const bool located = bool(hand);
+			const bool input_source = located and hand->is_input_source();
+			const bool buttons = controller_button_active();
+			const bool hands_drive = located and input_source and not buttons;
+
+			if (hands_drive != bool(last_hands_drive[controller_index]))
+			{
+				spdlog::info("imgui hand input {}: located={} input_source={} buttons={} -> {}",
+				             controller_index,
+				             located,
+				             input_source,
+				             buttons,
+				             hands_drive ? "poke" : "aim");
+				last_hands_drive[controller_index] = hands_drive;
+			}
+
+			if (hands_drive)
 			{
 				XrHandJointLocationEXT & index_tip = hand->joints[XR_HAND_JOINT_INDEX_TIP_EXT].first;
 
@@ -660,6 +701,8 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 			state.source = ImGuiMouseSource_VRHandTracking;
 		else
 			state.source = ImGuiMouseSource_VRController;
+
+		controller_index++;
 	}
 
 	return new_states;
