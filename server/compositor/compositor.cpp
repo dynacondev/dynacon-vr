@@ -1037,6 +1037,27 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// but missing" (wire loss or pairing miss). Set after the pack
 	// block above, before the encoder handoff below.
 	images[slot].view_info.depth_expected = images[slot].has_depth;
+	{
+		// Depth-pack forensics (1s throttle): what the packer consumed
+		// and produced. near/far pin down the linearize mapping (a 2x
+		// near error doubles every packed meter); has_depth is the
+		// strict-pairing gate; extents pin the MIN-pool resample
+		// geometry. Cross-check against the client VR-depth pair line
+		// (near/far must match the app's real projection; staging WxH
+		// the advertised depth size).
+		static uint64_t last_depth_pack_log_ns = 0;
+		uint64_t depth_pack_now_ns = uint64_t(os_monotonic_get_ns());
+		if (depth_pack_now_ns - last_depth_pack_log_ns > 1'000'000'000ull)
+		{
+			last_depth_pack_log_ns = depth_pack_now_ns;
+			auto warp_ext = images[0].image.info().extent;
+			auto pack_ext = depth_images[0].image.info().extent;
+			U_LOG_I("depth pack: warped %d depth_enabled %d has_depth %d near %.4f/%.4f far %.3f/%.3f warp %ux%u staging %ux%u",
+			        (int)warped, (int)settings[3].enabled, (int)images[slot].has_depth,
+			        src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1],
+			        warp_ext.width, warp_ext.height, pack_ext.width, pack_ext.height);
+		}
+	}
 
 	for (auto & encoder: encoders)
 	{
