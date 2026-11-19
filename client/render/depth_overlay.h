@@ -177,6 +177,20 @@ public:
 	                 const wivrn::decoder::ycbcr_definition & ycbcr,
 	                 const frame_params & params);
 
+	// Unpacked-depth range reduction (forensics): dispatches a GPU
+	// min/max/near/far reduction over the decoded SBS view with the
+	// decoder's sampler/conversion (the exact tap the verdict/viz
+	// sample) into a host-visible 8-uint SSBO. Returns true when
+	// dispatched (caller widens the blit-semaphore wait stages to
+	// cover compute). drain_depth_range() reads back after the frame
+	// fence and logs; throttled by the dispatch cadence. Render
+	// thread only.
+	bool record_depth_range(vk::raii::CommandBuffer & cmd,
+	                        vk::ImageView virt_view, vk::Sampler virt_sampler,
+	                        const wivrn::decoder::ycbcr_definition & ycbcr,
+	                        vk::Extent2D extent, uint64_t depth_frame);
+	void drain_depth_range();
+
 	// Release the acquired image (after submit, before endFrame).
 	void release();
 
@@ -250,6 +264,31 @@ private:
 	vk::raii::DescriptorSet virt_set{nullptr};
 	vk::raii::PipelineLayout virt_pipeline_layout{nullptr};
 	vk::raii::Pipeline virt_pipeline{nullptr};
+	// Unpacked-depth range state (decoder SBS sampler + SSBO): own
+	// layout + pool + set + compute pipeline. Converted views bake
+	// the decoder's live sampler as immutable (VUID-02738, viz
+	// pattern); plain views keep the mutable layout. waitIdle'd
+	// rebuild, rare. Declaration order matters: layout outlives sets
+	// (reverse destruction). Non-owning alias: refreshed on every
+	// rebuild before any bind (handle comparison in
+	// ensure_minmax_layout).
+	vk::Sampler minmax_immutable_src{nullptr};
+	wivrn::decoder::ycbcr_definition minmax_ycbcr_built{};
+	void create_minmax_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void ensure_minmax_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	vk::raii::DescriptorSetLayout minmax_layout{nullptr};
+	vk::raii::DescriptorPool minmax_pool{nullptr};
+	vk::raii::DescriptorSet minmax_set{nullptr};
+	vk::raii::PipelineLayout minmax_pipeline_layout{nullptr};
+	vk::raii::Pipeline minmax_pipeline{nullptr};
+	// Host-visible 8-uint accumulators (full min/max/near/far +
+	// center min/max/near/far), written by the reduction dispatch,
+	// read after the frame fence. Last dispatched extent/frame for
+	// the log line.
+	buffer_allocation minmax_stats;
+	vk::Extent2D minmax_extent{0, 0};
+	uint64_t minmax_frame = 0;
+	bool minmax_pending = false;
 
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;
