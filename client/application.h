@@ -454,6 +454,12 @@ public:
 	// or rate is Auto (0).
 	static bool apply_preferred_refresh_rate();
 
+	// Request the configured hand tracking frequency (Meta
+	// XR_META_hand_tracking_frequency_hint). Advisory only: no-op when
+	// Unspecified or the extension is unavailable. Live: safe to call
+	// mid-stream, no restart needed.
+	static void apply_hand_tracking_frequency();
+
 	static boost::locale::gnu_gettext::messages_info & get_messages_info()
 	{
 		return instance().messages_info;

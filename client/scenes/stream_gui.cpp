@@ -32,6 +32,7 @@
 #include "utils/i18n.h"
 #include "utils/ranges.h"
 #include <IconsFontAwesome7.h>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <glm/ext.hpp>
@@ -1448,15 +1449,17 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 
 		if (left_hand and right_hand)
 		{
+			// locate() already guarantees the joints that matter (wrist,
+			// palm, index chain); hide on located + input-source, same as
+			// the lobby. (A stricter all-joints check here disagreed with
+			// locate() and left rays stuck to partially-tracked hands.)
 			auto left = left_hand->locate(world_space, predicted_display_time);
 			auto right = right_hand->locate(world_space, predicted_display_time);
 
-			if (left and left->is_input_source() and
-			    xr::hand_tracker::check_flags(left->joints, XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT, 0))
+			if (left and left->is_input_source())
 				hide_left_controller = true;
 
-			if (right and right->is_input_source() and
-			    xr::hand_tracker::check_flags(right->joints, XR_SPACE_LOCATION_POSITION_TRACKED_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT, 0))
+			if (right and right->is_input_source())
 				hide_right_controller = true;
 		}
 

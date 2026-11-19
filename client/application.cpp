@@ -1169,7 +1169,7 @@ void application::initialize_actions()
 		profile.available = std::ranges::all_of(profile.required_extensions, [&](auto & ext) { return xr_instance.has_extension(ext); }) and
 		                    profile.min_version <= api_version;
 
-		// Hands-only mode (default): never let hands masquerade as
+		// Hands-only mode: never let hands masquerade as
 		// controllers. The Quest runtime fakes khr/simple_controller when
 		// hand tracking is on, and any runtime with suggested
 		// ext/hand_interaction_ext bindings auto-switches /user/hand/*
@@ -1177,12 +1177,13 @@ void application::initialize_actions()
 		// touch_controller_plus and null on every pinch. Withholding both
 		// profiles keeps hands on the 26-joint hand-tracking path only;
 		// real controllers (touch_*, etc.) are unaffected.
-		const bool hands_emulate_controllers = application::get_config().hands_emulate_controllers;
-		if (profile.profile_name.ends_with("ext/hand_interaction_ext") and not hands_emulate_controllers)
+		const auto hand_mode = application::get_config().hand_mode;
+		const bool emulate_controllers = hand_mode != hand_controller_mode::off;
+		if (profile.profile_name.ends_with("ext/hand_interaction_ext") and not emulate_controllers)
 			profile.available = false;
 
 		if (profile.profile_name.ends_with("khr/simple_controller") and
-		    (not get_hmd_traits().bind_simple_controller or not hands_emulate_controllers))
+		    (not get_hmd_traits().bind_simple_controller or not emulate_controllers))
 			profile.available = false;
 
 		if (!profile.available)
@@ -1248,7 +1249,7 @@ void application::initialize_actions()
 		}
 	}
 
-	if (not application::get_config().hands_emulate_controllers)
+	if (application::get_config().hand_mode == hand_controller_mode::off)
 		spdlog::info("Hands-only mode: simple_controller and hand_interaction bindings withheld, hands report joints only");
 
 	// For each possible input source, create a XrAction and add it to the suggested binding
@@ -1363,6 +1364,20 @@ void application::initialize_actions()
 	xr_session.attach_actionsets(action_sets);
 }
 
+// XR_META_hand_tracking_frequency_hint: newer than our vendored loader
+// headers, so define the pieces locally when missing. Values from the
+// extension spec; the function resolves via xrGetInstanceProcAddr, so no
+// loader support is needed.
+#ifndef XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME
+#define XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME "XR_META_hand_tracking_frequency_hint"
+typedef enum XrHandTrackingFrequencyHintMETA {
+	XR_HAND_TRACKING_FREQUENCY_HINT_DEFAULT_META = 1,
+	XR_HAND_TRACKING_FREQUENCY_HINT_HIGH_META = 2,
+	XR_HAND_TRACKING_FREQUENCY_HINT_MAX_ENUM_META = 0x7FFFFFFF,
+} XrHandTrackingFrequencyHintMETA;
+typedef XrResult(XRAPI_PTR * PFN_xrSetHandTrackingFrequencyHintMETA)(XrSession session, XrHandTrackingFrequencyHintMETA frequencyHint);
+#endif
+
 void application::initialize()
 {
 	runtime_hmd_traits.init();
@@ -1386,6 +1401,9 @@ void application::initialize()
 	        XR_EXT_HAND_TRACKING_EXTENSION_NAME,
 	        XR_EXT_HAND_TRACKING_DATA_SOURCE_EXTENSION_NAME,
 	        XR_FB_HAND_TRACKING_MESH_EXTENSION_NAME,
+	        // Hand tracking frequency hint (Meta): probed like all opt
+	        // extensions below; absent runtimes are unaffected.
+	        XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME,
 	        XR_EXT_PALM_POSE_EXTENSION_NAME,
 	        XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME,
 	        XR_EXT_USER_PRESENCE_EXTENSION_NAME,
@@ -1544,6 +1562,10 @@ void application::initialize()
 	}
 
 	xr_session.set_passthrough_boundary_enabled(config->passthrough_boundary_enabled);
+
+	// XR_META_hand_tracking_frequency_hint is session-global: apply the
+	// persisted mode once the session exists (safe to re-apply live).
+	apply_hand_tracking_frequency();
 
 #ifdef __ANDROID__
 	set_usb_networking(config->usb_network);
@@ -2115,6 +2137,41 @@ bool application::apply_preferred_refresh_rate()
 		return false;
 	self.xr_session.set_refresh_rate(self.config->preferred_refresh_rate);
 	return true;
+}
+
+void application::apply_hand_tracking_frequency()
+{
+	auto & self = instance();
+	if (not self.config or self.config->hand_tracking_frequency == hand_frequency::unspecified)
+		return;
+	if (not self.xr_session)
+		return;
+	if (not self.xr_instance.has_extension(XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME))
+	{
+		// Expected on non-Meta runtimes: info, not warn.
+		static bool warned = false;
+		if (not warned)
+		{
+			warned = true;
+			spdlog::info("Hand tracking frequency hint not supported by runtime, ignoring {}",
+			             magic_enum::enum_name(self.config->hand_tracking_frequency));
+		}
+		return;
+	}
+	PFN_xrSetHandTrackingFrequencyHintMETA xrSetHandTrackingFrequencyHintMETA = nullptr;
+	if (XR_FAILED(xrGetInstanceProcAddr(self.xr_instance, "xrSetHandTrackingFrequencyHintMETA", (PFN_xrVoidFunction *)&xrSetHandTrackingFrequencyHintMETA)) or
+	    not xrSetHandTrackingFrequencyHintMETA)
+	{
+		spdlog::warn("Hand tracking frequency hint advertised but entry point missing");
+		return;
+	}
+	auto hint = self.config->hand_tracking_frequency == hand_frequency::high
+	        ? XR_HAND_TRACKING_FREQUENCY_HINT_HIGH_META
+	        : XR_HAND_TRACKING_FREQUENCY_HINT_DEFAULT_META;
+	if (XR_FAILED(xrSetHandTrackingFrequencyHintMETA(self.xr_session, hint)))
+		spdlog::warn("Hand tracking frequency hint request rejected by runtime");
+	else
+		spdlog::info("Hand tracking frequency hint: {}", magic_enum::enum_name(self.config->hand_tracking_frequency));
 }
 
 void application::session_state_changed(XrSessionState new_state, XrTime timestamp)

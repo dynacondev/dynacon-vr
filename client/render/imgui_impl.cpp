@@ -565,7 +565,14 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 	std::vector<controller_state> new_states;
 	new_states.resize(controllers.size());
 	if (not controllers_enabled)
+	{
+		// Disabled (kiosk / hidden GUI): no pointer, no clicks — and
+		// reset the aim blend, otherwise it freezes at its last value
+		// and a frozen aim==1 keeps rays submitted (lobby kiosk renders
+		// the ray layer unconditionally).
+		aim_interaction = {0, 0};
 		return new_states;
+	}
 
 	aim_interaction = {1, 1};
 
@@ -574,17 +581,44 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 	{
 		const auto & ctrl = controller.first;
 		std::pair<std::optional<ImVec2>, float> index_tip_position{{}, std::numeric_limits<float>::max()};
-		std::pair<std::optional<ImVec2>, float> palm_position{{}, std::numeric_limits<float>::max()};
 		std::pair<std::optional<ImVec2>, float> controller_position{{}, std::numeric_limits<float>::max()};
 
 		// First hands, so we can set aim_interaction
 		current_aim_interaction = 1;
 		if (ctrl.hand)
 		{
-			if (auto hand = ctrl.hand->locate(world, display_time); hand and hand->is_input_source())
+			// Controller-exclusive inputs: the lobby binds squeeze/scroll
+			// for controller profiles only. The shared trigger action is
+			// deliberately excluded: under the hand profile it carries the
+			// aim-activate gesture, and counting it would kill poke the
+			// moment a user pinches to click.
+			auto controller_button_active = [&ctrl] {
+				if (ctrl.squeeze)
+				{
+					if (auto s = application::read_action_float(ctrl.squeeze); s and s->second > 0.05f)
+						return true;
+				}
+				if (ctrl.scroll)
+				{
+					// Deliberate deadzone: worn sticks drift well above the
+					// 0.01 GUI-scroll threshold, and drift must not veto poke.
+					constexpr float stick_active_thd = 0.2f;
+					if (auto v = application::read_action_vec2(ctrl.scroll); v and glm::length(glm::vec2(v->second.x, v->second.y)) > stick_active_thd)
+						return true;
+				}
+				return false;
+			};
+
+			// Hands drive only with located, input-source joints and no
+			// controller buttons: gripping kills joints (fast path),
+			// pressing kills poke instantly (override path). Either side
+			// is decided independently.
+			auto hand = ctrl.hand->locate(world, display_time);
+			const bool hands_drive = hand and hand->is_input_source() and not controller_button_active();
+
+			if (hands_drive)
 			{
 				XrHandJointLocationEXT & index_tip = hand->joints[XR_HAND_JOINT_INDEX_TIP_EXT].first;
-				XrHandJointLocationEXT & palm = hand->joints[XR_HAND_JOINT_PALM_EXT].first;
 
 				if (index_tip.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
 				{
@@ -599,30 +633,17 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 					});
 				}
 
-				if (palm.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
-				{
-					palm_position = compute_pointer_position(controller_state{
-					        .aim_position = {
-					                palm.pose.position.x,
-					                palm.pose.position.y,
-					                palm.pose.position.z,
-					        },
-					        .source = ImGuiMouseSource_VRHandTracking,
-					});
-				}
-
 				if (index_tip_position.second < constants::gui::fingertip_distance_touching_thd_hi and
 				    index_tip_position.second > constants::gui::fingertip_distance_touching_thd_lo)
 					state.fingertip_touching = true;
 
-				if (palm_position.second < constants::gui::palm_distance_close_thd_lo)
-					current_aim_interaction = 0;
-				else if (palm_position.second > constants::gui::palm_distance_close_thd_hi)
-					current_aim_interaction = 1;
-				else
-					current_aim_interaction =
-					        (palm_position.second - constants::gui::palm_distance_close_thd_lo) /
-					        (constants::gui::palm_distance_close_thd_hi - constants::gui::palm_distance_close_thd_lo);
+				// Hands are poke-only: no far-field ray or distance click.
+				// The ray visuals hide via is_aim_interaction(), the
+				// trigger block below is skipped at aim == 0, and clicks
+				// come from fingertip touch only. Controllers (no .hand /
+				// no located joints) and the in-stream GUI (no .hand
+				// controllers) are unaffected.
+				current_aim_interaction = 0;
 			}
 		}
 
@@ -671,6 +692,7 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 			state.source = ImGuiMouseSource_VRHandTracking;
 		else
 			state.source = ImGuiMouseSource_VRController;
+
 	}
 
 	return new_states;

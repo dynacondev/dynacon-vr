@@ -71,6 +71,7 @@ enum class ui_kind
 	combo,
 	combo_multi,
 	button,
+	input_int,
 };
 
 // one declarative setting, `enabled` greys the row out without hiding it
@@ -88,6 +89,7 @@ struct setting
 	std::function<void(int)> set_int;
 	int v_min = 0;
 	int v_max = 0;
+	int v_step = 1; // ui_kind::input_int stepper increment
 
 	std::function<bool(int)> get_multi;
 	std::function<void(int, bool)> set_multi;
@@ -180,6 +182,12 @@ void render_settings(const wivrn::gui::settings_context & ctx, const char * card
 			case ui_kind::button: {
 				if (ui::button(s.button_label, ui::button_style::secondary, {control_w, 0}) and s.on_click)
 					s.on_click();
+				break;
+			}
+			case ui_kind::input_int: {
+				int v = s.get_int();
+				if (ui::input_int(s.id, &v, s.v_step, s.v_min, s.v_max, control_w))
+					s.set_int(v);
 				break;
 			}
 		}
@@ -700,15 +708,97 @@ bool settings_tracking(const settings_context & ctx)
 
 	if (ctx.system.hand_tracking_supported())
 		list.push_back({
-		        .id = "##hands_emulate_controllers",
+		        .id = "##hand_controller_mode",
 		        .label = _C("setting name", "Hands emulate controllers"),
-		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. On: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles)."),
-		        .ui = ui_kind::toggle,
-		        .get_bool = [&config] { return config.hands_emulate_controllers; },
-		        .set_bool = [&config](bool v) { config.hands_emulate_controllers = v; config.save(); },
-		        .default_bool = default_config.hands_emulate_controllers,
+		        .description = _("Off: hands are reported as hand joints only, never as controller input. Standard: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles). Extended (default): pinch and fist feed a single thresholded binary pinch; pinch/grasp analogs and ready flags are not forwarded. Takes effect after restarting the client."),
+		        .ui = ui_kind::segmented,
+		        .get_int = [&config] { return static_cast<int>(config.hand_mode); },
+		        .set_int = [&config](int v) { config.hand_mode = static_cast<hand_controller_mode>(std::clamp(v, static_cast<int>(hand_controller_mode::off), static_cast<int>(hand_controller_mode::extended))); config.save(); },
+		        .options = [] {
+			        return std::vector<std::string>{
+			                _C("hand controller mode", "Off"),
+			                _C("hand controller mode", "Standard"),
+			                _C("hand controller mode", "Extended"),
+			        };
+		        },
+		        .default_int = static_cast<int>(default_config.hand_mode),
 		        .enabled = [&ctx] { return not ctx.in_game; },
 		        .disabled_tooltip = disconnect_tip,
+		});
+
+	if (ctx.system.hand_tracking_supported())
+		list.push_back({
+		        .id = "##hand_frequency",
+		        .label = _C("setting name", "Hand tracking frequency"),
+		        .description = _("How often the headset tracks your hands. High is more responsive but can show more jitter; low saves power. Advisory only: the runtime may ignore the request, headsets without Meta's frequency hint ignore this setting, and switching back to Unspecified does not revoke an earlier request (the hint persists for the session)."),
+		        .ui = ui_kind::combo,
+		        .get_int = [&config] { return static_cast<int>(config.hand_tracking_frequency); },
+		        .set_int = [&config](int v) {
+			        config.hand_tracking_frequency = static_cast<hand_frequency>(std::clamp(v, static_cast<int>(hand_frequency::unspecified), static_cast<int>(hand_frequency::high)));
+			        config.save();
+			        application::apply_hand_tracking_frequency(); },
+		        .options = [] {
+			        return std::vector<std::string>{
+			                _C("hand tracking frequency", "Unspecified"),
+			                _C("hand tracking frequency", "Low"),
+			                _C("hand tracking frequency", "High"),
+			        };
+		        },
+		        .title = _C("setting name", "Hand tracking frequency"),
+		        .default_int = static_cast<int>(default_config.hand_tracking_frequency),
+		});
+
+	// Live threshold for the extended-mode binary pinch: visible only
+	// when extended is selected, adjustable in-stream (takes effect on the
+	// next sampled frame, no restart needed).
+	if (ctx.system.hand_tracking_supported() and config.hand_mode == hand_controller_mode::extended)
+		list.push_back({
+		        .id = "##pinch_emit_threshold",
+		        .label = _C("setting name", "Pinch threshold"),
+		        .description = _("Combined pinch and fist closure at which the binary pinch fires in Extended mode."),
+		        .ui = ui_kind::slider,
+		        .get_int = [&config] { return int(std::lround(config.pinch_emit_threshold * 100)); },
+		        .set_int = [&config](int v) { config.pinch_emit_threshold = std::clamp(v, 0, 100) / 100.f; config.save(); },
+		        .v_min = 0,
+		        .v_max = 100,
+		        .fmt = "%d%%",
+		        .default_int = int(std::lround(default_config.pinch_emit_threshold * 100)),
+		});
+
+	// Controller rotation offset, applied to streamed grip/aim poses when
+	// hands emulate controllers. Controller-local X/Y/Z in degrees, 45
+	// steps. Takes effect live, no restart.
+	if (ctx.system.hand_tracking_supported() and config.hand_mode != hand_controller_mode::off)
+	{
+		auto rotation_row = [&](const char * id, std::string label, float configuration::* member) {
+			list.push_back({
+			        .id = id,
+			        .label = std::move(label),
+			        .description = _("Rotates the streamed controller pose around this axis when hands drive it (-90 X and Z point it toward you with the arm out front; flip the signs if it points away on your runtime)."),
+			        .ui = ui_kind::input_int,
+			        .get_int = [&config, member] { return int(std::lround(config.*member)); },
+			        .set_int = [&config, member](int v) { config.*member = float(std::clamp(v, -180, 180)); config.save(); },
+			        .v_min = -180,
+			        .v_max = 180,
+			        .v_step = 45,
+			});
+		};
+		rotation_row("##hand_rotation_x", _C("setting name", "Hand rotation offset X"), &configuration::hand_controller_rotation_offset_x);
+		rotation_row("##hand_rotation_y", _C("setting name", "Hand rotation offset Y"), &configuration::hand_controller_rotation_offset_y);
+		rotation_row("##hand_rotation_z", _C("setting name", "Hand rotation offset Z"), &configuration::hand_controller_rotation_offset_z);
+	}
+
+	// lobby-only cosmetic, hidden in-stream (connection-time settings use
+	// the disabled-row pattern instead, but this has no in-stream effect)
+	if (ctx.system.hand_tracking_supported() and not ctx.in_game)
+		list.push_back({
+		        .id = "##show_hand_meshes_in_lobby",
+		        .label = _C("setting name", "Show hand meshes in lobby"),
+		        .description = _("Show tracked hand meshes in the lobby. Off hides the meshes; hand pointing still works."),
+		        .ui = ui_kind::toggle,
+		        .get_bool = [&config] { return config.show_hand_meshes_in_lobby; },
+		        .set_bool = [&config](bool v) { config.show_hand_meshes_in_lobby = v; config.save(); },
+		        .default_bool = default_config.show_hand_meshes_in_lobby,
 		});
 
 	if (application::get_eye_gaze_supported())

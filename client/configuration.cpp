@@ -263,6 +263,22 @@ configuration::configuration(xr::system & system, xr::session & session, const s
 		for (const auto & f: config_fields())
 			f.load(root, *this);
 
+		// Migrate the pre-dropdown boolean: true -> standard, false -> off.
+		// Only when the new key is absent so an explicit new value wins.
+		if (not root["hand_controller_mode"].is_string())
+		{
+			if (auto v = root["hands_emulate_controllers"]; v.is_bool())
+				hand_mode = v.get_bool() ? hand_controller_mode::standard : hand_controller_mode::off;
+		}
+
+		// Renamed from grasp_trigger_threshold: carry the value across once.
+		// read_value tolerates int/uint/double (a GUI-set 100% saves as `1`).
+		if (not root["pinch_emit_threshold"].is_number())
+		{
+			if (auto old = read_value<float>(root["grasp_trigger_threshold"]))
+				pinch_emit_threshold = *old;
+		}
+
 		// refresh rate must be supported by this headset, otherwise fall back to the default
 		const auto & rates = session.get_refresh_rates();
 		if (preferred_refresh_rate != 0 and not utils::contains(rates, preferred_refresh_rate))
@@ -337,7 +353,13 @@ const std::vector<config_field> & configuration::config_fields()
 	        scalar("forward_keyboard", &configuration::forward_keyboard),
 	        scalar("forward_mouse", &configuration::forward_mouse),
 	        scalar("forward_gamepad", &configuration::forward_gamepad),
-	        scalar("hands_emulate_controllers", &configuration::hands_emulate_controllers),
+	        scalar("hand_controller_mode", &configuration::hand_mode),
+	        scalar("hand_tracking_frequency", &configuration::hand_tracking_frequency),
+	        scalar("pinch_emit_threshold", &configuration::pinch_emit_threshold),
+	        scalar("hand_controller_rotation_offset_x", &configuration::hand_controller_rotation_offset_x),
+	        scalar("hand_controller_rotation_offset_y", &configuration::hand_controller_rotation_offset_y),
+	        scalar("hand_controller_rotation_offset_z", &configuration::hand_controller_rotation_offset_z),
+	        scalar("show_hand_meshes_in_lobby", &configuration::show_hand_meshes_in_lobby),
 	        scalar("virtual_keyboard_layout", &configuration::virtual_keyboard_layout),
 	        scalar("override_foveation_enable", &configuration::override_foveation_enable),
 	        scalar("override_foveation_pitch", &configuration::override_foveation_pitch),

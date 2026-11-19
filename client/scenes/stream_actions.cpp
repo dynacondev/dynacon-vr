@@ -19,11 +19,28 @@
 
 #include "application.h"
 #include "stream.h"
+#include <algorithm>
 #include <spdlog/spdlog.h>
 
 void scenes::stream::read_actions()
 {
 	from_headset::inputs inputs;
+
+	// Extended hand mode: pinch and grasp analogs are never forwarded.
+	// Instead their max feeds a single snapped binary output on the pinch
+	// value channel (driving select downstream exactly as pinch does, but
+	// thresholded). Debounce is left to the runtime.
+	const auto & config = application::get_config();
+	const bool extended = config.hand_mode == hand_controller_mode::extended;
+	const float threshold = std::clamp(config.pinch_emit_threshold, 0.0f, 1.0f);
+
+	struct pinch_accum
+	{
+		float best = 0;
+		XrTime timestamp = 0;
+		bool seen = false;
+	};
+	pinch_accum accum_left, accum_right;
 
 	if (not is_gui_interactable())
 	{
@@ -33,15 +50,33 @@ void scenes::stream::read_actions()
 			{
 				case XR_ACTION_TYPE_BOOLEAN_INPUT: {
 					auto value = application::read_action_bool(action);
-					if (value)
+					if (value and not (extended and (id == device_id::LEFT_PINCH_READY or id == device_id::RIGHT_PINCH_READY or id == device_id::LEFT_GRASP_READY or id == device_id::RIGHT_GRASP_READY)))
 						inputs.values.push_back({id, (float)value->second, value->first});
 				}
 				break;
 
 				case XR_ACTION_TYPE_FLOAT_INPUT: {
 					auto value = application::read_action_float(action);
-					if (value)
-						inputs.values.push_back({id, value->second, value->first});
+					if (not value)
+						break;
+					pinch_accum * accum = nullptr;
+					if (id == device_id::LEFT_PINCH_VALUE or id == device_id::LEFT_GRASP_VALUE)
+						accum = &accum_left;
+					else if (id == device_id::RIGHT_PINCH_VALUE or id == device_id::RIGHT_GRASP_VALUE)
+						accum = &accum_right;
+					if (extended and accum)
+					{
+						// Order is not guaranteed (unordered source map):
+						// accumulate the max, emit once after the loop.
+						if (not accum->seen or value->second > accum->best)
+						{
+							accum->best = value->second;
+							accum->timestamp = value->first;
+						}
+						accum->seen = true;
+						break;
+					}
+					inputs.values.push_back({id, value->second, value->first});
 				}
 				break;
 
@@ -59,6 +94,17 @@ void scenes::stream::read_actions()
 				default:
 					break;
 			}
+		}
+
+		if (extended)
+		{
+			auto emit = [&](const pinch_accum & accum, device_id pinch_id) {
+				if (not accum.seen)
+					return;
+				inputs.values.push_back({pinch_id, accum.best >= threshold ? 1.0f : 0.0f, accum.timestamp});
+			};
+			emit(accum_left, device_id::LEFT_PINCH_VALUE);
+			emit(accum_right, device_id::RIGHT_PINCH_VALUE);
 		}
 	}
 

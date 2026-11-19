@@ -56,6 +56,20 @@ enum class posture
 	seated,
 };
 
+enum class hand_controller_mode
+{
+	off = 0,
+	standard = 1,
+	extended = 2,
+};
+
+enum class hand_frequency
+{
+	unspecified = 0,
+	low = 1,
+	high = 2,
+};
+
 class configuration
 {
 public:
@@ -87,13 +101,34 @@ public:
 	bool forward_mouse = false;
 	bool forward_gamepad = false;
 
-	// Hands-only mode (default): hands are reported as 26-joint hand
-	// tracking only, never as controller input on /user/hand/*. When
-	// false, simple_controller and hand_interaction bindings are withheld
-	// so the runtime cannot promote hands to controllers; hand joints
-	// still stream via XrHandTracker. Set true to restore legacy
-	// hand-as-controller emulation (pinch driving controller input).
-	bool hands_emulate_controllers = false;
+	// Hands-only mode: hands are reported as 26-joint hand tracking only, never as controller input on /user/hand/*. In
+	// standard/extended modes, simple_controller and hand_interaction
+	// bindings are suggested so the runtime can promote hands to
+	// controllers; hand joints still stream via XrHandTracker.
+	// Extended: pinch and fist feed a single thresholded binary pinch on the
+	// pinch channel; raw pinch/grasp analogs and ready flags are not forwarded.
+	hand_controller_mode hand_mode = hand_controller_mode::extended;
+
+	// Extended hand mode: combined pinch/fist closure (0..1) at which the
+	// binary pinch fires.
+	float pinch_emit_threshold = 0.9f;
+
+	// Controller rotation offset, applied to streamed grip/aim poses when
+	// hands emulate controllers. Defaults point a forward-held controller
+	// toward the user; flip signs if yours points away on your runtime.
+	float hand_controller_rotation_offset_x = -90;
+	float hand_controller_rotation_offset_y = 0;
+	float hand_controller_rotation_offset_z = -90;
+
+	// Preferred hand tracking update rate (Meta
+	// XR_META_hand_tracking_frequency_hint). Advisory only; runtimes
+	// without the extension ignore it. High is the default.
+	hand_frequency hand_tracking_frequency = hand_frequency::high;
+
+	// Show tracked hand meshes in the lobby. Off (default): meshes are
+	// hidden; hand pointing still works and controller hide/show behaviour
+	// is unchanged.
+	bool show_hand_meshes_in_lobby = false;
 
 	std::underlying_type_t<wivrn::from_headset::body_part_mask> body_part_mask = ~0;
 

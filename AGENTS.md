@@ -69,3 +69,12 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   without a video tap); binary hole-punch was discussed but not shipped.
 - Config + packet fields removed too (server dot-pitch/dot-color,
   packet members, session fill, docs): dev branch, no compat shims.
+
+## Lobby hands: arbitrate on joints + input-source + buttons, never joints alone (Quest)
+
+- Symptom x2: (a) rays stuck on after putting controllers down, (b) one hand poke-dead (no ray, no click) while holding controllers. Both traced to the poke/aim arbiter in `imgui_impl::read_controllers_state()` keying on joint presence alone: (a) was the runtime still routing to awake desk controllers (`is_input_source()` false, CONTROLLER_GHOST data source), (b) was spuriously-valid joints on a gripped hand pinning that side to poke.
+- Rules:
+  1. Hands drive a side only when joints locate AND `is_input_source()` AND no controller-exclusive buttons (squeeze > 0.05, thumbstick > 0.2 deadzone — drift must not veto). The shared trigger action is deliberately excluded: under the hand profile it carries aim-activate, and counting it kills poke on every pinch-click.
+  2. `locate()` only guarantees wrist + palm + index chain (`hand_tracker.cpp`); other fingers may be curled/occluded. The old all-26 bail never fired in debug builds (`#ifndef NDEBUG` pre-sets flags valid) — reproduces on device only.
+  3. Debug via a transition log (`located input_source data_source buttons -> poke/aim` per side, fires on change only): `located=0` = joint bail, `input_source=0` = runtime routing, `buttons=1` = veto. Removed after validation; re-add if regressions return.
+  4. Poke needs no runtime cooperation (joint-driven touch), so forcing poke when the runtime routes elsewhere is safe; the reverse (forcing aim) strands clicks. When in doubt, bias toward poke.
