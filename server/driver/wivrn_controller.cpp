@@ -698,11 +698,36 @@ xrt_binding_input_pair hand_interaction_simple_input_binding[] = {
         {XRT_INPUT_SIMPLE_AIM_POSE, XRT_INPUT_HAND_AIM_POSE},
 };
 
+// Extended hand mode (client mirrors grasp onto the trigger channels):
+// expose the fist as trigger inputs to apps binding controller profiles.
+xrt_binding_input_pair hand_interaction_trigger_input_binding_touch[] = {
+        {XRT_INPUT_TOUCH_TRIGGER_VALUE, XRT_INPUT_TOUCH_TRIGGER_VALUE},
+};
+
+xrt_binding_input_pair hand_interaction_trigger_input_binding_index[] = {
+        {XRT_INPUT_INDEX_TRIGGER_CLICK, XRT_INPUT_INDEX_TRIGGER_CLICK},
+        {XRT_INPUT_INDEX_TRIGGER_VALUE, XRT_INPUT_TOUCH_TRIGGER_VALUE},
+};
+
 xrt_binding_profile hand_interaction_binding_profiles[] = {
         {
                 .name = XRT_DEVICE_SIMPLE_CONTROLLER,
                 .inputs = hand_interaction_simple_input_binding,
                 .input_count = std::size(hand_interaction_simple_input_binding),
+                .outputs = nullptr,
+                .output_count = 0,
+        },
+        {
+                .name = XRT_DEVICE_TOUCH_CONTROLLER,
+                .inputs = hand_interaction_trigger_input_binding_touch,
+                .input_count = std::size(hand_interaction_trigger_input_binding_touch),
+                .outputs = nullptr,
+                .output_count = 0,
+        },
+        {
+                .name = XRT_DEVICE_INDEX_CONTROLLER,
+                .inputs = hand_interaction_trigger_input_binding_index,
+                .input_count = std::size(hand_interaction_trigger_input_binding_index),
                 .outputs = nullptr,
                 .output_count = 0,
         },
@@ -858,6 +883,11 @@ wivrn_controller::wivrn_controller(xrt_device_name name,
 		SET_INPUT(HAND, AIM_ACTIVATE_READY);
 		SET_INPUT(HAND, GRASP_VALUE);
 		SET_INPUT(HAND, GRASP_READY);
+		// Extended hand mode: the client mirrors grasp onto these channels.
+		// Same slot names as the controller device so the packets populate
+		// named inputs; exposed to apps via the touch/index profiles above.
+		SET_INPUT(TOUCH, TRIGGER_VALUE);
+		SET_INPUT(INDEX, TRIGGER_CLICK);
 	}
 
 #undef SET_INPUT
