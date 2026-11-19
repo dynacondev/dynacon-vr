@@ -75,7 +75,5 @@ public:
 
 	std::optional<located_hand> locate(XrSpace space, XrTime time);
 	const mesh_data * mesh();
-
-	static bool check_flags(const joint_array & joints, XrSpaceLocationFlags position, XrSpaceVelocityFlags velocity);
 };
 } // namespace xr

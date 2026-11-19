@@ -261,10 +261,3 @@ const xr::hand_tracker::mesh_data * xr::hand_tracker::mesh()
 	cached_hand_mesh_fb = std::move(data);
 	return &*cached_hand_mesh_fb;
 }
-
-bool xr::hand_tracker::check_flags(const joint_array & joints, XrSpaceLocationFlags position, XrSpaceVelocityFlags velocity)
-{
-	return std::ranges::all_of(joints, [position, velocity](const auto & joint) {
-		return (joint.first.locationFlags & position) == position and (joint.second.velocityFlags & velocity) == velocity;
-	});
-}
