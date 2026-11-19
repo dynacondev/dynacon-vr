@@ -99,7 +99,8 @@ public:
 	// standard/extended modes, simple_controller and hand_interaction
 	// bindings are suggested so the runtime can promote hands to
 	// controllers; hand joints still stream via XrHandTracker.
-	// Extended additionally mirrors grasp onto the trigger channels.
+	// Extended: pinch and fist feed a single thresholded binary pinch on the
+	// pinch channel; raw pinch/grasp analogs and ready flags are not forwarded.
 	hand_controller_mode hand_mode = hand_controller_mode::off;
 
 	// Extended hand mode: combined pinch/fist closure (0..1) at which the

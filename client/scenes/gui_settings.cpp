@@ -702,7 +702,7 @@ bool settings_tracking(const settings_context & ctx)
 		list.push_back({
 		        .id = "##hand_controller_mode",
 		        .label = _C("setting name", "Hands emulate controllers"),
-		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. Standard: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles). Extended: pinch and fist feed a single thresholded binary pinch, no analog hand inputs. Takes effect after restarting the client."),
+		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. Standard: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles). Extended: pinch and fist feed a single thresholded binary pinch; pinch/grasp analogs and ready flags are not forwarded. Takes effect after restarting the client."),
 		        .ui = ui_kind::segmented,
 		        .get_int = [&config] { return static_cast<int>(config.hand_mode); },
 		        .set_int = [&config](int v) { config.hand_mode = static_cast<hand_controller_mode>(std::clamp(v, static_cast<int>(hand_controller_mode::off), static_cast<int>(hand_controller_mode::extended))); config.save(); },
@@ -718,7 +718,7 @@ bool settings_tracking(const settings_context & ctx)
 		        .disabled_tooltip = disconnect_tip,
 		});
 
-	// Live threshold for the extended-mode emulated trigger: visible only
+	// Live threshold for the extended-mode binary pinch: visible only
 	// when extended is selected, adjustable in-stream (takes effect on the
 	// next sampled frame, no restart needed).
 	if (ctx.system.hand_tracking_supported() and config.hand_mode == hand_controller_mode::extended)

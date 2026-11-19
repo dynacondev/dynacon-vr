@@ -272,11 +272,11 @@ configuration::configuration(xr::system & system, xr::session & session, const s
 		}
 
 		// Renamed from grasp_trigger_threshold: carry the value across once.
+		// read_value tolerates int/uint/double (a GUI-set 100% saves as `1`).
 		if (not root["pinch_emit_threshold"].is_number())
 		{
-			double old_threshold = 0;
-			if (root["grasp_trigger_threshold"].get_double().get(old_threshold) == simdjson::SUCCESS)
-				pinch_emit_threshold = (float)old_threshold;
+			if (auto old = read_value<float>(root["grasp_trigger_threshold"]))
+				pinch_emit_threshold = *old;
 		}
 
 		// refresh rate must be supported by this headset, otherwise fall back to the default
