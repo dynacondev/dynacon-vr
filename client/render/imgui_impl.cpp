@@ -598,7 +598,7 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 				}
 				if (ctrl.scroll)
 				{
-					if (auto v = application::read_action_vec2(ctrl.scroll); v and glm::length(v->second) > constants::gui::scroll_value_thd)
+					if (auto v = application::read_action_vec2(ctrl.scroll); v and glm::length(glm::vec2(v->second.x, v->second.y)) > constants::gui::scroll_value_thd)
 						return true;
 				}
 				return false;
