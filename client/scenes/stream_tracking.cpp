@@ -651,11 +651,20 @@ void scenes::stream::tracking()
 
 					if ((rotate_left or rotate_right) and not offset_identity)
 					{
-						const glm::quat q_user =
-							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_x), glm::vec3{1, 0, 0}) *
-							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_y), glm::vec3{0, 1, 0}) *
-							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_z), glm::vec3{0, 0, 1});
-						auto world_delta = [&](device_id grip, device_id aim) -> std::optional<glm::quat> {
+						auto user_quat = [](float x, float y, float z) {
+							return glm::angleAxis(glm::radians(x), glm::vec3{1, 0, 0}) *
+								glm::angleAxis(glm::radians(y), glm::vec3{0, 1, 0}) *
+								glm::angleAxis(glm::radians(z), glm::vec3{0, 0, 1});
+						};
+						// Left/right grip frames are mirror images: negate Y/Z on the
+						// left so identical slider values behave symmetrically in mirror
+						// poses. Labels state right-hand semantics.
+						const float ox = config.hand_controller_rotation_offset_x;
+						const float oy = config.hand_controller_rotation_offset_y;
+						const float oz = config.hand_controller_rotation_offset_z;
+						const glm::quat q_user_right = user_quat(ox, oy, oz);
+						const glm::quat q_user_left = user_quat(ox, -oy, -oz);
+						auto world_delta = [&](device_id grip, device_id aim, const glm::quat & q_user) -> std::optional<glm::quat> {
 							for (device_id id : {grip, aim}) // grip anchors the delta; fall back to aim
 							{
 								for (auto & dp: tracking.device_poses)
@@ -669,10 +678,10 @@ void scenes::stream::tracking()
 							}
 							return std::nullopt;
 						};
-						auto apply_side = [&](device_id grip, device_id aim, bool rotate) {
+						auto apply_side = [&](device_id grip, device_id aim, bool rotate, const glm::quat & q_user) {
 							if (not rotate)
 								return;
-							auto delta = world_delta(grip, aim);
+							auto delta = world_delta(grip, aim, q_user);
 							if (not delta)
 								return;
 							for (auto & dp: tracking.device_poses)
@@ -688,8 +697,8 @@ void scenes::stream::tracking()
 								}
 							}
 						};
-						apply_side(device_id::LEFT_GRIP, device_id::LEFT_AIM, rotate_left);
-						apply_side(device_id::RIGHT_GRIP, device_id::RIGHT_AIM, rotate_right);
+						apply_side(device_id::LEFT_GRIP, device_id::LEFT_AIM, rotate_left, q_user_left);
+						apply_side(device_id::RIGHT_GRIP, device_id::RIGHT_AIM, rotate_right, q_user_right);
 					}
 				}
 				else
