@@ -30,7 +30,7 @@ void scenes::stream::read_actions()
 	// trigger's value/click split, so forward both onto the existing
 	// trigger channels (otherwise silent: hand_interaction defines no
 	// trigger inputs, and no packet/server change is needed).
-	const bool grasp_drives_trigger = application::get_config().hand_controller_mode == hand_controller_mode::extended;
+	const bool grasp_drives_trigger = application::get_config().hand_mode == hand_controller_mode::extended;
 
 	if (not is_gui_interactable())
 	{

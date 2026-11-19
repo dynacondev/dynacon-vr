@@ -268,7 +268,7 @@ configuration::configuration(xr::system & system, xr::session & session, const s
 		if (not root["hand_controller_mode"].is_string())
 		{
 			if (auto v = root["hands_emulate_controllers"]; v.is_bool())
-				hand_controller_mode = v.get_bool() ? hand_controller_mode::standard : hand_controller_mode::off;
+				hand_mode = v.get_bool() ? hand_controller_mode::standard : hand_controller_mode::off;
 		}
 
 		// refresh rate must be supported by this headset, otherwise fall back to the default
@@ -345,7 +345,7 @@ const std::vector<config_field> & configuration::config_fields()
 	        scalar("forward_keyboard", &configuration::forward_keyboard),
 	        scalar("forward_mouse", &configuration::forward_mouse),
 	        scalar("forward_gamepad", &configuration::forward_gamepad),
-	        scalar("hand_controller_mode", &configuration::hand_controller_mode),
+	        scalar("hand_controller_mode", &configuration::hand_mode),
 	        scalar("show_hand_meshes_in_lobby", &configuration::show_hand_meshes_in_lobby),
 	        scalar("virtual_keyboard_layout", &configuration::virtual_keyboard_layout),
 	        scalar("override_foveation_enable", &configuration::override_foveation_enable),

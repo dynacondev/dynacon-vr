@@ -58,9 +58,9 @@ enum class posture
 
 enum class hand_controller_mode
 {
-	off,
-	standard,
-	extended,
+	off = 0,
+	standard = 1,
+	extended = 2,
 };
 
 class configuration
@@ -100,7 +100,7 @@ public:
 	// bindings are suggested so the runtime can promote hands to
 	// controllers; hand joints still stream via XrHandTracker.
 	// Extended additionally mirrors grasp onto the trigger channels.
-	hand_controller_mode hand_controller_mode = hand_controller_mode::off;
+	hand_controller_mode hand_mode = hand_controller_mode::off;
 
 	// Show tracked hand meshes in the lobby. Off (default): meshes are
 	// hidden; hand pointing still works and controller hide/show behaviour
