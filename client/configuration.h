@@ -94,18 +94,17 @@ public:
 	bool forward_mouse = false;
 	bool forward_gamepad = false;
 
-	// Hands-only mode (default): hands are reported as 26-joint hand
-	// tracking only, never as controller input on /user/hand/*. In
+	// Hands-only mode: hands are reported as 26-joint hand tracking only, never as controller input on /user/hand/*. In
 	// standard/extended modes, simple_controller and hand_interaction
 	// bindings are suggested so the runtime can promote hands to
 	// controllers; hand joints still stream via XrHandTracker.
 	// Extended: pinch and fist feed a single thresholded binary pinch on the
 	// pinch channel; raw pinch/grasp analogs and ready flags are not forwarded.
-	hand_controller_mode hand_mode = hand_controller_mode::off;
+	hand_controller_mode hand_mode = hand_controller_mode::extended;
 
 	// Extended hand mode: combined pinch/fist closure (0..1) at which the
 	// binary pinch fires.
-	float pinch_emit_threshold = 0.5f;
+	float pinch_emit_threshold = 0.9f;
 
 	// Show tracked hand meshes in the lobby. Off (default): meshes are
 	// hidden; hand pointing still works and controller hide/show behaviour

@@ -702,7 +702,7 @@ bool settings_tracking(const settings_context & ctx)
 		list.push_back({
 		        .id = "##hand_controller_mode",
 		        .label = _C("setting name", "Hands emulate controllers"),
-		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. Standard: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles). Extended: pinch and fist feed a single thresholded binary pinch; pinch/grasp analogs and ready flags are not forwarded. Takes effect after restarting the client."),
+		        .description = _("Off: hands are reported as hand joints only, never as controller input. Standard: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles). Extended (default): pinch and fist feed a single thresholded binary pinch; pinch/grasp analogs and ready flags are not forwarded. Takes effect after restarting the client."),
 		        .ui = ui_kind::segmented,
 		        .get_int = [&config] { return static_cast<int>(config.hand_mode); },
 		        .set_int = [&config](int v) { config.hand_mode = static_cast<hand_controller_mode>(std::clamp(v, static_cast<int>(hand_controller_mode::off), static_cast<int>(hand_controller_mode::extended))); config.save(); },
