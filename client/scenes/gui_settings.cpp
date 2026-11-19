@@ -774,7 +774,7 @@ bool settings_tracking(const settings_context & ctx)
 			list.push_back({
 			        .id = id,
 			        .label = std::move(label),
-			        .description = _("Rotates the streamed controller pose around this axis when hands drive it. +90 X pitches it toward you with the arm out front; flip the sign if it pitches away on your runtime."),
+			        .description = _("Rotates the streamed controller pose around this axis when hands drive it (-90 X and Z point it toward you with the arm out front; flip the signs if it points away on your runtime)."),
 			        .ui = ui_kind::input_int,
 			        .get_int = [&config, member] { return int(std::lround(config.*member)); },
 			        .set_int = [&config, member](int v) { config.*member = float(std::clamp(v, -180, 180)); config.save(); },

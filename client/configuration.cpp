@@ -279,6 +279,16 @@ configuration::configuration(xr::system & system, xr::session & session, const s
 				pinch_emit_threshold = *old;
 		}
 
+		// Rotation defaults changed from (90, 0, 0) to (-90, 0, -90):
+		// adopt the new defaults only if the saved values are exactly the
+		// old defaults (i.e. never customized).
+		if (hand_controller_rotation_offset_x == 90 and hand_controller_rotation_offset_y == 0 and
+		    hand_controller_rotation_offset_z == 0)
+		{
+			hand_controller_rotation_offset_x = -90;
+			hand_controller_rotation_offset_z = -90;
+		}
+
 		// refresh rate must be supported by this headset, otherwise fall back to the default
 		const auto & rates = session.get_refresh_rates();
 		if (preferred_refresh_rate != 0 and not utils::contains(rates, preferred_refresh_rate))

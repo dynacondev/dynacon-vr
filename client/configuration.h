@@ -113,13 +113,12 @@ public:
 	// binary pinch fires.
 	float pinch_emit_threshold = 0.9f;
 
-	// Rotational offset (degrees, controller-local X then Y then Z) applied
-	// to streamed grip/aim poses when hands emulate controllers. Default
-	// pitches the controller toward the user when held out front; flip the
-	// X sign if it pitches away on your runtime.
-	float hand_controller_rotation_offset_x = 90;
+	// Controller rotation offset, applied to streamed grip/aim poses when
+	// hands emulate controllers. Defaults point a forward-held controller
+	// toward the user; flip signs if yours points away on your runtime.
+	float hand_controller_rotation_offset_x = -90;
 	float hand_controller_rotation_offset_y = 0;
-	float hand_controller_rotation_offset_z = 0;
+	float hand_controller_rotation_offset_z = -90;
 
 	// Preferred hand tracking update rate (Meta
 	// XR_META_hand_tracking_frequency_hint). Advisory only; runtimes
