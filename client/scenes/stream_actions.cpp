@@ -19,6 +19,7 @@
 
 #include "application.h"
 #include "stream.h"
+#include <algorithm>
 #include <spdlog/spdlog.h>
 
 void scenes::stream::read_actions()
@@ -30,9 +31,12 @@ void scenes::stream::read_actions()
 	// click uses a custom threshold (not the runtime's ready signal) with a
 	// 10% release hysteresis band. Otherwise silent: hand_interaction
 	// defines no trigger inputs.
-	const bool grasp_drives_trigger = application::get_config().hand_mode == hand_controller_mode::extended;
-	const float grasp_threshold = application::get_config().grasp_trigger_threshold;
+	const auto & config = application::get_config();
+	const bool grasp_drives_trigger = config.hand_mode == hand_controller_mode::extended;
 	constexpr float grasp_release_band = 0.10f;
+	// Floor at the release band so the release point stays reachable;
+	// without this a threshold <= 10% would latch the trigger on forever.
+	const float grasp_threshold = std::clamp(config.grasp_trigger_threshold, grasp_release_band, 1.0f);
 
 	if (not is_gui_interactable())
 	{
