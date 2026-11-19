@@ -32,6 +32,7 @@
 #include "utils/i18n.h"
 #include "utils/ranges.h"
 #include <IconsFontAwesome7.h>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <glm/ext.hpp>
@@ -1460,6 +1461,44 @@ void scenes::stream::draw_gui(XrTime predicted_display_time, XrDuration predicte
 
 			if (right and right->is_input_source())
 				hide_right_controller = true;
+
+			// Transition log (flight recorder, fires on change only):
+			// located/input_source/data_source from the joints, buttons
+			// from the controller-exclusive squeeze/scroll actions (the
+			// shared trigger action is excluded: hand aim-activate under
+			// the hand profile, same as the lobby arbiter).
+			static std::array<char, 2> last_hide = {false, false};
+			auto controller_button_active = [](XrAction squeeze, XrAction scroll) {
+				if (squeeze)
+				{
+					if (auto s = application::read_action_float(squeeze); s and s->second > 0.05f)
+						return true;
+				}
+				if (scroll)
+				{
+					if (auto v = application::read_action_vec2(scroll); v and std::hypot(v->second.x, v->second.y) > 0.2f)
+						return true;
+				}
+				return false;
+			};
+			auto log_side = [&](int side, const auto & hand, bool hide, XrAction squeeze, XrAction scroll) {
+				const bool located = bool(hand);
+				const bool input_source = located and hand->is_input_source();
+				const bool buttons = controller_button_active(squeeze, scroll);
+				if (hide != bool(last_hide[side]))
+				{
+					spdlog::info("stream hand input {}: located={} input_source={} data_source={} buttons={} -> {}",
+					             side,
+					             located,
+					             input_source,
+					             (located and hand->data_source) ? int(*hand->data_source) : -1,
+					             buttons,
+					             hide ? "hide" : "show");
+					last_hide[side] = hide;
+				}
+			};
+			log_side(0, left, hide_left_controller, get_action("left_squeeze").first, get_action("left_scroll").first);
+			log_side(1, right, hide_right_controller, get_action("right_squeeze").first, get_action("right_scroll").first);
 		}
 
 		input->apply(world,
