@@ -49,8 +49,10 @@ class session;
 // layer of placed passthrough objects before the verdict (same
 // 0..2.046m ramp, far >2.041m saturates red, absent FAR black).
 // Verdict = final VR-vs-passthrough comparison (red = VR wins incl.
-// far-vs-far, green = passthrough, no-window black). All modes share
-// the global opacity below.
+// far-vs-far, green = passthrough, no-window black). Raster_vs_sensor
+// validates the composited layer against the live sensor depth
+// (green = agree, red ramp = |layer - sensor| over 0..2m, no-data
+// black). All modes share the global opacity below.
 enum class debug_viz_mode
 {
 	none = 0,
@@ -58,6 +60,7 @@ enum class debug_viz_mode
 	vr_depth,
 	layer,
 	verdict,
+	raster_vs_sensor,
 };
 
 inline const char *
@@ -75,6 +78,8 @@ debug_viz_mode_name(debug_viz_mode m)
 			return "Composited Depth";
 		case debug_viz_mode::verdict:
 			return "VR vs Passthrough";
+		case debug_viz_mode::raster_vs_sensor:
+			return "Raster vs Sensor";
 	}
 	return "None";
 }
@@ -131,6 +136,18 @@ public:
 	                    vk::Image layer_image, vk::ImageView layer_view,
 	                    const frame_params & params);
 
+	// Raster-vs-sensor validation viz (R16F layer + runtime D16 sensor
+	// for the same eye UV): green = agree, red ramp = |layer - sensor|
+	// over 0..2m, no-data (layer FAR / sensor no-return) black. Null
+	// views record opaque black. Sensor needs no barrier (runtime hands
+	// it ready to sample, like the sensor path); layer rides the
+	// cross-CB read barrier.
+	void record_raster_sensor(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                          const std::array<vk::Extent2D, 2> & extents,
+	                          vk::Image layer_image, vk::ImageView layer_view,
+	                          vk::ImageView sensor_view,
+	                          const frame_params & params);
+
 	// VR-depth viz (decoder SBS, single image, GENERAL): green->red
 	// over 0..2.046m, far past 1020 black. Null view records opaque
 	// black. YCbCr views ride the immutable-sampler path (verdict
@@ -172,6 +189,14 @@ private:
 	vk::raii::DescriptorPool verdict_viz_pool{nullptr};
 	vk::raii::DescriptorSet verdict_viz_set{nullptr};
 	vk::raii::PipelineLayout verdict_viz_pipeline_layout{nullptr};
+	// Raster-vs-sensor state (layer R16F + sensor D16 + UBO): own layout
+	// (two image bindings), pool, set, layout and pipeline; shares the
+	// eye-push shape and renderpass/targets above (verdict-viz pattern).
+	vk::raii::DescriptorSetLayout raster_sensor_layout{nullptr};
+	vk::raii::DescriptorPool raster_sensor_pool{nullptr};
+	vk::raii::DescriptorSet raster_sensor_set{nullptr};
+	vk::raii::PipelineLayout raster_sensor_pipeline_layout{nullptr};
+	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
 	// VR-depth viz state (decoder SBS sampler2D + UBO): own layout +
 	// pool + set + pipeline. Converted views bake the decoder's live
 	// sampler as immutable (VUID-02738, verdict pattern); plain views
