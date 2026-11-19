@@ -3443,6 +3443,37 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						break;
 					}
+					case debug_viz_mode::vr_raster:
+					{
+						auto & dh = current_blit_handles[depth_stream_index];
+						vk::Sampler samp = decoders[depth_stream_index].decoder ? decoders[depth_stream_index].decoder->sampler() : vk::Sampler{};
+						bool have_virt = (bool)dh and (bool)dh->image_view and (bool)samp;
+						bool have_layer = merge_renderer and merge_this_frame;
+						if (have_virt)
+						{
+							depth_overlay->record_vr_raster(command_buffer, (size_t)depth_image, depth_ext,
+							                               dh->image_view, samp, dh->ycbcr,
+							                               have_layer ? merge_renderer->layer_image() : vk::Image{},
+							                               have_layer ? merge_renderer->layer_view_array() : vk::ImageView{},
+							                               params);
+							if (have_layer)
+							{
+								auto le = merge_renderer->debug_layer_extent();
+								depth_status = fmt::format("VR+raster live {}x{} layer {}x{}", dh->extent.width, dh->extent.height,
+								                           le.width, le.height);
+							}
+							else
+								depth_status = fmt::format("VR depth live {}x{} (no raster: merge sat out)", dh->extent.width, dh->extent.height);
+						}
+						else
+						{
+							depth_overlay->record_vr_raster(command_buffer, (size_t)depth_image, depth_ext,
+							                               vk::ImageView{}, vk::Sampler{}, wivrn::decoder::ycbcr_definition{},
+							                               vk::Image{}, vk::ImageView{}, params);
+							depth_status = "waiting for VR depth stream";
+						}
+						break;
+					}
 				}
 			}
 			else
