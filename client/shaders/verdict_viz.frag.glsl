@@ -20,9 +20,10 @@
 
 // Verdict debug view: samples the binary R8 verdict (1 = passthrough
 // reveal, 0 = VR wins) and paints green / red. Geometry-free pixels
-// (layer FAR >= 65000: no-window frames, reversed-only cuts) read
-// opaque black regardless of the verdict value, so empty frames never
-// read all-green. Far-vs-far reads red (VR wins), same as the verdict.
+// (layer FAR >= 65000: no-window frames, reversed-only cuts, hidden,
+// debug cutouts) read opaque black regardless of the verdict value,
+// so empty frames never read all-green. Far-vs-far reads red (VR wins),
+// same as the verdict.
 //
 // No Y-flip: both targets share the top-left UV convention of the
 // fullscreen triangle.

@@ -40,10 +40,10 @@
  * as far.
  *
  * Row convention: output row 0 = scene top (top-down on the wire, like
- * the foveated color streams and the client volume canvas). The warp
- * splat is GL-ordered (row 0 = scene bottom), so source rows are read
- * flipped. The client compares in D space: showReal = sensorD <
- * min(volumeD, virtualD).
+ * the foveated color streams). The warp splat is GL-ordered (row 0 =
+ * scene bottom), so source rows are read flipped. The client compares
+ * in meters: reveal = !(virt strictly nearer than the rasterized
+ * window), far-vs-far is a VR win.
  */
 
 #version 450
@@ -96,7 +96,7 @@ void main()
 		return;
 
 	// Wire convention (see wivrn_packets.h): row 0 = scene top, matching
-	// the volume canvas and the foveated color streams. The warp splat is
+	// the foveated color streams. The warp splat is
 	// GL-ordered (row 0 = scene bottom), so the source window is read
 	// vertically flipped. Geometry derives from the actual image (never
 	// hardcoded): left eye x[0..half), right eye x[half..2*half).
@@ -121,8 +121,7 @@ void main()
 		}
 	}
 
-	float virt_m;
-	uint u10;
+	float u10;
 	if (best == DEPTH_SENTINEL)
 	{
 		u10 = FAR_CODE; // hole: far
@@ -134,7 +133,7 @@ void main()
 			u10 = FAR_CODE; // sky pinned at far: far
 		else
 		{
-			virt_m = linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l);
+			float virt_m = linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l);
 			if (virt_m > VALID_MAX_M)
 				u10 = FAR_CODE; // beyond-range: far
 			else

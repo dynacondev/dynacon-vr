@@ -1346,7 +1346,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 	}
 
 	// Virtual depth (stream 3): never defoveated; same ownership/layout
-	// barrier discipline as color so the volume compare samples defined
+	// barrier discipline as color so the fused verdict samples defined
 	// data. Bookkeeping mirrors color (blitted/displayed feed the
 	// feedback loop below, which is what drives depth IDR + bitrate).
 	// Layout is normalized to GENERAL: most backends hand over Undefined
