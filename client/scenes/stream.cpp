@@ -2867,7 +2867,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 													last_virt_pair_log = virt_pair_now;
 													auto & pdh = current_blit_handles[depth_stream_index];
 													if (pdh)
-														spdlog::info("VR depth pair: valid={} view={} frame={} expected={} {}x{} ycbcr(conv={} ext={:#x} fmt={} model={} range={}) verdict_safe={}",
+														spdlog::info("VR depth pair: valid={} view={} frame={} expected={} {}x{} ycbcr(conv={} ext={:#x} fmt={} model={} range={} comp={}/{}/{}/{} xoff={} yoff={} cfilt={}) verdict_safe={}",
 														             virt.valid, (bool)pdh->image_view, pdh->feedback.frame_index,
 														             (bool)pdh->view_info.depth_expected,
 														             pdh->extent.width, pdh->extent.height,
@@ -2875,6 +2875,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 														             vk::to_string(pdh->ycbcr.format),
 														             vk::to_string(pdh->ycbcr.ycbcr_model),
 														             vk::to_string(pdh->ycbcr.ycbcr_range),
+														             vk::to_string(pdh->ycbcr.components.r),
+														             vk::to_string(pdh->ycbcr.components.g),
+														             vk::to_string(pdh->ycbcr.components.b),
+														             vk::to_string(pdh->ycbcr.components.a),
+														             vk::to_string(pdh->ycbcr.x_chroma_offset),
+														             vk::to_string(pdh->ycbcr.y_chroma_offset),
+														             vk::to_string(pdh->ycbcr.chroma_filter),
 														             (bool)depth_verdict_safe);
 													else
 														spdlog::info("VR depth pair: valid={} (no depth handle) verdict_safe={}",

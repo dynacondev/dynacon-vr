@@ -19,12 +19,16 @@
 /*
  * Unpacked-depth range reduction (forensics): samples the decoded SBS
  * virtual-depth frame with the decoder's own sampler (the exact tap
- * the verdict/viz use: green channel, 2mm/LSB, codes 0-1023) and
- * reduces full-frame + center-patch (middle 50% each axis)
- * min/max/near/far counts into one host-visible SSBO (8 uints).
- * Dispatched throttled (~5s) from stream.cpp after the last depth
- * use; read back after the frame fence and logged. Answers whether
- * near-zero codes reach the client.
+ * the verdict/viz use: 2mm/LSB, codes 0-1023) and reduces
+ * full-frame + center-patch (middle 50% each axis)
+ * min/max/near/far counts per channel (R, G, B) into one host-visible
+ * SSBO (24 uints: per channel, full min/max/near/far + center
+ * min/max/near/far). The verdict/viz sample .g only; R and B expose
+ * whether a shift is luma-wide (R=G=B, genuine depth offset) or
+ * chroma leakage (709-full with zero chroma lifts G by +335 while
+ * crushing R to Y-0.79 and B to Y-0.93). Dispatched throttled (~5s)
+ * from stream.cpp after the last depth use; read back after the frame
+ * fence and logged. Answers whether near-zero codes reach the client.
  */
 
 #version 450
@@ -35,14 +39,7 @@ layout(set = 0, binding = 0) uniform sampler2D virt_tex;
 
 layout(set = 0, binding = 1, std430) buffer Stats
 {
-	uint full_min;
-	uint full_max;
-	uint full_near;
-	uint full_far;
-	uint ctr_min;
-	uint ctr_max;
-	uint ctr_near;
-	uint ctr_far;
+	uint d[24];
 } s;
 
 void main()
@@ -53,21 +50,25 @@ void main()
 		return;
 	bool center = xy.x >= sz.x / 4 && xy.x < sz.x - sz.x / 4 &&
 	              xy.y >= sz.y / 4 && xy.y < sz.y - sz.y / 4;
-	float vd = textureLod(virt_tex, (vec2(xy) + vec2(0.5)) / vec2(sz), 0.0).g;
-	uint c = uint(clamp(vd * 1023.0 + 0.5, 0.0, 1023.0));
-	atomicMin(s.full_min, c);
-	atomicMax(s.full_max, c);
-	if (c <= 5u)
-		atomicAdd(s.full_near, 1u);
-	if (c >= 1021u)
-		atomicAdd(s.full_far, 1u);
-	if (center)
+	vec3 rgb = textureLod(virt_tex, (vec2(xy) + vec2(0.5)) / vec2(sz), 0.0).rgb;
+	for (int ch = 0; ch < 3; ++ch)
 	{
-		atomicMin(s.ctr_min, c);
-		atomicMax(s.ctr_max, c);
+		uint c = uint(clamp(rgb[ch] * 1023.0 + 0.5, 0.0, 1023.0));
+		uint b = uint(ch) * 8u;
+		atomicMin(s.d[b + 0u], c);
+		atomicMax(s.d[b + 1u], c);
 		if (c <= 5u)
-			atomicAdd(s.ctr_near, 1u);
+			atomicAdd(s.d[b + 2u], 1u);
 		if (c >= 1021u)
-			atomicAdd(s.ctr_far, 1u);
+			atomicAdd(s.d[b + 3u], 1u);
+		if (center)
+		{
+			atomicMin(s.d[b + 4u], c);
+			atomicMax(s.d[b + 5u], c);
+			if (c <= 5u)
+				atomicAdd(s.d[b + 6u], 1u);
+			if (c >= 1021u)
+				atomicAdd(s.d[b + 7u], 1u);
+		}
 	}
 }

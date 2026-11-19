@@ -180,10 +180,11 @@ public:
 	// Unpacked-depth range reduction (forensics): dispatches a GPU
 	// min/max/near/far reduction over the decoded SBS view with the
 	// decoder's sampler/conversion (the exact tap the verdict/viz
-	// sample) into a host-visible 8-uint SSBO. Returns true when
-	// dispatched (caller widens the blit-semaphore wait stages to
-	// cover compute). drain_depth_range() reads back after the frame
-	// fence and logs; throttled by the dispatch cadence. Render
+	// sample) into a host-visible 24-uint SSBO (per channel R/G/B:
+	// full min/max/near/far + center min/max/near/far). Returns true
+	// when dispatched (caller widens the blit-semaphore wait stages
+	// to cover compute). drain_depth_range() reads back after the
+	// frame fence and logs; throttled by the dispatch cadence. Render
 	// thread only.
 	bool record_depth_range(vk::raii::CommandBuffer & cmd,
 	                        vk::ImageView virt_view, vk::Sampler virt_sampler,
@@ -281,10 +282,10 @@ private:
 	vk::raii::DescriptorSet minmax_set{nullptr};
 	vk::raii::PipelineLayout minmax_pipeline_layout{nullptr};
 	vk::raii::Pipeline minmax_pipeline{nullptr};
-	// Host-visible 8-uint accumulators (full min/max/near/far +
-	// center min/max/near/far), written by the reduction dispatch,
-	// read after the frame fence. Last dispatched extent/frame for
-	// the log line.
+	// Host-visible 24-uint accumulators (per channel R/G/B: full
+	// min/max/near/far + center min/max/near/far), written by the
+	// reduction dispatch, read after the frame fence. Last dispatched
+	// extent/frame for the log line.
 	buffer_allocation minmax_stats;
 	vk::Extent2D minmax_extent{0, 0};
 	uint64_t minmax_frame = 0;
