@@ -569,7 +569,6 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 
 	aim_interaction = {1, 1};
 
-	static std::vector<char> last_hands_drive;
 	if (last_hands_drive.size() != controllers.size())
 		last_hands_drive.assign(controllers.size(), false);
 
@@ -623,7 +622,7 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 				             controller_index,
 				             located,
 				             input_source,
-				             hand and hand->data_source ? int(*hand->data_source) : -1,
+				             (hand and hand->data_source) ? int(*hand->data_source) : -1,
 				             buttons,
 				             hands_drive ? "poke" : "aim");
 				last_hands_drive[controller_index] = hands_drive;

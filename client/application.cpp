@@ -1169,7 +1169,7 @@ void application::initialize_actions()
 		profile.available = std::ranges::all_of(profile.required_extensions, [&](auto & ext) { return xr_instance.has_extension(ext); }) and
 		                    profile.min_version <= api_version;
 
-		// Hands-only mode (default): never let hands masquerade as
+		// Hands-only mode: never let hands masquerade as
 		// controllers. The Quest runtime fakes khr/simple_controller when
 		// hand tracking is on, and any runtime with suggested
 		// ext/hand_interaction_ext bindings auto-switches /user/hand/*
