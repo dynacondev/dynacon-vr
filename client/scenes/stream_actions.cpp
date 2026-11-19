@@ -69,7 +69,6 @@ void scenes::stream::read_actions()
 						}
 						if (latched)
 						{
-							inputs.values.push_back({trigger_value, value->second, value->first});
 							if (*latched)
 							{
 								if (value->second < grasp_threshold - grasp_release_band)
@@ -77,7 +76,11 @@ void scenes::stream::read_actions()
 							}
 							else if (value->second >= grasp_threshold)
 								*latched = true;
-							inputs.values.push_back({trigger_click, *latched ? 1.0f : 0.0f, value->first});
+							// Snap the emulated trigger to full pull / released:
+							// apps see a clean digital-style trigger.
+							const float pulled = *latched ? 1.0f : 0.0f;
+							inputs.values.push_back({trigger_value, pulled, value->first});
+							inputs.values.push_back({trigger_click, pulled, value->first});
 						}
 					}
 				}
