@@ -461,6 +461,38 @@ void compositor::log_depth_range(int slot)
 	        pct(full.far, full.count), pct(full.zero, full.count),
 	        ctr.min_c, ctr.min_c * 0.002, mean(ctr), mean(ctr) * 0.002, ctr.max_c, ctr.max_c * 0.002,
 	        pct(ctr.far, ctr.count), pct(ctr.zero, ctr.count));
+	// Neutral-chroma plane (R16G16 words, half res): the 0.5 clear is
+	// 32768 raw (512 in >>6 codes). Anything else here explains a
+	// client-side chroma-lift forensics finding directly.
+	auto & cbuf = depth_range_buf_c[slot];
+	vk::DeviceSize csize = depth_range_buf_c_size[slot];
+	uint32_t cw = w / 2, chh = h / 2;
+	if (cbuf and csize == vk::DeviceSize(cw) * chh * 4)
+	{
+		if ((cbuf.properties() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0)
+			vmaInvalidateAllocation(vk_allocator::instance(), cbuf, 0, VK_WHOLE_SIZE);
+		const uint16_t * cpx = cbuf.data<uint16_t>();
+		uint64_t ccount = 0, csum = 0, cflat = 0;
+		unsigned cmin = 0xFFFF, cmax = 0;
+		for (uint64_t i = 0, n = uint64_t(cw) * chh * 2; i < n; ++i)
+		{
+			uint16_t v = cpx[i];
+			ccount++;
+			csum += v;
+			if (v < cmin)
+				cmin = v;
+			if (v > cmax)
+				cmax = v;
+			if (v >= 32767 and v <= 32768)
+				cflat++;
+		}
+		U_LOG_I("depth range srv chroma: slot %d frame %llu %ux%u raw min=%u max=%u mean=%.1f flat32768=%.2f%% (>>6 codes min=%u max=%u)",
+		        slot, (unsigned long long)images[slot].frame_index, cw, chh,
+		        cmin, cmax, ccount ? double(csum) / double(ccount) : 0.0, pct(cflat, ccount),
+		        cmin >> 6, cmax >> 6);
+	}
+	else
+		U_LOG_W("depth range srv chroma: slot %d no data (size %llu, want %ux%u)", slot, (unsigned long long)csize, cw, chh);
 }
 
 xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
@@ -1100,8 +1132,24 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 						                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
 						        },
 						        std::format("depth range readback {}", slot));
-						depth_range_buf_size[slot] = need;
-						depth_range_extent[slot] = range_ext;
+					        depth_range_buf_size[slot] = need;
+					        depth_range_extent[slot] = range_ext;
+					}
+					vk::DeviceSize need_c = vk::DeviceSize(range_ext.width / 2) * (range_ext.height / 2) * 4;
+					if (not depth_range_buf_c[slot] or depth_range_buf_c_size[slot] != need_c)
+					{
+						depth_range_buf_c[slot] = buffer_allocation(
+						        vk.device,
+						        vk::BufferCreateInfo{
+						                .size = need_c,
+						                .usage = vk::BufferUsageFlagBits::eTransferDst,
+						        },
+						        VmaAllocationCreateInfo{
+						                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+						                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+						        },
+						        std::format("depth range chroma readback {}", slot));
+					        depth_range_buf_c_size[slot] = need_c;
 					}
 					vk::ImageMemoryBarrier2 range_acquire{
 					        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -1118,9 +1166,28 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					                .layerCount = 1,
 					        },
 					};
+					// Chroma plane: the neutral clear (transfer write,
+					// disjoint plane) is the only writer; order the
+					// copy after it.
+					vk::ImageMemoryBarrier2 range_acquire_c{
+					        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+					        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+					        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+					        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+					        .oldLayout = vk::ImageLayout::eGeneral,
+					        .newLayout = vk::ImageLayout::eGeneral,
+					        .image = depth.image,
+					        .subresourceRange = {
+					                .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+					                .levelCount = 1,
+					                .baseArrayLayer = 3,
+					                .layerCount = 1,
+					        },
+					};
+					vk::ImageMemoryBarrier2 range_acquires[2] = {range_acquire, range_acquire_c};
 					cmd.pipelineBarrier2(vk::DependencyInfo{
-					        .imageMemoryBarrierCount = 1,
-					        .pImageMemoryBarriers = &range_acquire,
+					        .imageMemoryBarrierCount = 2,
+					        .pImageMemoryBarriers = range_acquires,
 					});
 					cmd.copyImageToBuffer(
 					        depth.image,
@@ -1136,6 +1203,26 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					                .imageExtent = {
 					                        .width = range_ext.width,
 					                        .height = range_ext.height,
+					                        .depth = 1,
+					                },
+					        });
+					// Chroma plane (half res, R16G16 words): the 0.5
+					// clear is the ground truth for the client's
+					// neutral-chroma assumption.
+					cmd.copyImageToBuffer(
+					        depth.image,
+					        vk::ImageLayout::eGeneral,
+					        depth_range_buf_c[slot],
+					        vk::BufferImageCopy{
+					                .bufferRowLength = range_ext.width / 2,
+					                .imageSubresource = {
+					                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+					                        .baseArrayLayer = 3,
+					                        .layerCount = 1,
+					                },
+					                .imageExtent = {
+					                        .width = range_ext.width / 2,
+					                        .height = range_ext.height / 2,
 					                        .depth = 1,
 					                },
 					        });
