@@ -321,6 +321,25 @@ void decoder::on_image_available(AImageReader * reader)
 		        image_reader,
 		        std::move(image));
 
+		// Conversion definition for VUID-02738 consumers (immutable
+		// samplers): mirrors create_sampler exactly (709/Full overrides,
+		// resolved chroma filter), so a conversion built from this is
+		// identically defined to the view's. Single-threaded here (all
+		// writes to ahb_format happen on this thread via
+		// map_hardware_buffer), and the value is immutable once the
+		// handle is published.
+		handle->ycbcr.has_conversion = true;
+		handle->ycbcr.external_format = ahb_format.externalFormat;
+		handle->ycbcr.format = vk::Format::eUndefined;
+		handle->ycbcr.ycbcr_model = vk::SamplerYcbcrModelConversion::eYcbcr709;
+		handle->ycbcr.ycbcr_range = vk::SamplerYcbcrRange::eItuFull;
+		handle->ycbcr.components = ahb_format.samplerYcbcrConversionComponents;
+		handle->ycbcr.x_chroma_offset = ahb_format.suggestedXChromaOffset;
+		handle->ycbcr.y_chroma_offset = ahb_format.suggestedYChromaOffset;
+		handle->ycbcr.chroma_filter = (ahb_format.formatFeatures & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter)
+		        ? vk::Filter::eLinear
+		        : vk::Filter::eNearest;
+
 		if (auto scene = weak_scene.lock())
 			scene->push_blit_handle(accumulator, std::move(handle));
 	}

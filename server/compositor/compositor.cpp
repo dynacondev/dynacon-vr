@@ -396,6 +396,105 @@ xrt_result_t compositor::mark_frame(int64_t frame_id,
 	return XRT_ERROR_VULKAN;
 }
 
+void compositor::log_depth_range(int slot)
+{
+	auto & buf = depth_range_buf[slot];
+	vk::DeviceSize size = depth_range_buf_size[slot];
+	vk::Extent2D ext = depth_range_extent[slot];
+	if (not buf or size == 0 or ext.width == 0 or ext.height == 0)
+		return;
+	// Host-coherent is the norm for these buffers (x264 pattern);
+	// invalidate when the heap isn't.
+	if ((buf.properties() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0)
+		vmaInvalidateAllocation(vk_allocator::instance(), buf, 0, VK_WHOLE_SIZE);
+	const uint16_t * px = buf.data<uint16_t>();
+	uint32_t w = ext.width, h = ext.height;
+	if (uint64_t(w) * h != uint64_t(size / 2))
+	{
+		U_LOG_W("depth range srv: slot %d size/extent mismatch (%llu vs %ux%u)",
+		        slot, (unsigned long long)size, w, h);
+		return;
+	}
+	struct accum
+	{
+		uint64_t count = 0, sum = 0, far = 0, zero = 0;
+		unsigned min_c = 0xFFFF, max_c = 0;
+	};
+	accum full, ctr;
+	uint32_t x0 = w / 4, x1 = w - w / 4, y0 = h / 4, y1 = h - h / 4;
+	for (uint32_t y = 0; y < h; ++y)
+	{
+		bool cy = y >= y0 and y < y1;
+		for (uint32_t x = 0; x < w; ++x)
+		{
+			uint16_t c = px[uint64_t(y) * w + x] >> 6; // what the P010 encoder ingests
+			full.count++;
+			full.sum += c;
+			if (c < full.min_c)
+				full.min_c = c;
+			if (c > full.max_c)
+				full.max_c = c;
+			if (c >= 1021)
+				full.far++;
+			if (c == 0)
+				full.zero++;
+			if (cy and x >= x0 and x < x1)
+			{
+				ctr.count++;
+				ctr.sum += c;
+				if (c < ctr.min_c)
+					ctr.min_c = c;
+				if (c > ctr.max_c)
+					ctr.max_c = c;
+				if (c >= 1021)
+					ctr.far++;
+				if (c == 0)
+					ctr.zero++;
+			}
+		}
+	}
+	auto pct = [](uint64_t part, uint64_t total) { return total ? 100.0 * double(part) / double(total) : 0.0; };
+	auto mean = [](const accum & a) { return a.count ? double(a.sum) / double(a.count) : 0.0; };
+	U_LOG_I("depth range srv: slot %d frame %llu %ux%u codes(>>6, 2mm/LSB): full min=%u (%.3fm) mean=%.1f (%.3fm) max=%u (%.3fm) far1021+=%.2f%% zero=%.2f%% | center min=%u (%.3fm) mean=%.1f (%.3fm) max=%u (%.3fm) far+=%.2f%% zero=%.2f%%",
+	        slot, (unsigned long long)images[slot].frame_index, w, h,
+	        full.min_c, full.min_c * 0.002, mean(full), mean(full) * 0.002, full.max_c, full.max_c * 0.002,
+	        pct(full.far, full.count), pct(full.zero, full.count),
+	        ctr.min_c, ctr.min_c * 0.002, mean(ctr), mean(ctr) * 0.002, ctr.max_c, ctr.max_c * 0.002,
+	        pct(ctr.far, ctr.count), pct(ctr.zero, ctr.count));
+	// Neutral-chroma plane (R16G16 words, half res): the 0.5 clear is
+	// 32768 raw (512 in >>6 codes). Anything else here explains a
+	// client-side chroma-lift forensics finding directly.
+	auto & cbuf = depth_range_buf_c[slot];
+	vk::DeviceSize csize = depth_range_buf_c_size[slot];
+	uint32_t cw = w / 2, chh = h / 2;
+	if (cbuf and csize == vk::DeviceSize(cw) * chh * 4)
+	{
+		if ((cbuf.properties() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0)
+			vmaInvalidateAllocation(vk_allocator::instance(), cbuf, 0, VK_WHOLE_SIZE);
+		const uint16_t * cpx = cbuf.data<uint16_t>();
+		uint64_t ccount = 0, csum = 0, cflat = 0;
+		unsigned cmin = 0xFFFF, cmax = 0;
+		for (uint64_t i = 0, n = uint64_t(cw) * chh * 2; i < n; ++i)
+		{
+			uint16_t v = cpx[i];
+			ccount++;
+			csum += v;
+			if (v < cmin)
+				cmin = v;
+			if (v > cmax)
+				cmax = v;
+			if (v >= 32767 and v <= 32768)
+				cflat++;
+		}
+		U_LOG_I("depth range srv chroma: slot %d frame %llu %ux%u raw min=%u max=%u mean=%.1f flat32768=%.2f%% (>>6 codes min=%u max=%u)",
+		        slot, (unsigned long long)images[slot].frame_index, cw, chh,
+		        cmin, cmax, ccount ? double(csum) / double(ccount) : 0.0, pct(cflat, ccount),
+		        cmin >> 6, cmax >> 6);
+	}
+	else
+		U_LOG_W("depth range srv chroma: slot %d no data (size %llu, want %ux%u)", slot, (unsigned long long)csize, cw, chh);
+}
+
 xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 {
 	u_graphics_sync_unref(&sync_handle);
@@ -929,8 +1028,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	// Virtual-depth pack (stream 3): MIN-pool the warp's target-view splat
 	// to half stream resolution per eye, linearise, quantize 2mm/LSB
-	// clamped at ~2.04m (beyond-range VR reads as near and occludes
-	// passthrough) into the SBS staging image (layer 3). Runs only on warped frames with
+	// (valid 0-1020, far pins to 1023) into the SBS staging image
+	// (layer 3). Runs only on warped frames with
 	// valid near/far; otherwise images[slot].has_depth stays false and the
 	// worker never touches the depth encoder (strict pairing: no stale
 	// virtual depth on the client).
@@ -938,6 +1037,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	if (warped and settings[3].enabled)
 	{
 		auto & depth = depth_images[slot];
+
+		// Throttled packed-depth range drain (forensics): the copy
+		// recorded on this slot's previous packed frame retired with
+		// that frame (re-acquire implies its submits completed).
+		if (depth_range_pending[slot])
+		{
+			depth_range_pending[slot] = false;
+			log_depth_range(slot);
+		}
 
 		// Same shape as the color top-of-commit barrier: contents are
 		// fully overwritten every packed frame (Y by the pack dispatch
@@ -999,6 +1107,140 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            *depth.out_y,
 		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height}))
 		{
+			// Throttled packed-depth range copy (forensics): snapshot
+			// the Y plane right after the pack while it is GENERAL.
+			// ~5 s cadence; the release barrier below is extended to
+			// cover this read on the cross-queue path.
+			{
+				static uint64_t last_depth_range_ns = 0;
+				uint64_t range_now_ns = uint64_t(os_monotonic_get_ns());
+				if (range_now_ns - last_depth_range_ns > 5'000'000'000ull)
+				{
+					last_depth_range_ns = range_now_ns;
+					vk::Extent2D range_ext{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height};
+					vk::DeviceSize need = vk::DeviceSize(range_ext.width) * range_ext.height * 2;
+					if (not depth_range_buf[slot] or depth_range_buf_size[slot] != need)
+					{
+						depth_range_buf[slot] = buffer_allocation(
+						        vk.device,
+						        vk::BufferCreateInfo{
+						                .size = need,
+						                .usage = vk::BufferUsageFlagBits::eTransferDst,
+						        },
+						        VmaAllocationCreateInfo{
+						                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+						                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+						        },
+						        std::format("depth range readback {}", slot));
+					        depth_range_buf_size[slot] = need;
+					        depth_range_extent[slot] = range_ext;
+					}
+					vk::DeviceSize need_c = vk::DeviceSize(range_ext.width / 2) * (range_ext.height / 2) * 4;
+					if (not depth_range_buf_c[slot] or depth_range_buf_c_size[slot] != need_c)
+					{
+						depth_range_buf_c[slot] = buffer_allocation(
+						        vk.device,
+						        vk::BufferCreateInfo{
+						                .size = need_c,
+						                .usage = vk::BufferUsageFlagBits::eTransferDst,
+						        },
+						        VmaAllocationCreateInfo{
+						                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT,
+						                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+						        },
+						        std::format("depth range chroma readback {}", slot));
+					        depth_range_buf_c_size[slot] = need_c;
+					}
+					vk::ImageMemoryBarrier2 range_acquire{
+					        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+					        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+					        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+					        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+					        .oldLayout = vk::ImageLayout::eGeneral,
+					        .newLayout = vk::ImageLayout::eGeneral,
+					        .image = depth.image,
+					        .subresourceRange = {
+					                .aspectMask = vk::ImageAspectFlagBits::ePlane0,
+					                .levelCount = 1,
+					                .baseArrayLayer = 3,
+					                .layerCount = 1,
+					        },
+					};
+					// Chroma plane: the neutral clear (transfer write,
+					// disjoint plane) is the only writer; order the
+					// copy after it.
+					vk::ImageMemoryBarrier2 range_acquire_c{
+					        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+					        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+					        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+					        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+					        .oldLayout = vk::ImageLayout::eGeneral,
+					        .newLayout = vk::ImageLayout::eGeneral,
+					        .image = depth.image,
+					        .subresourceRange = {
+					                .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+					                .levelCount = 1,
+					                .baseArrayLayer = 3,
+					                .layerCount = 1,
+					        },
+					};
+					vk::ImageMemoryBarrier2 range_acquires[2] = {range_acquire, range_acquire_c};
+					cmd.pipelineBarrier2(vk::DependencyInfo{
+					        .imageMemoryBarrierCount = 2,
+					        .pImageMemoryBarriers = range_acquires,
+					});
+					cmd.copyImageToBuffer(
+					        depth.image,
+					        vk::ImageLayout::eGeneral,
+					        depth_range_buf[slot],
+					        vk::BufferImageCopy{
+					                .bufferRowLength = range_ext.width,
+					                .imageSubresource = {
+					                        .aspectMask = vk::ImageAspectFlagBits::ePlane0,
+					                        .baseArrayLayer = 3,
+					                        .layerCount = 1,
+					                },
+					                .imageExtent = {
+					                        .width = range_ext.width,
+					                        .height = range_ext.height,
+					                        .depth = 1,
+					                },
+					        });
+					// Chroma plane (half res, R16G16 words): the 0.5
+					// clear is the ground truth for the client's
+					// neutral-chroma assumption.
+					cmd.copyImageToBuffer(
+					        depth.image,
+					        vk::ImageLayout::eGeneral,
+					        depth_range_buf_c[slot],
+					        vk::BufferImageCopy{
+					                .bufferRowLength = range_ext.width / 2,
+					                .imageSubresource = {
+					                        .aspectMask = vk::ImageAspectFlagBits::ePlane1,
+					                        .baseArrayLayer = 3,
+					                        .layerCount = 1,
+					                },
+					                .imageExtent = {
+					                        .width = range_ext.width / 2,
+					                        .height = range_ext.height / 2,
+					                        .depth = 1,
+					                },
+					        });
+					// Transfer writes visible to the CPU read on next
+					// reuse (execution completion via slot reuse).
+					vk::MemoryBarrier2 range_host{
+					        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+					        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+					        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+					        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+					};
+					cmd.pipelineBarrier2(vk::DependencyInfo{
+					        .memoryBarrierCount = 1,
+					        .pMemoryBarriers = &range_host,
+					});
+					depth_range_pending[slot] = true;
+				}
+			}
 			auto & depth_enc = encoders[3];
 			// Mirrors the color encoder handoff: single eColor barrier
 			// over the layer the backend reads, so the release range
@@ -1009,7 +1251,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				std::array depth_post{
 				        vk::ImageMemoryBarrier2{
 				                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader | vk::PipelineStageFlagBits2KHR::eTransfer,
-				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite,
+				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eTransferRead, // +read: covers the throttled range copy above (no-op when none recorded)
 				                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
 				                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
 				                .oldLayout = vk::ImageLayout::eGeneral,
@@ -1037,6 +1279,27 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// but missing" (wire loss or pairing miss). Set after the pack
 	// block above, before the encoder handoff below.
 	images[slot].view_info.depth_expected = images[slot].has_depth;
+	{
+		// Depth-pack forensics (1s throttle): what the packer consumed
+		// and produced. near/far pin down the linearize mapping (a 2x
+		// near error doubles every packed meter); has_depth is the
+		// strict-pairing gate; extents pin the MIN-pool resample
+		// geometry. Cross-check against the client VR-depth pair line
+		// (near/far must match the app's real projection; staging WxH
+		// the advertised depth size).
+		static uint64_t last_depth_pack_log_ns = 0;
+		uint64_t depth_pack_now_ns = uint64_t(os_monotonic_get_ns());
+		if (depth_pack_now_ns - last_depth_pack_log_ns > 1'000'000'000ull)
+		{
+			last_depth_pack_log_ns = depth_pack_now_ns;
+			auto warp_ext = images[0].image.info().extent;
+			auto pack_ext = depth_images[0].image.info().extent;
+			U_LOG_I("depth pack: warped %d depth_enabled %d has_depth %d near %.4f/%.4f far %.3f/%.3f warp %ux%u staging %ux%u",
+			        (int)warped, (int)settings[3].enabled, (int)images[slot].has_depth,
+			        src_near_z[0], src_near_z[1], src_far_z[0], src_far_z[1],
+			        warp_ext.width, warp_ext.height, pack_ext.width, pack_ext.height);
+		}
+	}
 
 	for (auto & encoder: encoders)
 	{

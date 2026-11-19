@@ -27,6 +27,7 @@
 
 #include "vk/allocation.h"
 #include "xr/swapchain.h"
+#include "decoder/decoder.h"
 
 // Fullscreen environment-depth visualizer: samples the runtime's D16
 // depth array texture and false-colors it green (nearZ) to red (farZ).
@@ -40,6 +41,54 @@ namespace xr
 class instance;
 class session;
 } // namespace xr
+
+// Debug visualization selector (Passthrough tab, session-scoped,
+// render thread only). None = off. Sensor = existing runtime D16
+// false-color. Vr_depth = VR depth stream (SBS, green->red over
+// 0..2.046m, far past 1020 black). Layer = composited common depth
+// layer of placed passthrough objects before the verdict (same
+// 0..2.046m ramp, far >2.041m saturates red, absent FAR black).
+// Verdict = final VR-vs-passthrough comparison (red = VR wins incl.
+// far-vs-far, green = passthrough, no-window black). Raster_vs_sensor
+// validates the composited layer against the live sensor depth
+// (green = agree, red ramp = |layer - sensor| over 0..2m, no-data
+// black). Vr_raster overlays the composited raster ramp on the VR
+// depth ramp wherever a window is present (shared ramp: same wall,
+// different color = the paths disagree by that distance). All modes
+// share the global opacity below.
+enum class debug_viz_mode
+{
+	none = 0,
+	sensor,
+	vr_depth,
+	layer,
+	verdict,
+	raster_vs_sensor,
+	vr_raster,
+};
+
+inline const char *
+debug_viz_mode_name(debug_viz_mode m)
+{
+	switch (m)
+	{
+		case debug_viz_mode::none:
+			return "None";
+		case debug_viz_mode::sensor:
+			return "Depth Sensor";
+		case debug_viz_mode::vr_depth:
+			return "VR Depth";
+		case debug_viz_mode::layer:
+			return "Composited Depth";
+		case debug_viz_mode::verdict:
+			return "VR vs Passthrough";
+		case debug_viz_mode::raster_vs_sensor:
+			return "Raster vs Sensor";
+		case debug_viz_mode::vr_raster:
+			return "VR + Raster";
+	}
+	return "None";
+}
 
 class depth_overlay_renderer
 {
@@ -76,6 +125,73 @@ public:
 	            vk::ImageView depth_view,
 	            const frame_params & params);
 
+	// Composited-layer viz (R16F linear meters, 2-layer array, half
+	// merge res): green->red over 0..2.046m to match VR depth, FAR
+	// (>=65000) black. Null view records opaque black (no merge yet).
+	void record_layer(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                  const std::array<vk::Extent2D, 2> & extents,
+	                  vk::Image layer_image, vk::ImageView layer_view,
+	                  const frame_params & params);
+
+	// Verdict viz (R8 binary + R16F layer for the no-window mask):
+	// red = VR wins, green = passthrough, layer FAR black. Null views
+	// record opaque black.
+	void record_verdict(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                    const std::array<vk::Extent2D, 2> & extents,
+	                    vk::Image verdict_image, vk::ImageView verdict_view,
+	                    vk::Image layer_image, vk::ImageView layer_view,
+	                    const frame_params & params);
+
+	// Raster-vs-sensor validation viz (R16F layer + runtime D16 sensor
+	// for the same eye UV): green = agree, red ramp = |layer - sensor|
+	// over 0..2m, no-data (layer FAR / sensor no-return) black. Null
+	// views record opaque black. Sensor needs no barrier (runtime hands
+	// it ready to sample, like the sensor path); layer rides the
+	// cross-CB read barrier.
+	void record_raster_sensor(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                          const std::array<vk::Extent2D, 2> & extents,
+	                          vk::Image layer_image, vk::ImageView layer_view,
+	                          vk::ImageView sensor_view,
+	                          const frame_params & params);
+
+	// VR-depth viz with the raster ramp pasted on top wherever a window
+	// is present (shared 0..2.046m ramp, far past 1020 black, no-window
+	// pixels keep the VR color). Null virt view records opaque black;
+	// null layer falls back to plain VR depth. YCbCr views ride the
+	// immutable-sampler path (verdict pattern: decoder-shared sampler,
+	// waitIdle'd rebuild).
+	void record_vr_raster(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                      const std::array<vk::Extent2D, 2> & extents,
+	                      vk::ImageView virt_view, vk::Sampler virt_sampler,
+	                      const wivrn::decoder::ycbcr_definition & ycbcr,
+	                      vk::Image layer_image, vk::ImageView layer_view,
+	                      const frame_params & params);
+
+	// VR-depth viz (decoder SBS, single image, GENERAL): green->red
+	// over 0..2.046m, far past 1020 black. Null view records opaque
+	// black. YCbCr views ride the immutable-sampler path (verdict
+	// pattern: decoder-shared sampler, waitIdle'd rebuild).
+	void record_virt(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                 const std::array<vk::Extent2D, 2> & extents,
+	                 vk::ImageView virt_view, vk::Sampler virt_sampler,
+	                 const wivrn::decoder::ycbcr_definition & ycbcr,
+	                 const frame_params & params);
+
+	// Unpacked-depth range reduction (forensics): dispatches a GPU
+	// min/max/near/far reduction over the decoded SBS view with the
+	// decoder's sampler/conversion (the exact tap the verdict/viz
+	// sample) into a host-visible 24-uint SSBO (per channel R/G/B:
+	// full min/max/near/far + center min/max/near/far). Returns true
+	// when dispatched (caller widens the blit-semaphore wait stages
+	// to cover compute). drain_depth_range() reads back after the
+	// frame fence and logs; throttled by the dispatch cadence. Render
+	// thread only.
+	bool record_depth_range(vk::raii::CommandBuffer & cmd,
+	                        vk::ImageView virt_view, vk::Sampler virt_sampler,
+	                        const wivrn::decoder::ycbcr_definition & ycbcr,
+	                        vk::Extent2D extent, uint64_t depth_frame);
+	void drain_depth_range();
+
 	// Release the acquired image (after submit, before endFrame).
 	void release();
 
@@ -86,17 +202,94 @@ public:
 
 private:
 	void init_pipelines(vk::Format format);
+	void upload_viz_params(const frame_params & params);
 
 	vk::raii::Device * device = nullptr;
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	vk::raii::RenderPass renderpass{nullptr};
-	vk::raii::Pipeline pipeline{nullptr}; // fullscreen triangle, blended
+	vk::raii::Pipeline pipeline{nullptr}; // sensor viz (D16 false-color)
+	vk::raii::Pipeline layer_pipeline{nullptr}; // composited R16F viz
+	vk::raii::Pipeline verdict_pipeline{nullptr}; // VR-vs-passthrough viz
 	vk::raii::DescriptorSetLayout set_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	vk::raii::DescriptorSet descriptor_set{nullptr};
 	vk::raii::Sampler sampler{nullptr};
 	buffer_allocation ubo;
+	// Verdict-viz state (verdict R8 + layer R16F + UBO): own layout
+	// (two image bindings), pool and set; shares pipeline_layout push
+	// shape (eye) and renderpass/targets above.
+	vk::raii::DescriptorSetLayout verdict_viz_layout{nullptr};
+	vk::raii::DescriptorPool verdict_viz_pool{nullptr};
+	vk::raii::DescriptorSet verdict_viz_set{nullptr};
+	vk::raii::PipelineLayout verdict_viz_pipeline_layout{nullptr};
+	// Raster-vs-sensor state (layer R16F + sensor D16 + UBO): own layout
+	// (two image bindings), pool, set, layout and pipeline; shares the
+	// eye-push shape and renderpass/targets above (verdict-viz pattern).
+	vk::raii::DescriptorSetLayout raster_sensor_layout{nullptr};
+	vk::raii::DescriptorPool raster_sensor_pool{nullptr};
+	vk::raii::DescriptorSet raster_sensor_set{nullptr};
+	vk::raii::PipelineLayout raster_sensor_pipeline_layout{nullptr};
+	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
+	// VR+raster state (decoder SBS sampler2D + R16F layer + UBO): own
+	// layout + pool + set + pipeline. Converted views bake the decoder's
+	// live sampler as immutable (VUID-02738, verdict pattern); plain
+	// views keep the mutable layout. waitIdle'd rebuild, rare.
+	// Declaration order matters: layout outlives sets (reverse
+	// destruction). Non-owning alias: refreshed on every rebuild before
+	// any bind; a decoder-side sampler recreation rebuilds before the
+	// next bind (handle comparison in ensure_vr_raster_layout).
+	vk::Sampler vr_raster_immutable_src{nullptr};
+	wivrn::decoder::ycbcr_definition vr_raster_ycbcr_built{};
+	void create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	vk::raii::DescriptorSetLayout vr_raster_layout{nullptr};
+	vk::raii::DescriptorPool vr_raster_pool{nullptr};
+	vk::raii::DescriptorSet vr_raster_set{nullptr};
+	vk::raii::PipelineLayout vr_raster_pipeline_layout{nullptr};
+	vk::raii::Pipeline vr_raster_pipeline{nullptr};
+	// VR-depth viz state (decoder SBS sampler2D + UBO): own layout +
+	// pool + set + pipeline. Converted views bake the decoder's live
+	// sampler as immutable (VUID-02738, verdict pattern); plain views
+	// keep the mutable layout. waitIdle'd rebuild, rare. Declaration
+	// order matters: layout outlives sets (reverse destruction).
+	// Non-owning alias: refreshed on every rebuild before any bind;
+	// a decoder-side sampler recreation rebuilds before the next bind
+	// (handle comparison in ensure_virt_layout).
+	vk::Sampler virt_immutable_src{nullptr};
+	wivrn::decoder::ycbcr_definition virt_ycbcr_built{};
+	void create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	vk::raii::DescriptorSetLayout virt_layout{nullptr};
+	vk::raii::DescriptorPool virt_pool{nullptr};
+	vk::raii::DescriptorSet virt_set{nullptr};
+	vk::raii::PipelineLayout virt_pipeline_layout{nullptr};
+	vk::raii::Pipeline virt_pipeline{nullptr};
+	// Unpacked-depth range state (decoder SBS sampler + SSBO): own
+	// layout + pool + set + compute pipeline. Converted views bake
+	// the decoder's live sampler as immutable (VUID-02738, viz
+	// pattern); plain views keep the mutable layout. waitIdle'd
+	// rebuild, rare. Declaration order matters: layout outlives sets
+	// (reverse destruction). Non-owning alias: refreshed on every
+	// rebuild before any bind (handle comparison in
+	// ensure_minmax_layout).
+	vk::Sampler minmax_immutable_src{nullptr};
+	wivrn::decoder::ycbcr_definition minmax_ycbcr_built{};
+	void create_minmax_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void ensure_minmax_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	vk::raii::DescriptorSetLayout minmax_layout{nullptr};
+	vk::raii::DescriptorPool minmax_pool{nullptr};
+	vk::raii::DescriptorSet minmax_set{nullptr};
+	vk::raii::PipelineLayout minmax_pipeline_layout{nullptr};
+	vk::raii::Pipeline minmax_pipeline{nullptr};
+	// Host-visible 24-uint accumulators (per channel R/G/B: full
+	// min/max/near/far + center min/max/near/far), written by the
+	// reduction dispatch, read after the frame fence. Last dispatched
+	// extent/frame for the log line.
+	buffer_allocation minmax_stats;
+	vk::Extent2D minmax_extent{0, 0};
+	uint64_t minmax_frame = 0;
+	bool minmax_pending = false;
 
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;

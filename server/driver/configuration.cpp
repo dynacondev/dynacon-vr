@@ -666,6 +666,21 @@ configuration::configuration()
 			}
 		}
 
+		if (auto it = json.find("startup-fade-time"); it != json.end())
+		{
+			if (not it->is_number())
+				U_LOG_W("startup-fade-time must be a number of seconds, ignoring");
+			else
+			{
+				startup_fade_time_s = it->get<float>();
+				if (startup_fade_time_s < 0)
+				{
+					U_LOG_W("startup-fade-time negative, clamping to 0");
+					startup_fade_time_s = 0;
+				}
+			}
+		}
+
 		if (auto it = json.find("alignment"); it != json.end())
 		{
 			if (not it->is_object())

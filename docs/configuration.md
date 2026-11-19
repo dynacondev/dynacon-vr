@@ -21,7 +21,7 @@ Bit depth of the video. 8-bit is supported by all encoders. 10-bit is supported 
 The encoder to use, either a single string or object applied to all streams, or a list of string or objects with values for left, right, alpha and virtual depth (in that order).
 When a string it is used, it is equivalent to the `encoder` item of the object.
 
-WiVRn encodes each eye separately, and the alpha channel as one for both eyes. Each stream is processed independently, this may use resources more effectively and reduce latency. A fourth stream carries the warped virtual depth (half stream resolution side-by-side, 10-bit 2mm/LSB clamped at ~2.04m so beyond-range VR occludes passthrough) for depth-tested passthrough; it requires `h265` and is pinned to ~15% of the total bitrate. When H.265 Main10 is unavailable (headset or GPU) the depth stream is disabled with a warning and the share returns to color.
+WiVRn encodes each eye separately, and the alpha channel as one for both eyes. Each stream is processed independently, this may use resources more effectively and reduce latency. A fourth stream carries the warped virtual depth (half stream resolution side-by-side, 10-bit 2mm/LSB valid 0-1020 with far pinned to 1023) for depth-tested passthrough; it requires `h265` and is pinned to ~15% of the total bitrate. When H.265 Main10 is unavailable (headset or GPU) the depth stream is disabled with a warning and the share returns to color.
 
 ### `encoder`
 Default value, in order: `vulkan` if supported, `nvenc` on Nvidia GPU, `vaapi` on all other GPU, else `x264`.
@@ -324,6 +324,17 @@ only — boundary zones and everything else are untouched (zones still
 hold passthrough independently via min-combine: either source can
 demand it). `0` releases instantly.
 
+## `startup-fade-time`
+Default value: `2` (seconds)
+
+Smoothstep fade from full passthrough to video whenever the video
+feed (re)starts after a gap. Re-arms whenever video has been absent
+for ~2s (same holdoff as the waiting kiosk), independent of
+kiosk-mode: first connect and stop->start both fade. Min-combined
+with boundary zones / `passthrough-until-lock`, so a starting feed
+always forces fullscreen passthrough while fading. `0` disables
+(instant cut).
+
 ## `alignment`
 Default value: unset (feature disabled)
 
@@ -415,28 +426,15 @@ Each `passthrough` entry has:
 
 - `type`: behavior type (required). `"3d-passthrough"` renders the
   model as a flat-feed passthrough cutout through the single merged
-  alpha layer; unknown types are
-  skipped with a warning. Where a warped virtual-depth frame is paired,
-  VR content also occludes the cutout eye-space (`virt < object` at
-  half stream resolution, feathered like a silhouette edge). `"3d-passthrough-reversed"` reverse-cuts
+  alpha layer; where a virtual-depth frame pairs with the color frame,
+  VR content in front of the window occludes the cutout (exact
+  eye-space test of virtual depth against the rasterized window
+  depth, nearer VR wins, ties keep the window, far-vs-far VR wins;
+  unpaired frames submit un-cut). Unknown types are
+  skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each
-  pixel). `"3d-depth-passthrough"` reveals the flat feed where the
-  runtime depth map resolves *inside* the model volume (depth-tested
-  volume, feathered like a normal window): the volume rasterizes its
-  far side at 320px, strict `sensor < render` flattens to a binary
-  mask, and it upscales+MAXes over every layer — including reversed
-  cutthroughs — before the shared erode/blur. Per-eye display MVPs
-  keep it in sync with VR content; pose-delay correction is future
-  work, so expect a texel of swim during fast motion. The headset
-  Passthrough tab offers a Rotation reprojection toggle (default on):
-  the sensor tap is remapped through the capture <-> display relative
-  rotation plus a depth-dependent lateral shift (sideways parallax;
-  forward/radial and depth-value terms excluded), so the comparison
-  tests the same world ray, falling back to the direct tap when off.
-  A Depth time bias slider (+/-50ms) shifts the assumed content age
-  to hunt a constant sensor lag (+ = older = larger correction). Meshes should be
-  **closed volumes** (far side is well-defined). `"3d-boundary"` shows
+  pixel). `"3d-depth-passthrough"` is reserved (currently inert, skipped silently). `"3d-boundary"` shows
   game video only *inside* the model volume and passthrough outside
   it — a Quest-guardian-style zone with adjustable size, shape and
   fade. `"3d-boundary-reversed"` inverts it (passthrough inside, game

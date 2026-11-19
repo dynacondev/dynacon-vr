@@ -271,6 +271,10 @@ private:
 	// predictedDisplayTime of the last frame that took the video path (both
 	// decoder queues non-empty); the kiosk returns 2s after this goes stale
 	XrTime last_video_t = 0;
+	// Video-absent gap that re-shows the kiosk and re-arms the startup
+	// fade (shared: the fade mirrors the kiosk signal but ignores
+	// kiosk-mode / GUI state so it works with the kiosk off).
+	static constexpr XrDuration video_gap_holdoff = 2'000'000'000LL; // 2s
 	XrTime last_stream_kiosk_toggle = 0;
 	bool stream_chord_held = false;
 	std::optional<wivrn::kiosk_planes> kiosk_planes_;
@@ -496,84 +500,6 @@ private:
 	double fid_detect_ms = 0, fid_solve_ms = 0, fid_place_ms = 0;
 	int fid_votes = 0, fid_tags = 0;
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
-	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
-	double volume_raster_ms = 0, volume_virt_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
-	double vr_raster_ms = 0, vr_compare_ms = 0, vr_merge_ms = 0; // VR-occlusion chain CPU (eye-space virt<object MIN-cut)
-	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
-	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
-	// never read unwritten queries). volume_ts_async selects the fence
-	// that retires the writing command buffer (mask vs main).
-	vk::raii::QueryPool volume_query_pool = nullptr;
-	bool volume_ts_valid = false;
-	bool volume_ts_async = false;
-	struct volume_gpu_spans
-	{
-		float raster = 0, virt = 0, compare = 0, merge = 0;
-	};
-	volume_gpu_spans last_volume_gpu;
-	// Volume heartbeat snapshot (last volume group) + 5s window sums for
-	// the adb Volume: line (stable numbers under jitter).
-	int volume_last_tier = -1;
-	float volume_last_feather = 0;
-	int volume_last_draws = 0;
-	float volume_last_box_pct = 100; // merge-box % of seed (last group)
-	uint32_t volume_last_seed_w = 0, volume_last_seed_h = 0;
-	uint32_t volume_sensor_w = 0, volume_sensor_h = 0;
-	float volume_sensor_near = 0, volume_sensor_far = 0;
-	uint64_t volume_win_frames = 0, volume_win_sensor = 0;
-	double volume_win_acquire_ms = 0, volume_win_raster_ms = 0;
-	double volume_win_virt_ms = 0, volume_win_virt_gpu = 0;
-	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
-	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
-	uint64_t volume_win_virt_missing = 0; // color expected depth (view_info flag) but none paired
-	// VR-occlusion diagnostics (unconditional: unlike the Volume block
-	// above, VR cut candidates in 3d-passthrough windows count even when
-	// no 3d-depth-passthrough volume is placed). wanted = any feather
-	// group carried window positives this frame; paired/missing split
-	// that by tolerant (±1) depth pairing (missing only when depth_expected).
-	// Windowed + 5s heartbeat in accumulate_metrics ("VRoccl:" line).
-	bool vr_frame_wanted = false; // set by the mask record loop (any group, any_positive)
-	bool vr_frame_virt_paired = false; // set alongside volume_frame_virt_paired when any_vr ran
-	uint64_t vr_win_frames = 0, vr_win_paired = 0, vr_win_missing = 0;
-	XrTime vr_win_t0 = 0;
-	XrTime vr_last_log = 0;
-	// Throttles for the per-event pairing forensics in common_frame and
-	// the mask record loop (1s: isolated single-frame misses each log,
-	// sustained outages don't spam at 90Hz).
-	XrTime depth_miss_last_log = 0;
-	XrTime vr_cut_skip_last_log = 0;
-	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
-	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
-	XrTime volume_last_log = 0;
-	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
-	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
-	bool volume_remap_logged = false; // one-shot H log for convention validation
-	// Depth time-bias test (Passthrough tab slider, ms, +/-50): assumes
-	// the depth content is bias_ms older than its pose claims (+ = older
-	// = larger correction, the trailing-lag direction). Extrapolates the
-	// reported depth pose backward along head motion; 0 = today's
-	// behavior bit-identically. Render thread only.
-	float volume_time_bias_ms = 0;
-	int volume_bias_logged_ms = 999; // debounced slider log (int ms)
-	// Eye velocity history (world frame, per-eye finite difference of
-	// consecutive predicted mask poses) feeding the bias above. Rigid
-	// head => per-eye differencing, no lever-arm approximation.
-	std::array<XrPosef, 2> volume_prev_mask_pose{};
-	XrTime volume_prev_mask_time = 0;
-	bool volume_have_prev_mask = false;
-	std::array<glm::vec3, 2> volume_eye_lin_vel{};
-	std::array<glm::vec3, 2> volume_eye_ang_vel{}; // axis * rate (rad/s)
-	// Sensor-mapping forensics (Volume heartbeat): content age from the
-	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
-	// divergence at record time, swapchain index for the effective Hz.
-	float volume_last_age_ms = 0;
-	double volume_win_age_sum = 0, volume_win_age_max = 0;
-	uint64_t volume_win_acquired = 0;
-	uint32_t volume_last_index = 0xFFFFFFFF;
-	uint64_t volume_win_new_content = 0;
-	float volume_last_dpos_mm = 0, volume_last_dang_deg = 0;
-	double volume_win_dpos_sum = 0, volume_win_dang_sum = 0;
-	XrTime volume_win_t0 = 0;
 	int mask_draws = 0;
 	// Frame-phase waits (milliseconds): fence wait at frame top,
 	// draw_gui, and render_end (end_frame IPC). Assigned
@@ -643,19 +569,6 @@ private:
 		float mask_raster_ms = 0;
 		float mask_erode_ms = 0;
 		float mask_blur_ms = 0;
-		float volume_acquire_ms = 0;
-		float volume_raster_ms = 0;
-		float volume_virt_ms = 0;
-		float volume_compare_ms = 0;
-		float volume_merge_ms = 0;
-		float vr_raster_ms = 0;
-		float vr_compare_ms = 0;
-		float vr_merge_ms = 0;
-		float volume_raster_gpu_ms = 0;
-		float volume_virt_gpu_ms = 0;
-		float volume_compare_gpu_ms = 0;
-		float volume_merge_gpu_ms = 0;
-		float virt_paired = 0; // depth frames paired / volume frames (windowed below)
 		float gizmo_ms = 0;
 		float mask_gpu_ms = 0;
 		float defoveate_gpu_ms = 0;
@@ -772,14 +685,33 @@ private:
 	mask_group hidden_group;
 	// Merge (single submitted alpha layer for the flat feed):
 	// MAX-combines every active contributor (feather groups +
-	// debug + hidden) into one full-res image, submitted once with
-	// REPLACE. merge_image is the acquired target (-1 = none);
-	// merge_this_frame is evaluated ONCE at record time (contributor
-	// activity, not submit_flat/cutouts_punched) and read back at
-	// submit, so record and submit cannot disagree. Render thread only.
+	// debug + hidden) into the owned merged target, then the VR
+	// verdict gates it (common depth layer vs virtual depth) into the
+	// acquired submit image. merge_image is the acquired target
+	// (-1 = none); merge_this_frame is evaluated ONCE at record time
+	// (contributor activity, not submit_flat/cutouts_punched) and read
+	// back at submit, so record and submit cannot disagree. Render
+	// thread only.
 	std::unique_ptr<union_merge_renderer> merge_renderer;
 	int merge_image = -1;
 	bool merge_this_frame = false;
+	// Common depth-layer working buffers (positives only, rebuilt every
+	// mask frame): per-object MVPs on the server color-eye timebase +
+	// upload hashes for the merge-owned mesh store. Capacity survives
+	// clear(). Render thread only.
+	std::vector<union_merge_renderer::geom_draw> layer_draws;
+	std::map<std::string, std::string> layer_mesh_hashes;
+	// One-shot log when the VR verdict first engages (virt paired).
+	bool vr_occlusion_logged = false;
+	// Layout gate for the async verdict sample (see depth block): the
+	// fused verdict samples the decoder SBS image as GENERAL. The
+	// frame-top transition executes on the main command buffer, which
+	// the async mask submission can precede — so the verdict only
+	// samples when the image was already GENERAL before this frame's
+	// transition (steady state), or on the inline path where the
+	// barrier executes first in the same command buffer. Transition
+	// frames submit merged directly (neutral, fail-open).
+	bool depth_verdict_safe = false;
 	// Per-frame hidden working buffers (filled by the shared silhouette
 	// build in the mask phase; capacity survives clear()). Render thread
 	// only.
@@ -839,6 +771,16 @@ private:
 	float until_lock_fade_s = 2.0f;
 	XrTime until_lock_time = 0; // latch time; 0 = not fading
 	bool until_lock_fading = false;
+	// Video (re)start fade: fullscreen passthrough whenever the feed
+	// resumes after a gap, fading to normal over startup-fade-time
+	// (smoothstep, min-combined into boundary_s so a starting feed
+	// always wins while fading). Re-arms on the same gap as the
+	// waiting kiosk (video absent > holdoff) but independent of
+	// kiosk-mode, so first connect and stop->start both fade with
+	// the kiosk off. Render thread only.
+	float startup_fade_s = 2.0f;
+	XrTime startup_time = 0; // fade start; 0 = never
+	bool startup_fading = false;
 	// Origin alignment (alignment -> local-origin): render thread derives
 	// the correction from the resolved board pose every frame, tracking
 	// thread applies it to outgoing poses. configured = map carries a
@@ -879,25 +821,41 @@ private:
 	size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts
 	std::unique_ptr<debug_lines_renderer> gizmo_lines;
 
-	// Environment-depth debug overlay (Quest 3/3S, Passthrough tab,
-	// session-scoped, render thread only): fullscreen false-color of the
-	// runtime D16 (green = nearZ, red = farZ) with a global opacity.
-	// Provider cost is bound to the toggle (off = zero cost).
+	// Debug visualization selector (Passthrough tab, session-scoped,
+	// render thread only): fullscreen false-color viz as ONE transparent
+	// projection layer above passthrough/video, below the GUI. Sensor =
+	// runtime D16 (green = nearZ, red = farZ). The VR/layer/verdict modes
+	// isolate the occlusion comparison (green->red over 0..2.046m, virt
+	// far past 1020 black, layer far saturates red, absent black;
+	// verdict red = VR wins incl. far-vs-far, green = passthrough). The
+	// raster-vs-sensor mode validates the composited layer against the
+	// live sensor depth (green = agree, red ramp = |layer - sensor|
+	// over 0..2m, no-data black). Vr_raster overlays the raster ramp on
+	// the VR depth ramp wherever a window is present (shared ramp: same
+	// wall, different color = the paths disagree by that distance). All
+	// modes share the opacity below.
+	// Sensor provider cost is bound to its mode (off = zero cost).
 	std::unique_ptr<depth_overlay_renderer> depth_overlay;
 	std::unique_ptr<xr::environment_depth> env_depth;
 	bool env_depth_probed = false;   // supported() queried once, cached below
 	bool env_depth_supported = false;
-	bool debug_depth_overlay = false; // master toggle (starts the provider)
-	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1
+	debug_viz_mode debug_viz = debug_viz_mode::none;
+	bool debug_viz_show_vr = false; // viz background: VR video instead of passthrough
+	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1 (all modes)
 	std::string depth_status;         // UI status line, refreshed per frame
-	// Fullscreen flat passthrough while depth debugging: the mask floor
-	// lifts to full alpha under the viz (same lift as the boundary
-	// veil). True from the toggle frame (pre-probe optimistic) so the
-	// canvas exists when the probe lands; runtimes without depth support
-	// drop out once probing reports unsupported.
+	// Fullscreen flat passthrough under the viz (same lift as the
+	// boundary veil). True from the toggle frame for sensor (pre-probe
+	// optimistic so the canvas exists when the probe lands; runtimes
+	// without depth support drop out once probing reports unsupported)
+	// and whenever a VR/layer/verdict viz is active. Show-VR suppresses
+	// the viz-forced part only (boundary/effects veils still hold).
 	bool depth_fullscreen_passthrough() const
 	{
-		return debug_depth_overlay and (not env_depth_probed or env_depth_supported);
+		if (debug_viz == debug_viz_mode::none or debug_viz_show_vr)
+			return false;
+		if (debug_viz == debug_viz_mode::sensor)
+			return not env_depth_probed or env_depth_supported;
+		return true;
 	}
 
 	// Stale-hold multiplier for debug visuals: full presence on fresh

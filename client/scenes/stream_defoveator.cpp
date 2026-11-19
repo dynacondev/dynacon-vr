@@ -292,6 +292,12 @@ void stream_defoveator::reset_pipelines()
 		p = {};
 	for (auto & p: pipeline_a)
 		p = {};
+	// The sets above are raw handles abandoned on reset (never freed
+	// individually by design): return their capacity to the pool, or the
+	// next lifetime's re-ensures allocate past maxSets and throw
+	// OutOfPoolMemory. Resetting is safe here: every pipeline (the only
+	// set holders) was just destroyed.
+	ds_pool.reset();
 }
 
 static size_t required_vertices(const wivrn::to_headset::foveation_parameter & p)

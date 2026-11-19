@@ -20,20 +20,20 @@
 
 #extension GL_EXT_multiview : require
 
-// Multiview volume vertex shader: per-eye MVP selected by
-// gl_ViewIndex. One draw broadcasts to both layers, halving
-// the volume/VR raster begins. Plain integer indexing only (see
-// AGENTS.md: no mat3/ternary on this driver path). The fragment stage
-// reads only near_z/far_z; the push carries an MVP pair (136B — same
-// >128B note as the hidden/silhouette MV pushes; Adreno 740
-// provides 256B).
+// Common depth-layer vertex shader: per-eye MVP selected by
+// gl_ViewIndex. One draw broadcasts to both layers. Plain integer
+// indexing only (see AGENTS.md: no mat3/ternary on this driver path).
+// The fragment stage linearizes nothing: clip.w is already meters (see
+// the frag derivation), so the push carries an MVP pair only (128B —
+// exactly the Vulkan-guaranteed minimum, no maxPushConstantsSize throw
+// needed; the layout range stays VERT-only and the fragment declares
+// no push block, so the mask_mv offset trap is structurally
+// impossible).
 layout(location = 0) in vec3 pos;
 
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp[2];
-	float near_z;
-	float far_z;
 }
 pc;
 
@@ -44,7 +44,6 @@ void main()
 	vec4 clip = pc.mvp[gl_ViewIndex] * vec4(pos, 1.0);
 	gl_Position = clip;
 	// Planar eye distance (-z view): clip.w for the perspective
-	// projection the MVP came from. The fragment stage converts it
-	// to sensor-compatible D.
+	// projection the MVP came from. Same convention as mask_mv.
 	eye_depth = clip.w;
 }

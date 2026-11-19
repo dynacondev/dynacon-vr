@@ -37,6 +37,7 @@ class stream_defoveator
 
 	// Graphic pipeline
 	vk::raii::RenderPass renderpass = nullptr;
+	// No FREE_DESCRIPTOR_SET_BIT: sets are raw handles freed only by whole-pool destruction, never individually.
 	vk::raii::DescriptorPool ds_pool = nullptr;
 	struct pipeline_t
 	{
