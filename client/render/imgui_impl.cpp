@@ -580,7 +580,11 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 		current_aim_interaction = 1;
 		if (ctrl.hand)
 		{
-			if (auto hand = ctrl.hand->locate(world, display_time); hand and hand->is_input_source())
+			// Hands-active means joints locate, full stop: no data-source
+			// check, no waiting on the controller signal. Gripping
+			// controllers invalidates the joints, so hands die the frame
+			// joints stop and controllers take over immediately.
+			if (auto hand = ctrl.hand->locate(world, display_time); hand)
 			{
 				XrHandJointLocationEXT & index_tip = hand->joints[XR_HAND_JOINT_INDEX_TIP_EXT].first;
 
@@ -601,11 +605,12 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 				    index_tip_position.second > constants::gui::fingertip_distance_touching_thd_lo)
 					state.fingertip_touching = true;
 
-				// Hands are poke-only: no far-field ray or distance click
-				// when controllers aren't held (hand is the input source).
-				// This also hides the ray visuals via is_aim_interaction().
-				// Controllers (no .hand / not input source) and the
-				// in-stream GUI (no .hand controllers) are unaffected.
+				// Hands are poke-only: no far-field ray or distance click.
+				// The ray visuals hide via is_aim_interaction(), the
+				// trigger block below is skipped at aim == 0, and clicks
+				// come from fingertip touch only. Controllers (no .hand /
+				// no located joints) and the in-stream GUI (no .hand
+				// controllers) are unaffected.
 				current_aim_interaction = 0;
 			}
 		}
