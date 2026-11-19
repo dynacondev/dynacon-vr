@@ -25,12 +25,14 @@ void scenes::stream::read_actions()
 {
 	from_headset::inputs inputs;
 
-	// Extended mode: a fist also drives the trigger. The runtime reports
-	// grasp as analog value + its own ready threshold, mirroring the
-	// trigger's value/click split, so forward both onto the existing
-	// trigger channels (otherwise silent: hand_interaction defines no
-	// trigger inputs, and no packet/server change is needed).
+	// Extended mode: a fist also drives the trigger. The analog grasp value
+	// is forwarded as-is onto the trigger value channel, while the trigger
+	// click uses a custom threshold (not the runtime's ready signal) with a
+	// 10% release hysteresis band. Otherwise silent: hand_interaction
+	// defines no trigger inputs.
 	const bool grasp_drives_trigger = application::get_config().hand_mode == hand_controller_mode::extended;
+	const float grasp_threshold = application::get_config().grasp_trigger_threshold;
+	constexpr float grasp_release_band = 0.10f;
 
 	if (not is_gui_interactable())
 	{
@@ -41,16 +43,7 @@ void scenes::stream::read_actions()
 				case XR_ACTION_TYPE_BOOLEAN_INPUT: {
 					auto value = application::read_action_bool(action);
 					if (value)
-					{
 						inputs.values.push_back({id, (float)value->second, value->first});
-						if (grasp_drives_trigger)
-						{
-							if (id == device_id::LEFT_GRASP_READY)
-								inputs.values.push_back({device_id::LEFT_TRIGGER_CLICK, (float)value->second, value->first});
-							else if (id == device_id::RIGHT_GRASP_READY)
-								inputs.values.push_back({device_id::RIGHT_TRIGGER_CLICK, (float)value->second, value->first});
-						}
-					}
 				}
 				break;
 
@@ -59,12 +52,28 @@ void scenes::stream::read_actions()
 					if (value)
 					{
 						inputs.values.push_back({id, value->second, value->first});
-						if (grasp_drives_trigger)
+						bool * latched = nullptr;
+						device_id trigger_value = device_id::LEFT_TRIGGER_VALUE;
+						device_id trigger_click = device_id::LEFT_TRIGGER_CLICK;
+						if (grasp_drives_trigger and id == device_id::LEFT_GRASP_VALUE)
+							latched = &grasp_trigger_left;
+						else if (grasp_drives_trigger and id == device_id::RIGHT_GRASP_VALUE)
 						{
-							if (id == device_id::LEFT_GRASP_VALUE)
-								inputs.values.push_back({device_id::LEFT_TRIGGER_VALUE, value->second, value->first});
-							else if (id == device_id::RIGHT_GRASP_VALUE)
-								inputs.values.push_back({device_id::RIGHT_TRIGGER_VALUE, value->second, value->first});
+							latched = &grasp_trigger_right;
+							trigger_value = device_id::RIGHT_TRIGGER_VALUE;
+							trigger_click = device_id::RIGHT_TRIGGER_CLICK;
+						}
+						if (latched)
+						{
+							inputs.values.push_back({trigger_value, value->second, value->first});
+							if (*latched)
+							{
+								if (value->second < grasp_threshold - grasp_release_band)
+									*latched = false;
+							}
+							else if (value->second >= grasp_threshold)
+								*latched = true;
+							inputs.values.push_back({trigger_click, *latched ? 1.0f : 0.0f, value->first});
 						}
 					}
 				}

@@ -346,6 +346,7 @@ const std::vector<config_field> & configuration::config_fields()
 	        scalar("forward_mouse", &configuration::forward_mouse),
 	        scalar("forward_gamepad", &configuration::forward_gamepad),
 	        scalar("hand_controller_mode", &configuration::hand_mode),
+	        scalar("grasp_trigger_threshold", &configuration::grasp_trigger_threshold),
 	        scalar("show_hand_meshes_in_lobby", &configuration::show_hand_meshes_in_lobby),
 	        scalar("virtual_keyboard_layout", &configuration::virtual_keyboard_layout),
 	        scalar("override_foveation_enable", &configuration::override_foveation_enable),

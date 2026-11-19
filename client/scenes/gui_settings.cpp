@@ -718,6 +718,23 @@ bool settings_tracking(const settings_context & ctx)
 		        .disabled_tooltip = disconnect_tip,
 		});
 
+	// Live threshold for the extended-mode emulated trigger: visible only
+	// when extended is selected, adjustable in-stream (takes effect on the
+	// next sampled frame, no restart needed).
+	if (ctx.system.hand_tracking_supported() and config.hand_mode == hand_controller_mode::extended)
+		list.push_back({
+		        .id = "##grasp_trigger_threshold",
+		        .label = _C("setting name", "Trigger threshold"),
+		        .description = _("Fist closure at which the emulated trigger clicks in Extended mode. Releases 10% below this."),
+		        .ui = ui_kind::slider,
+		        .get_int = [&config] { return int(std::lround(config.grasp_trigger_threshold * 100)); },
+		        .set_int = [&config](int v) { config.grasp_trigger_threshold = std::clamp(v, 0, 100) / 100.f; config.save(); },
+		        .v_min = 0,
+		        .v_max = 100,
+		        .fmt = "%d%%",
+		        .default_int = int(std::lround(default_config.grasp_trigger_threshold * 100)),
+		});
+
 	// lobby-only cosmetic, hidden in-stream (connection-time settings use
 	// the disabled-row pattern instead, but this has no in-stream effect)
 	if (ctx.system.hand_tracking_supported() and not ctx.in_game)
