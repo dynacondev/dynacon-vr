@@ -70,6 +70,18 @@ pc;
 #define DEPTH_SCALE 16777215.0
 #define DEPTH_SENTINEL 0xffffffffu
 #define LSB_PER_M 500.0
+// TEMP EXPERIMENT (prove/disprove half-capture hypothesis): capture
+// 2x as far (0-4.080m in codes 0-1020, i.e. 4mm/LSB). If server meters
+// run 2x true, this restores true client readings and moves the viz
+// far-cutoff from true ~1m to true ~2m. REVERT after the experiment.
+#define TEMP_CAPTURE_X2 1
+#if TEMP_CAPTURE_X2
+#define EFFECTIVE_LSB_PER_M 250.0
+#define EFFECTIVE_VALID_MAX_M 4.080
+#else
+#define EFFECTIVE_LSB_PER_M LSB_PER_M
+#define EFFECTIVE_VALID_MAX_M VALID_MAX_M
+#endif
 #define DEPTH_MAX_CODE 1023u
 // Valid codes 0-1020 (0-2.040m); holes/sky/beyond-range pin to FAR_CODE.
 // 1021-1023 is a guard band absorbing lossy wobble, decoded as far
@@ -134,10 +146,10 @@ void main()
 		else
 		{
 			float virt_m = linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l);
-			if (virt_m > VALID_MAX_M)
+			if (virt_m > EFFECTIVE_VALID_MAX_M)
 				u10 = FAR_CODE; // beyond-range: far
 			else
-				u10 = uint(clamp(virt_m * LSB_PER_M + 0.5, 0.0, float(VALID_MAX_CODE)));
+				u10 = uint(clamp(virt_m * EFFECTIVE_LSB_PER_M + 0.5, 0.0, float(VALID_MAX_CODE)));
 		}
 	}
 
