@@ -827,9 +827,11 @@ private:
 	// runtime D16 (green = nearZ, red = farZ). The VR/layer/verdict modes
 	// isolate the occlusion comparison (green->red over 0..2.046m, virt
 	// far past 1020 black, layer far saturates red, absent black;
-	// verdict red = VR wins incl. far-vs-far, green = passthrough). All
-	// modes share the opacity below. Sensor provider cost is bound to
-	// its mode (off = zero cost).
+	// verdict red = VR wins incl. far-vs-far, green = passthrough). The
+	// raster-vs-sensor mode validates the composited layer against the
+	// live sensor depth (green = agree, red ramp = |layer - sensor|
+	// over 0..2m, no-data black). All modes share the opacity below.
+	// Sensor provider cost is bound to its mode (off = zero cost).
 	std::unique_ptr<depth_overlay_renderer> depth_overlay;
 	std::unique_ptr<xr::environment_depth> env_depth;
 	bool env_depth_probed = false;   // supported() queried once, cached below

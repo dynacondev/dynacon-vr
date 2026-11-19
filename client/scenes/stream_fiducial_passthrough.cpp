@@ -1213,6 +1213,11 @@ void scenes::stream::gui_passthrough()
 			viz = (int)debug_viz_mode::verdict;
 			viz_changed = true;
 		}
+		if (ImGui::RadioButton(_S("Raster vs Sensor"), viz == (int)debug_viz_mode::raster_vs_sensor) and viz != (int)debug_viz_mode::raster_vs_sensor)
+		{
+			viz = (int)debug_viz_mode::raster_vs_sensor;
+			viz_changed = true;
+		}
 		if (viz_changed)
 		{
 			debug_viz = (debug_viz_mode)viz;

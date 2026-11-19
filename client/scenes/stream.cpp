@@ -1565,14 +1565,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 		}
 
-		// Once-per-frame sensor-depth acquire for the sensor viz mode.
-		// The spec allows a single acquire per frame
+		// Once-per-frame sensor-depth acquire for the sensor-driven viz
+		// modes. The spec allows a single acquire per frame
 		// (XR_ERROR_LIMIT_REACHED beyond that). Runs ahead of both
 		// record paths (async + inline). Other viz modes (VR depth,
 		// layer, verdict) sample already-acquired frames, no provider.
 		bool have_depth_frame = false;
 		xr::environment_depth::frame shared_depth{};
-		bool want_depth = debug_viz == debug_viz_mode::sensor;
+		bool want_depth = debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor;
 		if (want_depth)
 		{
 			if (not env_depth_probed)
@@ -3326,7 +3326,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			if (not depth_overlay)
 				depth_overlay = std::make_unique<depth_overlay_renderer>(device);
 			depth_overlay->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
-			if (debug_viz == debug_viz_mode::sensor and not have_depth_frame)
+			if ((debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor) and not have_depth_frame)
 			{
 				// No overlay this frame (status already set by the
 				// shared acquire site above: unsupported / unavailable
@@ -3337,8 +3337,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				depth_overlay_renderer::frame_params params;
 				params.opacity = debug_depth_opacity;
 				// near_z/far_z ride along at defaults: only the sensor
-				// shader reads them (the isolation ramps are hardcoded
-				// 0..2.046m in-shader).
+				// and raster-vs-sensor shaders read them (the isolation
+				// ramps are hardcoded 0..2.046m in-shader).
 				std::array<vk::Extent2D, 2> depth_ext;
 				for (uint32_t view = 0; view < view_count; ++view)
 					depth_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
@@ -3414,6 +3414,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						{
 							depth_overlay->record_verdict(command_buffer, (size_t)depth_image, depth_ext,
 							                              vk::Image{}, vk::ImageView{}, vk::Image{}, vk::ImageView{}, params);
+							depth_status = "waiting for merge (no windows placed or merge sat out)";
+						}
+						break;
+					}
+					case debug_viz_mode::raster_vs_sensor:
+					{
+						// have_depth_frame is guaranteed here (the acquire
+						// gate above skips the overlay without one).
+						params.near_z = shared_depth.near_z;
+						params.far_z = shared_depth.far_z;
+						if (merge_renderer and merge_this_frame and env_depth)
+						{
+							depth_overlay->record_raster_sensor(command_buffer, (size_t)depth_image, depth_ext,
+							                                    merge_renderer->layer_image(), merge_renderer->layer_view_array(),
+							                                    env_depth->depth_view(shared_depth.swapchain_index), params);
+							auto le = merge_renderer->debug_layer_extent();
+							depth_status = fmt::format("raster vs sensor live {}x{} sensor {}x{} near {:.2f}m far {:.2f}m",
+							                           le.width, le.height,
+							                           env_depth->depth_width(), env_depth->depth_height(),
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+						}
+						else
+						{
+							depth_overlay->record_raster_sensor(command_buffer, (size_t)depth_image, depth_ext,
+							                                    vk::Image{}, vk::ImageView{}, vk::ImageView{}, params);
 							depth_status = "waiting for merge (no windows placed or merge sat out)";
 						}
 						break;

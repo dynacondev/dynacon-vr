@@ -420,6 +420,96 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		verdict_pipeline = vk::raii::Pipeline(*device, nullptr, viz_pipeline_info);
 	}
 
+	// Raster-vs-sensor viz: same two-image + UBO shape as the verdict
+	// viz (verdict pattern above), own objects so both modes stay bound
+	// independently.
+	raster_sensor_set.clear();
+	raster_sensor_pipeline.clear();
+	raster_sensor_pipeline_layout.clear();
+	{
+		vk::DescriptorSetLayoutBinding rs_bindings[3] = {
+		        {
+		                .binding = 0,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        },
+		        {
+		                .binding = 1,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        },
+		        {
+		                .binding = 2,
+		                .descriptorType = vk::DescriptorType::eUniformBuffer,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        },
+		};
+		vk::DescriptorSetLayoutCreateInfo rs_layout_info{
+		        .bindingCount = 3,
+		        .pBindings = rs_bindings,
+		};
+		raster_sensor_layout = vk::raii::DescriptorSetLayout(*device, rs_layout_info);
+		vk::DescriptorPoolSize rs_pool_sizes[2] = {
+		        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 2},
+		        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1},
+		};
+		vk::DescriptorPoolCreateInfo rs_pool_info{
+		        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+		        .maxSets = 1,
+		        .poolSizeCount = 2,
+		        .pPoolSizes = rs_pool_sizes,
+		};
+		raster_sensor_pool = vk::raii::DescriptorPool(*device, rs_pool_info);
+		vk::DescriptorSetAllocateInfo rs_alloc{
+		        .descriptorPool = *raster_sensor_pool,
+		        .descriptorSetCount = 1,
+		        .pSetLayouts = &*raster_sensor_layout,
+		};
+		auto rs_sets = vk::raii::DescriptorSets(*device, rs_alloc);
+		raster_sensor_set = std::move(rs_sets.front());
+	}
+	{
+		auto rs_frag = load_shader(*device, "raster_sensor_viz.frag");
+		vk::PipelineShaderStageCreateInfo rs_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **rs_frag,
+		                .pName = "main",
+		        },
+		};
+		vk::PipelineLayoutCreateInfo rs_layout_info{
+		        .setLayoutCount = 1,
+		        .pSetLayouts = &*raster_sensor_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &push_range,
+		};
+		// Dedicated layout (a pipeline bakes its set layout, so the
+		// two-image layout needs its own).
+		raster_sensor_pipeline_layout = vk::raii::PipelineLayout(*device, rs_layout_info);
+		vk::GraphicsPipelineCreateInfo rs_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = rs_stages,
+		        .pVertexInputState = &vertex_input,
+		        .pInputAssemblyState = &input_assembly,
+		        .pViewportState = &viewport_state,
+		        .pRasterizationState = &rasterization,
+		        .pMultisampleState = &multisample,
+		        .pColorBlendState = &blend,
+		        .pDynamicState = &dynamic,
+		        .layout = *raster_sensor_pipeline_layout,
+		        .renderPass = *renderpass,
+		};
+		raster_sensor_pipeline = vk::raii::Pipeline(*device, nullptr, rs_pipeline_info);
+	}
+
 	// VR-depth viz initial plain state (converted views rebuild the
 	// immutable-sampler layout via ensure_virt_layout below).
 	create_virt_state(wivrn::decoder::ycbcr_definition{}, vk::Sampler{});
@@ -862,6 +952,104 @@ void depth_overlay_renderer::record_verdict(vk::raii::CommandBuffer & cmd, size_
 	{
 		auto & tgt = targets[image_index][eye];
 		cmd.pushConstants<push>(*verdict_viz_pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, push{(int32_t)eye});
+		cmd.setViewport(0, vk::Viewport{
+		                        .x = 0,
+		                        .y = 0,
+		                        .width = (float)extents[eye].width,
+		                        .height = (float)extents[eye].height,
+		                        .minDepth = 0,
+		                        .maxDepth = 1,
+		                });
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extents[eye]});
+		vk::ClearValue clear{};
+		clear.color.float32.fill(0);
+		if (not have_data)
+			clear = black_clear(params.opacity);
+		vk::RenderPassBeginInfo begin_info{
+		        .renderPass = *renderpass,
+		        .framebuffer = *tgt.framebuffer,
+		        .renderArea = {.offset = {0, 0}, .extent = extents[eye]},
+		        .clearValueCount = 1,
+		        .pClearValues = &clear,
+		};
+		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+		if (have_data)
+			cmd.draw(3, 1, 0, 0);
+		cmd.endRenderPass();
+	}
+}
+
+void depth_overlay_renderer::record_raster_sensor(vk::raii::CommandBuffer & cmd, size_t image_index,
+                                                                                  const std::array<vk::Extent2D, 2> & extents,
+                                                                                  vk::Image layer_image, vk::ImageView layer_view,
+                                                                                  vk::ImageView sensor_view,
+                                                                                  const frame_params & params)
+{
+	if (image_index >= targets.size())
+		return;
+
+	upload_viz_params(params);
+	{
+		// Pack valid images front for the cross-CB read barrier. The
+		// sensor view rides no barrier (the runtime hands the acquired
+		// image ready to sample, same as the sensor path).
+		vk::Image packed[1];
+		size_t m = 0;
+		if ((bool)layer_view and layer_image != vk::Image{})
+			packed[m++] = layer_image;
+		viz_read_barrier(cmd, std::span<const vk::Image>(packed, m));
+	}
+
+	bool have_data = (bool)layer_view and layer_image != vk::Image{} and (bool)sensor_view;
+	if (have_data)
+	{
+		vk::DescriptorImageInfo layer_info{
+		        .sampler = *sampler,
+		        .imageView = layer_view,
+		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		};
+		vk::DescriptorImageInfo sensor_info{
+		        .sampler = *sampler,
+		        .imageView = sensor_view,
+		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		};
+		vk::DescriptorBufferInfo buffer_info{
+		        .buffer = vk::Buffer(ubo),
+		        .offset = 0,
+		        .range = sizeof(frame_params),
+		};
+		std::array<vk::WriteDescriptorSet, 3> writes = {{
+		        {
+		                .dstSet = *raster_sensor_set,
+		                .dstBinding = 0,
+		                .descriptorCount = 1,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .pImageInfo = &layer_info,
+		        },
+		        {
+		                .dstSet = *raster_sensor_set,
+		                .dstBinding = 1,
+		                .descriptorCount = 1,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .pImageInfo = &sensor_info,
+		        },
+		        {
+		                .dstSet = *raster_sensor_set,
+		                .dstBinding = 2,
+		                .descriptorCount = 1,
+		                .descriptorType = vk::DescriptorType::eUniformBuffer,
+		                .pBufferInfo = &buffer_info,
+		        },
+		}};
+		device->updateDescriptorSets(writes, nullptr);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *raster_sensor_pipeline);
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *raster_sensor_pipeline_layout, 0, *raster_sensor_set, {});
+	}
+
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		auto & tgt = targets[image_index][eye];
+		cmd.pushConstants<push>(*raster_sensor_pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, push{(int32_t)eye});
 		cmd.setViewport(0, vk::Viewport{
 		                        .x = 0,
 		                        .y = 0,
