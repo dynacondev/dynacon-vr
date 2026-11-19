@@ -1218,6 +1218,11 @@ void scenes::stream::gui_passthrough()
 			viz = (int)debug_viz_mode::raster_vs_sensor;
 			viz_changed = true;
 		}
+		if (ImGui::RadioButton(_S("VR + Raster"), viz == (int)debug_viz_mode::vr_raster) and viz != (int)debug_viz_mode::vr_raster)
+		{
+			viz = (int)debug_viz_mode::vr_raster;
+			viz_changed = true;
+		}
 		if (viz_changed)
 		{
 			debug_viz = (debug_viz_mode)viz;

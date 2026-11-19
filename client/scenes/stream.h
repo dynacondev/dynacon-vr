@@ -830,7 +830,10 @@ private:
 	// verdict red = VR wins incl. far-vs-far, green = passthrough). The
 	// raster-vs-sensor mode validates the composited layer against the
 	// live sensor depth (green = agree, red ramp = |layer - sensor|
-	// over 0..2m, no-data black). All modes share the opacity below.
+	// over 0..2m, no-data black). Vr_raster overlays the raster ramp on
+	// the VR depth ramp wherever a window is present (shared ramp: same
+	// wall, different color = the paths disagree by that distance). All
+	// modes share the opacity below.
 	// Sensor provider cost is bound to its mode (off = zero cost).
 	std::unique_ptr<depth_overlay_renderer> depth_overlay;
 	std::unique_ptr<xr::environment_depth> env_depth;

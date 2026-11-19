@@ -52,7 +52,10 @@ class session;
 // far-vs-far, green = passthrough, no-window black). Raster_vs_sensor
 // validates the composited layer against the live sensor depth
 // (green = agree, red ramp = |layer - sensor| over 0..2m, no-data
-// black). All modes share the global opacity below.
+// black). Vr_raster overlays the composited raster ramp on the VR
+// depth ramp wherever a window is present (shared ramp: same wall,
+// different color = the paths disagree by that distance). All modes
+// share the global opacity below.
 enum class debug_viz_mode
 {
 	none = 0,
@@ -61,6 +64,7 @@ enum class debug_viz_mode
 	layer,
 	verdict,
 	raster_vs_sensor,
+	vr_raster,
 };
 
 inline const char *
@@ -80,6 +84,8 @@ debug_viz_mode_name(debug_viz_mode m)
 			return "VR vs Passthrough";
 		case debug_viz_mode::raster_vs_sensor:
 			return "Raster vs Sensor";
+		case debug_viz_mode::vr_raster:
+			return "VR + Raster";
 	}
 	return "None";
 }
@@ -148,6 +154,19 @@ public:
 	                          vk::ImageView sensor_view,
 	                          const frame_params & params);
 
+	// VR-depth viz with the raster ramp pasted on top wherever a window
+	// is present (shared 0..2.046m ramp, far past 1020 black, no-window
+	// pixels keep the VR color). Null virt view records opaque black;
+	// null layer falls back to plain VR depth. YCbCr views ride the
+	// immutable-sampler path (verdict pattern: decoder-shared sampler,
+	// waitIdle'd rebuild).
+	void record_vr_raster(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                      const std::array<vk::Extent2D, 2> & extents,
+	                      vk::ImageView virt_view, vk::Sampler virt_sampler,
+	                      const wivrn::decoder::ycbcr_definition & ycbcr,
+	                      vk::Image layer_image, vk::ImageView layer_view,
+	                      const frame_params & params);
+
 	// VR-depth viz (decoder SBS, single image, GENERAL): green->red
 	// over 0..2.046m, far past 1020 black. Null view records opaque
 	// black. YCbCr views ride the immutable-sampler path (verdict
@@ -197,6 +216,23 @@ private:
 	vk::raii::DescriptorSet raster_sensor_set{nullptr};
 	vk::raii::PipelineLayout raster_sensor_pipeline_layout{nullptr};
 	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
+	// VR+raster state (decoder SBS sampler2D + R16F layer + UBO): own
+	// layout + pool + set + pipeline. Converted views bake the decoder's
+	// live sampler as immutable (VUID-02738, verdict pattern); plain
+	// views keep the mutable layout. waitIdle'd rebuild, rare.
+	// Declaration order matters: layout outlives sets (reverse
+	// destruction). Non-owning alias: refreshed on every rebuild before
+	// any bind; a decoder-side sampler recreation rebuilds before the
+	// next bind (handle comparison in ensure_vr_raster_layout).
+	vk::Sampler vr_raster_immutable_src{nullptr};
+	wivrn::decoder::ycbcr_definition vr_raster_ycbcr_built{};
+	void create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	vk::raii::DescriptorSetLayout vr_raster_layout{nullptr};
+	vk::raii::DescriptorPool vr_raster_pool{nullptr};
+	vk::raii::DescriptorSet vr_raster_set{nullptr};
+	vk::raii::PipelineLayout vr_raster_pipeline_layout{nullptr};
+	vk::raii::Pipeline vr_raster_pipeline{nullptr};
 	// VR-depth viz state (decoder SBS sampler2D + UBO): own layout +
 	// pool + set + pipeline. Converted views bake the decoder's live
 	// sampler as immutable (VUID-02738, verdict pattern); plain views
