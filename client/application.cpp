@@ -1401,11 +1401,9 @@ void application::initialize()
 	        XR_EXT_HAND_TRACKING_EXTENSION_NAME,
 	        XR_EXT_HAND_TRACKING_DATA_SOURCE_EXTENSION_NAME,
 	        XR_FB_HAND_TRACKING_MESH_EXTENSION_NAME,
-#ifdef XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME
 	        // Hand tracking frequency hint (Meta): probed like all opt
-	        // extensions; absent runtimes/headers are unaffected.
+	        // extensions below; absent runtimes are unaffected.
 	        XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME,
-#endif
 	        XR_EXT_PALM_POSE_EXTENSION_NAME,
 	        XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME,
 	        XR_EXT_USER_PRESENCE_EXTENSION_NAME,
@@ -2146,8 +2144,11 @@ void application::apply_hand_tracking_frequency()
 	auto & self = instance();
 	if (not self.config or self.config->hand_tracking_frequency == hand_frequency::unspecified)
 		return;
+	if (not self.xr_session)
+		return;
 	if (not self.xr_instance.has_extension(XR_META_HAND_TRACKING_FREQUENCY_HINT_EXTENSION_NAME))
 	{
+		// Expected on non-Meta runtimes: info, not warn.
 		static bool warned = false;
 		if (not warned)
 		{

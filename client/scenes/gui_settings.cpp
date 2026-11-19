@@ -722,11 +722,11 @@ bool settings_tracking(const settings_context & ctx)
 		list.push_back({
 		        .id = "##hand_frequency",
 		        .label = _C("setting name", "Hand tracking frequency"),
-		        .description = _("How often the headset tracks your hands. High is more responsive, low saves power. Advisory only: the runtime may ignore the request, and headsets without Meta's frequency hint ignore this setting."),
+		        .description = _("How often the headset tracks your hands. High is more responsive but can show more jitter; low saves power. Advisory only: the runtime may ignore the request, headsets without Meta's frequency hint ignore this setting, and switching back to Unspecified does not revoke an earlier request (the hint persists for the session)."),
 		        .ui = ui_kind::combo,
 		        .get_int = [&config] { return static_cast<int>(config.hand_tracking_frequency); },
 		        .set_int = [&config](int v) {
-			        config.hand_tracking_frequency = static_cast<hand_frequency>(std::clamp(v, 0, 2));
+			        config.hand_tracking_frequency = static_cast<hand_frequency>(std::clamp(v, static_cast<int>(hand_frequency::unspecified), static_cast<int>(hand_frequency::high)));
 			        config.save();
 			        application::apply_hand_tracking_frequency(); },
 		        .options = [] {
