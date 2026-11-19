@@ -189,8 +189,6 @@ private:
 	size_t focused_controller = (size_t)-1;
 	XrTime last_display_time = 0;
 	bool controllers_enabled = true;
-	// last poke/aim decision per controller, for transition logging only
-	std::vector<char> last_hands_drive;
 
 	bool button_pressed = false;
 	bool fingertip_touching = false;

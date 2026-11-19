@@ -576,11 +576,7 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 
 	aim_interaction = {1, 1};
 
-	if (last_hands_drive.size() != controllers.size())
-		last_hands_drive.assign(controllers.size(), false);
-
 	// Get the hand/controller state from OpenXR
-	size_t controller_index = 0;
 	for (const auto & [controller, state, current_aim_interaction]: std::ranges::zip_view(controllers, new_states, aim_interaction))
 	{
 		const auto & ctrl = controller.first;
@@ -618,22 +614,7 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 			// pressing kills poke instantly (override path). Either side
 			// is decided independently.
 			auto hand = ctrl.hand->locate(world, display_time);
-			const bool located = bool(hand);
-			const bool input_source = located and hand->is_input_source();
-			const bool buttons = controller_button_active();
-			const bool hands_drive = located and input_source and not buttons;
-
-			if (hands_drive != bool(last_hands_drive[controller_index]))
-			{
-				spdlog::info("imgui hand input {}: located={} input_source={} data_source={} buttons={} -> {}",
-				             controller_index,
-				             located,
-				             input_source,
-				             (hand and hand->data_source) ? int(*hand->data_source) : -1,
-				             buttons,
-				             hands_drive ? "poke" : "aim");
-				last_hands_drive[controller_index] = hands_drive;
-			}
+			const bool hands_drive = hand and hand->is_input_source() and not controller_button_active();
 
 			if (hands_drive)
 			{
@@ -712,7 +693,6 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 		else
 			state.source = ImGuiMouseSource_VRController;
 
-		controller_index++;
 	}
 
 	return new_states;

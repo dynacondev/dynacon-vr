@@ -76,5 +76,5 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
 - Rules:
   1. Hands drive a side only when joints locate AND `is_input_source()` AND no controller-exclusive buttons (squeeze > 0.05, thumbstick > 0.2 deadzone — drift must not veto). The shared trigger action is deliberately excluded: under the hand profile it carries aim-activate, and counting it kills poke on every pinch-click.
   2. `locate()` only guarantees wrist + palm + index chain (`hand_tracker.cpp`); other fingers may be curled/occluded. The old all-26 bail never fired in debug builds (`#ifndef NDEBUG` pre-sets flags valid) — reproduces on device only.
-  3. Transition log (`imgui hand input N: located input_source data_source buttons -> poke/aim`, `imgui_impl.cpp`) is the flight recorder: `located=0` = joint bail, `input_source=0` = runtime routing, `buttons=1` = veto. Keep it; it fires on change only.
+  3. Debug via a transition log (`located input_source data_source buttons -> poke/aim` per side, fires on change only): `located=0` = joint bail, `input_source=0` = runtime routing, `buttons=1` = veto. Removed after validation; re-add if regressions return.
   4. Poke needs no runtime cooperation (joint-driven touch), so forcing poke when the runtime routes elsewhere is safe; the reverse (forcing aim) strands clicks. When in doubt, bias toward poke.
