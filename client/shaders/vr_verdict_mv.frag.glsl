@@ -38,15 +38,17 @@ layout(location = 0) out vec4 out_color;
 // so lossy chroma wobble perturbs depth least through green (same
 // convention as the old volume_virt decode).
 //
-// SBS encoding: 10-bit 2mm/LSB luma, server-clamped at 2.040m (code
-// 1020) so beyond-range VR reads as near and occludes; 1021+ is a
-// lossy-overshoot guard band, decoded as far. No near/far push: SBS
-// codes are already meters (code * 0.002), so neither side needs a
-// frustum to agree.
+// SBS encoding: 10-bit 2mm/LSB luma, valid codes 0-1020 (0-2.040m);
+// holes, sky and beyond-range pin to 1023 (far); 1021-1023 is a guard
+// band absorbing lossy wobble. Anything past 1020 decodes as far. No
+// near/far push: SBS codes are already meters (code * 0.002), so
+// neither side needs a frustum to agree. The raster layer uses the
+// same cut: l > 2.041m (1020.5 * 0.002) is far.
 //
-// verdict: reveal = !(present && virt strictly nearer). Exact, no
-// bias anywhere — crisp occlusion edges are intentional. Tie keeps
-// the window. Geometry-free pixels (reversed-only cuts, hidden,
+// verdict: absent (FAR clear) keeps merged; far-vs-far is a VR win
+// (reveal 0); virt-far alone keeps the window (reveal 1); otherwise
+// reveal = !(virt strictly nearer). Exact, no bias anywhere — crisp
+// occlusion edges are intentional. Tie keeps the window. Geometry-free pixels (reversed-only cuts, hidden,
 // debug cutouts never write the layer) read FAR and keep whatever
 // the merged union says. Global: applies to every group at once,
 // after all alpha is combined; reversed cuts stay per-group feather
@@ -72,20 +74,12 @@ void main()
 	vec2 vuv = vec2(uv.x * 0.5 + vi * 0.5, uv.y);
 	float vd = texture(virt_tex, vuv).g;
 
-	float virt_m;
-	if (vd >= 1020.5 / 1023.0)
-	{
-		// Lossy overshoot past the server clamp: no virtual
-		// occluder (compare no-op).
-		virt_m = 1e9;
-	}
-	else
-	{
-		virt_m = max(vd * 2.046, 1e-3);
-	}
-
-	float layer_present = 1.0 - step(65000.0, l);
-	float vr_wins = 1.0 - step(l, virt_m);
-	float reveal = 1.0 - layer_present * vr_wins;
+	float virt_far = step(1020.5 / 1023.0, vd);
+	float layer_absent = step(65000.0, l);
+	float layer_far = step(2.041, l) * (1.0 - layer_absent);
+	float virt_m = vd * 2.046;
+	float vr_wins_near = (1.0 - virt_far) * (1.0 - step(l, virt_m));
+	float vr_wins = max(vr_wins_near, virt_far * layer_far);
+	float reveal = 1.0 - (1.0 - layer_absent) * vr_wins;
 	out_color = vec4(reveal);
 }

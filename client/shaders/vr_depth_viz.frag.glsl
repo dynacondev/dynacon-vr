@@ -22,9 +22,10 @@
 // frame (single image, both eyes side by side) with the decoder's own
 // sampler and maps 0..2.046m green->red. Same decode convention as the
 // verdict: green channel (smallest chroma-crosstalk gain under the 709
-// conversion), 2mm/LSB, server clamp at code 1020 (~2.04m), guard band
-// 1021+ decoded as empty. Empty reads opaque black (same as the layer
-// and verdict viz modes), never transparent.
+// conversion), 2mm/LSB, valid codes 0-1020 (0-2.040m); holes, sky and
+// beyond-range pin to 1023, anything past 1020 decodes as far (black).
+// Far reads opaque black (same as the layer and verdict viz modes),
+// never transparent.
 //
 // No Y-flip: the SBS image shares the top-left UV convention of the
 // fullscreen triangle (verdict path), unlike the runtime D16 which is

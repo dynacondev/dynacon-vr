@@ -45,11 +45,12 @@ class session;
 // Debug visualization selector (Passthrough tab, session-scoped,
 // render thread only). None = off. Sensor = existing runtime D16
 // false-color. Vr_depth = VR depth stream (SBS, green->red over
-// 0..2.046m, empty black). Layer = composited common depth layer of
-// placed passthrough objects before the verdict (same 0..2.046m ramp,
-// FAR black). Verdict = final VR-vs-passthrough comparison (red = VR
-// wins, green = passthrough, no-window black). All modes share the
-// global opacity below.
+// 0..2.046m, far past 1020 black). Layer = composited common depth
+// layer of placed passthrough objects before the verdict (same
+// 0..2.046m ramp, far >2.041m saturates red, absent FAR black).
+// Verdict = final VR-vs-passthrough comparison (red = VR wins incl.
+// far-vs-far, green = passthrough, no-window black). All modes share
+// the global opacity below.
 enum class debug_viz_mode
 {
 	none = 0,
@@ -131,7 +132,7 @@ public:
 	                    const frame_params & params);
 
 	// VR-depth viz (decoder SBS, single image, GENERAL): green->red
-	// over 0..2.046m, lossy guard band black. Null view records opaque
+	// over 0..2.046m, far past 1020 black. Null view records opaque
 	// black. YCbCr views ride the immutable-sampler path (verdict
 	// pattern: decoder-shared sampler, waitIdle'd rebuild).
 	void record_virt(vk::raii::CommandBuffer & cmd, size_t image_index,

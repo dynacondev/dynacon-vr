@@ -34,11 +34,10 @@
  * Linearisation runs only at depth resolution (~1M px/eye at 2K stream,
  * not ~4M): zt back to eye meters via the dst frustum near/far (same
  * math as depth_viz's linearize_depth, mirrored here), then 2mm/LSB
- * quantize CLAMPED at 2.040m (code 1020): beyond-range content (sky
- * pinned at 1.0, holes, sentinel) reads as a near wall, so VR occludes
- * passthrough there instead of flagging far (which would let
- * passthrough win over far VR). Codes 1021-1023 are a guard band for
- * lossy overshoot; the client decodes them as far.
+ * quantize: valid codes 0-1020 (0-2.040m); holes, sky pinned at 1.0
+ * and beyond-range all pin to 1023 (far). Codes 1021-1023 are a guard
+ * band absorbing lossy wobble; the client decodes anything past 1020
+ * as far.
  *
  * Row convention: output row 0 = scene top (top-down on the wire, like
  * the foveated color streams and the client volume canvas). The warp
@@ -72,11 +71,12 @@ pc;
 #define DEPTH_SENTINEL 0xffffffffu
 #define LSB_PER_M 500.0
 #define DEPTH_MAX_CODE 1023u
-// Clamp: beyond-range VR reads as a near wall (occludes passthrough)
-// instead of flagging far. Codes above this are a guard band for lossy
-// overshoot, decoded as far client-side.
-#define DEPTH_CLAMP_CODE 1020u
-#define MAX_VIRT_M 2.040
+// Valid codes 0-1020 (0-2.040m); holes/sky/beyond-range pin to FAR_CODE.
+// 1021-1023 is a guard band absorbing lossy wobble, decoded as far
+// client-side.
+#define VALID_MAX_CODE 1020u
+#define FAR_CODE 1023u
+#define VALID_MAX_M 2.040
 
 float linearize(float d, float n, float f)
 {
@@ -122,19 +122,25 @@ void main()
 	}
 
 	float virt_m;
+	uint u10;
 	if (best == DEPTH_SENTINEL)
 	{
-		virt_m = MAX_VIRT_M; // hole: clamps to near-max, VR wins
+		u10 = FAR_CODE; // hole: far
 	}
 	else
 	{
 		float zt = float(best) / DEPTH_SCALE;
 		if (zt >= 1.0)
-			virt_m = MAX_VIRT_M; // sky pinned at far: clamp, VR wins
+			u10 = FAR_CODE; // sky pinned at far: far
 		else
-			virt_m = min(linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l), MAX_VIRT_M);
+		{
+			virt_m = linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l);
+			if (virt_m > VALID_MAX_M)
+				u10 = FAR_CODE; // beyond-range: far
+			else
+				u10 = uint(clamp(virt_m * LSB_PER_M + 0.5, 0.0, float(VALID_MAX_CODE)));
+		}
 	}
 
-	uint u10 = uint(clamp(virt_m * LSB_PER_M + 0.5, 0.0, float(DEPTH_CLAMP_CODE)));
 	imageStore(dst_y, out_xy, vec4(float(u10) / float(DEPTH_MAX_CODE)));
 }
