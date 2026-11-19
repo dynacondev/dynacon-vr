@@ -1177,12 +1177,13 @@ void application::initialize_actions()
 		// touch_controller_plus and null on every pinch. Withholding both
 		// profiles keeps hands on the 26-joint hand-tracking path only;
 		// real controllers (touch_*, etc.) are unaffected.
-		const bool hands_emulate_controllers = application::get_config().hands_emulate_controllers;
-		if (profile.profile_name.ends_with("ext/hand_interaction_ext") and not hands_emulate_controllers)
+		const auto hand_mode = application::get_config().hand_controller_mode;
+		const bool emulate_controllers = hand_mode != hand_controller_mode::off;
+		if (profile.profile_name.ends_with("ext/hand_interaction_ext") and not emulate_controllers)
 			profile.available = false;
 
 		if (profile.profile_name.ends_with("khr/simple_controller") and
-		    (not get_hmd_traits().bind_simple_controller or not hands_emulate_controllers))
+		    (not get_hmd_traits().bind_simple_controller or not emulate_controllers))
 			profile.available = false;
 
 		if (!profile.available)
@@ -1248,7 +1249,7 @@ void application::initialize_actions()
 		}
 	}
 
-	if (not application::get_config().hands_emulate_controllers)
+	if (application::get_config().hand_controller_mode == hand_controller_mode::off)
 		spdlog::info("Hands-only mode: simple_controller and hand_interaction bindings withheld, hands report joints only");
 
 	// For each possible input source, create a XrAction and add it to the suggested binding

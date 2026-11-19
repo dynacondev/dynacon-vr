@@ -700,13 +700,20 @@ bool settings_tracking(const settings_context & ctx)
 
 	if (ctx.system.hand_tracking_supported())
 		list.push_back({
-		        .id = "##hands_emulate_controllers",
+		        .id = "##hand_controller_mode",
 		        .label = _C("setting name", "Hands emulate controllers"),
-		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. On: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles)."),
-		        .ui = ui_kind::toggle,
-		        .get_bool = [&config] { return config.hands_emulate_controllers; },
-		        .set_bool = [&config](bool v) { config.hands_emulate_controllers = v; config.save(); },
-		        .default_bool = default_config.hands_emulate_controllers,
+		        .description = _("Off (default): hands are reported as hand joints only, never as controller input. Standard: also expose pinch and hand poses as controller input (legacy behaviour, can flap the app between controller profiles). Extended: standard inputs, plus grasp also drives the trigger. Takes effect after restarting the client."),
+		        .ui = ui_kind::segmented,
+		        .get_int = [&config] { return static_cast<int>(config.hand_controller_mode); },
+		        .set_int = [&config](int v) { config.hand_controller_mode = static_cast<hand_controller_mode>(std::clamp(v, 0, 2)); config.save(); },
+		        .options = [] {
+			        return std::vector<std::string>{
+			                _C("hand controller mode", "Off"),
+			                _C("hand controller mode", "Standard"),
+			                _C("hand controller mode", "Extended"),
+			        };
+		        },
+		        .default_int = static_cast<int>(default_config.hand_controller_mode),
 		        .enabled = [&ctx] { return not ctx.in_game; },
 		        .disabled_tooltip = disconnect_tip,
 		});

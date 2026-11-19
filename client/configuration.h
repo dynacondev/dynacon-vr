@@ -56,6 +56,13 @@ enum class posture
 	seated,
 };
 
+enum class hand_controller_mode
+{
+	off,
+	standard,
+	extended,
+};
+
 class configuration
 {
 public:
@@ -88,12 +95,12 @@ public:
 	bool forward_gamepad = false;
 
 	// Hands-only mode (default): hands are reported as 26-joint hand
-	// tracking only, never as controller input on /user/hand/*. When
-	// false, simple_controller and hand_interaction bindings are withheld
-	// so the runtime cannot promote hands to controllers; hand joints
-	// still stream via XrHandTracker. Set true to restore legacy
-	// hand-as-controller emulation (pinch driving controller input).
-	bool hands_emulate_controllers = false;
+	// tracking only, never as controller input on /user/hand/*. In
+	// standard/extended modes, simple_controller and hand_interaction
+	// bindings are suggested so the runtime can promote hands to
+	// controllers; hand joints still stream via XrHandTracker.
+	// Extended additionally mirrors grasp onto the trigger channels.
+	hand_controller_mode hand_controller_mode = hand_controller_mode::off;
 
 	// Show tracked hand meshes in the lobby. Off (default): meshes are
 	// hidden; hand pointing still works and controller hide/show behaviour
