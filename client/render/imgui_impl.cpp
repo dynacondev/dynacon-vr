@@ -574,7 +574,6 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 	{
 		const auto & ctrl = controller.first;
 		std::pair<std::optional<ImVec2>, float> index_tip_position{{}, std::numeric_limits<float>::max()};
-		std::pair<std::optional<ImVec2>, float> palm_position{{}, std::numeric_limits<float>::max()};
 		std::pair<std::optional<ImVec2>, float> controller_position{{}, std::numeric_limits<float>::max()};
 
 		// First hands, so we can set aim_interaction
@@ -584,7 +583,6 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 			if (auto hand = ctrl.hand->locate(world, display_time); hand and hand->is_input_source())
 			{
 				XrHandJointLocationEXT & index_tip = hand->joints[XR_HAND_JOINT_INDEX_TIP_EXT].first;
-				XrHandJointLocationEXT & palm = hand->joints[XR_HAND_JOINT_PALM_EXT].first;
 
 				if (index_tip.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
 				{
@@ -599,30 +597,16 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 					});
 				}
 
-				if (palm.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
-				{
-					palm_position = compute_pointer_position(controller_state{
-					        .aim_position = {
-					                palm.pose.position.x,
-					                palm.pose.position.y,
-					                palm.pose.position.z,
-					        },
-					        .source = ImGuiMouseSource_VRHandTracking,
-					});
-				}
-
 				if (index_tip_position.second < constants::gui::fingertip_distance_touching_thd_hi and
 				    index_tip_position.second > constants::gui::fingertip_distance_touching_thd_lo)
 					state.fingertip_touching = true;
 
-				if (palm_position.second < constants::gui::palm_distance_close_thd_lo)
-					current_aim_interaction = 0;
-				else if (palm_position.second > constants::gui::palm_distance_close_thd_hi)
-					current_aim_interaction = 1;
-				else
-					current_aim_interaction =
-					        (palm_position.second - constants::gui::palm_distance_close_thd_lo) /
-					        (constants::gui::palm_distance_close_thd_hi - constants::gui::palm_distance_close_thd_lo);
+				// Hands are poke-only: no far-field ray or distance click
+				// when controllers aren't held (hand is the input source).
+				// This also hides the ray visuals via is_aim_interaction().
+				// Controllers (no .hand / not input source) and the
+				// in-stream GUI (no .hand controllers) are unaffected.
+				current_aim_interaction = 0;
 			}
 		}
 
