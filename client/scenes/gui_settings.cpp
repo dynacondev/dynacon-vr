@@ -71,6 +71,7 @@ enum class ui_kind
 	combo,
 	combo_multi,
 	button,
+	input_int,
 };
 
 // one declarative setting, `enabled` greys the row out without hiding it
@@ -88,6 +89,7 @@ struct setting
 	std::function<void(int)> set_int;
 	int v_min = 0;
 	int v_max = 0;
+	int v_step = 1; // ui_kind::input_int stepper increment
 
 	std::function<bool(int)> get_multi;
 	std::function<void(int, bool)> set_multi;
@@ -180,6 +182,12 @@ void render_settings(const wivrn::gui::settings_context & ctx, const char * card
 			case ui_kind::button: {
 				if (ui::button(s.button_label, ui::button_style::secondary, {control_w, 0}) and s.on_click)
 					s.on_click();
+				break;
+			}
+			case ui_kind::input_int: {
+				int v = s.get_int();
+				if (ui::input_int(s.id, &v, s.v_step, s.v_min, s.v_max, control_w))
+					s.set_int(v);
 				break;
 			}
 		}
@@ -756,6 +764,30 @@ bool settings_tracking(const settings_context & ctx)
 		        .fmt = "%d%%",
 		        .default_int = int(std::lround(default_config.pinch_emit_threshold * 100)),
 		});
+
+	// Controller rotation offset, applied to streamed grip/aim poses when
+	// hands emulate controllers. Controller-local X/Y/Z in degrees, 45
+	// steps. Takes effect live, no restart.
+	if (ctx.system.hand_tracking_supported() and config.hand_mode != hand_controller_mode::off)
+	{
+		auto rotation_row = [&](const char * id, std::string label, float configuration::* member, float default_value) {
+			list.push_back({
+			        .id = id,
+			        .label = std::move(label),
+			        .description = _("Rotates the streamed controller pose around this axis when hands drive it. +90 X pitches it toward you with the arm out front; flip the sign if it pitches away on your runtime."),
+			        .ui = ui_kind::input_int,
+			        .get_int = [&config, member] { return int(std::lround(config.*member)); },
+			        .set_int = [&config, member](int v) { config.*member = float(std::clamp(v, -180, 180)); config.save(); },
+			        .v_min = -180,
+			        .v_max = 180,
+			        .v_step = 45,
+			        .default_int = int(std::lround(default_value)),
+			});
+		};
+		rotation_row("##hand_rotation_x", _C("setting name", "Hand rotation offset X"), &configuration::hand_controller_rotation_offset_x, default_config.hand_controller_rotation_offset_x);
+		rotation_row("##hand_rotation_y", _C("setting name", "Hand rotation offset Y"), &configuration::hand_controller_rotation_offset_y, default_config.hand_controller_rotation_offset_y);
+		rotation_row("##hand_rotation_z", _C("setting name", "Hand rotation offset Z"), &configuration::hand_controller_rotation_offset_z, default_config.hand_controller_rotation_offset_z);
+	}
 
 	// lobby-only cosmetic, hidden in-stream (connection-time settings use
 	// the disabled-row pattern instead, but this has no in-stream effect)

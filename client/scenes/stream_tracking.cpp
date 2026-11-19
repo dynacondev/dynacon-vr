@@ -370,6 +370,17 @@ void scenes::stream::tracking()
 	XrDuration frame_duration{};
 	XrTime pattern_begin = instance.now();
 
+	// Per-side latch for the controller rotation offset. Engage and
+	// disengage both need 150ms of continuous state so profile flaps
+	// (pinch) and transient nulls can't strobe streamed orientations.
+	struct rotation_offset_latch
+	{
+		bool rotated = false;
+		XrTime pending_since = 0;
+	};
+	rotation_offset_latch rotation_latch_left, rotation_latch_right;
+	static constexpr XrDuration rotation_offset_hold_ns = 150'000'000;
+
 	while (state_ != state::shutdown)
 	{
 		try
@@ -606,6 +617,59 @@ void scenes::stream::tracking()
 					}
 				}
 				locate_spaces.resolve(session, tracking.timestamp, tracking.device_poses);
+
+				// Controller rotation offset, hands emulating controllers only:
+				// rotate streamed grip/aim orientations controller-locally
+				// (position untouched). Gated on the runtime's current profile
+				// per hand path - ground truth for who drives - with a hold so
+				// flaps and transient nulls can not strobe it. Palm/pinch/poke
+				// stay untouched (hand-space, no controller equivalent).
+				if (config.hand_mode != hand_controller_mode::off)
+				{
+					auto drive_state = [&](int side, rotation_offset_latch & latch) {
+						const auto profile = tracking.interaction_profiles[side];
+						if (profile == interaction_profile::none)
+							return latch.rotated; // transition artifact: hold
+						const bool want = profile == interaction_profile::ext_hand_interaction_ext;
+						if (want == latch.rotated)
+							latch.pending_since = 0;
+						else if (not latch.pending_since)
+							latch.pending_since = tracking.timestamp;
+						else if (tracking.timestamp - latch.pending_since >= rotation_offset_hold_ns)
+						{
+							latch.rotated = want;
+							latch.pending_since = 0;
+						}
+						return latch.rotated;
+					};
+					const bool rotate_left = drive_state(0, rotation_latch_left);
+					const bool rotate_right = drive_state(1, rotation_latch_right);
+
+					if (rotate_left or rotate_right)
+					{
+						const glm::quat q_user =
+							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_x), glm::vec3{1, 0, 0}) *
+							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_y), glm::vec3{0, 1, 0}) *
+							glm::angleAxis(glm::radians(config.hand_controller_rotation_offset_z), glm::vec3{0, 0, 1});
+						for (auto & dp: tracking.device_poses)
+						{
+							const bool left_side = dp.device == device_id::LEFT_GRIP or dp.device == device_id::LEFT_AIM;
+							const bool right_side = dp.device == device_id::RIGHT_GRIP or dp.device == device_id::RIGHT_AIM;
+							if ((left_side and rotate_left) or (right_side and rotate_right))
+							{
+								if (dp.flags & static_cast<uint8_t>(from_headset::pose_flags::orientation_valid))
+								{
+									glm::quat q(dp.pose.orientation.w, dp.pose.orientation.x, dp.pose.orientation.y, dp.pose.orientation.z);
+									q = glm::normalize(q * q_user);
+									dp.pose.orientation.x = q.x;
+									dp.pose.orientation.y = q.y;
+									dp.pose.orientation.z = q.z;
+									dp.pose.orientation.w = q.w;
+								}
+							}
+						}
+					}
+				}
 
 				// Origin alignment: re-base outgoing poses so the PC
 				// origin sits at the rig frame. Eye gaze stays
