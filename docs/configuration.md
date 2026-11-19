@@ -21,7 +21,7 @@ Bit depth of the video. 8-bit is supported by all encoders. 10-bit is supported 
 The encoder to use, either a single string or object applied to all streams, or a list of string or objects with values for left, right, alpha and virtual depth (in that order).
 When a string it is used, it is equivalent to the `encoder` item of the object.
 
-WiVRn encodes each eye separately, and the alpha channel as one for both eyes. Each stream is processed independently, this may use resources more effectively and reduce latency. A fourth stream carries the warped virtual depth (half stream resolution side-by-side, 10-bit 2mm/LSB clamped at ~2.04m so beyond-range VR occludes passthrough) for depth-tested passthrough; it requires `h265` and is pinned to ~15% of the total bitrate. When H.265 Main10 is unavailable (headset or GPU) the depth stream is disabled with a warning and the share returns to color.
+WiVRn encodes each eye separately, and the alpha channel as one for both eyes. Each stream is processed independently, this may use resources more effectively and reduce latency. A fourth stream carries the warped virtual depth (half stream resolution side-by-side, 10-bit 2mm/LSB valid 0-1020 with far pinned to 1023) for depth-tested passthrough; it requires `h265` and is pinned to ~15% of the total bitrate. When H.265 Main10 is unavailable (headset or GPU) the depth stream is disabled with a warning and the share returns to color.
 
 ### `encoder`
 Default value, in order: `vulkan` if supported, `nvenc` on Nvidia GPU, `vaapi` on all other GPU, else `x264`.
@@ -429,8 +429,8 @@ Each `passthrough` entry has:
   alpha layer; where a virtual-depth frame pairs with the color frame,
   VR content in front of the window occludes the cutout (exact
   eye-space test of virtual depth against the rasterized window
-  depth, nearer VR wins, ties keep the window; unpaired frames
-  submit un-cut). Unknown types are
+  depth, nearer VR wins, ties keep the window, far-vs-far VR wins;
+  unpaired frames submit un-cut). Unknown types are
   skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each

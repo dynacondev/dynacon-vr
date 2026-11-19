@@ -21,9 +21,10 @@
 // Composited-layer debug false-color: samples the owned R16F common
 // depth layer (linear meters, 2-layer array, half merge res) and maps
 // 0..2.046m green->red to match the VR-depth viz, so the two are
-// directly comparable. Beyond-range windows saturate red; FAR clear
-// (65504, geometry-free pixels incl. reversed-only cuts and empty
-// frames) reads opaque black, never transparent.
+// directly comparable. Far windows (>2.041m, same cut as the verdict)
+// saturate red; FAR clear (65504, geometry-free pixels incl.
+// reversed-only cuts and empty frames, >=65000) reads opaque black,
+// never transparent.
 //
 // No Y-flip: the layer shares the top-left UV convention of the
 // fullscreen triangle it was rasterized with.

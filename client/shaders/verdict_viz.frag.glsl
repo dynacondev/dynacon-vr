@@ -22,7 +22,7 @@
 // reveal, 0 = VR wins) and paints green / red. Geometry-free pixels
 // (layer FAR >= 65000: no-window frames, reversed-only cuts) read
 // opaque black regardless of the verdict value, so empty frames never
-// read all-green.
+// read all-green. Far-vs-far reads red (VR wins), same as the verdict.
 //
 // No Y-flip: both targets share the top-left UV convention of the
 // fullscreen triangle.
