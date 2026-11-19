@@ -565,7 +565,14 @@ std::vector<imgui_context::controller_state> imgui_context::read_controllers_sta
 	std::vector<controller_state> new_states;
 	new_states.resize(controllers.size());
 	if (not controllers_enabled)
+	{
+		// Disabled (kiosk / hidden GUI): no pointer, no clicks — and
+		// reset the aim blend, otherwise it freezes at its last value
+		// and a frozen aim==1 keeps rays submitted (lobby kiosk renders
+		// the ray layer unconditionally).
+		aim_interaction = {0, 0};
 		return new_states;
+	}
 
 	aim_interaction = {1, 1};
 
