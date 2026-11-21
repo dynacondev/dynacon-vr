@@ -40,7 +40,6 @@
 #include "utils/wivrn_trace.h"
 
 #include <atomic>
-#include <cstring>
 #include <format>
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
@@ -243,9 +242,9 @@ std::array<wivrn::compositor::depth_image, 2> make_depth_images(wivrn::vk_bundle
 	                .mipLevels = 1,
 	                .arrayLayers = 4, // depth lives in layer 3
 	                .samples = vk::SampleCountFlagBits::e1,
-	                // STORAGE (pack write incl. chroma store) + TRANSFER_SRC (encoder copy-out,
-	                // like the color image). TRANSFER_DST retained (harmless, no producer left).
-	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+	                // STORAGE (pack Y + chroma stores) + TRANSFER_SRC (encoder copy-out,
+	                // like the color image).
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
 	        },
 	        vk::ImageFormatListCreateInfo{
 	                .viewFormatCount = formats.size(),
@@ -628,7 +627,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
 	// Per-slot frame context: everything this commit records or uploads
-	// lives in this slot, owned until image slot recycles (see TODO.md). Only
+	// lives in this slot, owned until image slot recycles (the submit
+	// fence, polled at acquire, proves the prior submit retired). Only
 	// this slot's pool is reset; the other slot may still execute.
 	auto & cmd = cmds[slot];
 	auto & query_pool = query_pools[slot];
@@ -964,8 +964,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		std::array depth_pre{
 		        vk::ImageMemoryBarrier2{
 		                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
-		                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader,
-		                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite,
+		                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+		                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
 		                .oldLayout = vk::ImageLayout::eUndefined,
 		                .newLayout = vk::ImageLayout::eGeneral,
 		                .image = depth.image,
@@ -1010,14 +1010,13 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			// Mirrors the color encoder handoff: single eColor barrier
 			// over the layer the backend reads, so the release range
 			// matches the backend acquire's eColor range. src covers
-			// the pack (compute) and the throttled range copies
-			// (transfer, when recorded).
+			// the pack's storage writes (Y + CbCr planes).
 			if (depth_enc->need_transfer or depth_enc->target_queue == vk.queue.family_index)
 			{
 				std::array depth_post{
 				        vk::ImageMemoryBarrier2{
-				                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader | vk::PipelineStageFlagBits2KHR::eTransfer,
-				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite,
+				                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
 				                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
 				                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
 				                .oldLayout = vk::ImageLayout::eGeneral,
@@ -1413,8 +1412,8 @@ compositor::compositor(wivrn_session & session) :
 	// allocation entirely when the depth stream is disabled.
 	if (settings[3].enabled)
 		depth_images = make_depth_images(vk, settings[3]);
-	// Per-slot frame context (see TODO.md): one pool+buffer+query pool
-	// per compositor image, so the commit for images[slot] only ever resets
+	// Per-slot frame context: one pool+buffer+query pool+fence per
+	// compositor image, so the commit for images[slot] only ever resets
 	// and records its own slot while the other slot may still execute.
 	for (size_t slot = 0; slot < num_frame_slots; ++slot)
 	{
