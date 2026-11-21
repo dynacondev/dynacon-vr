@@ -1085,11 +1085,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		fence_wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - fence_t0).count();
 	}
 
-	// Unpacked-depth range readback (forensics): the reduction
-	// dispatched into the retired command buffer is safe to read now.
-	if (depth_overlay)
-		depth_overlay->drain_depth_range();
-
 	// Split-submit decision: reuse the mask slot when its fence reads
 	// signaled (previous mask work retired, descriptors safe to
 	// rewrite); otherwise this frame records inline exactly like
@@ -3517,30 +3512,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);
 
-		// Throttled unpacked-depth range (forensics): reduces the
-		// decoded SBS view with the decoder's sampler/conversion (the
-		// exact tap the verdict/viz sample), after every consumer
-		// above. Read back + logged at the next frame top after the
-		// fence. ~5 s cadence (frame-counted).
-		bool range_dispatched = false;
-		{
-			auto & dh = current_blit_handles[depth_stream_index];
-			vk::Sampler samp = decoders[depth_stream_index].decoder ? decoders[depth_stream_index].decoder->sampler() : vk::Sampler{};
-			static uint64_t range_frame_count = 0;
-			if ((bool)dh and (bool)dh->image_view and (bool)samp and depth_verdict_safe and ++range_frame_count >= 360)
-			{
-				// Lazily created (no swapchain needed: the reduction
-				// never touches the viz targets).
-				if (not depth_overlay)
-					depth_overlay = std::make_unique<depth_overlay_renderer>(device);
-				if (depth_overlay->record_depth_range(command_buffer, dh->image_view, samp, dh->ycbcr, dh->extent, dh->feedback.frame_index))
-				{
-					range_frame_count = 0;
-					range_dispatched = true;
-				}
-			}
-		}
-
 		command_buffer.end();
 		vk::SubmitInfo submit_info;
 		submit_info.setCommandBuffers(*command_buffer);
@@ -3548,21 +3519,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		inplace_vector<vk::Semaphore, decoder_count> semaphores;
 		inplace_vector<uint64_t, decoder_count> semaphore_vals;
 		inplace_vector<vk::PipelineStageFlags, decoder_count> wait_stages;
-		for (size_t bi = 0; bi < current_blit_handles.size(); ++bi)
+		for (auto b: current_blit_handles)
 		{
-			auto b = current_blit_handles[bi];
 			if (b and b->semaphore)
 			{
 				assert(b->semaphore_val);
 				semaphores.push_back(b->semaphore);
 				semaphore_vals.push_back(*b->semaphore_val);
-				// The range reduction samples the depth image in
-				// compute: widen that handle's wait to cover compute
-				// (fragment alone would leave the dispatch unordered
-				// against the decoder writes).
-				bool compute_wait = range_dispatched and bi == depth_stream_index;
-				wait_stages.push_back(compute_wait ? (vk::PipelineStageFlagBits::eFragmentShader | vk::PipelineStageFlagBits::eComputeShader)
-				                                  : vk::PipelineStageFlagBits::eFragmentShader);
+				wait_stages.push_back(vk::PipelineStageFlagBits::eFragmentShader);
 			}
 		}
 		submit_info.setWaitDstStageMask(wait_stages);
