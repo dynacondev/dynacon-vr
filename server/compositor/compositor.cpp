@@ -667,9 +667,23 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		return XRT_SUCCESS;
 	}
 
+	// GPU-completion gate for this slot's prior submit: on all-skip
+	// frames no encoder waits on the submit semaphore, so the worker
+	// clears busy with the submit potentially still pending. Never
+	// park the commit thread: drop like a busy slot (the GPU is more
+	// than a frame behind).
+	if (vk.device.waitForFences(*slot_fences[slot], true, 0) != vk::Result::eSuccess)
+	{
+		images[slot].busy = false;
+		triage_drop_acquire.fetch_add(1, std::memory_order_relaxed);
+		comp_frame_clear_locked(&frame.rendering);
+		return XRT_SUCCESS;
+	}
+
 	// Lazy timestamp read for this slot: these queries describe the last
 	// submit that used it, whose completion is implied by image slot
-	// having recycled — so the poll almost always hits and never parks.
+	// having recycled *and* the submit fence below polling signalled —
+	// so the poll almost always hits and never parks.
 	// A miss means the GPU is more than a frame behind: count it (it
 	// doubles as the wedge detector), never wait for it. Polls before
 	// the resetQueryPool below, which would discard the results.
@@ -1349,12 +1363,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        .commandBuffer = cmd,
 		};
 		std::unique_lock lock{vk.queue.mutex};
+		vk.device.resetFences(*slot_fences[slot]);
 		vk.queue.queue.submit2(vk::SubmitInfo2{
 		        .commandBufferInfoCount = 1,
 		        .pCommandBufferInfos = &cmd_info,
 		        .signalSemaphoreInfoCount = 1,
 		        .pSignalSemaphoreInfos = &sem_info,
-		});
+		},
+		*slot_fences[slot]);
 	}
 	query_armed[slot] = true;
 
@@ -1435,13 +1451,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	comp_frame_clear_locked(&frame.rendering);
 
 	// Decoupled: no GPU-progress waits on the commit thread. This slot is
-	// owned until image slot recycles (which strictly postdates this
-	// submit's completion via the encoder semaphore/fifo chain), queries
-	// read lazily at the next acquire, and overload sheds via
-	// drop_busy/drop_acquire/drop_present — so nothing here needs
-	// completion. A slow GPU delays this frame's encode, never the next
-	// tick. (Garbage collection below needs no completion either: it
-	// only pops the app-governed destroy stack.)
+	// owned until image slot recycles; the per-slot submit fence
+	// (polled, never waited, at acquire) is what proves the prior
+	// submit retired — the encoder semaphore/fifo chain alone does not
+	// cover all-skip frames. Queries read lazily at the next acquire,
+	// and overload sheds via drop_busy/drop_acquire/drop_present — so
+	// nothing here needs completion. A slow GPU delays this frame's
+	// encode, never the next tick. (Garbage collection below needs no
+	// completion either: it only pops the app-governed destroy stack.)
 
 	// Now is a good point to garbage collect.
 	comp_swapchain_shared_garbage_collect(&cscs);
@@ -1669,6 +1686,12 @@ compositor::compositor(wivrn_session & session) :
 		                .queryCount = 4,
 		        });
 		vk.name(query_pools[slot], std::format("compositor query pool {}", slot));
+		slot_fences[slot] = vk::raii::Fence(
+		        vk.device,
+		        vk::FenceCreateInfo{
+		                .flags = vk::FenceCreateFlagBits::eSignaled,
+		        });
+		vk.name(slot_fences[slot], std::format("compositor submit fence {}", slot));
 	}
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers

@@ -113,6 +113,11 @@ private:
 
 	std::array<image, num_frame_slots> images;
 	std::array<vk::raii::CommandBuffer, num_frame_slots> cmds{nullptr, nullptr};
+	// Per-slot submit fence (created signalled): the worker clears
+	// busy without waiting on all-skip frames (no encoder waits on the
+	// submit semaphore then), so the fence — polled at acquire, never
+	// waited on — is the only proof the slot's prior submit retired.
+	std::array<vk::raii::Fence, num_frame_slots> slot_fences{nullptr, nullptr};
 	vk::raii::Semaphore sem;
 	uint64_t sem_value = 0;
 
