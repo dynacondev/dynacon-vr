@@ -56,6 +56,12 @@ layout(set = 0, binding = 1, r32ui) readonly uniform uimage2D splat_r;
 // 10-bit in R16). Geometry derives from the actual image (never
 // hardcoded).
 layout(set = 0, binding = 2, r16) writeonly uniform image2D dst_y;
+// CbCr plane of the same staging image, 2D R16G16 view on layer 3
+// (half-res 4:2:0). The pack writes the neutral chroma itself: a
+// vkCmdClearColorImage here would be illegal (VUID-02498 aspect,
+// VUID-01545 YCbCr-conversion format), and the driver silently drops
+// it — which reads as +335 codes of green lift client-side.
+layout(set = 0, binding = 3, rg16) writeonly uniform image2D dst_cbcr;
 
 layout(push_constant) uniform Push
 {
@@ -142,4 +148,12 @@ void main()
 	}
 
 	imageStore(dst_y, out_xy, vec4(float(u10) / float(DEPTH_MAX_CODE)));
+
+	// Neutral chroma for the luma-only depth payload: Plane 1 is
+	// half-res, so each even/even Y thread owns exactly one chroma
+	// texel (staging dims are always even — encoder sizes).
+	// UNORM16(0.5) = 0x8000, i.e. 10-bit neutral 512 in the upper
+	// bits under the 3PACK16 low-6-pad convention.
+	if ((out_xy.x & 1) == 0 && (out_xy.y & 1) == 0)
+		imageStore(dst_cbcr, out_xy / 2, vec4(0.5, 0.5, 0.0, 1.0));
 }

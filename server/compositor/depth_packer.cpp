@@ -44,6 +44,12 @@ depth_packer::depth_packer(vk_bundle & vk)
 	                .descriptorCount = 1,
 	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
 	        },
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 3,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
 	};
 	set_layout = vk::raii::DescriptorSetLayout{
 	        vk.device,
@@ -88,7 +94,7 @@ depth_packer::depth_packer(vk_bundle & vk)
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageImage,
-	                .descriptorCount = uint32_t(num_slots * 3),
+	                .descriptorCount = uint32_t(num_slots * 4),
 	        },
 	};
 	pool = vk::raii::DescriptorPool{
@@ -123,6 +129,7 @@ bool depth_packer::pack(vk::raii::Device & device,
                         float near_r,
                         float far_r,
                         vk::ImageView dst_y,
+                        vk::ImageView dst_cbcr,
                         vk::Extent2D dst_extent)
 {
 	if (slot < 0 or slot >= int(num_slots))
@@ -133,7 +140,7 @@ bool depth_packer::pack(vk::raii::Device & device,
 		return false;
 	if (not(near_l > 0 and far_l > near_l and near_r > 0 and far_r > near_r))
 		return false;
-	if (splat_l == vk::ImageView{} or splat_r == vk::ImageView{} or dst_y == vk::ImageView{})
+	if (splat_l == vk::ImageView{} or splat_r == vk::ImageView{} or dst_y == vk::ImageView{} or dst_cbcr == vk::ImageView{})
 		return false;
 
 	vk::DescriptorImageInfo splat_l_info{
@@ -146,6 +153,10 @@ bool depth_packer::pack(vk::raii::Device & device,
 	};
 	vk::DescriptorImageInfo dst_info{
 	        .imageView = dst_y,
+	        .imageLayout = vk::ImageLayout::eGeneral,
+	};
+	vk::DescriptorImageInfo dst_cbcr_info{
+	        .imageView = dst_cbcr,
 	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	std::array writes{
@@ -169,6 +180,13 @@ bool depth_packer::pack(vk::raii::Device & device,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eStorageImage,
 	                .pImageInfo = &dst_info,
+	        },
+	        vk::WriteDescriptorSet{
+	                .dstSet = sets[slot],
+	                .dstBinding = 3,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .pImageInfo = &dst_cbcr_info,
 	        },
 	};
 	device.updateDescriptorSets(writes, {});

@@ -243,8 +243,8 @@ std::array<wivrn::compositor::depth_image, 2> make_depth_images(wivrn::vk_bundle
 	                .mipLevels = 1,
 	                .arrayLayers = 4, // depth lives in layer 3
 	                .samples = vk::SampleCountFlagBits::e1,
-	                // STORAGE (pack write) + TRANSFER_DST (chroma clear) +
-	                // TRANSFER_SRC (encoder copy-out, like the color image).
+	                // STORAGE (pack write incl. chroma store) + TRANSFER_SRC (encoder copy-out,
+	                // like the color image). TRANSFER_DST retained (harmless, no producer left).
 	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
 	        },
 	        vk::ImageFormatListCreateInfo{
@@ -461,7 +461,7 @@ void compositor::log_depth_range(int slot)
 	        pct(full.far, full.count), pct(full.zero, full.count),
 	        ctr.min_c, ctr.min_c * 0.002, mean(ctr), mean(ctr) * 0.002, ctr.max_c, ctr.max_c * 0.002,
 	        pct(ctr.far, ctr.count), pct(ctr.zero, ctr.count));
-	// Neutral-chroma plane (R16G16 words, half res): the 0.5 clear is
+	// Neutral-chroma plane (R16G16 words, half res): the 0.5 store is
 	// 32768 raw (512 in >>6 codes). Anything else here explains a
 	// client-side chroma-lift forensics finding directly.
 	auto & cbuf = depth_range_buf_c[slot];
@@ -1048,10 +1048,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		}
 
 		// Same shape as the color top-of-commit barrier: contents are
-		// fully overwritten every packed frame (Y by the pack dispatch
-		// below, CbCr by the neutral clear), so Undefined discards and
+		// fully overwritten every packed frame (Y + CbCr both by the
+		// pack dispatch below), so Undefined discards and
 		// no first-use tracking is needed. Single eColor barrier (both
-		// planes): dst covers the transfer clear and the compute pack.
+		// planes): dst covers the compute pack.
 		std::array depth_pre{
 		        vk::ImageMemoryBarrier2{
 		                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
@@ -1073,23 +1073,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        .pImageMemoryBarriers = depth_pre.data(),
 		});
 
-		// Neutral chroma for the luma-only depth payload (GENERAL is a
-		// legal layout for vkCmdClearColorImage; no ping-pong needed).
-		// memcpy: ClearColorValue union members are C arrays here (same
-		// as the splat clear in depth_reprojector), not assignable.
-		vk::ClearColorValue neutral{};
-		const float chroma[4] = {0.5f, 0.5f, 0.0f, 1.0f};
-		std::memcpy(neutral.float32, chroma, sizeof(chroma));
-		cmd.clearColorImage(
-		        depth.image,
-		        vk::ImageLayout::eGeneral,
-		        neutral,
-		        vk::ImageSubresourceRange{
-		                .aspectMask = vk::ImageAspectFlagBits::ePlane1,
-		                .levelCount = 1,
-		                .baseArrayLayer = 3,
-		                .layerCount = 1,
-		        });
+		// Neutral chroma used to ride a clearColorImage here, but that
+		// call is illegal on YCbCr-conversion planes
+		// (VUID-02498 aspect, VUID-01545 format — the driver silently
+		// dropped it, leaving Plane 1 zero-filled and lifting every
+		// decoded pixel by +335 codes under 709-full). The pack
+		// dispatch writes neutral 0.5 through the out_cbcr view instead.
 
 		const auto splat_views = reprojector.get_splat_views(slot);
 		const auto warp_extent = images[0].image.info().extent;
@@ -1105,6 +1094,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            src_near_z[1],
 		            src_far_z[1],
 		            *depth.out_y,
+		            *depth.out_cbcr,
 		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height}))
 		{
 			// Throttled packed-depth range copy (forensics): snapshot
@@ -1166,12 +1156,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 					                .layerCount = 1,
 					        },
 					};
-					// Chroma plane: the neutral clear (transfer write,
+					// Chroma plane: the pack dispatch (compute store,
 					// disjoint plane) is the only writer; order the
 					// copy after it.
 					vk::ImageMemoryBarrier2 range_acquire_c{
-					        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-					        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+					        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+					        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
 					        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
 					        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
 					        .oldLayout = vk::ImageLayout::eGeneral,
@@ -1245,7 +1235,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			// Mirrors the color encoder handoff: single eColor barrier
 			// over the layer the backend reads, so the release range
 			// matches the backend acquire's eColor range. src covers
-			// the pack (compute) and the neutral clear (transfer).
+			// the pack (compute) and the throttled range copies
+			// (transfer, when recorded).
 			if (depth_enc->need_transfer or depth_enc->target_queue == vk.queue.family_index)
 			{
 				std::array depth_post{

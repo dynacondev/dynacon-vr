@@ -36,8 +36,10 @@ struct vk_bundle;
 // x[half..2*half), 10-bit 2mm/LSB valid codes 0-1020 (0-2.040m);
 // holes, sky and beyond-range pin to 1023 (far), 1021-1023 = guard
 // band absorbing lossy wobble, decoded as far, where
-// half/height track half the stream resolution per eye.
-//
+// half/height track half the stream resolution per eye. The CbCr
+// plane (2D R16G16 view on the same layer 3) is filled with neutral
+// 0.5 by the same dispatch — a clearColorImage here would be illegal
+// (VUID-02498/01545: no clears on YCbCr-conversion planes).
 // Resample (MIN-pool, foreground wins) runs before linearisation, in the
 // encoded domain; linearisation + quantize run at depth resolution. See
 // shaders/depth_pack.comp.
@@ -53,7 +55,7 @@ public:
 
 	// Records the pack into cmd. Returns false on degenerate input
 	// (nothing recorded). The caller owns layout/barrier transitions of
-	// dst_y (GENERAL on entry); splat inputs must be visible for shader
+	// dst_y/dst_cbcr (GENERAL on entry); splat inputs must be visible for shader
 	// read (the warp's own barriers cover this when recorded after fill).
 	// dst_extent sizes the dispatch and must match the dst_y image.
 	bool pack(vk::raii::Device & device,
@@ -67,6 +69,7 @@ public:
 	          float near_r,
 	          float far_r,
 	          vk::ImageView dst_y,
+	          vk::ImageView dst_cbcr,
 	          vk::Extent2D dst_extent);
 
 private:
