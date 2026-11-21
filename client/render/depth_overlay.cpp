@@ -967,7 +967,7 @@ void depth_overlay_renderer::create_minmax_state(const wivrn::decoder::ycbcr_def
 		minmax_stats = buffer_allocation(
 		        *device,
 		        vk::BufferCreateInfo{
-		                .size = sizeof(uint32_t) * 24,
+		                .size = sizeof(uint32_t) * 8,
 		                .usage = vk::BufferUsageFlagBits::eStorageBuffer,
 		        },
 		        VmaAllocationCreateInfo{
@@ -1014,7 +1014,7 @@ bool depth_overlay_renderer::record_depth_range(vk::raii::CommandBuffer & cmd,
 	vk::DescriptorBufferInfo stats_info{
 	        .buffer = vk::Buffer(minmax_stats),
 	        .offset = 0,
-	        .range = sizeof(uint32_t) * 24,
+	        .range = sizeof(uint32_t) * 8,
 	};
 	std::array<vk::WriteDescriptorSet, 2> writes = {{
 	        {
@@ -1034,20 +1034,16 @@ bool depth_overlay_renderer::record_depth_range(vk::raii::CommandBuffer & cmd,
 	}};
 	device->updateDescriptorSets(writes, nullptr);
 	// Reset accumulators on the CPU; the barrier below makes the
-	// write visible to the dispatch. Per channel (R, G, B): full
-	// min/max/near/far + center min/max/near/far.
+	// write visible to the dispatch.
 	uint32_t * s = minmax_stats.data<uint32_t>();
-	for (int ch = 0; ch < 3; ++ch)
-	{
-		s[ch * 8 + 0] = 0xFFFFFFFFu; // full_min
-		s[ch * 8 + 1] = 0;           // full_max
-		s[ch * 8 + 2] = 0;           // full_near (codes <= 5)
-		s[ch * 8 + 3] = 0;           // full_far (codes >= 1021)
-		s[ch * 8 + 4] = 0xFFFFFFFFu; // ctr_min
-		s[ch * 8 + 5] = 0;           // ctr_max
-		s[ch * 8 + 6] = 0;           // ctr_near
-		s[ch * 8 + 7] = 0;           // ctr_far
-	}
+	s[0] = 0xFFFFFFFFu; // full_min
+	s[1] = 0;           // full_max
+	s[2] = 0;           // full_near (codes <= 5)
+	s[3] = 0;           // full_far (codes >= 1021)
+	s[4] = 0xFFFFFFFFu; // ctr_min
+	s[5] = 0;           // ctr_max
+	s[6] = 0;           // ctr_near
+	s[7] = 0;           // ctr_far
 	// Host-coherent is the norm; flush the reset when the heap isn't.
 	if ((minmax_stats.properties() & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) == 0)
 		vmaFlushAllocation(vk_allocator::instance(), minmax_stats, 0, VK_WHOLE_SIZE);
@@ -1058,7 +1054,7 @@ bool depth_overlay_renderer::record_depth_range(vk::raii::CommandBuffer & cmd,
 	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	        .buffer = vk::Buffer(minmax_stats),
 	        .offset = 0,
-	        .size = sizeof(uint32_t) * 24,
+	        .size = sizeof(uint32_t) * 8,
 	};
 	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eHost, vk::PipelineStageFlagBits::eComputeShader, {}, {}, host_to_compute, {});
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *minmax_pipeline);
@@ -1072,7 +1068,7 @@ bool depth_overlay_renderer::record_depth_range(vk::raii::CommandBuffer & cmd,
 	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 	        .buffer = vk::Buffer(minmax_stats),
 	        .offset = 0,
-	        .size = sizeof(uint32_t) * 24,
+	        .size = sizeof(uint32_t) * 8,
 	};
 	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader, vk::PipelineStageFlagBits::eHost, {}, {}, compute_to_host, {});
 	minmax_pending = true;
@@ -1098,23 +1094,13 @@ void depth_overlay_renderer::drain_depth_range()
 	uint32_t x0 = w / 4, x1 = w - w / 4, y0 = h / 4, y1 = h - h / 4;
 	uint64_t ctr_n = uint64_t(x1 - x0) * (y1 - y0);
 	auto pct = [](uint64_t part, uint64_t total) { return total ? 100.0 * double(part) / double(total) : 0.0; };
-	// Per channel (R=0, G=1, B=2): full min/max/near/far + center
-	// min/max/near/far, codes ch*1023 (2mm/LSB, server convention
-	// C=round(m*500)). The verdict/viz sample .g only; R and B split
-	// a genuine luma shift (R=G=B) from zero-chroma leakage (709-full
-	// lifts G by +335 while crushing R to Y-0.79, B to Y-0.93).
-	// Compare G against the server "depth range srv" line.
-	const uint32_t * g = s + 8;
+	// Codes are G*1023 (2mm/LSB, server convention C=round(m*500));
+	// compare against the server "depth range srv" line: +200 codes
+	// is the +400mm under investigation.
 	spdlog::info("depth range cli: depth_frame={} {}x{} codes(G*1023, 2mm/LSB): full min={} ({:.3f}m) near<=5:{:.2f}% far>=1021:{:.2f}% max={} ({:.3f}m) | center min={} ({:.3f}m) near:{:.2f}% far:{:.2f}% max={} ({:.3f}m)",
 	             minmax_frame, w, h,
-	             g[0], g[0] * 0.002, pct(g[2], full_n), pct(g[3], full_n), g[1], g[1] * 0.002,
-	             g[4], g[4] * 0.002, pct(g[6], ctr_n), pct(g[7], ctr_n), g[5], g[5] * 0.002);
-	const uint32_t * r = s + 0;
-	const uint32_t * b = s + 16;
-	spdlog::info("depth range cli RB: depth_frame={} R: full min={} max={} near:{:.2f}% far:{:.2f}% | ctr min={} max={} || B: full min={} max={} near:{:.2f}% far:{:.2f}% | ctr min={} max={}",
-	             minmax_frame,
-	             r[0], r[1], pct(r[2], full_n), pct(r[3], full_n), r[4], r[5],
-	             b[0], b[1], pct(b[2], full_n), pct(b[3], full_n), b[4], b[5]);
+	             s[0], s[0] * 0.002, pct(s[2], full_n), pct(s[3], full_n), s[1], s[1] * 0.002,
+	             s[4], s[4] * 0.002, pct(s[6], ctr_n), pct(s[7], ctr_n), s[5], s[5] * 0.002);
 }
 
 namespace
