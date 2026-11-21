@@ -422,7 +422,7 @@ video_encoder_nvenc::~video_encoder_nvenc()
 		shared_state->fn.nvEncDestroyEncoder(session_handle);
 }
 
-bool video_encoder_nvenc::try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo, uint8_t slot, uint64_t frame_index)
+bool video_encoder_nvenc::try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmitInfo compositor_sem, uint8_t slot, uint64_t frame_index)
 {
 	// Poll, never park: a busy slot means the worker is behind, so the
 	// frame skips (the base layer records the skip). Must precede cmd
@@ -472,9 +472,12 @@ bool video_encoder_nvenc::try_present_image(vk::Image y_cbcr, vk::SemaphoreSubmi
 	vk::CommandBufferSubmitInfo cmd_info{
 	        .commandBuffer = *cmd,
 	};
+	compositor_sem.stageMask = vk::PipelineStageFlagBits2::eTransfer;
 
 	vk.device.resetFences(*in[slot].fence);
 	vk.queue.queue.submit2(vk::SubmitInfo2{
+	                               .waitSemaphoreInfoCount = 1,
+	                               .pWaitSemaphoreInfos = &compositor_sem,
 	                               .commandBufferInfoCount = 1,
 	                               .pCommandBufferInfos = &cmd_info,
 	                       },
