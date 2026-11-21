@@ -71,7 +71,7 @@ public:
 	struct depth_image
 	{
 		image_allocation image;
-		// 2D views on layer 3: pack target (Y) + neutral-chroma clear (CbCr).
+		// 2D views on layer 3: pack target (Y) + neutral-chroma store (CbCr).
 		vk::raii::ImageView out_y = nullptr;
 		vk::raii::ImageView out_cbcr = nullptr;
 	};
@@ -141,7 +141,7 @@ private:
 	std::array<vk::DeviceSize, num_frame_slots> depth_range_buf_size = {};
 	std::array<vk::Extent2D, num_frame_slots> depth_range_extent = {};
 	// Same, for the neutral-chroma plane (R16G16 words, half res):
-	// answers whether the 0.5 clear lands (zero chroma reads as a
+	// answers whether the 0.5 store lands (zero chroma reads as a
 	// +335-code lift through green under 709-full).
 	std::array<buffer_allocation, num_frame_slots> depth_range_buf_c;
 	std::array<vk::DeviceSize, num_frame_slots> depth_range_buf_c_size = {};
