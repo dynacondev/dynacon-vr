@@ -136,17 +136,6 @@ private:
 	// Depth staging images (stream 3), one per color slot.
 	std::array<depth_image, num_frame_slots> depth_images;
 
-	// Throttled packed-depth range readback (forensics): per-slot
-	// host-visible copy of the packed Y plane (R16 words, >>6 = the
-	// P010 codes the encoder ingests). Copied in-commit right after
-	// the pack while the image is GENERAL; read on this slot's next
-	// reuse (shared busy lifetime guarantees the copy retired).
-	// Answers whether near-zero codes leave the server.
-	std::array<buffer_allocation, num_frame_slots> depth_range_buf;
-	std::array<vk::DeviceSize, num_frame_slots> depth_range_buf_size = {};
-	std::array<vk::Extent2D, num_frame_slots> depth_range_extent = {};
-	std::array<bool, num_frame_slots> depth_range_pending = {};
-
 	std::array<std::unique_ptr<video_encoder>, 4> encoders;
 
 #ifdef __cpp_lib_atomic_lock_free_type_aliases
@@ -192,8 +181,6 @@ private:
 	};
 
 	xrt_result_t layer_commit(xrt_graphics_sync_handle_t sync_handle);
-
-	void log_depth_range(int slot);
 
 	xrt_result_t get_display_refresh_rate(float * out_display_refresh_rate_hz);
 
