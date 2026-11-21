@@ -2846,36 +2846,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 												virt.ycbcr = dh->ycbcr;
 												virt.valid = true;
 											}
-											{
-												// VR-depth pairing forensics (1s throttle): which
-												// depth frame the verdict samples, its
-												// conversion identity (an immutable-sampler
-												// staleness shows here as a handle/format
-												// change), the strict-pairing expectation,
-												// and the layout gate. Cross-check against
-												// the server depth-pack line (frame_idx pairs
-												// with color; extents pin the resample).
-												static XrTime last_virt_pair_log = 0;
-												XrTime virt_pair_now = instance.now();
-												if (virt_pair_now - last_virt_pair_log > 1'000'000'000LL)
-												{
-													last_virt_pair_log = virt_pair_now;
-													auto & pdh = current_blit_handles[depth_stream_index];
-													if (pdh)
-														spdlog::info("VR depth pair: valid={} view={} frame={} expected={} {}x{} ycbcr(conv={} ext={:#x} fmt={} model={} range={}) verdict_safe={}",
-														             virt.valid, (bool)pdh->image_view, pdh->feedback.frame_index,
-														             (bool)pdh->view_info.depth_expected,
-														             pdh->extent.width, pdh->extent.height,
-														             pdh->ycbcr.has_conversion, pdh->ycbcr.external_format,
-														             vk::to_string(pdh->ycbcr.format),
-														             vk::to_string(pdh->ycbcr.ycbcr_model),
-														             vk::to_string(pdh->ycbcr.ycbcr_range),
-														             (bool)depth_verdict_safe);
-													else
-														spdlog::info("VR depth pair: valid={} (no depth handle) verdict_safe={}",
-														             virt.valid, (bool)depth_verdict_safe);
-												}
-											}
 											if (merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt))
 											{
 												merge_image = merge_idx;
