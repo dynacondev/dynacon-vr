@@ -50,6 +50,14 @@ depth_packer::depth_packer(vk_bundle & vk)
 	                .descriptorCount = 1,
 	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
 	        },
+	        // Shared color foveation tables (per-slot storage buffer,
+	        // read-only here): the spans this pack MIN-gathers over.
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 4,
+	                .descriptorType = vk::DescriptorType::eStorageBuffer,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
 	};
 	set_layout = vk::raii::DescriptorSetLayout{
 	        vk.device,
@@ -96,6 +104,10 @@ depth_packer::depth_packer(vk_bundle & vk)
 	                .type = vk::DescriptorType::eStorageImage,
 	                .descriptorCount = uint32_t(num_slots * 4),
 	        },
+	        vk::DescriptorPoolSize{
+	                .type = vk::DescriptorType::eStorageBuffer,
+	                .descriptorCount = uint32_t(num_slots),
+	        },
 	};
 	pool = vk::raii::DescriptorPool{
 	        vk.device,
@@ -130,7 +142,8 @@ bool depth_packer::pack(vk::raii::Device & device,
                         float far_r,
                         vk::ImageView dst_y,
                         vk::ImageView dst_cbcr,
-                        vk::Extent2D dst_extent)
+                        vk::Extent2D dst_extent,
+                        vk::Buffer foveation_tables)
 {
 	if (slot < 0 or slot >= int(num_slots))
 		return false;
@@ -141,6 +154,8 @@ bool depth_packer::pack(vk::raii::Device & device,
 	if (not(near_l > 0 and far_l > near_l and near_r > 0 and far_r > near_r))
 		return false;
 	if (splat_l == vk::ImageView{} or splat_r == vk::ImageView{} or dst_y == vk::ImageView{} or dst_cbcr == vk::ImageView{})
+		return false;
+	if (foveation_tables == vk::Buffer{})
 		return false;
 
 	vk::DescriptorImageInfo splat_l_info{
@@ -158,6 +173,11 @@ bool depth_packer::pack(vk::raii::Device & device,
 	vk::DescriptorImageInfo dst_cbcr_info{
 	        .imageView = dst_cbcr,
 	        .imageLayout = vk::ImageLayout::eGeneral,
+	};
+	vk::DescriptorBufferInfo tables_info{
+	        .buffer = foveation_tables,
+	        .offset = 0,
+	        .range = vk::WholeSize,
 	};
 	std::array writes{
 	        vk::WriteDescriptorSet{
@@ -188,12 +208,17 @@ bool depth_packer::pack(vk::raii::Device & device,
 	                .descriptorType = vk::DescriptorType::eStorageImage,
 	                .pImageInfo = &dst_cbcr_info,
 	        },
+	        vk::WriteDescriptorSet{
+	                .dstSet = sets[slot],
+	                .dstBinding = 4,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eStorageBuffer,
+	                .pBufferInfo = &tables_info,
+	        },
 	};
 	device.updateDescriptorSets(writes, {});
 
 	push pc{
-	        .src_w = float(src_extent.width),
-	        .src_h = float(src_extent.height),
 	        .near_l = near_l,
 	        .far_l = far_l,
 	        .near_r = near_r,

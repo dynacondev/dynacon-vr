@@ -1025,10 +1025,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        view_info.alpha);
 	}
 
-	// Virtual-depth pack (stream 3): MIN-pool the warp's target-view splat
-	// to half stream resolution per eye, linearise, quantize 2mm/LSB
-	// (valid 0-1020, far pins to 1023) into the SBS staging image
-	// (layer 3). Runs only on warped frames with
+	// Virtual-depth pack (stream 3): foveated MIN-gather over the
+	// warp's target-view splat (shared color tables, same gaze center
+	// and source size) down to per-eye stream res, linearise,
+	// quantize 2mm/LSB (valid 0-1020, far pins to 1023) into the SBS
+	// staging image (layer 3). Runs only on warped frames with
 	// valid near/far; otherwise images[slot].has_depth stays false and the
 	// worker never touches the depth encoder (strict pairing: no stale
 	// virtual depth on the client).
@@ -1071,8 +1072,10 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// dispatch writes neutral 0.5 through the out_cbcr view instead.
 
 		const auto splat_views = reprojector.get_splat_views(slot);
-		// Splat grid == warp grid (render size), not the stream staging
-		// size: the pack MIN-pools from full warp res down to depth res.
+		// Splat grid == warp grid (render size): the pack foveated-gathers
+		// from full warp res down to depth res, using color's per-slot
+		// tables (foveate() ran above this commit — same slot, read-only
+		// here, never re-uploaded).
 		const auto splat_extent = reprojector.target_extent();
 		if (packer.pack(
 		            vk.device,
@@ -1087,7 +1090,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            src_far_z[1],
 		            *depth.out_y,
 		            *depth.out_cbcr,
-		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height}))
+		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height},
+		            foveation.tables_buffer(slot)))
 		{
 			auto & depth_enc = encoders[3];
 			// Mirrors the color encoder handoff: single eColor barrier

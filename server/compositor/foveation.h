@@ -105,5 +105,15 @@ public:
 	        std::array<xrt_rect, 2> src_rect,
 	        std::array<xrt_fov, 2> src_fov,
 	        bool alpha);
+
+	// Shared foveation tables for the depth packer: the same per-slot
+	// storage buffer color foveation uploads. Read-only; valid once
+	// foveate() ran this slot this commit (it owns the upload — the
+	// packer must not re-upload, or a gaze update landing between the
+	// two would skew depth against the already-sent color params).
+	vk::Buffer tables_buffer(int slot)
+	{
+		return vk::Buffer(gpu_buffers[slot]);
+	}
 };
 } // namespace wivrn
