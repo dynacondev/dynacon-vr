@@ -338,6 +338,16 @@ vk::Extent3D render_extent(const wivrn::from_headset::headset_info_packet & info
 	};
 }
 
+// Warp grid: full render size, never the stream staging size. The warp
+// must preserve the app's detail (the foveator downsamples after) —
+// sizing it at stream res silently pins warped display to transport
+// res even when the game renders full res.
+vk::Extent2D warp_extent(const wivrn::from_headset::headset_info_packet & info)
+{
+	const auto re = render_extent(info);
+	return {re.width, re.height};
+}
+
 } // namespace
 
 namespace wivrn
@@ -977,15 +987,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			view_info.pose[view] = xrt_cast(dst_pose[view]);
 			view_info.fov[view] = xrt_cast(dst_fov[view]);
 		}
-		const auto warp_extent = images[0].image.info().extent;
+		const auto warp_rect_extent = reprojector.target_extent();
 		const std::array<xrt_rect, 2> warp_rect{
 		        xrt_rect{
 		                .offset = {.w = 0, .h = 0},
-		                .extent = {.w = int(warp_extent.width), .h = int(warp_extent.height)},
+		                .extent = {.w = int(warp_rect_extent.width), .h = int(warp_rect_extent.height)},
 		        },
 		        xrt_rect{
 		                .offset = {.w = 0, .h = 0},
-		                .extent = {.w = int(warp_extent.width), .h = int(warp_extent.height)},
+		                .extent = {.w = int(warp_rect_extent.width), .h = int(warp_rect_extent.height)},
 		        },
 		};
 		view_info.foveation = foveation.foveate(
@@ -1061,14 +1071,16 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// dispatch writes neutral 0.5 through the out_cbcr view instead.
 
 		const auto splat_views = reprojector.get_splat_views(slot);
-		const auto warp_extent = images[0].image.info().extent;
+		// Splat grid == warp grid (render size), not the stream staging
+		// size: the pack MIN-pools from full warp res down to depth res.
+		const auto splat_extent = reprojector.target_extent();
 		if (packer.pack(
 		            vk.device,
 		            cmd,
 		            slot,
 		            splat_views[0],
 		            splat_views[1],
-		            vk::Extent2D{warp_extent.width, warp_extent.height},
+		            vk::Extent2D{splat_extent.width, splat_extent.height},
 		            src_near_z[0],
 		            src_far_z[0],
 		            src_near_z[1],
@@ -1461,7 +1473,7 @@ compositor::compositor(wivrn_session & session) :
         foveation(vk, images[0].image.info().extent),
         reprojector(
                 vk,
-                vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
+                warp_extent(session.get_info()),
                 cached_reprojection_switches().source_reverse_z),
         packer(vk),
         depth_reprojection_enabled(cached_reprojection_switches().enabled)

@@ -115,6 +115,14 @@ public:
 	// by the depth packer. Slot-owned like everything above.
 	std::array<vk::ImageView, 2> get_splat_views(int slot);
 
+	// Warp grid size (== splat/target allocation extent): the foveation
+	// warp_rect and the depth pack src extent must track this, never
+	// the stream staging size.
+	vk::Extent2D target_extent() const
+	{
+		return extent;
+	}
+
 private:
 	// Depth encoding at construction (config source-reverse-z):
 	// reverse-Z sources are converted in the splat pass. Read once
