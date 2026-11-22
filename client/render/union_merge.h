@@ -160,7 +160,7 @@ public:
 
 	// Global VR-occlusion finish: fused SBS-decode + exact verdict
 	// (common layer vs virtual depth, NEAREST/NEAREST, R8 at W) then
-	// the apply (merged alpha x bilinear verdict) into both eye layers
+	// the apply (merged alpha x Scale2x verdict) into both eye layers
 	// of the acquired submit image. !virt.valid clears the verdict to
 	// 1 and applies (submit merged directly: today's neutral parity).
 	bool record_finish(vk::raii::CommandBuffer & cmd,
@@ -286,7 +286,7 @@ private:
 	// verdict apply has a stable input.
 	layer_target merged_;
 	// Binary verdict (R8, half merge res): fused decode+compare output,
-	// bilinear-upsampled by the apply.
+	// Scale2x-upsampled by the apply.
 	layer_target verdict_;
 	vk::Extent2D layer_extent_{0, 0}; // W, half of extent_ (min 8px)
 
@@ -335,8 +335,10 @@ private:
 	vk::raii::PipelineLayout apply_layout{nullptr};
 	vk::raii::Pipeline apply_pipeline{nullptr};
 	// NEAREST + ClampToEdge (layer tap in the verdict, merged tap in
-	// the apply: both inputs are already filtered) and LINEAR +
-	// ClampToEdge (verdict upscale in the apply is the point).
+	// the apply: both inputs are already filtered). The verdict upscale
+	// lives in the apply shader (binary Scale2x via texelFetch, no
+	// sampler filtering); sampler_linear is retained unused so a future
+	// bilinear fallback needs no plumbing.
 	vk::raii::Sampler sampler_nearest{nullptr};
 	vk::raii::Sampler sampler_linear{nullptr};
 

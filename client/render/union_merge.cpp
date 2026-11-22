@@ -664,7 +664,7 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	// a swapchain rebuild, so a stale YCbCr build can never persist).
 	create_verdict_state(wivrn::decoder::ycbcr_definition{}, vk::Sampler{});
 
-	auto apply_frag = load_shader(*device, "vr_apply_mv.frag");
+	auto apply_frag = load_shader(*device, "vr_apply_scale2x_mv.frag");
 	vk::PipelineShaderStageCreateInfo apply_stages[2] = {
 	        {
 	                .stage = vk::ShaderStageFlagBits::eVertex,
@@ -1149,7 +1149,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	                    verdict_barrier);
 
 	// Apply pass into the acquired submit image: merged (NEAREST) x
-	// bilinear verdict (W -> full). RGB zero; the submit-time REPLACE
+	// Scale2x verdict (W -> full, binary edge-preserving upscale in the
+	// shader via texelFetch). RGB zero; the submit-time REPLACE
 	// preserves dst color.
 	apply_set_parity = !apply_set_parity;
 	vk::DescriptorSet aset = *apply_descriptor_sets[apply_set_parity ? 1 : 0];
@@ -1159,7 +1160,7 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	vk::DescriptorImageInfo apply_verdict_info{
-	        .sampler = *sampler_linear,
+	        .sampler = *sampler_nearest,
 	        .imageView = *verdict_.view_array,
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
