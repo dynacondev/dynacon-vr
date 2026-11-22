@@ -898,10 +898,12 @@ private:
 		bool has_frames = false;
 		uint16_t req_render_w = 0, req_render_h = 0;
 		uint16_t req_stream_w = 0, req_stream_h = 0;
+		// Merge working res (64-quantized displayed size) for the
+		// verdict table layout. Cheap ints: ungated.
+		int32_t merge_w = 0, merge_h = 0;
 		// App-submitted sizes, copied from the color view_info each video
-		// frame (ungated ints; the foveation/extent copies above stay
-		// page-gated). app_layers: 1 = fast path, N = squashed N layers,
-		// 0 = unset (has_app false).
+		// frame (ungated ints). app_layers: 1 = fast path, N = squashed
+		// N layers, 0 = unset (has_app false).
 		bool has_app = false;
 		uint16_t app_w[2]{}, app_h[2]{};
 		uint16_t app_depth_w[2]{}, app_depth_h[2]{};
