@@ -761,13 +761,14 @@ void scenes::stream::gui_diagnostics()
 		ImGui::Text("%s", _cS("diagnostics", "VR depth described"));
 		ImGui::TableNextColumn();
 		if (w > 0)
-			ImGui::TextColored(plain, "%dx%d", w, h);
+			// Per-eye half in both columns: the two eyes share one SBS
+			// canvas (left eye in x[0..depth_width/2) per the wire spec),
+			// so L and R match and the full canvas goes in the note.
+			ImGui::TextColored(plain, "%dx%d", w / 2, h);
 		else
 			ImGui::TextUnformatted("—");
 		ImGui::TableNextColumn();
 		if (w > 0)
-			// Left SBS half per the wire spec (packets.h: left eye in
-			// x[0..depth_width/2), floor matches the left half).
 			ImGui::TextColored(plain, "%dx%d", w / 2, h);
 		else
 			ImGui::TextUnformatted("—");
@@ -775,7 +776,7 @@ void scenes::stream::gui_diagnostics()
 		if (not note.empty())
 			ImGui::TextUnformatted(note.c_str());
 		else if (w > 0)
-			ImGui::TextUnformatted(_cS("diagnostics", "full / per-eye"));
+			ImGui::Text("%s %dx%d", _cS("diagnostics", "SBS full"), w, h);
 	}
 	{
 		auto & hd = current_blit_handles[depth_stream_index];
@@ -797,19 +798,16 @@ void scenes::stream::gui_diagnostics()
 		ImGui::TableNextColumn();
 		ImGui::Text("%s", _cS("diagnostics", "VR depth decoded"));
 		ImGui::TableNextColumn();
-		value(w, h, v);
+		value(w > 0 ? w / 2 : 0, h, v);
 		ImGui::TableNextColumn();
-		if (w > 0)
-			value(w / 2, h, v);
-		else
-			ImGui::TextUnformatted("—");
+		value(w > 0 ? w / 2 : 0, h, v);
 		ImGui::TableNextColumn();
 		if (not note.empty())
 			ImGui::TextUnformatted(note.c_str());
 		else if (v != verdict::neutral)
 			ImGui::TextColored(color_of(v), "%s", note_of(v).c_str());
 		else if (w > 0)
-			ImGui::TextUnformatted(_cS("diagnostics", "full / per-eye"));
+			ImGui::Text("%s %dx%d", _cS("diagnostics", "SBS full"), w, h);
 	}
 	{
 		std::string note;
