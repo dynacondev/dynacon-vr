@@ -262,12 +262,16 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 
 			info.render_eye_width = view.recommendedImageRectWidth * config.resolution_scale;
 			info.render_eye_height = view.recommendedImageRectHeight * config.resolution_scale;
+			self->diag.req_render_w = info.render_eye_width;
+			self->diag.req_render_h = info.render_eye_height;
 		}
 
 		{
 			auto scale = config.get_stream_scale();
 			info.stream_eye_width = info.render_eye_width * scale;
 			info.stream_eye_height = info.render_eye_height * scale;
+			self->diag.req_stream_w = info.stream_eye_width;
+			self->diag.req_stream_h = info.stream_eye_height;
 		}
 
 		if (self->instance.has_extension(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME))
@@ -1502,6 +1506,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				}
 			}
+			// Diagnostics snapshot (render thread): what the GUI tab reads.
+			// video_stream_description is network-thread owned, so copy the
+			// ints under a shared lock; extents/foveation are locals here.
+			{
+				std::shared_lock lock(decoder_mutex);
+				diag.has_desc = (bool)video_stream_description;
+				if (diag.has_desc)
+				{
+					diag.desc_w = video_stream_description->width;
+					diag.desc_h = video_stream_description->height;
+					diag.desc_depth_w = video_stream_description->depth_width;
+					diag.desc_depth_h = video_stream_description->depth_height;
+				}
+			}
+			for (size_t i = 0; i < view_count; ++i)
+			{
+				diag.last_extents[i] = extents[i];
+				diag.last_foveation[i] = foveation[i];
+			}
+			diag.has_frames = true;
 		}
 		bool mask_frame = composition_layer_alpha_blend_supported and view_count == 2;
 		std::vector<mask_group *> acquired_groups;

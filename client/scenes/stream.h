@@ -199,6 +199,7 @@ private:
 		devices,
 		tracking,
 		passthrough,
+		diagnostics,
 		theme,
 		system,
 	};
@@ -880,6 +881,25 @@ private:
 	void gui_kiosk_waiting();
 	void gui_passthrough();
 	void gui_fiducial_status();
+	void gui_diagnostics();
+
+	// Diagnostics resolutions snapshot (render thread only): filled in
+	// render() each frame, read by gui_diagnostics(). Only copied ints
+	// are GUI-visible: video_stream_description lives on the network
+	// thread, and extents/foveation are render() locals. Requested sizes
+	// are written once in create() (read-only after).
+	struct diagnostics_snapshot
+	{
+		bool has_desc = false;
+		uint16_t desc_w = 0, desc_h = 0;
+		uint16_t desc_depth_w = 0, desc_depth_h = 0;
+		XrExtent2Di last_extents[2]{{0, 0}, {0, 0}};
+		wivrn::to_headset::foveation_parameter last_foveation[2]{};
+		bool has_frames = false;
+		uint16_t req_render_w = 0, req_render_h = 0;
+		uint16_t req_stream_w = 0, req_stream_h = 0;
+	};
+	diagnostics_snapshot diag;
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period, std::span<const XrView> live_views = {});
 
 	// Eager USE_SCENE runtime-permission request (Android): manifest presence
