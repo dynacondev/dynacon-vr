@@ -41,6 +41,7 @@
 
 #include <atomic>
 #include <format>
+#include <string>
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 #ifdef XRT_FEATURE_RENDERDOC
@@ -773,35 +774,62 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// App-submitted sizes, on change only: what the game actually
 	// rendered into its swapchains vs what we requested (render_eye).
 	// The client mirrors these in the Diagnostics tab; the log is the
-	// server-side record (no headset needed).
+	// server-side record (no headset needed). Single-threaded commit
+	// path: plain statics are safe here. Integer compare first:
+	// std::format heap-allocates and this runs per commit.
 	{
 		const auto & req = session.get_info();
-		std::string cur;
-		if (triage_fast_path)
+		static bool last_fast = false;
+		static bool last_has_depth = false;
+		static uint16_t last_w[2]{}, last_h[2]{};
+		static uint16_t last_dw[2]{}, last_dh[2]{};
+		static uint8_t last_layers = 0;
+		static uint16_t last_rw = 0, last_rh = 0;
+		bool same = last_fast == triage_fast_path
+		        and last_has_depth == has_depth_src
+		        and last_layers == view_info.app_layers
+		        and last_rw == req.render_eye_width
+		        and last_rh == req.render_eye_height
+		        and last_w[0] == view_info.app_w[0] and last_h[0] == view_info.app_h[0]
+		        and last_w[1] == view_info.app_w[1] and last_h[1] == view_info.app_h[1]
+		        and last_dw[0] == view_info.app_depth_w[0] and last_dh[0] == view_info.app_depth_h[0]
+		        and last_dw[1] == view_info.app_depth_w[1] and last_dh[1] == view_info.app_depth_h[1];
+		if (not same)
 		{
-			if (has_depth_src)
-				cur = std::format("color L {}x{} R {}x{} depth L {}x{} R {}x{}, requested {}x{}",
-				                  view_info.app_w[0], view_info.app_h[0],
-				                  view_info.app_w[1], view_info.app_h[1],
-				                  view_info.app_depth_w[0], view_info.app_depth_h[0],
-				                  view_info.app_depth_w[1], view_info.app_depth_h[1],
-				                  req.render_eye_width, req.render_eye_height);
+			last_fast = triage_fast_path;
+			last_has_depth = has_depth_src;
+			last_layers = view_info.app_layers;
+			last_rw = req.render_eye_width;
+			last_rh = req.render_eye_height;
+			for (int view = 0; view < 2; ++view)
+			{
+				last_w[view] = view_info.app_w[view];
+				last_h[view] = view_info.app_h[view];
+				last_dw[view] = view_info.app_depth_w[view];
+				last_dh[view] = view_info.app_depth_h[view];
+			}
+			std::string cur;
+			if (triage_fast_path)
+			{
+				if (has_depth_src)
+					cur = std::format("color L {}x{} R {}x{} depth L {}x{} R {}x{}, requested {}x{}",
+					                  view_info.app_w[0], view_info.app_h[0],
+					                  view_info.app_w[1], view_info.app_h[1],
+					                  view_info.app_depth_w[0], view_info.app_depth_h[0],
+					                  view_info.app_depth_w[1], view_info.app_depth_h[1],
+					                  req.render_eye_width, req.render_eye_height);
+				else
+					cur = std::format("color L {}x{} R {}x{} no depth submitted, requested {}x{}",
+					                  view_info.app_w[0], view_info.app_h[0],
+					                  view_info.app_w[1], view_info.app_h[1],
+					                  req.render_eye_width, req.render_eye_height);
+			}
 			else
-				cur = std::format("color L {}x{} R {}x{} no depth submitted, requested {}x{}",
-				                  view_info.app_w[0], view_info.app_h[0],
-				                  view_info.app_w[1], view_info.app_h[1],
+			{
+				cur = std::format("squashed {} layers, requested {}x{}",
+				                  unsigned(view_info.app_layers),
 				                  req.render_eye_width, req.render_eye_height);
-		}
-		else
-		{
-			cur = std::format("squashed {} layers, requested {}x{}",
-			                  unsigned(view_info.app_layers),
-			                  req.render_eye_width, req.render_eye_height);
-		}
-		static std::string last;
-		if (cur != last)
-		{
-			last = cur;
+			}
 			U_LOG_I("app submitted %s", cur.c_str());
 		}
 	}

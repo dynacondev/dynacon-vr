@@ -1031,6 +1031,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// No video this frame: drop the diagnostics snapshot so the
 			// tab shows dashes instead of last session's numbers.
 			diag.has_frames = false;
+			diag.has_app = false;
 			if (stream_kiosk_shown)
 				session.enable_passthrough(system);
 			else

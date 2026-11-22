@@ -659,7 +659,7 @@ void scenes::stream::gui_diagnostics()
 		ImGui::Text("%s", _cS("diagnostics", "App submitted color"));
 		std::string squash_note;
 		if (diag.has_app and diag.app_layers != 1)
-			squash_note = fmt::format(fmt::runtime(_cS("diagnostics", "squashed {} layers")), unsigned(diag.app_layers));
+			squash_note = fmt::format(_cF("diagnostics", "squashed {} layers"), unsigned(diag.app_layers));
 		for (int eye = 0; eye < 2; ++eye)
 		{
 			ImGui::TableNextColumn();
@@ -779,7 +779,7 @@ void scenes::stream::gui_diagnostics()
 		if (not diag.has_app)
 			app_depth_note = _cS("diagnostics", "waiting for stream");
 		else if (diag.app_layers != 1)
-			app_depth_note = fmt::format(fmt::runtime(_cS("diagnostics", "squashed {} layers")), unsigned(diag.app_layers));
+			app_depth_note = fmt::format(_cF("diagnostics", "squashed {} layers"), unsigned(diag.app_layers));
 		else if (diag.app_depth_w[0] == 0 and diag.app_depth_w[1] == 0 and
 		         diag.app_depth_h[0] == 0 and diag.app_depth_h[1] == 0)
 			app_depth_note = _cS("diagnostics", "no depth submitted");
