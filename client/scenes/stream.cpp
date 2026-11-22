@@ -1028,6 +1028,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// passthrough behind the overlay mirroring the lobby kiosk.
 			// Per-frame enable matches the normal path below; it resumes
 			// owning passthrough state once video flows.
+			// No video this frame: drop the diagnostics snapshot so the
+			// tab shows dashes instead of last session's numbers.
+			diag.has_frames = false;
 			if (stream_kiosk_shown)
 				session.enable_passthrough(system);
 			else
@@ -1506,26 +1509,29 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				}
 			}
-			// Diagnostics snapshot (render thread): what the GUI tab reads.
-			// video_stream_description is network-thread owned, so copy the
-			// ints under a shared lock; extents/foveation are locals here.
+			// Diagnostics snapshot (render thread): the outer shared_lock
+			// on decoder_mutex (function scope above) is already held —
+			// copy under it, never re-lock (non-recursive shared_mutex:
+			// a setup() writer between two shared acquisitions would
+			// deadlock the render thread).
+			diag.has_desc = (bool)video_stream_description;
+			if (diag.has_desc)
 			{
-				std::shared_lock lock(decoder_mutex);
-				diag.has_desc = (bool)video_stream_description;
-				if (diag.has_desc)
-				{
-					diag.desc_w = video_stream_description->width;
-					diag.desc_h = video_stream_description->height;
-					diag.desc_depth_w = video_stream_description->depth_width;
-					diag.desc_depth_h = video_stream_description->depth_height;
-				}
-			}
-			for (size_t i = 0; i < view_count; ++i)
-			{
-				diag.last_extents[i] = extents[i];
-				diag.last_foveation[i] = foveation[i];
+				diag.desc_w = video_stream_description->width;
+				diag.desc_h = video_stream_description->height;
+				diag.desc_depth_w = video_stream_description->depth_width;
+				diag.desc_depth_h = video_stream_description->depth_height;
 			}
 			diag.has_frames = true;
+			// Foveation params heap-copy: only while the page is open.
+			if (current_settings_page == settings_page::diagnostics)
+			{
+				for (size_t i = 0; i < view_count; ++i)
+				{
+					diag.last_extents[i] = extents[i];
+					diag.last_foveation[i] = foveation[i];
+				}
+			}
 		}
 		bool mask_frame = composition_layer_alpha_blend_supported and view_count == 2;
 		std::vector<mask_group *> acquired_groups;

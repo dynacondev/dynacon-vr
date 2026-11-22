@@ -899,6 +899,8 @@ private:
 		uint16_t req_render_w = 0, req_render_h = 0;
 		uint16_t req_stream_w = 0, req_stream_h = 0;
 	};
+	// Snapshot arrays assume stereo; fail loudly if that ever changes.
+	static_assert(view_count == 2, "diagnostics_snapshot assumes stereo");
 	diagnostics_snapshot diag;
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period, std::span<const XrView> live_views = {});
 

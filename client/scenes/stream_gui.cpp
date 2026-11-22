@@ -559,8 +559,8 @@ static void send_settings_changed_packet(xr::session & session, wivrn_session * 
 
 void scenes::stream::gui_diagnostics()
 {
-	wivrn::ui::page_header(_S("Diagnostics"), _S("Live resolution chain: where each stage shrinks the image."));
-	ImGui::SeparatorText(_S("Resolutions"));
+	wivrn::ui::page_header(_cS("diagnostics", "Diagnostics"), _cS("diagnostics", "Live resolution chain: where each stage shrinks the image."));
+	ImGui::SeparatorText(_cS("diagnostics", "Resolutions"));
 
 	// Traffic lights: green = matches the stage's expected size, yellow
 	// = larger than expected, red = shrunk. Expected sizes account for
@@ -596,9 +596,9 @@ void scenes::stream::gui_diagnostics()
 		switch (v)
 		{
 			case verdict::big:
-				return std::string(_S("larger"));
+				return std::string(_cS("diagnostics", "larger"));
 			case verdict::small:
-				return std::string(_S("shrunk"));
+				return std::string(_cS("diagnostics", "shrunk"));
 			default:
 				return std::string();
 		}
@@ -619,9 +619,9 @@ void scenes::stream::gui_diagnostics()
 
 	if (not ImGui::BeginTable("diagnostics_resolutions", 4))
 		return;
-	ImGui::TableSetupColumn(_S("Stage"));
-	ImGui::TableSetupColumn(_S("Left"));
-	ImGui::TableSetupColumn(_S("Right"));
+	ImGui::TableSetupColumn(_cS("diagnostics", "Stage"));
+	ImGui::TableSetupColumn(_cS("diagnostics", "Left"));
+	ImGui::TableSetupColumn(_cS("diagnostics", "Right"));
 	ImGui::TableSetupColumn("");
 	ImGui::TableHeadersRow();
 
@@ -647,9 +647,9 @@ void scenes::stream::gui_diagnostics()
 			ImGui::TextColored(color_of(v), "%s", note_of(v).c_str());
 	};
 
-	sym_row(_S("Display recommended"), (int32_t)width, (int32_t)height, verdict::neutral);
-	sym_row(_S("Render requested"), diag.req_render_w, diag.req_render_h, verdict::neutral);
-	sym_row(_S("Stream requested"), diag.req_stream_w, diag.req_stream_h, verdict::neutral);
+	sym_row(_cS("diagnostics", "Display recommended"), (int32_t)width, (int32_t)height, verdict::neutral);
+	sym_row(_cS("diagnostics", "Render requested"), diag.req_render_w, diag.req_render_h, verdict::neutral);
+	sym_row(_cS("diagnostics", "Stream requested"), diag.req_stream_w, diag.req_stream_h, verdict::neutral);
 	{
 		// Encoder 64-aligns up: described may exceed requested by the
 		// padding without it meaning anything.
@@ -664,7 +664,7 @@ void scenes::stream::gui_diagnostics()
 			h = diag.desc_h;
 			v = link(w, h, rw, rh, slack_w, slack_h);
 		}
-		sym_row(_S("Encode described"), w, h, v);
+		sym_row(_cS("diagnostics", "Encode described"), w, h, v);
 	}
 	// Per-eye rows: decoded and displayed can legitimately differ per
 	// eye, so Left and Right get independent verdicts.
@@ -675,7 +675,7 @@ void scenes::stream::gui_diagnostics()
 	{
 		ImGui::TableNextRow();
 		ImGui::TableNextColumn();
-		ImGui::Text("%s", _S("Decoded color"));
+		ImGui::Text("%s", _cS("diagnostics", "Decoded color"));
 		for (int eye = 0; eye < 2; ++eye)
 		{
 			ImGui::TableNextColumn();
@@ -685,21 +685,27 @@ void scenes::stream::gui_diagnostics()
 				ImGui::TextUnformatted("—");
 				continue;
 			}
-			XrExtent2Di exp = stream_defoveator::defoveated_size(diag.last_foveation[eye]);
-			verdict v = link(hb->extent.width, hb->extent.height, exp.width, exp.height);
-			value(hb->extent.width, hb->extent.height, v);
+			// Decoded transport must equal what the server advertised
+			// (the description sizes the decoder output). The defoveated
+			// display size is larger by design and checked one row down.
+			verdict v = verdict::neutral;
+			int32_t dw = static_cast<int32_t>(hb->extent.width);
+			int32_t dh = static_cast<int32_t>(hb->extent.height);
+			if (diag.has_desc)
+				v = link(dw, dh, diag.desc_w, diag.desc_h);
+			value(dw, dh, v);
 		}
 		ImGui::TableNextColumn();
 	}
 	{
 		ImGui::TableNextRow();
 		ImGui::TableNextColumn();
-		ImGui::Text("%s", _S("Displayed"));
+		ImGui::Text("%s", _cS("diagnostics", "Displayed"));
 		std::string eye_note;
 		if (diag.has_frames and
 		    (diag.last_extents[0].width != diag.last_extents[1].width or
 		     diag.last_extents[0].height != diag.last_extents[1].height))
-			eye_note = _S("eyes differ — merge sits out");
+			eye_note = _cS("diagnostics", "eyes differ — merge sits out");
 		for (int eye = 0; eye < 2; ++eye)
 		{
 			ImGui::TableNextColumn();
@@ -708,24 +714,13 @@ void scenes::stream::gui_diagnostics()
 				ImGui::TextUnformatted("—");
 				continue;
 			}
-			// Expected = decoded clamped to the swapchain (the clamp at
-			// the end of the extents block); without a decoded frame yet,
-			// fall back to the defoveated size.
-			auto & hb = eye == 0 ? h0 : h1;
-			int32_t bw = 0, bh = 0;
-			if (hb)
-			{
-				bw = hb->extent.width;
-				bh = hb->extent.height;
-			}
-			else
-			{
-				XrExtent2Di exp = stream_defoveator::defoveated_size(diag.last_foveation[eye]);
-				bw = exp.width;
-				bh = exp.height;
-			}
-			int32_t ew = sw > 0 ? std::min(bw, sw) : bw;
-			int32_t eh = sh > 0 ? std::min(bh, sh) : bh;
+			// Expected = defoveated display size clamped to the swapchain
+			// (mirrors the extents block). Self-consistent by
+			// construction: this row only fires on the swapchain-growth
+			// failure clamp; per-eye divergence is the "eyes differ" note.
+			XrExtent2Di fov_exp = stream_defoveator::defoveated_size(diag.last_foveation[eye]);
+			int32_t ew = sw > 0 ? std::min(fov_exp.width, sw) : fov_exp.width;
+			int32_t eh = sh > 0 ? std::min(fov_exp.height, sh) : fov_exp.height;
 			verdict v = link(diag.last_extents[eye].width, diag.last_extents[eye].height, ew, eh);
 			value(diag.last_extents[eye].width, diag.last_extents[eye].height, v);
 		}
@@ -742,11 +737,10 @@ void scenes::stream::gui_diagnostics()
 			h = (int32_t)merge_renderer->swapchain().height();
 		}
 		else
-			note = _S("merge not active");
-		sym_row(_S("Merge alpha"), w, h, verdict::neutral, note);
+			note = _cS("diagnostics", "merge not active");
+		sym_row(_cS("diagnostics", "Merge alpha"), w, h, verdict::neutral, note);
 	}
 	{
-		verdict v = verdict::neutral;
 		int32_t w = 0, h = 0;
 		std::string note;
 		if (diag.has_desc)
@@ -757,44 +751,50 @@ void scenes::stream::gui_diagnostics()
 				h = diag.desc_depth_h;
 			}
 			else
-				note = _S("depth stream disabled");
+				note = _cS("diagnostics", "depth stream disabled");
 		}
+		else
+			note = _cS("diagnostics", "waiting for stream");
 		ImGui::TableNextRow();
 		ImGui::TableNextColumn();
-		ImGui::Text("%s", _S("VR depth described"));
+		ImGui::Text("%s", _cS("diagnostics", "VR depth described"));
 		ImGui::TableNextColumn();
 		if (w > 0)
-			ImGui::TextColored(color_of(v), "%dx%d", w, h);
+			ImGui::TextColored(plain, "%dx%d", w, h);
 		else
 			ImGui::TextUnformatted("—");
 		ImGui::TableNextColumn();
 		if (w > 0)
-			ImGui::TextColored(color_of(v), "%dx%d", w / 2, h);
+			// Left SBS half per the wire spec (packets.h: left eye in
+			// x[0..depth_width/2), floor matches the left half).
+			ImGui::TextColored(plain, "%dx%d", w / 2, h);
 		else
 			ImGui::TextUnformatted("—");
 		ImGui::TableNextColumn();
 		if (not note.empty())
 			ImGui::TextUnformatted(note.c_str());
 		else if (w > 0)
-			ImGui::TextUnformatted(_S("full / per-eye"));
+			ImGui::TextUnformatted(_cS("diagnostics", "full / per-eye"));
 	}
 	{
 		auto & hd = current_blit_handles[depth_stream_index];
 		verdict v = verdict::neutral;
 		int32_t w = 0, h = 0;
 		std::string note;
-		if (hd)
+		if (not diag.has_frames)
+			note = _cS("diagnostics", "waiting for stream");
+		else if (hd)
 		{
-			w = hd->extent.width;
-			h = hd->extent.height;
+			w = static_cast<int32_t>(hd->extent.width);
+			h = static_cast<int32_t>(hd->extent.height);
 			if (diag.has_desc and diag.desc_depth_w > 0)
 				v = link(w, h, diag.desc_depth_w, diag.desc_depth_h);
 		}
 		else
-			note = _S("unpaired");
+			note = _cS("diagnostics", "unpaired");
 		ImGui::TableNextRow();
 		ImGui::TableNextColumn();
-		ImGui::Text("%s", _S("VR depth decoded"));
+		ImGui::Text("%s", _cS("diagnostics", "VR depth decoded"));
 		ImGui::TableNextColumn();
 		value(w, h, v);
 		ImGui::TableNextColumn();
@@ -808,31 +808,31 @@ void scenes::stream::gui_diagnostics()
 		else if (v != verdict::neutral)
 			ImGui::TextColored(color_of(v), "%s", note_of(v).c_str());
 		else if (w > 0)
-			ImGui::TextUnformatted(_S("full / per-eye"));
+			ImGui::TextUnformatted(_cS("diagnostics", "full / per-eye"));
 	}
 	{
 		std::string note;
 		int32_t w = 0, h = 0;
 		if (not env_depth_probed)
-			note = _S("not probed");
+			note = _cS("diagnostics", "not probed");
 		else if (not env_depth_supported or not env_depth)
-			note = _S("unsupported");
+			note = _cS("diagnostics", "unsupported");
 		else
 		{
 			w = (int32_t)env_depth->depth_width();
 			h = (int32_t)env_depth->depth_height();
 		}
-		sym_row(_S("Headset depth sensor"), w, h, verdict::neutral, note);
+		sym_row(_cS("diagnostics", "Headset depth sensor"), w, h, verdict::neutral, note);
 	}
 	ImGui::EndTable();
 
-	ImGui::TextColored(ok, "%s", _S("green: as expected"));
+	ImGui::TextColored(ok, "%s", _cS("diagnostics", "green: as expected"));
 	ImGui::SameLine();
-	ImGui::TextColored(big, "%s", _S("yellow: larger"));
+	ImGui::TextColored(big, "%s", _cS("diagnostics", "yellow: larger"));
 	ImGui::SameLine();
-	ImGui::TextColored(small, "%s", _S("red: shrunk"));
+	ImGui::TextColored(small, "%s", _cS("diagnostics", "red: shrunk"));
 	if (not depth_status.empty())
-		ImGui::Text("%s: %s", _S("Sensor status"), depth_status.c_str());
+		ImGui::Text("%s: %s", _cS("diagnostics", "Sensor status"), depth_status.c_str());
 }
 
 void scenes::stream::gui_settings(float)
