@@ -22,6 +22,7 @@
 #include "vk/shader.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
@@ -92,10 +93,15 @@ static void expand_foveation_axis(const std::vector<uint16_t> & runs, int render
 	}
 	while ((int)r2p.size() < render_n)
 		r2p.push_back(r2p.empty() ? 0 : r2p.back());
+	const uint32_t packed_max = packed_n > 0 ? (uint32_t)packed_n - 1 : 0;
 	for (int u = 0; u < merge_n; ++u)
 	{
 		int64_t r = (int64_t)u * render_n / merge_n;
-		out[u] = r2p[(size_t)std::min<int64_t>(r, render_n - 1)];
+		uint32_t v = r2p[(size_t)std::min<int64_t>(r, render_n - 1)];
+		// Clamp to the packed range: the runs should tile exactly it,
+		// but an overrun here would read the other eye's half (eye 0)
+		// or ClampToEdge texels (eye 1) — silent wrong depth.
+		out[u] = packed_n > 0 ? std::min(v, packed_max) : 0;
 	}
 }
 
@@ -251,7 +257,7 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	layer_extent_ = new_extent;
 	// Foveation index maps (SSBO pair, host-visible): per-eye packed
 	// index per merge pixel, [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s.
-	verdict_tables_bytes = vk::DeviceSize(2 * (new_extent.width + new_extent.height) * sizeof(uint32_t));
+	verdict_tables_bytes = vk::DeviceSize(2 * (new_extent.width + new_extent.height)) * sizeof(uint32_t);
 	for (auto & t: verdict_tables)
 	{
 		t = buffer_allocation(
@@ -637,11 +643,10 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	verdict_renderpass = vk::raii::RenderPass(*device, verdict_renderpass_info);
 
 	// Verdict + apply sampler/descriptor state (static 2-slot CIS
-	// layouts, FRAG-only, same Adreno-safe pattern as the merge):
-	// verdict reads layer NEAREST + SBS virt (decoder sampler);
-	// apply reads merged NEAREST + verdict NEAREST (Scale2x via
-	// texelFetch — the sampler object is required but its filter is
-	// ignored).
+	// layouts for layer/virt, FRAG-only, same Adreno-safe pattern as
+	// the merge): verdict reads layer NEAREST + SBS virt (decoder
+	// sampler); apply reads merged NEAREST + verdict NEAREST (both
+	// plain texture() taps at full res — no upscale, filter matters).
 	vk::SamplerCreateInfo nearest_info{
 	        .magFilter = vk::Filter::eNearest,
 	        .minFilter = vk::Filter::eNearest,
@@ -1126,6 +1131,12 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	if (image_index >= targets.size())
 		return false;
 
+	// Single merge size: the submit image, the owned merged/layer/verdict
+	// targets and the verdict index maps all share it (ensure() rebuilds
+	// them together). The apply below reads extent, the verdict reads
+	// layer_extent_ — divergence would silently misalign the two.
+	assert(extent.width == layer_extent_.width and extent.height == layer_extent_.height);
+
 	// Verdict pass at full merge res: fused foveated-decode + exact
 	// compare when a depth frame paired, else a CLEAR to 1 (submit
 	// merged directly — today's neutral parity, pixel-identical).
@@ -1164,17 +1175,21 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 			const int W = (int)layer_extent_.width, H = (int)layer_extent_.height;
 			const int render_w = virt_in.render_w, render_h = virt_in.render_h;
 			const int packed_w = virt_in.packed_w, packed_h = virt_in.packed_h;
-			std::vector<uint32_t> map((size_t)2 * (W + H));
+			assert(W > 0 and H > 0);
+			verdict_map_scratch.resize((size_t)2 * (W + H));
+			uint32_t * map = verdict_map_scratch.data();
 			for (int eye = 0; eye < 2; ++eye)
 			{
-				expand_foveation_axis(virt_in.foveation[eye].x, render_w, W, packed_w, map.data() + eye * W);
-				expand_foveation_axis(virt_in.foveation[eye].y, render_h, H, packed_h, map.data() + 2 * W + eye * H);
+				assert(virt_in.foveation[eye].x.size() % 2 == 1);
+				assert(virt_in.foveation[eye].y.size() % 2 == 1);
+				expand_foveation_axis(virt_in.foveation[eye].x, render_w, W, packed_w, map + eye * W);
+				expand_foveation_axis(virt_in.foveation[eye].y, render_h, H, packed_h, map + 2 * W + eye * H);
 			}
-			std::memcpy(tables.map(), map.data(), map.size() * sizeof(uint32_t));
+			std::memcpy(tables.map(), map, verdict_map_scratch.size() * sizeof(uint32_t));
 			tables.unmap();
 			// Non-coherent host-visible memory: flush, or the GPU reads
 			// stale tables forever (depth_overlay precedent).
-			vmaFlushAllocation(vk_allocator::instance(), tables, 0, map.size() * sizeof(uint32_t));
+			vmaFlushAllocation(vk_allocator::instance(), tables, 0, verdict_map_scratch.size() * sizeof(uint32_t));
 		}
 		vk::DescriptorSet vset = *verdict_descriptor_sets[verdict_set_parity ? 1 : 0];
 		vk::DescriptorImageInfo layer_info{

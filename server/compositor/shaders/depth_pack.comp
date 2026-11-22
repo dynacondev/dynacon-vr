@@ -137,6 +137,14 @@ void main()
 		ymin = ymax;
 		ymax = tmp;
 	}
+	// Belt-and-braces clamp against the splat: the shared tables always
+	// cover exactly this image (same slot, same commit), but an OOB
+	// imageLoad is silent undefined behavior, never a validation error.
+	ivec2 splat_size = imageSize(splat_l);
+	xmin = min(xmin, uint(splat_size.x));
+	xmax = min(xmax, uint(splat_size.x));
+	ymin = min(ymin, uint(splat_size.y));
+	ymax = min(ymax, uint(splat_size.y));
 
 	uint best = DEPTH_SENTINEL;
 	for (uint y = ymin; y < ymax; ++y)

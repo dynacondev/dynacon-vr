@@ -207,7 +207,7 @@ public:
 	}
 
 	// Borrowed debug-viz views of the owned common-layer and verdict
-	// targets (2-layer arrays, half merge res). Raw handles, same-frame
+	// targets (2-layer arrays, full merge res). Raw handles, same-frame
 	// use only; null when never built. Images end SHADER_READ_ONLY
 	// after the mask-phase barriers, so the viz pass needs only an
 	// execution barrier on the async path (same-queue ordering).
@@ -356,6 +356,9 @@ private:
 	// an in-flight async verdict still reads.
 	buffer_allocation verdict_tables[2];
 	vk::DeviceSize verdict_tables_bytes = 0;
+	// Expanded index-map scratch (capacity persists after the first
+	// verdict frame): avoids a ~2*(W+H) uint32 heap alloc per frame.
+	std::vector<uint32_t> verdict_map_scratch;
 	vk::raii::DescriptorSetLayout apply_descriptor_layout{nullptr};
 	vk::raii::DescriptorPool apply_descriptor_pool{nullptr};
 	std::vector<vk::raii::DescriptorSet> apply_descriptor_sets;

@@ -863,8 +863,8 @@ struct video_stream_description
 	// convention: row 0 = scene top, left eye in x[0..depth_width/2),
 	// 10-bit 2mm/LSB luma valid 0-1020 (0-2.040m); 1021+ decodes as far
 	// (server pins far to 1023).
-	// Overwritten on connect from the encoder settings (half stream
-	// resolution per eye); 0 = not yet advertised. No legacy default:
+	// Overwritten on connect from the encoder settings (full stream
+	// resolution per eye, SBS canvas 2x width); 0 = not yet advertised. No legacy default:
 	// the client sizes its idle decoder from the connect-time describe.
 	uint16_t depth_width = 0;
 	uint16_t depth_height = 0;
@@ -882,7 +882,7 @@ public:
 	// 0 left
 	// 1 right
 	// 2 alpha
-	// 3 virtual depth SBS (half-res left|right, strict frame_idx pairing
+	// 3 virtual depth SBS (full-res left|right, strict frame_idx pairing
 	//   with color; absent when the color frame had no depth warp)
 	uint8_t stream_item_idx;
 	// Counter increased for each frame

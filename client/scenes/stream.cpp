@@ -1544,12 +1544,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				break;
 			}
 			// Foveation params heap-copy: needed every frame now (the
-			// verdict expands them into the packed-index SSBO), plus
-			// merge dims for the table layout. Cheap ints/vectors;
-			// the table expansion itself happens in record_finish.
-			// (mirrors mw/mh below: 64-quantized extents[0]).
-			diag.merge_w = std::max(64, (extents[0].width + 32) / 64 * 64);
-			diag.merge_h = std::max(64, (extents[0].height + 32) / 64 * 64);
+			// verdict expands them into the packed-index SSBO in
+			// record_finish). Cheap vector copies.
 			for (size_t i = 0; i < view_count; ++i)
 			{
 				diag.last_extents[i] = extents[i];
@@ -1986,8 +1982,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// the alpha).
 				layer_draws.clear();
 				{
-					float lm_x = 1.f / (float)mw;
-					float lm_y = 1.f / (float)mh;
+					float lm_x = 2.f / (float)mw;
+					float lm_y = 2.f / (float)mh;
 					auto layer_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & mvp) {
 						auto bounds = merge_renderer->layer_mesh_bounds(mesh);
 						if (not bounds)

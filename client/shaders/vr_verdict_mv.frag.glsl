@@ -34,13 +34,15 @@ layout(location = 0) out vec4 out_color;
 // exact fragment centers, no halo.
 //
 // virt_tex: decoded stream-3 SBS frame (single image, both eyes side
-// by side), sampled with the decoder's own YCbCr sampler. Green
-// channel: smallest chroma-crosstalk gain under the 709 conversion,
-// so lossy chroma wobble perturbs depth least through green (same
-// convention as the old volume_virt decode). Sampled at exact packed
-// texel centers (NEAREST-equivalent: a center tap returns that texel
-// under either filter), so the foveated packing is read exactly —
-// never interpolated. Interpolating depths would blend
+// by side), sampled with the decoder's own YCbCr sampler at exact
+// packed texel centers. Green channel: smallest chroma-crosstalk gain
+// under the 709 conversion, so lossy chroma wobble perturbs depth
+// least through green (same convention as the old volume_virt decode).
+// A center tap returns that texel — but note the depth payload writes
+// constant neutral chroma, so no chroma filtering can perturb this
+// path today; a future chroma-modulating payload would need to
+// re-check the LINEAR case. Either way the foveated packing is read
+// exactly, never interpolated. Interpolating depths would blend
 // foreground/background into false mid-depths (halo); the broadcast
 // used here (many uniform pixels sharing one packed texel) is exact
 // by construction.

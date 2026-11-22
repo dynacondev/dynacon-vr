@@ -26,6 +26,8 @@
 #include <mutex>
 #include <vulkan/vulkan_raii.hpp>
 
+#include <cassert>
+
 struct render_resources;
 
 namespace wivrn
@@ -113,7 +115,8 @@ public:
 	// two would skew depth against the already-sent color params).
 	vk::Buffer tables_buffer(int slot)
 	{
-		return vk::Buffer(gpu_buffers[slot]);
+		assert(slot >= 0 and slot < int(num_slots));
+		return vk::Buffer(gpu_buffers[slot]); // implicit operator T(), unambiguous
 	}
 };
 } // namespace wivrn
