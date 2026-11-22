@@ -651,6 +651,33 @@ void scenes::stream::gui_diagnostics()
 	sym_row(_cS("diagnostics", "Render requested"), diag.req_render_w, diag.req_render_h, verdict::neutral);
 	sym_row(_cS("diagnostics", "Stream requested"), diag.req_stream_w, diag.req_stream_h, verdict::neutral);
 	{
+		// What the game actually rendered: traffic-lit vs render
+		// requested (the size the app was asked for). Squashed frames
+		// carry the squash canvas instead: neutral + layer count note.
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		ImGui::Text("%s", _cS("diagnostics", "App submitted color"));
+		std::string squash_note;
+		if (diag.has_app and diag.app_layers != 1)
+			squash_note = fmt::format(fmt::runtime(_cS("diagnostics", "squashed {} layers")), unsigned(diag.app_layers));
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			ImGui::TableNextColumn();
+			if (not diag.has_app)
+			{
+				ImGui::TextUnformatted("—");
+				continue;
+			}
+			verdict v = verdict::neutral;
+			if (diag.app_layers == 1)
+				v = link(diag.app_w[eye], diag.app_h[eye], diag.req_render_w, diag.req_render_h);
+			value(diag.app_w[eye], diag.app_h[eye], v);
+		}
+		ImGui::TableNextColumn();
+		if (not squash_note.empty())
+			ImGui::TextUnformatted(squash_note.c_str());
+	}
+	{
 		// Encoder 64-aligns up: described may exceed requested by the
 		// padding without it meaning anything.
 		int32_t rw = diag.req_stream_w, rh = diag.req_stream_h;
@@ -740,6 +767,33 @@ void scenes::stream::gui_diagnostics()
 		else
 			note = _cS("diagnostics", "merge not active");
 		sym_row(_cS("diagnostics", "Merge alpha"), w, h, verdict::neutral, note);
+	}
+	{
+		// Depth the game submitted (neutral: the app picks its own depth
+		// size, nothing to compare against). All-zero on the fast path =
+		// plain PROJECTION, no depth layer at all.
+		ImGui::TableNextRow();
+		ImGui::TableNextColumn();
+		ImGui::Text("%s", _cS("diagnostics", "App submitted depth"));
+		std::string app_depth_note;
+		if (not diag.has_app)
+			app_depth_note = _cS("diagnostics", "waiting for stream");
+		else if (diag.app_layers != 1)
+			app_depth_note = fmt::format(fmt::runtime(_cS("diagnostics", "squashed {} layers")), unsigned(diag.app_layers));
+		else if (diag.app_depth_w[0] == 0 and diag.app_depth_w[1] == 0 and
+		         diag.app_depth_h[0] == 0 and diag.app_depth_h[1] == 0)
+			app_depth_note = _cS("diagnostics", "no depth submitted");
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			ImGui::TableNextColumn();
+			if (not diag.has_app or diag.app_layers != 1)
+				ImGui::TextUnformatted("—");
+			else
+				value(diag.app_depth_w[eye], diag.app_depth_h[eye], verdict::neutral);
+		}
+		ImGui::TableNextColumn();
+		if (not app_depth_note.empty())
+			ImGui::TextUnformatted(app_depth_note.c_str());
 	}
 	{
 		int32_t w = 0, h = 0;

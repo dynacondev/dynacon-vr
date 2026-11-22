@@ -1523,6 +1523,25 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				diag.desc_depth_h = video_stream_description->depth_height;
 			}
 			diag.has_frames = true;
+			// App-submitted sizes ride the color view_info (streams 0/1
+			// agree; first present handle wins). Cheap ints: ungated.
+			diag.has_app = false;
+			for (int i = 0; i < 2; ++i)
+			{
+				auto & hb = current_blit_handles[i];
+				if (not hb or hb->view_info.app_layers == 0)
+					continue;
+				diag.has_app = true;
+				diag.app_layers = hb->view_info.app_layers;
+				for (int eye = 0; eye < 2; ++eye)
+				{
+					diag.app_w[eye] = hb->view_info.app_w[eye];
+					diag.app_h[eye] = hb->view_info.app_h[eye];
+					diag.app_depth_w[eye] = hb->view_info.app_depth_w[eye];
+					diag.app_depth_h[eye] = hb->view_info.app_depth_h[eye];
+				}
+				break;
+			}
 			// Foveation params heap-copy: only while the page is open.
 			if (current_settings_page == settings_page::diagnostics)
 			{
