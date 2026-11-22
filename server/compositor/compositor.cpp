@@ -776,33 +776,33 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	// server-side record (no headset needed).
 	{
 		const auto & req = session.get_info();
-		char buf[256];
+		std::string cur;
 		if (triage_fast_path)
 		{
 			if (has_depth_src)
-				snprintf(buf, sizeof(buf), "color L %dx%d R %dx%d depth L %dx%d R %dx%d, requested %dx%d",
-				         view_info.app_w[0], view_info.app_h[0],
-				         view_info.app_w[1], view_info.app_h[1],
-				         view_info.app_depth_w[0], view_info.app_depth_h[0],
-				         view_info.app_depth_w[1], view_info.app_depth_h[1],
-				         req.render_eye_width, req.render_eye_height);
+				cur = std::format("color L {}x{} R {}x{} depth L {}x{} R {}x{}, requested {}x{}",
+				                  view_info.app_w[0], view_info.app_h[0],
+				                  view_info.app_w[1], view_info.app_h[1],
+				                  view_info.app_depth_w[0], view_info.app_depth_h[0],
+				                  view_info.app_depth_w[1], view_info.app_depth_h[1],
+				                  req.render_eye_width, req.render_eye_height);
 			else
-				snprintf(buf, sizeof(buf), "color L %dx%d R %dx%d no depth submitted, requested %dx%d",
-				         view_info.app_w[0], view_info.app_h[0],
-				         view_info.app_w[1], view_info.app_h[1],
-				         req.render_eye_width, req.render_eye_height);
+				cur = std::format("color L {}x{} R {}x{} no depth submitted, requested {}x{}",
+				                  view_info.app_w[0], view_info.app_h[0],
+				                  view_info.app_w[1], view_info.app_h[1],
+				                  req.render_eye_width, req.render_eye_height);
 		}
 		else
 		{
-			snprintf(buf, sizeof(buf), "squashed %u layers, requested %dx%d",
-			         view_info.app_layers,
-			         req.render_eye_width, req.render_eye_height);
+			cur = std::format("squashed {} layers, requested {}x{}",
+			                  unsigned(view_info.app_layers),
+			                  req.render_eye_width, req.render_eye_height);
 		}
 		static std::string last;
-		if (last != buf)
+		if (cur != last)
 		{
-			last = buf;
-			U_LOG_I("app submitted %s", buf);
+			last = cur;
+			U_LOG_I("app submitted %s", cur.c_str());
 		}
 	}
 
