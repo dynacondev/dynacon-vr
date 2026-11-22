@@ -716,8 +716,9 @@ void scenes::stream::gui_diagnostics()
 			}
 			// Expected = defoveated display size clamped to the swapchain
 			// (mirrors the extents block). Self-consistent by
-			// construction: this row only fires on the swapchain-growth
-			// failure clamp; per-eye divergence is the "eyes differ" note.
+			// construction — a tautology guarding only against future
+			// code drift; the live signal on this row is the "eyes
+			// differ" note (eye mismatch sits the merge out).
 			XrExtent2Di fov_exp = stream_defoveator::defoveated_size(diag.last_foveation[eye]);
 			int32_t ew = sw > 0 ? std::min(fov_exp.width, sw) : fov_exp.width;
 			int32_t eh = sh > 0 ? std::min(fov_exp.height, sh) : fov_exp.height;
