@@ -685,6 +685,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			view_info.pose[view] = xrt_cast(data.pose);
 			view_info.fov[view] = xrt_cast(data.fov);
 			src_pose[view] = data.pose;
+			view_info.app_w[view] = static_cast<uint16_t>(data.sub.rect.extent.w);
+			view_info.app_h[view] = static_cast<uint16_t>(data.sub.rect.extent.h);
 			const auto & cnr = data.sub.norm_rect;
 			src_color_nrect[view] = {cnr.x, cnr.y, cnr.w, cnr.h};
 			if (has_depth_src)
@@ -698,8 +700,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				src_depth_nrect[view] = {dnr.x, dnr.y, dnr.w, dnr.h};
 				src_near_z[view] = dvd.near_z;
 				src_far_z[view] = dvd.far_z;
+				view_info.app_depth_w[view] = static_cast<uint16_t>(dvd.sub.rect.extent.w);
+				view_info.app_depth_h[view] = static_cast<uint16_t>(dvd.sub.rect.extent.h);
 			}
 		}
+		view_info.app_layers = 1;
 	}
 	else
 	{
@@ -738,7 +743,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			view_info.pose[view] = xrt_cast(poses[view]);
 			view_info.fov[view] = xrt_cast(src_fov[view]);
+			// Squashed canvas sizes, not one app frame: the GUI marks
+			// these with the layer count instead of traffic lights.
+			view_info.app_w[view] = static_cast<uint16_t>(src_rect[view].extent.w);
+			view_info.app_h[view] = static_cast<uint16_t>(src_rect[view].extent.h);
 		}
+		view_info.app_layers = static_cast<uint8_t>(layer_accum.layer_count);
 
 		image_barriers.push_back(
 		        vk::ImageMemoryBarrier2{
@@ -759,6 +769,42 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	// NOTE: the warp block lives below (after q1) so the timestamp
 	// queries bracket squash / warp / foveation in GPU order.
+
+	// App-submitted sizes, on change only: what the game actually
+	// rendered into its swapchains vs what we requested (render_eye).
+	// The client mirrors these in the Diagnostics tab; the log is the
+	// server-side record (no headset needed).
+	{
+		const auto & req = session.get_info();
+		char buf[256];
+		if (triage_fast_path)
+		{
+			if (has_depth_src)
+				snprintf(buf, sizeof(buf), "color L %dx%d R %dx%d depth L %dx%d R %dx%d, requested %dx%d",
+				         view_info.app_w[0], view_info.app_h[0],
+				         view_info.app_w[1], view_info.app_h[1],
+				         view_info.app_depth_w[0], view_info.app_depth_h[0],
+				         view_info.app_depth_w[1], view_info.app_depth_h[1],
+				         req.render_eye_width, req.render_eye_height);
+			else
+				snprintf(buf, sizeof(buf), "color L %dx%d R %dx%d no depth submitted, requested %dx%d",
+				         view_info.app_w[0], view_info.app_h[0],
+				         view_info.app_w[1], view_info.app_h[1],
+				         req.render_eye_width, req.render_eye_height);
+		}
+		else
+		{
+			snprintf(buf, sizeof(buf), "squashed %u layers, requested %dx%d",
+			         view_info.app_layers,
+			         req.render_eye_width, req.render_eye_height);
+		}
+		static std::string last;
+		if (last != buf)
+		{
+			last = buf;
+			U_LOG_I("app submitted %s", buf);
+		}
+	}
 
 	image_barriers.push_back(
 	        vk::ImageMemoryBarrier2{

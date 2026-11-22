@@ -903,6 +903,19 @@ public:
 		// tell "no depth by design" from "depth expected but missing"
 		// (wire loss or pairing miss).
 		bool depth_expected = false;
+		// App-submitted sizes, per eye, as the game rendered them into
+		// its swapchains (sub.rect extents): the ground truth of what
+		// the server received, independent of requested/render sizes.
+		std::array<uint16_t, 2> app_w{};
+		std::array<uint16_t, 2> app_h{};
+		// Depth submitted rects per eye; all-zero when the app submitted
+		// no depth layer (plain PROJECTION).
+		std::array<uint16_t, 2> app_depth_w{};
+		std::array<uint16_t, 2> app_depth_h{};
+		// Submitted layer count: 1 = single-layer fast path, N =
+		// squashed N layers (sizes then describe the squashed canvas,
+		// not one app frame). 0 = unset (never sent: old server).
+		uint8_t app_layers = 0;
 	};
 	std::optional<view_info_t> view_info;
 
