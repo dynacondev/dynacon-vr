@@ -1180,6 +1180,9 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 			uint32_t * map = verdict_map_scratch.data();
 			for (int eye = 0; eye < 2; ++eye)
 			{
+				// Server invariant: compute_params always emits odd,
+				// non-empty runs (fill_param_2d ends count*2-1; the
+				// non-foveated fallback emits one element).
 				assert(virt_in.foveation[eye].x.size() % 2 == 1);
 				assert(virt_in.foveation[eye].y.size() % 2 == 1);
 				expand_foveation_axis(virt_in.foveation[eye].x, render_w, W, packed_w, map + eye * W);
