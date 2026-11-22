@@ -1080,7 +1080,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            slot,
 		            splat_views[0],
 		            splat_views[1],
-		            vk::Extent2D{splat_extent.width, splat_extent.height},
+		            splat_extent,
 		            src_near_z[0],
 		            src_far_z[0],
 		            src_near_z[1],
