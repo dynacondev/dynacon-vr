@@ -37,20 +37,22 @@ layout(location = 0) out vec4 out_color;
 //   E00 E01      D==B && B!=F && D!=H ? D : E      B==F && ... ? F : E
 //   E10 E11  =   D==H && ... ? D : E               H==F && ... ? F : E
 //
-// with the standard guard (B==H && D==F -> all E) suppressing
-// ambiguous-diagonal artifacts. Only the B/D/E/F/H subset is needed;
-// A/C/G/I belong to Scale3x/Eagle variants.
+// The outer both-equal early-out below is redundant but harmless: each
+// per-pixel 3-way check subsumes the canonical B!=H && D!=F gate, so
+// ambiguous diagonals resolve to E either way. Only the B/D/E/F/H
+// subset is needed; A/C/G/I belong to Scale3x/Eagle variants.
 //
-// Mapping: fullscreen triangle (blur.vert) + full-res viewport, so the
-// fragment covering dst texel (i,j) has gl_FragCoord.xy == (i+0.5,
-// j+0.5) and ivec2(gl_FragCoord.xy) == (i,j). With W_full == 2*W_half
-// the covering verdict texel is exactly dst/2 (integer division) and
-// the sub-pixel is dst - src*2. texelFetch is derivative-free, so the
-// per-sub-pixel branch divergence is safe (texture() with implicit
-// derivatives would be UB there). Coordinates are clamped per tap
-// (texelFetch does not clamp); the odd-extent edge (W_full == 2k+1,
-// half == k by floor) duplicates the edge texel for dst column 2k —
-// harmless, video extents are even in practice.
+// Mapping (single domain): dst is derived from the same normalized uv
+// as the merged tap (uv * merged size), so no gl_FragCoord/viewport
+// origin coupling — the verdict tap cannot silently misalign under a
+// future viewport offset. With W_full == 2*W_half the covering verdict
+// texel is exactly dst/2 (integer division) and the sub-pixel is
+// dst - src*2. texelFetch is derivative-free, so the per-sub-pixel
+// branch divergence is safe (texture() with implicit derivatives would
+// be UB there). Coordinates are clamped per tap (texelFetch does not
+// clamp); the odd-extent edge (W_full == 2k+1, half == k by floor)
+// duplicates the edge texel for dst column 2k — harmless, video extents
+// are even in practice.
 //
 // Fail-open: the no-virt fallback CLEARs the verdict to 1, so all 5
 // taps read 1 and every branch returns E == 1 (submit merged directly,
@@ -59,23 +61,25 @@ layout(location = 0) out vec4 out_color;
 // RGB stays zero (downstream the REPLACE blend preserves dst color and
 // the veil bias touches alpha only). No push constants (sizes from
 // textureSize), no YCbCr here (verdict tap is plain R8), plain scalar
-// math only (no mat3/ternary on this driver path).
+// math only (no mat3, no matrix ternary; scalar ternaries only).
 layout(set = 0, binding = 0) uniform sampler2DArray merged_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray verdict_tex;
 
 void main()
 {
-	vec3 buv = vec3(uv, float(gl_ViewIndex));
+	int layer = int(gl_ViewIndex);
+	vec3 buv = vec3(uv, float(layer));
 	float a = texture(merged_tex, buv).a;
 
-	int layer = int(gl_ViewIndex);
-	ivec2 dst_texel = ivec2(gl_FragCoord.xy);
+	ivec2 msize = textureSize(merged_tex, 0).xy;
+	ivec2 dst_texel = ivec2(uv * vec2(msize));
+	dst_texel = clamp(dst_texel, ivec2(0, 0), msize - ivec2(1, 1));
 	ivec2 src_texel = dst_texel / 2;
-	ivec2 sub = dst_texel - src_texel * 2;
+	ivec2 sub = dst_texel - (src_texel * 2);
 
 	ivec2 vsize = textureSize(verdict_tex, 0).xy;
-	ivec2 lo = ivec2(0);
-	ivec2 hi = vsize - ivec2(1);
+	ivec2 lo = ivec2(0, 0);
+	ivec2 hi = vsize - ivec2(1, 1);
 
 	float e = texelFetch(verdict_tex, ivec3(clamp(src_texel, lo, hi), layer), 0).r;
 	float b = texelFetch(verdict_tex, ivec3(clamp(src_texel + ivec2(0, -1), lo, hi), layer), 0).r;
@@ -85,23 +89,23 @@ void main()
 
 	// Binarize past the R8 quant (verdict writes exact 0/1, but never
 	// trust == on a sampled value).
-	bool be = b > 0.5;
-	bool de = d > 0.5;
-	bool ee = e > 0.5;
-	bool fe = f > 0.5;
-	bool he = h > 0.5;
+	bool b1 = b > 0.5;
+	bool d1 = d > 0.5;
+	bool e1 = e > 0.5;
+	bool f1 = f > 0.5;
+	bool h1 = h > 0.5;
 
-	float v = ee ? 1.0 : 0.0;
-	if (!(be == he && de == fe))
+	float v = e1 ? 1.0 : 0.0;
+	if (!(b1 == h1 && d1 == f1))
 	{
 		if (sub.x == 0 && sub.y == 0)
-			v = (de == be && be != fe && de != he) ? (de ? 1.0 : 0.0) : (ee ? 1.0 : 0.0);
+			v = (d1 == b1 && b1 != f1 && d1 != h1) ? (d1 ? 1.0 : 0.0) : (e1 ? 1.0 : 0.0);
 		else if (sub.x == 1 && sub.y == 0)
-			v = (be == fe && be != de && fe != he) ? (fe ? 1.0 : 0.0) : (ee ? 1.0 : 0.0);
+			v = (b1 == f1 && b1 != d1 && f1 != h1) ? (f1 ? 1.0 : 0.0) : (e1 ? 1.0 : 0.0);
 		else if (sub.x == 0 && sub.y == 1)
-			v = (de == he && de != be && he != fe) ? (de ? 1.0 : 0.0) : (ee ? 1.0 : 0.0);
-		else
-			v = (he == fe && he != be && fe != de) ? (fe ? 1.0 : 0.0) : (ee ? 1.0 : 0.0);
+			v = (d1 == h1 && d1 != b1 && h1 != f1) ? (d1 ? 1.0 : 0.0) : (e1 ? 1.0 : 0.0);
+		else // sub == (1, 1)
+			v = (h1 == f1 && h1 != b1 && f1 != d1) ? (f1 ? 1.0 : 0.0) : (e1 ? 1.0 : 0.0);
 	}
 
 	out_color = vec4(0.0, 0.0, 0.0, a * v);

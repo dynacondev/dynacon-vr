@@ -576,7 +576,9 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	// Verdict + apply sampler/descriptor state (static 2-slot CIS
 	// layouts, FRAG-only, same Adreno-safe pattern as the merge):
 	// verdict reads layer NEAREST + SBS virt (decoder sampler);
-	// apply reads merged NEAREST + verdict LINEAR.
+	// apply reads merged NEAREST + verdict NEAREST (Scale2x via
+	// texelFetch — the sampler object is required but its filter is
+	// ignored).
 	vk::SamplerCreateInfo nearest_info{
 	        .magFilter = vk::Filter::eNearest,
 	        .minFilter = vk::Filter::eNearest,
@@ -591,20 +593,6 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	        .maxLod = 0,
 	};
 	sampler_nearest = vk::raii::Sampler(*device, nearest_info);
-	vk::SamplerCreateInfo linear_info{
-	        .magFilter = vk::Filter::eLinear,
-	        .minFilter = vk::Filter::eLinear,
-	        .mipmapMode = vk::SamplerMipmapMode::eLinear,
-	        .addressModeU = vk::SamplerAddressMode::eClampToEdge,
-	        .addressModeV = vk::SamplerAddressMode::eClampToEdge,
-	        .addressModeW = vk::SamplerAddressMode::eClampToEdge,
-	        .mipLodBias = 0,
-	        .maxAnisotropy = 1,
-	        .compareEnable = VK_FALSE,
-	        .minLod = 0,
-	        .maxLod = 0,
-	};
-	sampler_linear = vk::raii::Sampler(*device, linear_info);
 	auto make_dual_cis = [&](vk::raii::DescriptorSetLayout & layout, vk::raii::DescriptorPool & pool,
 	                         std::vector<vk::raii::DescriptorSet> & sets) {
 		vk::DescriptorSetLayoutBinding bindings[2];

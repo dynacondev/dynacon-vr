@@ -336,11 +336,9 @@ private:
 	vk::raii::Pipeline apply_pipeline{nullptr};
 	// NEAREST + ClampToEdge (layer tap in the verdict, merged tap in
 	// the apply: both inputs are already filtered). The verdict upscale
-	// lives in the apply shader (binary Scale2x via texelFetch, no
-	// sampler filtering); sampler_linear is retained unused so a future
-	// bilinear fallback needs no plumbing.
+	// lives in the apply shader (binary Scale2x via texelFetch, so no
+	// LINEAR sampler exists).
 	vk::raii::Sampler sampler_nearest{nullptr};
-	vk::raii::Sampler sampler_linear{nullptr};
 
 	// One uploaded window mesh per object id. Staging is per mesh and
 	// shared-read (uploads are rare, map-change only); the pending
