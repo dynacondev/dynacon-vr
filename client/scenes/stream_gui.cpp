@@ -830,7 +830,7 @@ void scenes::stream::gui_diagnostics()
 		if (not note.empty())
 			ImGui::TextUnformatted(note.c_str());
 		else if (w > 0)
-			ImGui::Text("%s %dx%d", _cS("diagnostics", "SBS full"), w, h);
+			ImGui::Text("%s %dx%d", _cS("diagnostics", "foveated SBS full"), w, h);
 	}
 	{
 		auto & hd = current_blit_handles[depth_stream_index];
@@ -861,7 +861,7 @@ void scenes::stream::gui_diagnostics()
 		else if (v != verdict::neutral)
 			ImGui::TextColored(color_of(v), "%s", note_of(v).c_str());
 		else if (w > 0)
-			ImGui::Text("%s %dx%d", _cS("diagnostics", "SBS full"), w, h);
+			ImGui::Text("%s %dx%d", _cS("diagnostics", "foveated SBS full"), w, h);
 	}
 	{
 		std::string note;

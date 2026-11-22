@@ -23,20 +23,33 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Fused virtual-depth decode + exact global verdict at W (half merge
-// res). One fullscreen pass, no intermediate D canvas: the SBS layout
-// is trivial (left eye x[0..0.5), select half by gl_ViewIndex).
+// Foveated virtual-depth decode + exact global verdict at FULL merge
+// res. One fullscreen pass, no intermediate depth canvas: the verdict
+// compares the uniform raster layer against the foveated SBS depth
+// through the shared foveation tables (same tables as color: same
+// gaze center and source size on every depth-carrying warped frame).
 //
 // layer_tex: R16F common layer (linear meters, MIN of the positive
-// window draws, FAR clear 65504 reads as absent). NEAREST: the binary
-// verdict (never the depths) Scale2x-upsamples in the apply pass, so
-// no depth halo.
+// window draws, FAR clear 65504 reads as absent). NEAREST: sampled at
+// exact fragment centers, no halo.
 //
 // virt_tex: decoded stream-3 SBS frame (single image, both eyes side
 // by side), sampled with the decoder's own YCbCr sampler. Green
 // channel: smallest chroma-crosstalk gain under the 709 conversion,
 // so lossy chroma wobble perturbs depth least through green (same
-// convention as the old volume_virt decode).
+// convention as the old volume_virt decode). Sampled at exact packed
+// texel centers (NEAREST-equivalent: a center tap returns that texel
+// under either filter), so the foveated packing is read exactly —
+// never interpolated. Interpolating depths would blend
+// foreground/background into false mid-depths (halo); the broadcast
+// used here (many uniform pixels sharing one packed texel) is exact
+// by construction.
+//
+// Tables: CPU-expanded per frame from the shared compact runs into a
+// direct packed-index map per merge pixel, merge->render scale baked
+// in. Layout: [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s, W/H = merge
+// extent. SSBO (not UBO): the expanded map exceeds the guaranteed
+// maxUniformBufferRange.
 //
 // SBS encoding: 10-bit 2mm/LSB luma, valid codes 0-1020 (0-2.040m);
 // holes, sky and beyond-range pin to 1023 (far); 1021-1023 is a guard
@@ -47,8 +60,10 @@ layout(location = 0) out vec4 out_color;
 //
 // verdict: absent (FAR clear) keeps merged; far-vs-far is a VR win
 // (reveal 0); virt-far alone keeps the window (reveal 1); otherwise
-// reveal = !(virt strictly nearer). Exact, no bias anywhere — crisp
-// occlusion edges are intentional. Tie keeps the window.
+// reveal = !(virt strictly nearer). Exact, no bias anywhere — the
+// boundary follows the sharper input per pixel (partial smoothness:
+// the full-res raster varies inside one packed texel). Tie keeps the
+// window.
 // Geometry-free pixels (reversed-only cuts, hidden, debug cutouts
 // never write the layer) read FAR and keep whatever
 // the merged union says. Global: applies to every group at once,
@@ -62,17 +77,40 @@ layout(location = 0) out vec4 out_color;
 // merged submit, fail-open), so this pass only ever samples
 // steady-state GENERAL — including on the async mask path.
 //
-// Plain scalar math only (no mat3/ternary on this driver path).
+// Plain scalar math only (no mat3/ternary on this driver path). The
+// table fetch is derivative-free (integer indexing, no sampling), so
+// no derivative concerns anywhere in this shader.
 layout(set = 0, binding = 0) uniform sampler2DArray layer_tex;
 layout(set = 0, binding = 1) uniform sampler2D virt_tex;
+layout(set = 0, binding = 2) readonly buffer Fovea
+{
+	uint t[];
+};
 
 void main()
 {
 	float vi = float(gl_ViewIndex);
+	int eye = int(gl_ViewIndex);
 	vec3 buv = vec3(uv, vi);
 	float l = texture(layer_tex, buv).r;
 
-	vec2 vuv = vec2(uv.x * 0.5 + vi * 0.5, uv.y);
+	// Merge pixel -> packed texel through the CPU-expanded tables
+	// (single domain: same normalized uv as the layer tap, so the
+	// verdict cannot misalign under a future viewport offset).
+	ivec2 msize = textureSize(layer_tex, 0).xy;
+	ivec2 dst_texel = ivec2(uv * vec2(msize));
+	dst_texel = clamp(dst_texel, ivec2(0, 0), msize - ivec2(1, 1));
+	int W = msize.x;
+	int H = msize.y;
+	uint px = t[eye * W + dst_texel.x];
+	uint py = t[2 * W + eye * H + dst_texel.y];
+
+	// Texel-center UV into the SBS frame (row 0 = scene top on the
+	// wire, matching the tables' top-down packed rows).
+	ivec2 vsize = textureSize(virt_tex, 0).xy;
+	int half_w = vsize.x / 2;
+	vec2 vuv = vec2((float(int(px) + eye * half_w) + 0.5) / float(vsize.x),
+	                (float(py) + 0.5) / float(vsize.y));
 	float vd = texture(virt_tex, vuv).g;
 
 	float virt_far = step(1020.5 / 1023.0, vd);

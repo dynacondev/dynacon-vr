@@ -61,6 +61,7 @@
 
 #include "decoder/decoder.h"
 #include "render/passthrough_mesh.h"
+#include "vk/allocation.h"
 #include "xr/swapchain.h"
 
 namespace xr
@@ -111,12 +112,23 @@ public:
 	// conversion definition (Android AHB depth); the verdict layout
 	// bakes an identically defined immutable sampler from it
 	// (VUID-VkWriteDescriptorSet-descriptorType-02738).
+	// foveation carries the SHARED color runs (identical tables:
+	// same source size, center and transport as color on every
+	// depth-carrying warped frame — no separate depth params ride
+	// the wire). render_wh is the warp grid size (requested render
+	// eye size); packed_wh is the per-eye packed size (from the
+	// decoded SBS extent). The CPU expands runs to a direct
+	// packed-index map per full-res merge pixel (merge->render scale
+	// baked in) into the SSBO every verdict frame.
 	struct virt_input
 	{
 		vk::ImageView view = nullptr;
 		vk::Sampler sampler = nullptr;
 		bool valid = false;
 		wivrn::decoder::ycbcr_definition ycbcr{};
+		std::array<wivrn::to_headset::foveation_parameter, 2> foveation{};
+		uint16_t render_w = 0, render_h = 0;
+		uint16_t packed_w = 0, packed_h = 0;
 	};
 
 	explicit union_merge_renderer(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device);
@@ -158,11 +170,12 @@ public:
 	bool record(vk::raii::CommandBuffer & cmd,
 	            vk::Extent2D extent, std::span<const input> inputs);
 
-	// Global VR-occlusion finish: fused SBS-decode + exact verdict
-	// (common layer vs virtual depth, NEAREST/NEAREST, R8 at W) then
-	// the apply (merged alpha x Scale2x verdict) into both eye layers
-	// of the acquired submit image. !virt.valid clears the verdict to
-	// 1 and applies (submit merged directly: today's neutral parity).
+	// Global VR-occlusion finish: fused foveated-decode + exact verdict
+	// (common layer vs virtual depth, NEAREST/NEAREST, R8 at full merge
+	// res) then the apply (merged alpha x verdict, both NEAREST) into
+	// both eye layers of the acquired submit image. !virt.valid clears
+	// the verdict to 1 and applies (submit merged directly: today's
+	// neutral parity).
 	bool record_finish(vk::raii::CommandBuffer & cmd,
 	                   size_t image_index,
 	                   vk::Extent2D extent,
@@ -268,11 +281,10 @@ private:
 	// target per image — both eyes broadcast in one draw).
 	std::vector<target> targets;
 
-	// Common depth layer (R16F linear meters, half merge res): one
+	// Common depth layer (R16F linear meters, full merge res): one
 	// owned 2-layer image + array view + layers=1 framebuffer (view mask
-	// routes both eyes), rebuilt
-	// in ensure() alongside the swapchain targets above. MIN-blended
-	// by record_base, sampled by the verdict.
+	// routes both eyes), rebuilt in ensure() alongside the swapchain
+	// targets above. MIN-blended by record_base, sampled by the verdict.
 	struct layer_target
 	{
 		vk::raii::Image image{nullptr};
@@ -285,10 +297,15 @@ private:
 	// MAXes contributors here instead of the submit image, so the
 	// verdict apply has a stable input.
 	layer_target merged_;
-	// Binary verdict (R8, half merge res): fused decode+compare output,
-	// Scale2x-upsampled by the apply.
+	// Binary verdict (R8, full merge res): fused foveated-decode +
+	// compare output, multiplied directly by the apply (no upscale:
+	// the compare already runs at submit res).
 	layer_target verdict_;
-	vk::Extent2D layer_extent_{0, 0}; // W, half of extent_ (min 8px)
+	// Full merge res (== extent_): layer, merged and verdict all render
+	// here. The raster layer used to be half res with an upsampled
+	// verdict; foveated depth needs per-pixel precision, so the compare
+	// moved up to full res and the upscale is gone.
+	vk::Extent2D layer_extent_{0, 0};
 
 	// Geometry raster: R16F MIN-blend pipeline (CLEAR/STORE/OPTIMAL,
 	// CULL_NONE like the silhouette raster) + VERT-only MVP-pair push
@@ -328,6 +345,17 @@ private:
 	bool verdict_set_parity = false;
 	vk::raii::PipelineLayout verdict_layout{nullptr};
 	vk::raii::Pipeline verdict_pipeline{nullptr};
+	// Foveation index maps (SSBO pair, ping-ponged with the verdict
+	// sets): per-eye packed-texel index per full-res merge pixel,
+	// CPU-expanded from the shared foveation runs with the
+	// merge->render scale baked in. Layout: [x0(W)] [x1(W)] [y0(H)]
+	// [y1(H)] uint32s, W/H = merge extent. Host-visible, rewritten
+	// every verdict frame (depth_overlay UBO discipline: memcpy +
+	// vmaFlushAllocation under the same waitIdle'd ownership as the
+	// targets); ping-ponged so an inline record never rewrites what
+	// an in-flight async verdict still reads.
+	buffer_allocation verdict_tables[2];
+	vk::DeviceSize verdict_tables_bytes = 0;
 	vk::raii::DescriptorSetLayout apply_descriptor_layout{nullptr};
 	vk::raii::DescriptorPool apply_descriptor_pool{nullptr};
 	std::vector<vk::raii::DescriptorSet> apply_descriptor_sets;
@@ -335,9 +363,9 @@ private:
 	vk::raii::PipelineLayout apply_layout{nullptr};
 	vk::raii::Pipeline apply_pipeline{nullptr};
 	// NEAREST + ClampToEdge (layer tap in the verdict, merged tap in
-	// the apply: both inputs are already filtered). The verdict upscale
-	// lives in the apply shader (binary Scale2x via texelFetch, so no
-	// LINEAR sampler exists).
+	// the apply: both inputs are already filtered). The verdict runs
+	// at full merge res and multiplies directly in the apply (both
+	// NEAREST) — no upscale, no LINEAR sampler exists.
 	vk::raii::Sampler sampler_nearest{nullptr};
 
 	// One uploaded window mesh per object id. Staging is per mesh and

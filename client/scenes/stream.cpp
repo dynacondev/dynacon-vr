@@ -1543,14 +1543,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				break;
 			}
-			// Foveation params heap-copy: only while the page is open.
-			if (current_settings_page == settings_page::diagnostics)
+			// Foveation params heap-copy: needed every frame now (the
+			// verdict expands them into the packed-index SSBO), plus
+			// merge dims for the table layout. Cheap ints/vectors;
+			// the table expansion itself happens in record_finish.
+			// (mirrors mw/mh below: 64-quantized extents[0]).
+			diag.merge_w = std::max(64, (extents[0].width + 32) / 64 * 64);
+			diag.merge_h = std::max(64, (extents[0].height + 32) / 64 * 64);
+			for (size_t i = 0; i < view_count; ++i)
 			{
-				for (size_t i = 0; i < view_count; ++i)
-				{
-					diag.last_extents[i] = extents[i];
-					diag.last_foveation[i] = foveation[i];
-				}
+				diag.last_extents[i] = extents[i];
+				diag.last_foveation[i] = foveation[i];
 			}
 		}
 		bool mask_frame = composition_layer_alpha_blend_supported and view_count == 2;
@@ -1978,12 +1981,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// Common depth-layer draws: one per placed positive, model
 				// matrix from the fused placement, per-eye server MVPs
 				// (same timebase as the silhouettes). Conservative
-				// frustum skip with a 1px margin (no feather bleed: the
-				// layer is crisp, the feather band lives in the alpha).
+				// frustum skip with a 1px margin at full res (no feather
+				// bleed: the layer is crisp, the feather band lives in
+				// the alpha).
 				layer_draws.clear();
 				{
-					float lm_x = 1.f / ((float)mw * 0.5f);
-					float lm_y = 1.f / ((float)mh * 0.5f);
+					float lm_x = 1.f / (float)mw;
+					float lm_y = 1.f / (float)mh;
 					auto layer_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & mvp) {
 						auto bounds = merge_renderer->layer_mesh_bounds(mesh);
 						if (not bounds)
@@ -2883,10 +2887,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											// Virtual depth for the global
 											// verdict: the paired stream-3
 											// frame (SBS, decoder-owned view
-											// + sampler). Unpaired (not
-											// expected, decoder dead, ±1
-											// miss) submits merged directly
-											// — today's neutral parity.
+											// + sampler), with the shared
+											// foveation tables for the
+											// packed-index lookup.
+											// Unpaired (not expected,
+											// decoder dead, ±1 miss)
+											// submits merged directly —
+											// today's neutral parity.
 											union_merge_renderer::virt_input virt{};
 											if (auto & dh = current_blit_handles[depth_stream_index];
 											    dh and dh->image_view and depth_verdict_safe)
@@ -2894,6 +2901,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 												virt.view = dh->image_view;
 												virt.sampler = decoders[depth_stream_index].decoder->sampler();
 												virt.ycbcr = dh->ycbcr;
+												// Exact tables for THIS depth frame (the
+												// depth shards carry their own view_info):
+												// no gaze-update skew vs the color copy.
+												virt.foveation = dh->view_info.foveation;
+												virt.render_w = diag.req_render_w;
+												virt.render_h = diag.req_render_h;
+												virt.packed_w = (uint16_t)(dh->extent.width / 2);
+												virt.packed_h = (uint16_t)dh->extent.height;
 												virt.valid = true;
 											}
 											if (merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt))

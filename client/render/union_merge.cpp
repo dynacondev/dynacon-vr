@@ -53,6 +53,52 @@ struct geom_push
 };
 static_assert(sizeof(geom_push) == 128);
 
+// Expand compact foveation runs to a direct packed-index map per merge
+// pixel, baking the merge->render scale. Layout: [x0(W)] [x1(W)]
+// [y0(H)] [y1(H)] uint32s, W/H = merge extent. Runs describe packed
+// texels: entry i holds n_i texels covering n_i * ratio_i source
+// pixels (ratio_i = |n_ratio - i| + 1, middle run 1:1). Inverting gives
+// render->packed; the merge scale then picks the packed texel per
+// merge pixel (uniform floor, clamped). Empty runs fall back to a
+// uniform map over the packed size (straight / pre-foveation data).
+static void expand_foveation_axis(const std::vector<uint16_t> & runs, int render_n, int merge_n, int packed_n, uint32_t * out)
+{
+	if (render_n <= 0 or merge_n <= 0)
+	{
+		for (int u = 0; u < merge_n; ++u)
+			out[u] = 0;
+		return;
+	}
+	if (runs.empty())
+	{
+		for (int u = 0; u < merge_n; ++u)
+			out[u] = packed_n > 0 ? (uint32_t)std::min<int64_t>((int64_t)u * packed_n / merge_n, packed_n - 1) : 0;
+		return;
+	}
+	// Direct map: render pixel -> packed texel.
+	std::vector<uint32_t> r2p;
+	r2p.reserve((size_t)render_n);
+	const int n_ratio = (int)(runs.size() - 1) / 2;
+	uint32_t packed = 0;
+	for (size_t i = 0; i < runs.size() and (int)r2p.size() < render_n; ++i)
+	{
+		int ratio = std::abs(n_ratio - (int)i) + 1;
+		for (uint16_t k = 0; k < runs[i] and (int)r2p.size() < render_n; ++k)
+		{
+			for (int r = 0; r < ratio and (int)r2p.size() < render_n; ++r)
+				r2p.push_back(packed + k);
+		}
+		packed += runs[i];
+	}
+	while ((int)r2p.size() < render_n)
+		r2p.push_back(r2p.empty() ? 0 : r2p.back());
+	for (int u = 0; u < merge_n; ++u)
+	{
+		int64_t r = (int64_t)u * render_n / merge_n;
+		out[u] = r2p[(size_t)std::min<int64_t>(r, render_n - 1)];
+	}
+}
+
 uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
 {
 	auto mem = physical_device.getMemoryProperties();
@@ -149,10 +195,9 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		targets.back().framebuffer = vk::raii::Framebuffer(*device, fb_info);
 	}
 	// Common depth layer + merged + verdict targets (owned images, not
-	// swapchain): W is half the merge res (min 8px), merged is full.
-	// Rebuilt under the same waitIdle above; the mesh buffers survive
-	// (extent-independent).
-	vk::Extent2D half{(uint32_t)std::max(8u, new_extent.width / 2), (uint32_t)std::max(8u, new_extent.height / 2)};
+	// swapchain): all full merge res since the foveated verdict compares
+	// per-pixel. Rebuilt under the same waitIdle above; the mesh buffers
+	// survive (extent-independent).
 	auto make_owned = [&](vk::Format fmt, vk::Extent2D e, vk::ImageUsageFlags usage, vk::raii::RenderPass & rp) {
 		layer_target t;
 		vk::ImageCreateInfo image_info{
@@ -200,12 +245,30 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		t.framebuffer = vk::raii::Framebuffer(*device, fb_info);
 		return t;
 	};
-	layer_ = make_owned(layer_format, half, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, geom_renderpass);
+	layer_ = make_owned(layer_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, geom_renderpass);
 	merged_ = make_owned(new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, renderpass);
-	verdict_ = make_owned(verdict_format, half, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, verdict_renderpass);
-	layer_extent_ = half;
-	spdlog::info("Union merge layer targets: layer {}x{} merged {}x{} verdict {}x{}",
-	             half.width, half.height, new_extent.width, new_extent.height, half.width, half.height);
+	verdict_ = make_owned(verdict_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, verdict_renderpass);
+	layer_extent_ = new_extent;
+	// Foveation index maps (SSBO pair, host-visible): per-eye packed
+	// index per merge pixel, [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s.
+	verdict_tables_bytes = vk::DeviceSize(2 * (new_extent.width + new_extent.height) * sizeof(uint32_t));
+	for (auto & t: verdict_tables)
+	{
+		t = buffer_allocation(
+		        *device,
+		        vk::BufferCreateInfo{
+		                .size = verdict_tables_bytes,
+		                .usage = vk::BufferUsageFlagBits::eStorageBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "union merge verdict tables");
+	}
+	spdlog::info("Union merge layer targets: layer {}x{} merged {}x{} verdict {}x{} tables {}B",
+	             new_extent.width, new_extent.height, new_extent.width, new_extent.height,
+	             new_extent.width, new_extent.height, verdict_tables_bytes);
 	// Commit only after the whole rebuild succeeded (see above).
 	format_ = new_format;
 	extent_ = new_extent;
@@ -632,17 +695,24 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	};
 	// Verdict pool (sets/layout/pipeline built by create_verdict_state
 	// below so rebuilds share one path; the pool itself is
-	// format-agnostic and never changes).
+	// format-agnostic and never changes). Sized for the 2 image
+	// bindings + the foveation-table storage buffer on each set.
 	{
-		vk::DescriptorPoolSize pool_size{
-		        .type = vk::DescriptorType::eCombinedImageSampler,
-		        .descriptorCount = 4,
+		vk::DescriptorPoolSize pool_sizes[2] = {
+		        {
+		                .type = vk::DescriptorType::eCombinedImageSampler,
+		                .descriptorCount = 4,
+		        },
+		        {
+		                .type = vk::DescriptorType::eStorageBuffer,
+		                .descriptorCount = 2,
+		        },
 		};
 		vk::DescriptorPoolCreateInfo pool_info{
 		        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
 		        .maxSets = 2,
-		        .poolSizeCount = 1,
-		        .pPoolSizes = &pool_size,
+		        .poolSizeCount = 2,
+		        .pPoolSizes = pool_sizes,
 		};
 		verdict_descriptor_pool = vk::raii::DescriptorPool(*device, pool_info);
 	}
@@ -652,7 +722,7 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	// a swapchain rebuild, so a stale YCbCr build can never persist).
 	create_verdict_state(wivrn::decoder::ycbcr_definition{}, vk::Sampler{});
 
-	auto apply_frag = load_shader(*device, "vr_apply_scale2x_mv.frag");
+	auto apply_frag = load_shader(*device, "vr_apply_direct_mv.frag");
 	vk::PipelineShaderStageCreateInfo apply_stages[2] = {
 	        {
 	                .stage = vk::ShaderStageFlagBits::eVertex,
@@ -917,10 +987,11 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 	verdict_immutable_src = def.has_conversion ? decoder_sampler : vk::Sampler{};
 	// Binding 0 (common layer, plain view) stays mutable; binding 1
 	// (virt) is immutable exactly when the view carries a conversion.
-	// The immutable handle is copied by layout creation (defoveator
-	// precedent: pointer to a local is fine).
+	// Binding 2 (foveation index maps) is a plain storage buffer,
+	// rewritten per verdict frame. The immutable handle is copied by
+	// layout creation (defoveator precedent: pointer to a local is fine).
 	vk::Sampler immutable = verdict_immutable_src;
-	vk::DescriptorSetLayoutBinding bindings[2] = {
+	vk::DescriptorSetLayoutBinding bindings[3] = {
 	        {
 	                .binding = 0,
 	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -934,9 +1005,15 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
 	                .pImmutableSamplers = def.has_conversion ? &immutable : nullptr,
 	        },
+	        {
+	                .binding = 2,
+	                .descriptorType = vk::DescriptorType::eStorageBuffer,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	        },
 	};
 	verdict_descriptor_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
-	                                                                                 .bindingCount = 2,
+	                                                                                 .bindingCount = 3,
 	                                                                                 .pBindings = bindings,
 	                                                                         });
 	for (int i = 0; i < 2; ++i)
@@ -1049,9 +1126,9 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	if (image_index >= targets.size())
 		return false;
 
-	// Verdict pass at W: fused SBS-decode + exact compare when a depth
-	// frame paired, else a CLEAR to 1 (submit merged directly — today's
-	// neutral parity, pixel-identical).
+	// Verdict pass at full merge res: fused foveated-decode + exact
+	// compare when a depth frame paired, else a CLEAR to 1 (submit
+	// merged directly — today's neutral parity, pixel-identical).
 	vk::ClearValue verdict_clear{};
 	verdict_clear.color.float32 = std::array<float, 4>{1, 0, 0, 0};
 	vk::RenderPassBeginInfo verdict_begin{
@@ -1078,6 +1155,27 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 		// changes. waitIdle'd, rare.
 		ensure_verdict_layout(virt_in.ycbcr, virt_in.sampler);
 		verdict_set_parity = !verdict_set_parity;
+		// Foveation index maps, CPU-expanded per frame into the
+		// ping-ponged SSBO (depth_overlay UBO discipline: memcpy +
+		// flush, rewritten before the draw that reads them). Merge->render
+		// scale baked in; packed dims from the paired depth frame.
+		auto & tables = verdict_tables[verdict_set_parity ? 1 : 0];
+		{
+			const int W = (int)layer_extent_.width, H = (int)layer_extent_.height;
+			const int render_w = virt_in.render_w, render_h = virt_in.render_h;
+			const int packed_w = virt_in.packed_w, packed_h = virt_in.packed_h;
+			std::vector<uint32_t> map((size_t)2 * (W + H));
+			for (int eye = 0; eye < 2; ++eye)
+			{
+				expand_foveation_axis(virt_in.foveation[eye].x, render_w, W, packed_w, map.data() + eye * W);
+				expand_foveation_axis(virt_in.foveation[eye].y, render_h, H, packed_h, map.data() + 2 * W + eye * H);
+			}
+			std::memcpy(tables.map(), map.data(), map.size() * sizeof(uint32_t));
+			tables.unmap();
+			// Non-coherent host-visible memory: flush, or the GPU reads
+			// stale tables forever (depth_overlay precedent).
+			vmaFlushAllocation(vk_allocator::instance(), tables, 0, map.size() * sizeof(uint32_t));
+		}
 		vk::DescriptorSet vset = *verdict_descriptor_sets[verdict_set_parity ? 1 : 0];
 		vk::DescriptorImageInfo layer_info{
 		        .sampler = *sampler_nearest,
@@ -1093,8 +1191,13 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 		        .imageView = virt_in.view,
 		        .imageLayout = vk::ImageLayout::eGeneral,
 		};
+		vk::DescriptorBufferInfo tables_info{
+		        .buffer = vk::Buffer(tables),
+		        .offset = 0,
+		        .range = verdict_tables_bytes,
+		};
 		std::vector<vk::WriteDescriptorSet> vwrites;
-		vwrites.reserve(2);
+		vwrites.reserve(3);
 		vwrites.push_back(vk::WriteDescriptorSet{
 		        .dstSet = vset,
 		        .dstBinding = 0,
@@ -1108,6 +1211,13 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 		        .descriptorCount = 1,
 		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 		        .pImageInfo = &virt_info,
+		});
+		vwrites.push_back(vk::WriteDescriptorSet{
+		        .dstSet = vset,
+		        .dstBinding = 2,
+		        .descriptorCount = 1,
+		        .descriptorType = vk::DescriptorType::eStorageBuffer,
+		        .pBufferInfo = &tables_info,
 		});
 		device->updateDescriptorSets(vwrites, {});
 		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *verdict_pipeline);
@@ -1137,9 +1247,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	                    verdict_barrier);
 
 	// Apply pass into the acquired submit image: merged (NEAREST) x
-	// Scale2x verdict (W -> full, binary edge-preserving upscale in the
-	// shader via texelFetch). RGB zero; the submit-time REPLACE
-	// preserves dst color.
+	// verdict (NEAREST, already full-res — no upscale). RGB zero; the
+	// submit-time REPLACE preserves dst color.
 	apply_set_parity = !apply_set_parity;
 	vk::DescriptorSet aset = *apply_descriptor_sets[apply_set_parity ? 1 : 0];
 	vk::DescriptorImageInfo merged_info{
