@@ -849,17 +849,20 @@ struct video_stream_description
 	// dimensions of the video stream per eye
 	// alpha is half resolution
 	// depth is a side-by-side (left|right) 10-bit virtual-depth
-	// channel at half stream resolution per eye, 2mm/LSB, valid codes
-	// 0-1020 (0-2.040m); holes, sky and beyond-range pin to 1023 (far),
-	// 1021+ is a guard band absorbing lossy wobble, decoded as far
+	// channel at per-eye stream resolution, foveated with the same
+	// tables as color (shared gaze center and source size, so the
+	// pack grids match exactly); valid codes 0-1020 (0-2.040m);
+	// holes, sky and beyond-range pin to 1023 (far), 1021+ is a
+	// guard band absorbing lossy wobble, decoded as far
 	uint16_t width;
 	uint16_t height;
 	std::array<video_codec, 4> codec; // left, right, alpha, depth
 	// Depth SBS dimensions (left|right halves); color width/height above
-	// are per-eye. Half stream resolution per eye, carried explicitly so
-	// the client never hardcodes it. Wire convention: row 0 = scene top,
-	// left eye in x[0..depth_width/2), 10-bit 2mm/LSB luma valid
-	// 0-1020 (0-2.040m); 1021+ decodes as far (server pins far to 1023).
+	// are per-eye. Full stream resolution per eye (SBS canvas 2x width),
+	// carried explicitly so the client never hardcodes it. Wire
+	// convention: row 0 = scene top, left eye in x[0..depth_width/2),
+	// 10-bit 2mm/LSB luma valid 0-1020 (0-2.040m); 1021+ decodes as far
+	// (server pins far to 1023).
 	// Overwritten on connect from the encoder settings (half stream
 	// resolution per eye); 0 = not yet advertised. No legacy default:
 	// the client sizes its idle decoder from the connect-time describe.

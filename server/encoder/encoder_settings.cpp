@@ -48,12 +48,12 @@ namespace wivrn
 
 static const double passthrough_bitrate_factor = 0.05;
 
-// Depth stream (index 3, half-res SBS virtual depth) is pinned to 15% of
-// the total bitrate: it is larger than before but low-entropy 10-bit
-// luma, and must not starve color. Weights for 0..2 are area-based as
-// before; depth weight is derived from their sum so the final share is
-// exactly depth_share.
-static const double depth_bitrate_share = 0.15;
+// Depth stream (index 3, foveated virtual depth at color-equivalent
+// per-eye size, SBS canvas 2x stream width) is pinned to 20% of the
+// total bitrate: it is 10-bit low-entropy luma, and must not starve
+// color. Weights for 0..2 are area-based as before; depth weight is
+// derived from their sum so the final share is exactly depth_share.
+static const double depth_bitrate_share = 0.20;
 
 static void split_bitrate(std::array<wivrn::encoder_settings, 4> & encoders, uint64_t bitrate)
 {
@@ -453,17 +453,24 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 
 	for (auto [i, dst]: std::ranges::enumerate_view(res))
 	{
-		if (i == 3) // virtual depth SBS: half stream resolution per eye
-		            // (SBS width = full stream width, height = half).
-		            // width/height are 64-aligned above, so both stay
-		            // %32 for NVENC.
+		if (i == 3) // virtual depth SBS: per-eye stream resolution,
+		            // foveated with the same tables as color (shared gaze
+		            // center and source size, so the pack grids match
+		            // exactly). SBS canvas is 2x stream width, full height.
+		            // width/height are 64-aligned above. A backend clamp
+		            // below these sizes would silently break the shared
+		            // mapping: disable depth with a warning instead.
 		{
-			dst.width = width;
-			dst.height = height / 2;
+			dst.width = 2 * width;
+			dst.height = height;
 			uint16_t w = dst.width, h = dst.height;
 			check_video_size(dst.encoder_name, dst.codec, w, h);
-			dst.width = w;
-			dst.height = h;
+			if (dst.enabled and (w != dst.width or h != dst.height))
+			{
+				U_LOG_W("virtual depth stream disabled: encoder clamped %dx%d to %dx%d (foveation tables are shared with color)",
+				        dst.width, dst.height, w, h);
+				dst.enabled = false;
+			}
 			continue;
 		}
 		dst.width = width;
@@ -584,7 +591,7 @@ std::array<encoder_settings, 4> get_encoder_settings(wivrn::vk_bundle & bundle, 
 	split_bitrate(res, settings.bitrate_bps);
 	if (not res[3].enabled)
 	{
-		// Reclaim the depth share for color instead of reserving 15%
+		// Reclaim the depth share for color instead of reserving 20%
 		// for an encoder that never runs.
 		res[3].bitrate = 0;
 		res[3].bitrate_multiplier = 0;

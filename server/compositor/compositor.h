@@ -65,9 +65,10 @@ public:
 		bool has_depth = false;
 	};
 
-	// Virtual-depth staging for stream 3: half-res SBS YCbCr, depth in
-	// layer 3 (so encoder backends keep indexing baseArrayLayer 3).
-	// Paired 1:1 with the color slots above (shared busy lifetime).
+	// Virtual-depth staging for stream 3: foveated SBS YCbCr at
+	// color-equivalent per-eye size, depth in layer 3 (so encoder
+	// backends keep indexing baseArrayLayer 3). Paired 1:1 with the
+	// color slots above (shared busy lifetime).
 	struct depth_image
 	{
 		image_allocation image;
