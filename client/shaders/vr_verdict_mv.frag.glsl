@@ -29,7 +29,7 @@ layout(location = 0) out vec4 out_color;
 //
 // layer_tex: R16F common layer (linear meters, MIN of the positive
 // window draws, FAR clear 65504 reads as absent). NEAREST: the binary
-// verdict (never the depths) bilinear-upsamples in the apply pass, so
+// verdict (never the depths) Scale2x-upsamples in the apply pass, so
 // no depth halo.
 //
 // virt_tex: decoded stream-3 SBS frame (single image, both eyes side
