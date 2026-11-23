@@ -76,7 +76,9 @@ public:
 	          vk::ImageView dst_y,
 	          vk::ImageView dst_cbcr,
 	          vk::Extent2D dst_extent,
-	          vk::Buffer foveation_tables);
+	          vk::Buffer foveation_tables,
+	          vk::ImageView hole_l,
+	          vk::ImageView hole_r);
 
 private:
 	struct push

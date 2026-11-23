@@ -5,7 +5,11 @@
  * (the pull output needs no un-premultiply: valid is already (rgb,1)).
  * Hole pixels run an expanding-ring search (R = SMEAR_RADIUS) for the
  * nearest valid texel whose splat depth matches the hole's coarse
- * background reference, and copy its color verbatim. Smear instead of
+ * background reference, and copy its color verbatim — plus the
+ * donor's splat depth code into the hole-depth image (same donor,
+ * same search, no second pass). The packer prefers the hole depth
+ * over the sentinel, so disocclusions report background depth
+ * instead of FAR. Smear instead of
  * blur: no averaging, so a wrong donor shows up starkly (which is also
  * what makes this a good diagnostic for donor selection).
  *
@@ -30,6 +34,13 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D splatDepth;
 layout(set = 0, binding = 1, rgba8) uniform image2D dstImg;
 layout(set = 0, binding = 2, r32ui) uniform readonly uimage2D bgMax;
+// Donor depth store: per-hole splat code (sentinel elsewhere — the
+// image is cleared every warp, unfilled holes are left alone).
+// Separate image, never the splat: holes read splat texels other hole
+// threads would be writing, so in-place stores would make donor
+// selection nondeterministic. Here each thread writes only its own
+// texel and nobody reads it until the later pack dispatch.
+layout(set = 0, binding = 3, r32ui) uniform writeonly uimage2D holeImg;
 
 #define SPLAT_EMPTY 0xffffffffu
 #define DEPTH_SCALE 16777215.0
@@ -65,6 +76,7 @@ void main()
 	// initializers read back stale on some drivers).
 	float donorDist2 = 1e30;
 	vec3 donorRgb = vec3(0.0);
+	uint donorCode = SPLAT_EMPTY;
 	bool done = false;
 	for (int r = 1; r <= SMEAR_RADIUS && !done; r++) {
 		bool ringFound = false;
@@ -81,6 +93,7 @@ void main()
 						if (dist2 < donorDist2) {
 							donorDist2 = dist2;
 							donorRgb = t.rgb;
+							donorCode = e;
 							ringFound = true;
 						}
 					}
@@ -97,6 +110,7 @@ void main()
 						if (dist2 < donorDist2) {
 							donorDist2 = dist2;
 							donorRgb = t.rgb;
+							donorCode = e;
 							ringFound = true;
 						}
 					}
@@ -116,6 +130,7 @@ void main()
 						if (dist2 < donorDist2) {
 							donorDist2 = dist2;
 							donorRgb = t.rgb;
+							donorCode = e;
 							ringFound = true;
 						}
 					}
@@ -132,6 +147,7 @@ void main()
 						if (dist2 < donorDist2) {
 							donorDist2 = dist2;
 							donorRgb = t.rgb;
+							donorCode = e;
 							ringFound = true;
 						}
 					}
@@ -145,6 +161,8 @@ void main()
 		imageStore(dstImg, xy, vec4(0.0));
 		return;
 	}
-	// Donor color cached during the search (no second load).
+	// Donor color + depth cached during the search (no second load).
+	// Unfilled holes keep the cleared sentinel (pack reads FAR).
 	imageStore(dstImg, xy, vec4(donorRgb, 1.0));
+	imageStore(holeImg, xy, donorCode);
 }

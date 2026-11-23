@@ -74,6 +74,11 @@ layout(set = 0, binding = 4) readonly buffer Tables
 	uint fy[2 * MAX_DIM];
 }
 tables;
+// Hole-depth views (donor splat codes for fill-repaired holes,
+// sentinel elsewhere): read-only here, same GENERAL layout as the
+// splat views.
+layout(set = 0, binding = 5, r32ui) readonly uniform uimage2D hole_l;
+layout(set = 0, binding = 6, r32ui) readonly uniform uimage2D hole_r;
 
 layout(push_constant) uniform Push
 {
@@ -153,6 +158,12 @@ void main()
 		{
 			uint v = iz == 1 ? imageLoad(splat_r, ivec2(x, y)).x
 			                 : imageLoad(splat_l, ivec2(x, y)).x;
+			// Fill-repaired disocclusion: prefer the donor's
+			// background depth over the splat sentinel (unfilled
+			// holes stay sentinel and pin FAR below as before).
+			if (v == DEPTH_SENTINEL)
+				v = iz == 1 ? imageLoad(hole_r, ivec2(x, y)).x
+				            : imageLoad(hole_l, ivec2(x, y)).x;
 			best = min(best, v);
 		}
 	}

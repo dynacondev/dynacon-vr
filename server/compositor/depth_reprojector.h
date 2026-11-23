@@ -114,6 +114,10 @@ public:
 	// Valid only after a recorded warp in this slot; consumed read-only
 	// by the depth packer. Slot-owned like everything above.
 	std::array<vk::ImageView, 2> get_splat_views(int slot);
+	// Hole-depth scratch for this slot's warp (donor codes for
+	// filled holes, sentinel elsewhere). GENERAL layout, valid after
+	// the fill pass; consumed read-only by the depth packer.
+	std::array<vk::ImageView, 2> get_hole_views(int slot);
 
 	// Warp grid size (== splat/target allocation extent): the foveation
 	// warp_rect and the depth pack src extent must track this, never
@@ -146,6 +150,15 @@ private:
 	std::array<std::array<vk::raii::ImageView, 2>, num_slots> target_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
 	std::array<std::array<image_allocation, 2>, num_slots> splat_depth;
 	std::array<std::array<vk::raii::ImageView, 2>, num_slots> splat_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
+	// Hole-depth scratch: per-eye donor depth codes written by the fill
+	// pass for filled holes (sentinel elsewhere), consumed read-only by
+	// the depth packer. Lets the pack report background depth instead
+	// of pinning every disocclusion to FAR. Separate image (never the
+	// splat itself): holes read splat texels other holes would be
+	// writing, so in-place stores would make donor selection
+	// nondeterministic across runs.
+	std::array<std::array<image_allocation, 2>, num_slots> hole_depth;
+	std::array<std::array<vk::raii::ImageView, 2>, num_slots> hole_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
 	// Coarse background reference: one R32_UINT texel per 64x64 block
 	// (perimeter-max splat depth, EMPTY-skipped). Same slot/eye
 	// ownership as splat/target; stays GENERAL between warps.

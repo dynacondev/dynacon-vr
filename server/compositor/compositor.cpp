@@ -1091,7 +1091,9 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            *depth.out_y,
 		            *depth.out_cbcr,
 		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height},
-		            foveation.tables_buffer(slot)))
+		            foveation.tables_buffer(slot),
+		            reprojector.get_hole_views(slot)[0],
+		            reprojector.get_hole_views(slot)[1]))
 		{
 			auto & depth_enc = encoders[3];
 			// Mirrors the color encoder handoff: single eColor barrier
