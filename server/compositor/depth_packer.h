@@ -60,9 +60,10 @@ public:
 
 	// Records the pack into cmd. Returns false on degenerate input
 	// (nothing recorded). The caller owns layout/barrier transitions of
-	// dst_y/dst_cbcr (GENERAL on entry); splat inputs must be visible for shader
-	// read (the warp's own barriers cover this when recorded after fill).
-	// dst_extent sizes the dispatch and must match the dst_y image.
+	// dst_y/dst_cbcr (GENERAL on entry); splat and hole inputs must be
+	// visible for shader read (the warp's own barriers cover this when
+	// recorded after fill). dst_extent sizes the dispatch and must match
+	// the dst_y image.
 	bool pack(vk::raii::Device & device,
 	          vk::raii::CommandBuffer & cmd,
 	          int slot,

@@ -170,7 +170,7 @@ private:
 	// color storage target (write). Bgmax: splat storage image (read) +
 	// coarse reference storage image (write). Fill: splat storage image
 	// (read) + color storage target (read-write) + coarse reference
-	// storage image (read). Splat/pull sets are rewritten per warp (src
+	// storage image (read) + hole-depth image (write). Splat/pull sets are rewritten per warp (src
 	// views change per app frame); bgmax/fill sets reference only owned
 	// images and are written once. Only the UBO contents change
 	// otherwise. Per-(slot, eye): CPU rewrites are unordered by GPU

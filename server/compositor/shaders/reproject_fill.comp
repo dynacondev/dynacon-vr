@@ -164,5 +164,5 @@ void main()
 	// Donor color + depth cached during the search (no second load).
 	// Unfilled holes keep the cleared sentinel (pack reads FAR).
 	imageStore(dstImg, xy, vec4(donorRgb, 1.0));
-	imageStore(holeImg, xy, donorCode);
+	imageStore(holeImg, xy, uvec4(donorCode));
 }

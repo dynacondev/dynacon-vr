@@ -1072,6 +1072,7 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		// dispatch writes neutral 0.5 through the out_cbcr view instead.
 
 		const auto splat_views = reprojector.get_splat_views(slot);
+		const auto hole_views = reprojector.get_hole_views(slot);
 		// Splat grid == warp grid (render size): the pack foveated-gathers
 		// from full warp res down to depth res, using color's per-slot
 		// tables (foveate() ran above this commit — same slot, read-only
@@ -1092,8 +1093,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		            *depth.out_cbcr,
 		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height},
 		            foveation.tables_buffer(slot),
-		            reprojector.get_hole_views(slot)[0],
-		            reprojector.get_hole_views(slot)[1]))
+		            hole_views[0],
+		            hole_views[1]))
 		{
 			auto & depth_enc = encoders[3];
 			// Mirrors the color encoder handoff: single eColor barrier
