@@ -190,7 +190,8 @@ vk::raii::Pipeline make_pipeline(
         wivrn::vk_bundle & vk,
         vk::PipelineLayout layout,
         const char * shader_name,
-        const char * name)
+        const char * name,
+        const vk::SpecializationInfo * spec = nullptr)
 {
 	auto shader = vk.load_shader(shader_name);
 	vk::raii::Pipeline res{
@@ -201,6 +202,7 @@ vk::raii::Pipeline make_pipeline(
 	                        .stage = vk::ShaderStageFlagBits::eCompute,
 	                        .module = *shader,
 	                        .pName = "main",
+	                        .pSpecializationInfo = spec,
 	                },
 	                .layout = layout,
 	        },
@@ -352,7 +354,19 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	        },
 	};
 	vk.name(*bgmax_layout, "reproject bgmax pipeline layout");
-	bgmax_pipeline = make_pipeline(vk, *bgmax_layout, "reproject_bgmax", "reproject bgmax pipeline");
+	// Coarse block + search radius follow the warp grid (half-res mode
+	// halves both to preserve visual scale); baked at creation,
+	// startup-fixed like the grid itself.
+	const uint32_t bgmax_cell = half_res_warp ? 32 : 64;
+	const uint32_t smear_radius = half_res_warp ? 8 : 16;
+	vk::SpecializationMapEntry bgmax_entries[1] = {{.constantID = 0, .offset = 0, .size = sizeof(uint32_t)}};
+	vk::SpecializationInfo bgmax_spec{
+	        .mapEntryCount = 1,
+	        .pMapEntries = bgmax_entries,
+	        .dataSize = sizeof(bgmax_cell),
+	        .pData = &bgmax_cell,
+	};
+	bgmax_pipeline = make_pipeline(vk, *bgmax_layout, "reproject_bgmax", "reproject bgmax pipeline", &bgmax_spec);
 
 	std::array fill_bindings{
 	        vk::DescriptorSetLayoutBinding{
@@ -391,7 +405,18 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	        },
 	};
 	vk.name(*fill_layout, "reproject fill pipeline layout");
-	fill_pipeline = make_pipeline(vk, *fill_layout, "reproject_fill", "reproject fill pipeline");
+	vk::SpecializationMapEntry fill_entries[2] = {
+	        {.constantID = 0, .offset = 0 * sizeof(uint32_t), .size = sizeof(uint32_t)},
+	        {.constantID = 1, .offset = 1 * sizeof(uint32_t), .size = sizeof(uint32_t)},
+	};
+	const uint32_t fill_spec_data[2] = {smear_radius, bgmax_cell};
+	vk::SpecializationInfo fill_spec{
+	        .mapEntryCount = 2,
+	        .pMapEntries = fill_entries,
+	        .dataSize = sizeof(fill_spec_data),
+	        .pData = fill_spec_data,
+	};
+	fill_pipeline = make_pipeline(vk, *fill_layout, "reproject_fill", "reproject fill pipeline", &fill_spec);
 
 	// Per (slot, eye): splat takes 1 combined + 1 uniform + 1 storage,
 	// pull takes 1 combined + 1 uniform + 2 storage, bgmax takes
@@ -847,8 +872,11 @@ bool depth_reprojector::reproject(
 	// colors are never stored to), so the in-place target update needs
 	// no second buffer — one visibility barrier before the fill covers
 	// pull writes (target) and bgmax writes (reference).
-	const uint32_t bgmax_x = (extent.width + 63) / 64;
-	const uint32_t bgmax_y = (extent.height + 63) / 64;
+	// Coarse grid follows the warp grid (spec constant at pipeline
+	// creation, same value here for the dispatch size).
+	const uint32_t bgmax_cell = half_res_warp ? 32 : 64;
+	const uint32_t bgmax_x = (extent.width + bgmax_cell - 1) / bgmax_cell;
+	const uint32_t bgmax_y = (extent.height + bgmax_cell - 1) / bgmax_cell;
 	cmd.bindPipeline(vk::PipelineBindPoint::eCompute, *bgmax_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *bgmax_layout, 0, bgmax_sets[slot][view], {});
 	cmd.dispatch((bgmax_x + 7) / 8, (bgmax_y + 7) / 8, 1);

@@ -45,14 +45,17 @@ layout(set = 0, binding = 3, r32ui) uniform writeonly uimage2D holeImg;
 #define SPLAT_EMPTY 0xffffffffu
 #define DEPTH_SCALE 16777215.0
 #define VALID_EPS (0.5 / 255.0)
-// Source must match reproject_bgmax.comp (coarse block size).
-#define BGMAX_CELL 64
+// Source must match reproject_bgmax.comp (coarse block size): same
+// specialization constant id, same value at pipeline creation.
+layout(constant_id = 1) const int BGMAX_CELL = 64;
 // Background gate width, nonlinear 0..1 depth units: taps this much
 // shallower than the coarse reference are occluders, never donors
 // (same order as the 0.02 depth tolerances used across the warp).
 #define SMEAR_DEPTH_TOL 0.02
 // Search radius in pixels: bands up to ~2*R wide fill completely.
-#define SMEAR_RADIUS 16
+// Specialization constant so half-res warp can preserve visual scale
+// (8) instead of rebuilding shaders.
+layout(constant_id = 0) const int SMEAR_RADIUS = 16;
 
 void main()
 {
