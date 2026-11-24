@@ -21,9 +21,7 @@ layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D splatDepth;
 layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D bgMax;
 
 #define SPLAT_EMPTY 0xffffffffu
-// Coarse block size: specialization constant so half-res warp can
-// preserve visual scale (32) instead of rebuilding shaders.
-layout(constant_id = 0) const int BGMAX_CELL = 64;
+#define BGMAX_CELL 64
 
 void main()
 {
