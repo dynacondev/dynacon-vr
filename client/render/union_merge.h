@@ -341,15 +341,16 @@ private:
 	// verdict apply has a stable input.
 	layer_target merged_;
 	// Binary verdict (R8, uniform half res): fused foveated-decode +
-	// compare output, upsampled 2x NEAREST (exact broadcast) by the
-	// apply.
+	// compare output, upsampled 2x by the apply (LINEAR tent filter:
+	// smooth ~2px reveal ramp, flat areas bit-identical).
 	layer_target verdict_;
 	// Full merge res (== extent_): merged target + submit image.
 	vk::Extent2D layer_extent_{0, 0};
 	// Uniform half working res (opt #U): the layer raster + verdict
 	// loop + verdict target all run here (quarter pixels). The layer
 	// and verdict are compared texel-to-texel in this domain; the
-	// apply upsamples the verdict 2x NEAREST (exact broadcast).
+	// apply upsamples the verdict 2x (LINEAR tent ramp over the
+	// exact NEAREST broadcast positions).
 	// Always even (asserted in ensure: merge dims are 64-aligned).
 	vk::Extent2D half_extent_{0, 0};
 
@@ -428,9 +429,9 @@ private:
 	// (Fold subpass apply pipelines live with the fold members above:
 	// fold_apply_pipeline s1 paired, fold_maskapply_pipeline s1 mask.)
 	// NEAREST + ClampToEdge (layer tap in the verdict, merged tap in
-	// the apply: both inputs are already filtered). The verdict runs
-	// at full merge res and multiplies directly in the apply (both
-	// NEAREST) — no upscale, no LINEAR sampler exists.
+	// the apply: both inputs are already filtered). The half-res
+	// verdict is LINEAR-tapped in the apply (tent ramp); merged stays
+	// NEAREST (exact alpha).
 	vk::raii::Sampler sampler_nearest{nullptr};
 
 	// One uploaded window mesh per object id. Staging is per mesh and

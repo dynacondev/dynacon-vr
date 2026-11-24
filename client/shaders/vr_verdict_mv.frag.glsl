@@ -24,12 +24,12 @@ layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
 // Foveated virtual-depth decode + exact global verdict at HALF merge
-// res (uniform half: quarter pixels, exact 2x NEAREST broadcast back
-// to full res in the apply). One fullscreen pass, no intermediate
-// depth canvas: the verdict compares the uniform raster layer against
-// the foveated SBS depth through the shared foveation tables (same
-// tables as color: same gaze center and source size on every
-// depth-carrying warped frame).
+// res (uniform half: quarter pixels; the apply upsamples 2x with a
+// LINEAR tent filter for a smooth reveal ramp). One fullscreen pass,
+// no intermediate depth canvas: the verdict compares the uniform
+// raster layer against the foveated SBS depth through the shared
+// foveation tables (same tables as color: same gaze center and source
+// size on every depth-carrying warped frame).
 //
 // layer_tex: R16F common layer (linear meters, MIN of the positive
 // window draws, FAR clear 65504 reads as absent). NEAREST: sampled at

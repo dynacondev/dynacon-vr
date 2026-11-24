@@ -169,8 +169,10 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	vk::Format new_format = format;
 	vk::Extent2D new_extent{(uint32_t)w, (uint32_t)h};
 	// Uniform-half working res (opt #U) must divide evenly: the
-	// apply's 2x NEAREST upscale is exact only for even dims. Merge
-	// dims are 64-aligned, so this always holds; assert it loudly.
+	// apply's 2x verdict upscale samples symmetric texel pairs only
+	// for even dims (NEAREST broadcast positions; LINEAR tent over
+	// them). Merge dims are 64-aligned, so this always holds; assert
+	// it loudly.
 	assert(w % 2 == 0 and h % 2 == 0);
 	vk::Extent2D half_extent{(uint32_t)w / 2, (uint32_t)h / 2};
 	swapchain_ = xr::swapchain(inst, sess, *device, new_format, w, h, 1, 2);
@@ -714,8 +716,8 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	// Verdict + apply sampler/descriptor state (static 2-slot CIS
 	// layouts for layer/virt, FRAG-only, same Adreno-safe pattern as
 	// the merge): verdict reads layer NEAREST + SBS virt (handle-generation
-	// sampler); apply reads merged NEAREST + verdict NEAREST (both
-	// plain texture() taps at full res — no upscale, filter matters).
+	// sampler); apply reads merged NEAREST (exact) + half-res verdict
+	// LINEAR (2x tent-filtered upscale = smooth reveal ramp).
 	vk::SamplerCreateInfo nearest_info{
 	        .magFilter = vk::Filter::eNearest,
 	        .minFilter = vk::Filter::eNearest,
@@ -1455,8 +1457,9 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	cmd.nextSubpass(vk::SubpassContents::eInline);
 
 	// Apply pass into the acquired submit image. Verdict path:
-	// merged (NEAREST) x verdict (NEAREST, already full-res — no
-	// upscale). Mask-only path (no verdict pass above): merged straight
+	// merged (NEAREST, full-res) x verdict (LINEAR 2x upscale of the
+	// half-res mask: smooth reveal ramp). Mask-only path (no verdict
+	// pass above): merged straight
 	// through (one tap, pixel-identical to x1). RGB zero; the
 	// submit-time REPLACE preserves dst color.
 	apply_set_parity = !apply_set_parity;
@@ -1517,8 +1520,9 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	device->updateDescriptorSets(apply_writes, {});
 	// Apply subpass s1: merged (tile-local GENERAL from s0 above) x
 	// verdict (SHADER_READ texture from its own RP), or merged straight
-	// through on the mask path. Same taps as the old split pass (both
-	// NEAREST). Fullscreen scissor inherited from s0.
+	// through on the mask path. Merged stays NEAREST (exact alpha);
+	// the verdict LINEAR tap is the upscale. Fullscreen scissor
+	// inherited from s0.
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, do_verdict ? *fold_apply_pipeline : *fold_maskapply_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *apply_layout, 0, aset, {});
 	cmd.draw(3, 1, 0, 0);
