@@ -2867,7 +2867,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							{
 								// Common depth layer first (stage 0): CLEAR +
 								// near-wins raster of every positive window
-								// into the half-res layer. Skipped only when
+								// into the full-res layer. Skipped only when
 								// the merge sits out (nothing consumes it),
 								// or when VR depth testing is toggled off
 								// (verdict submits merged directly, nothing
@@ -2897,8 +2897,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											// today's neutral parity.
 											union_merge_renderer::virt_input virt{};
 											if (vr_depth_test)
-											if (auto & dh = current_blit_handles[depth_stream_index];
-											    dh and dh->image_view and depth_verdict_safe)
+											{
+												if (auto & dh = current_blit_handles[depth_stream_index];
+												    dh and dh->image_view and depth_verdict_safe)
 											{
 												virt.view = dh->image_view;
 												virt.sampler = decoders[depth_stream_index].decoder->sampler();
@@ -2912,6 +2913,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 												virt.packed_w = (uint16_t)(dh->extent.width / 2);
 												virt.packed_h = (uint16_t)dh->extent.height;
 												virt.valid = true;
+											}
 											}
 											if (merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt))
 											{
