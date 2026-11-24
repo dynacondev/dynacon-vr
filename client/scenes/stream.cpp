@@ -1173,7 +1173,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					if (sres == vk::Result::eSuccess)
 					{
 						last_gpu_timestamps.um_layer_gpu = (stimestamps[0] - timestamps2[5]) * period;
-						last_gpu_timestamps.um_verdict_gpu = (stimestamps[2] - stimestamps[1]) * period;
+						// Split order is layer, verdict, merge, apply: q7 after the
+						// layer, q8 after the verdict, q9 after the merge subpass, so
+						// um_verdict is q8-q7 and the merge span (q9-q8) stays dark.
+						last_gpu_timestamps.um_verdict_gpu = (stimestamps[1] - stimestamps[0]) * period;
 						last_gpu_timestamps.um_apply_gpu = (timestamps2[6] - stimestamps[2]) * period;
 					}
 				}
@@ -1211,7 +1214,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (sres == vk::Result::eSuccess)
 				{
 					last_gpu_timestamps.um_layer_gpu = (stimestamps[0] - mtimestamps[3]) * period;
-					last_gpu_timestamps.um_verdict_gpu = (stimestamps[2] - stimestamps[1]) * period;
+					last_gpu_timestamps.um_verdict_gpu = (stimestamps[1] - stimestamps[0]) * period;
 					last_gpu_timestamps.um_apply_gpu = (mtimestamps[4] - stimestamps[2]) * period;
 				}
 			}
@@ -2963,13 +2966,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											}
 										}
 										auto um_t1 = std::chrono::steady_clock::now();
-										bool um_recorded = merge_renderer->record(rec_cmd, (size_t)merge_idx, merge_ext, merge_inputs, virt.valid, &rec_pool, qmerge + 3);
+										bool um_recorded = merge_renderer->record(rec_cmd, merge_ext, merge_inputs);
 										um_merge_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t1).count();
 										if (um_recorded)
 										{
-											// virt was built above (same object that fixed the
-											// folded path in record()): record_finish()
-											// asserts the pairing matches.
+											// Verdict runs ahead of the fold in its own RP
+											// (paired only); the fold below samples it.
+											if (virt.valid)
+												merge_renderer->record_verdict(rec_cmd, virt, &rec_pool, qmerge + 3);
 											auto um_t2 = std::chrono::steady_clock::now();
 											bool um_finished = merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt, &rec_pool, qmerge + 4);
 											um_finish_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t2).count();
@@ -2980,7 +2984,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 												merge_idx = -1; // owned by the submit phase now
 												finished = true;
 												// Split queries are consumable iff the verdict ran:
-												// record_finish stamps qmerge+4 only on the paired
+												// record_verdict stamps qmerge+3 only on the paired
 												// path (mask-only frames skip the verdict pass).
 												// virt.valid implies view + sampler (set together
 												// above), matching do_verdict.

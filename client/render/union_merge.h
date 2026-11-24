@@ -167,44 +167,38 @@ public:
 	// the last released image).
 	void release();
 
-	// Record subpass 0 of the folded pass: MAX merge of inputs into
-	// the OWNED merged attachment (both eye layers, one fullscreen
-	// multiview draw, full extent) — NOT the submit image. Begins the
-	// folded renderpass (fold3 when paired, fold2 otherwise) on the
-	// per-image framebuffer and LEAVES IT OPEN: record_finish()
-	// continues with nextSubpass. inputs must hold 1..max_inputs
-	// entries with valid borrowed views; empty, oversized or an
-	// unknown image_index returns false WITHOUT beginning anything
-	// (caller releases the acquisition to keep pairing). paired must
-	// equal the virt.valid record_finish will see (caller derives both
-	// from the same validity check — subpass counts differ, so a
-	// mismatch would record the wrong tail). The descriptor set is
-	// rewritten per call (contributor images cycle independently);
-	// two sets ping-pong by call parity so an inline-fallback record
-	// never rewrites the set a still-flight async command buffer reads.
-	// Split-timing tap: when pool != nullptr a TopOfPipe timestamp is
-	// written to qafter after the merge draw (GPU layer/merge/
-	// verdict/apply split spans, read by the scene).
+	// Record the MAX merge inputs: validate (1..max_inputs, valid
+	// borrowed views; empty, oversized or null-view returns false) and
+	// write the merge descriptor set (contributor images cycle
+	// independently; two sets ping-pong by call parity so an
+	// inline-fallback record never rewrites the set a still-flight
+	// async command buffer reads). No renderpass work here: the merge
+	// draw happens in record_finish's fold. CPU-only (um_merge_ms
+	// times it in the scene).
 	bool record(vk::raii::CommandBuffer & cmd,
-	            size_t image_index,
-	            vk::Extent2D extent, std::span<const input> inputs,
-	            bool paired,
-	            const vk::raii::QueryPool * pool = nullptr, uint32_t qafter = 0);
+	            vk::Extent2D extent, std::span<const input> inputs);
 
-	// Global VR-occlusion finish: continues the folded renderpass
-	// record() began. Paired (virt.valid, same value passed as paired
-	// above — asserted): nextSubpass, fused foveated-decode + exact
-	// verdict (common layer vs virtual depth, NEAREST/NEAREST, R8 at
-	// full merge res), nextSubpass, apply (merged alpha x verdict, both
-	// NEAREST) into both eye layers of the acquired submit image, end.
-	// Mask-only (!virt.valid): nextSubpass, merged straight through
-	// (one tap, pixel-identical to x1), end. RGB zero; the submit-time
-	// REPLACE preserves dst color.
+	// Verdict subpass content, own renderpass (R8, CLEAR-to-1 +
+	// content-box draw): fused foveated-decode + exact compare
+	// (common layer vs virtual depth, NEAREST/NEAREST). Empty box
+	// skips the update + draw, identical to all-absent. Ends
+	// SHADER_READ_ONLY for the apply tap (own barrier below).
+	// No-op (no stamp) unless virt is valid with view + sampler.
+	void record_verdict(vk::raii::CommandBuffer & cmd,
+	                    const virt_input & virt_in,
+	                    const vk::raii::QueryPool * pool = nullptr, uint32_t qafter = 0);
+
+	// Global VR-occlusion finish: folded merge→apply (merge MAX into
+	// the owned tile-local attachment, then merged alpha x verdict
+	// into both eye layers of the acquired submit image). Mask-only
+	// (!virt.valid) takes the mask pipeline (merged straight through,
+	// pixel-identical to x1). RGB zero; the submit-time REPLACE
+	// preserves dst color.
 	bool record_finish(vk::raii::CommandBuffer & cmd,
 	                   size_t image_index,
 	                   vk::Extent2D extent,
 	                   const virt_input & virt_in,
-	                   const vk::raii::QueryPool * pool = nullptr, uint32_t qafter_verdict = 0);
+	                   const vk::raii::QueryPool * pool = nullptr, uint32_t qafter_merge = 0);
 
 	// Stage 0 of the common depth layer (positives only): CLEAR the
 	// R16F intermediate (large-finite FAR) then MIN-blend every window
@@ -288,33 +282,31 @@ private:
 	// a prior submission still reads the other.
 	std::vector<vk::raii::DescriptorSet> descriptor_sets;
 	bool set_parity = false;
+	// Active merge input count for the uniform tap early-out push
+	// (record() validates, record_finish() pushes before the merge
+	// draw; same-frame use only, set on every successful record()).
+	int merge_count_ = 0;
 	vk::raii::Sampler sampler{nullptr};
 
-	// Folded merge→verdict→apply (paired) and merge→apply (mask-only)
-	// renderpasses (opt #8): one RP per path, fullscreen passes as
-	// subpasses, tile-resident intermediates (triple precedent:
-	// GENERAL attachments sampled across subpasses, subpass
-	// dependencies replace the split-pass barrier sets). Shaders,
+	// Folded merge→apply renderpass (opt #8): one RP, fullscreen
+	// passes as subpass 0 (merge) + subpass 1 (apply), tile-local
+	// merged intermediate (triple precedent: GENERAL attachments
+	// sampled across subpasses, subpass dependency replaces the
+	// split-pass barrier). The verdict runs ahead of the fold in its
+	// own RP (different size) and is sampled as a texture. Shaders,
 	// layouts, sets and taps are unchanged — only the RP/FB/pipeline
-	// shell folds. Subpass index is baked into each pipeline (one
-	// pipeline per subpass, same as every multiview pass).
-	vk::raii::RenderPass fold3_rp{nullptr};
-	vk::raii::RenderPass fold2_rp{nullptr};
-	// Per submit image (submit view varies): {merged, verdict, submit}
-	// and {merged, submit} framebuffers, parallel to targets.
-	std::vector<vk::raii::Framebuffer> fold3_fbs;
-	std::vector<vk::raii::Framebuffer> fold2_fbs;
-	// Subpass pipelines: merge s0 + apply s2 on fold3 (verdict s1 is
-	// rebuilt by create_verdict_state); merge s0 + mask-apply s1 on
-	// fold2. The old split RPs/pipelines are gone.
+	// shell folds. Subpass index is baked into each pipeline.
+	vk::raii::RenderPass fold_rp{nullptr};
+	// Per submit image (submit view varies): {merged, submit}
+	// framebuffers, parallel to targets.
+	std::vector<vk::raii::Framebuffer> fold_fbs;
+	// Subpass pipelines: merge s0 + apply s1 (paired verdict tap) or
+	// mask-apply s1 (merged straight through). Chosen per frame in
+	// record_finish; no cross-call RP state (each function owns
+	// complete renderpasses).
 	vk::raii::Pipeline fold_merge_pipeline{nullptr};
 	vk::raii::Pipeline fold_apply_pipeline{nullptr};
-	vk::raii::Pipeline fold2_merge_pipeline{nullptr};
-	vk::raii::Pipeline fold2_maskapply_pipeline{nullptr};
-	// Which folded RP record() began (fold3 iff paired): record_finish
-	// asserts its do_verdict matches before continuing the subpasses.
-	// Same-thread sequential use only, set on every record().
-	bool fold_paired_ = false;
+	vk::raii::Pipeline fold_maskapply_pipeline{nullptr};
 
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;
@@ -326,7 +318,7 @@ private:
 	};
 	// [image], parallel to the swapchain image list (one multiview
 	// view per image — both eyes broadcast in one draw; the folded
-	// framebuffers live in fold3_fbs/fold2_fbs below).
+	// framebuffers live in fold_fbs below).
 	std::vector<target> targets;
 
 	// Common depth layer (R16F linear meters, full merge res): one
@@ -362,10 +354,12 @@ private:
 	vk::raii::RenderPass geom_renderpass{nullptr};
 	vk::raii::PipelineLayout geom_layout{nullptr};
 	vk::raii::Pipeline geom_pipeline{nullptr};
-	// Verdict + apply sampler/descriptor state (static CIS layouts,
-	// FRAG-only): the subpass-1 verdict pipeline is rebuilt by
-	// create_verdict_state (fold3 s1), the rest in init_pipelines.
-	// The fullscreen passes carry no push.
+	// Verdict (fused SBS decode + exact compare) in its own
+	// single-attachment RP: half-res R8 (opt #U), CLEAR-to-1 + box draw
+	// (opt #A), STORE + SHADER_READ final (viz samples it after the
+	// frame). Fullscreen passes, no push, static sampler2DArray
+	// bindings (Adreno rule, same as the merge shader).
+	vk::raii::RenderPass verdict_rp{nullptr};
 	// Verdict YCbCr immutable-sampler state (VUID-...-02738): the depth
 	// SBS view carries a conversion, so binding 1 needs an immutable
 	// sampler baked into the layout. The baked sampler is the paired
@@ -394,8 +388,9 @@ private:
 	std::vector<vk::raii::DescriptorSet> verdict_descriptor_sets;
 	bool verdict_set_parity = false;
 	vk::raii::PipelineLayout verdict_layout{nullptr};
-	// Fold3 subpass-1 pipeline (rebuilt with the layout above).
-	vk::raii::Pipeline fold_verdict_pipeline{nullptr};
+	// Verdict pipeline (rebuilt with the layout above, bound to the
+	// standalone verdict RP, subpass 0).
+	vk::raii::Pipeline verdict_pipeline{nullptr};
 	// Verdict content box (opt #A): conservative both-eyes pixel union
 	// of the layer draws, computed in record_base from the same
 	// meshes/MVPs it rasterizes (mirrors the frustum-skip projections
@@ -425,8 +420,7 @@ private:
 	bool apply_set_parity = false;
 	vk::raii::PipelineLayout apply_layout{nullptr};
 	// (Fold subpass apply pipelines live with the fold members above:
-	// fold_apply_pipeline s2 on fold3, fold2_maskapply_pipeline s1 on
-	// fold2. Mask-only: binding 1 written but never sampled.)
+	// fold_apply_pipeline s1 paired, fold_maskapply_pipeline s1 mask.)
 	// NEAREST + ClampToEdge (layer tap in the verdict, merged tap in
 	// the apply: both inputs are already filtered). The verdict runs
 	// at full merge res and multiplies directly in the apply (both
