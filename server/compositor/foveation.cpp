@@ -410,12 +410,12 @@ void foveation::compute_params(int slot, bool full_for_client)
 
 foveation::foveation(wivrn::vk_bundle & bundle, vk::Extent3D foveated_size, bool half_res_warp) :
         foveated_size(foveated_size),
-        half_res_warp(half_res_warp),
         // normal sight line is between 10° and 15° below horizontal
         // https://apps.dtic.mil/sti/tr/pdf/AD0758339.pdf pages 393-394
         // testing shows 10° looks better
         angle_offset(10 * M_PI / 180),
         convergence_distance(1 /* meter*/),
+        half_res_warp(half_res_warp),
         sampler(make_sampler(bundle)),
         ds_layout(make_ds_layout(bundle)),
         layout(make_layout(bundle, ds_layout)),

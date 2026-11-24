@@ -16,7 +16,7 @@
  *
  * Half-res warp note: the grid covers the same frustum at half linear
  * res, so each thread center-taps one source texel per 2x2 group
- * (NEAREST at the normalized group center: deterministic, no shader
+ * (NEAREST at the normalized group center — deterministic, no shader
  * change needed here). Sub-2px geometry may not splat — accepted for
  * the opt-in low-end path; a convert-then-min 2x2 gather would be the
  * foreground-safe upgrade if that ever matters.
