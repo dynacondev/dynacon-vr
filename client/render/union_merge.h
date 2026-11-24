@@ -127,9 +127,10 @@ public:
 	// depth-carrying warped frame — no separate depth params ride
 	// the wire). render_wh is the warp grid size (requested render
 	// eye size); packed_wh is the per-eye packed size (from the
-	// decoded SBS extent). The CPU expands runs to a direct
-	// packed-index map per full-res merge pixel (merge->render scale
-	// baked in) into the SSBO every verdict frame.
+	// decoded SBS extent). The verdict shader walks the runs directly
+	// from a compact per-frame upload (header + 4 axes, see
+	// kFoveaMaxRuns) — no CPU expand, merge->render scale applied in
+	// the shader.
 	struct virt_input
 	{
 		vk::ImageView view = nullptr;
@@ -366,20 +367,15 @@ private:
 	bool verdict_set_parity = false;
 	vk::raii::PipelineLayout verdict_layout{nullptr};
 	vk::raii::Pipeline verdict_pipeline{nullptr};
-	// Foveation index maps (SSBO pair, ping-ponged with the verdict
-	// sets): per-eye packed-texel index per full-res merge pixel,
-	// CPU-expanded from the shared foveation runs with the
-	// merge->render scale baked in. Layout: [x0(W)] [x1(W)] [y0(H)]
-	// [y1(H)] uint32s, W/H = merge extent. Host-visible, rewritten
-	// every verdict frame (depth_overlay UBO discipline: memcpy +
-	// vmaFlushAllocation under the same waitIdle'd ownership as the
-	// targets); ping-ponged so an inline record never rewrites what
-	// an in-flight async verdict still reads.
+	// Compact foveation runs (SSBO pair, ping-ponged with the verdict
+	// sets): header (render_w/h, packed_w/h, 4 axis counts) + 4 run
+	// arrays of kFoveaMaxRuns uint32s, uploaded verbatim every verdict
+	// frame (depth_overlay UBO discipline: memcpy + vmaFlushAllocation
+	// under the same waitIdle'd ownership as the targets); ping-ponged
+	// so an inline record never rewrites what an in-flight async
+	// verdict still reads. ~1KB fixed, extent-independent.
 	buffer_allocation verdict_tables[2];
 	vk::DeviceSize verdict_tables_bytes = 0;
-	// Expanded index-map scratch (capacity persists after the first
-	// verdict frame): avoids a ~2*(W+H) uint32 heap alloc per frame.
-	std::vector<uint32_t> verdict_map_scratch;
 	vk::raii::DescriptorSetLayout apply_descriptor_layout{nullptr};
 	vk::raii::DescriptorPool apply_descriptor_pool{nullptr};
 	std::vector<vk::raii::DescriptorSet> apply_descriptor_sets;

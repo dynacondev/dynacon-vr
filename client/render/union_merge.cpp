@@ -54,56 +54,16 @@ struct geom_push
 };
 static_assert(sizeof(geom_push) == 128);
 
-// Expand compact foveation runs to a direct packed-index map per merge
-// pixel, baking the merge->render scale. Layout: [x0(W)] [x1(W)]
-// [y0(H)] [y1(H)] uint32s, W/H = merge extent. Runs describe packed
-// texels: entry i holds n_i texels covering n_i * ratio_i source
-// pixels (ratio_i = |n_ratio - i| + 1, middle run 1:1). Inverting gives
-// render->packed; the merge scale then picks the packed texel per
-// merge pixel (uniform floor, clamped). Empty runs fall back to a
-// uniform map over the packed size (straight / pre-foveation data).
-static void expand_foveation_axis(const std::vector<uint16_t> & runs, int render_n, int merge_n, int packed_n, uint32_t * out)
-{
-	if (render_n <= 0 or merge_n <= 0)
-	{
-		for (int u = 0; u < merge_n; ++u)
-			out[u] = 0;
-		return;
-	}
-	if (runs.empty())
-	{
-		for (int u = 0; u < merge_n; ++u)
-			out[u] = packed_n > 0 ? (uint32_t)std::min<int64_t>((int64_t)u * packed_n / merge_n, packed_n - 1) : 0;
-		return;
-	}
-	// Direct map: render pixel -> packed texel.
-	std::vector<uint32_t> r2p;
-	r2p.reserve((size_t)render_n);
-	const int n_ratio = (int)(runs.size() - 1) / 2;
-	uint32_t packed = 0;
-	for (size_t i = 0; i < runs.size() and (int)r2p.size() < render_n; ++i)
-	{
-		int ratio = std::abs(n_ratio - (int)i) + 1;
-		for (uint16_t k = 0; k < runs[i] and (int)r2p.size() < render_n; ++k)
-		{
-			for (int r = 0; r < ratio and (int)r2p.size() < render_n; ++r)
-				r2p.push_back(packed + k);
-		}
-		packed += runs[i];
-	}
-	while ((int)r2p.size() < render_n)
-		r2p.push_back(r2p.empty() ? 0 : r2p.back());
-	const uint32_t packed_max = packed_n > 0 ? (uint32_t)packed_n - 1 : 0;
-	for (int u = 0; u < merge_n; ++u)
-	{
-		int64_t r = (int64_t)u * render_n / merge_n;
-		uint32_t v = r2p[(size_t)std::min<int64_t>(r, render_n - 1)];
-		// Clamp to the packed range: the runs should tile exactly it,
-		// but an overrun here would read the other eye's half (eye 0)
-		// or ClampToEdge texels (eye 1) — silent wrong depth.
-		out[u] = packed_n > 0 ? std::min(v, packed_max) : 0;
-	}
-}
+// Compact foveation-run upload (opt #7): per-axis run capacity in the
+// verdict SSBO. Runs describe packed texels (entry i holds n_i texels
+// at ratio_i = |center-i|+1); real tables are ~7-15 entries per axis
+// (length = 2*max_ratio-1, ratios are single digits), so 64 covers a
+// max ratio of 32 with wide headroom. Must match FOVEA_MAX_RUNS in
+// vr_verdict_mv.frag.glsl. SSBO layout (uint32s): header [render_w,
+// render_h, packed_w, packed_h, nx0, nx1, ny0, ny1] then x0/x1/y0/y1
+// run arrays of kFoveaMaxRuns each.
+constexpr int kFoveaMaxRuns = 64;
+constexpr int kFoveaHeader = 8;
 
 uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
 {
@@ -255,9 +215,10 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	merged_ = make_owned(new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, renderpass);
 	verdict_ = make_owned(verdict_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, verdict_renderpass);
 	layer_extent_ = new_extent;
-	// Foveation index maps (SSBO pair, host-visible): per-eye packed
-	// index per merge pixel, [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s.
-	verdict_tables_bytes = vk::DeviceSize(2 * (new_extent.width + new_extent.height)) * sizeof(uint32_t);
+	// Compact foveation runs (SSBO pair, host-visible, fixed ~1KB):
+	// header + 4 verbatim run arrays, walked by the verdict shader.
+	// Extent-independent (no 2*(W+H) map anymore).
+	verdict_tables_bytes = vk::DeviceSize(kFoveaHeader + 4 * kFoveaMaxRuns) * sizeof(uint32_t);
 	for (auto & t: verdict_tables)
 	{
 		t = buffer_allocation(
@@ -1229,33 +1190,53 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 			// sampler changes. waitIdle'd, rare.
 			ensure_verdict_layout(virt_in.ycbcr, virt_in.sampler);
 			verdict_set_parity = !verdict_set_parity;
-			// Foveation index maps, CPU-expanded per frame into the
+			// Compact foveation runs, uploaded verbatim into the
 			// ping-ponged SSBO (depth_overlay UBO discipline: memcpy +
-			// flush, rewritten before the draw that reads them). Merge->render
-			// scale baked in; packed dims from the paired depth frame.
+			// flush, rewritten before the draw that reads them). The
+			// shader applies the merge->render scale and walks the runs
+			// (same math as the old CPU expand); packed dims from the
+			// paired depth frame.
 			auto & tables = verdict_tables[verdict_set_parity ? 1 : 0];
 			{
-				const int W = (int)layer_extent_.width, H = (int)layer_extent_.height;
-				const int render_w = virt_in.render_w, render_h = virt_in.render_h;
-				const int packed_w = virt_in.packed_w, packed_h = virt_in.packed_h;
-				assert(W > 0 and H > 0);
-				verdict_map_scratch.resize((size_t)2 * (W + H));
-				uint32_t * map = verdict_map_scratch.data();
-				for (int eye = 0; eye < 2; ++eye)
+				uint32_t * dst = tables.data<uint32_t>();
+				dst[0] = virt_in.render_w;
+				dst[1] = virt_in.render_h;
+				dst[2] = virt_in.packed_w;
+				dst[3] = virt_in.packed_h;
+				const std::vector<uint16_t> * axes[4] = {
+				        &virt_in.foveation[0].x, &virt_in.foveation[1].x,
+				        &virt_in.foveation[0].y, &virt_in.foveation[1].y,
+				};
+				for (int a = 0; a < 4; ++a)
 				{
 					// Server invariant: compute_params always emits odd,
 					// non-empty runs (fill_param_2d ends count*2-1; the
-					// non-foveated fallback emits one element).
-					assert(virt_in.foveation[eye].x.size() % 2 == 1);
-					assert(virt_in.foveation[eye].y.size() % 2 == 1);
-					expand_foveation_axis(virt_in.foveation[eye].x, render_w, W, packed_w, map + eye * W);
-					expand_foveation_axis(virt_in.foveation[eye].y, render_h, H, packed_h, map + 2 * W + eye * H);
+					// non-foveated fallback emits one element). The shader
+					// still handles count 0 (uniform fallback) if asserts
+					// are compiled out and an empty vector arrives.
+					assert(axes[a]->size() % 2 == 1);
+					size_t n = axes[a]->size();
+					if (n > (size_t)kFoveaMaxRuns)
+					{
+						static bool overflow_logged = false;
+						if (not overflow_logged)
+						{
+							overflow_logged = true;
+							spdlog::error("Union merge compact fovea: axis {} has {} runs, clamping to {} (tail maps wrong)", a, n, kFoveaMaxRuns);
+						}
+						n = kFoveaMaxRuns;
+					}
+					dst[4 + a] = (uint32_t)n;
+					uint32_t * base = dst + kFoveaHeader + a * kFoveaMaxRuns;
+					for (size_t i = 0; i < n; ++i)
+						base[i] = (*axes[a])[i];
+					for (size_t i = n; i < (size_t)kFoveaMaxRuns; ++i)
+						base[i] = 0;
 				}
-				std::memcpy(tables.map(), map, verdict_map_scratch.size() * sizeof(uint32_t));
 				tables.unmap();
 				// Non-coherent host-visible memory: flush, or the GPU reads
 				// stale tables forever (depth_overlay precedent).
-				vmaFlushAllocation(vk_allocator::instance(), tables, 0, verdict_map_scratch.size() * sizeof(uint32_t));
+				vmaFlushAllocation(vk_allocator::instance(), tables, 0, verdict_tables_bytes);
 			}
 			vk::DescriptorSet vset = *verdict_descriptor_sets[verdict_set_parity ? 1 : 0];
 			vk::DescriptorImageInfo layer_info{
