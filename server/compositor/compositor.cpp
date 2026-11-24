@@ -351,7 +351,7 @@ vk::Extent2D warp_extent(const wivrn::from_headset::headset_info_packet & info)
 	// foveation::foveate), only the server-side warp grid shrinks.
 	if (wivrn::configuration().reprojection.half_res_warp)
 	{
-		U_LOG_I("half-res warp grid %ux%u (render %ux%u)",
+		U_LOG_I("half-res warp grid %dx%d (render %dx%d)",
 		        re.width / 2, re.height / 2, re.width, re.height);
 		return {re.width / 2, re.height / 2};
 	}
@@ -1085,9 +1085,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 		const auto splat_views = reprojector.get_splat_views(slot);
 		const auto hole_views = reprojector.get_hole_views(slot);
-		// Splat grid == warp grid size (render size, or half when
-		// half-res-warp is set): the pack foveated-gathers
-		// from warp res down to depth res, using color's per-slot
+		// Splat grid == warp grid (render size): the pack foveated-gathers
+		// from full warp res down to depth res, using color's per-slot
 		// tables (foveate() ran above this commit — same slot, read-only
 		// here, never re-uploaded).
 		const auto splat_extent = reprojector.target_extent();

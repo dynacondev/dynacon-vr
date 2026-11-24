@@ -72,8 +72,7 @@ struct vk_bundle;
 // search radius, or no established background reference, stay black.
 //
 // Fixed owned scratch per (slot, eye): warped color + splat depth at
-// warp grid size (full render, or half when half-res-warp is set) —
-// not a pool, no acquire/release. Per-warp
+// full render size — not a pool, no acquire/release. Per-warp
 // descriptor rewrites and UBO uploads land in the commit's slot, so
 // overlapping submits never share CPU-written state (the safety story
 // is slot ownership via image-busy lifetime, not the commit tail).
@@ -133,13 +132,14 @@ private:
 	// reverse-Z sources are converted in the splat pass. Read once
 	// here so the hot path never touches the config.
 	const bool reverse_z;
-	// Half-res warp note: the grid covers the same frustum at half linear
-	// res, so each thread center-taps one source texel per 2x2 group
-	// (NEAREST at the normalized group center — deterministic, but
-	// sub-2px geometry may not splat). Pull's LINEAR center tap is the
-	// exact 2x2 box average. Passes scale with the grid automatically
-	// (extent-driven dispatches/clears); fill radius and bgmax cell are
-	// halved via specialization constants to preserve visual scale.
+	// Half-res warp grid (config half-res-warp, startup-only): the
+	// grid covers the same frustum at half linear res, so every warp
+	// thread handles a 2x2 group from a single center tap (splat
+	// (2i+1, 2j+1) via NEAREST — deterministic, but sub-2px geometry
+	// may not splat). Pull's LINEAR center tap is the exact 2x2 box
+	// average. Passes scale with the grid automatically (extent-driven
+	// dispatches/clears); fill radius and bgmax cell are halved via
+	// specialization constants to preserve visual scale.
 	const bool half_res_warp;
 	const vk::Extent2D extent;
 
@@ -168,8 +168,8 @@ private:
 	// nondeterministic across runs.
 	std::array<std::array<image_allocation, 2>, num_slots> hole_depth;
 	std::array<std::array<vk::raii::ImageView, 2>, num_slots> hole_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};
-	// Coarse background reference: one R32_UINT texel per BGMAX_CELL
-	// block (perimeter-max splat depth, EMPTY-skipped). Same slot/eye
+	// Coarse background reference: one R32_UINT texel per 64x64 block
+	// (perimeter-max splat depth, EMPTY-skipped). Same slot/eye
 	// ownership as splat/target; stays GENERAL between warps.
 	std::array<std::array<image_allocation, 2>, num_slots> bgmax;
 	std::array<std::array<vk::raii::ImageView, 2>, num_slots> bgmax_view{{{{nullptr, nullptr}}, {{nullptr, nullptr}}}};

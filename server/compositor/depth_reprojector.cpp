@@ -251,11 +251,8 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 			        vk, hole_depth[slot][view], vk::Format::eR32Uint,
 			        vk::ImageUsageFlagBits::eStorage,
 			        std::format("reproject hole view {}:{}", slot, view).c_str());
-			// Coarse grid follows the warp grid (spec constant at pipeline
-			// creation, same value here or blocks go unwritten/unread).
-			const uint32_t bgmax_div = half_res_warp ? 32 : 64;
 			bgmax[slot][view] = make_target(
-			        vk, {(target_size.width + bgmax_div - 1) / bgmax_div, (target_size.height + bgmax_div - 1) / bgmax_div},
+			        vk, {(target_size.width + 63) / 64, (target_size.height + 63) / 64},
 			        vk::Format::eR32Uint, vk::ImageUsageFlagBits::eStorage,
 			        std::format("reproject bgmax {}:{}", slot, view).c_str());
 			bgmax_view[slot][view] = make_view(

@@ -136,16 +136,6 @@ Default value: `true`
 Depth encoding of the submitting app: `true` = reverse-Z (X-Plane 12
 Vulkan). Normal-Z apps set `false` explicitly.
 
-### `half-res-warp`
-Default value: `false`
-
-Half-resolution warp grid (opt-in): splat/pull/fill/pack run at half
-linear res (quarter threads, center-tap source sampling). Trades
-quality for low-end GPU headroom — fovea softening, ±2px occlusion
-edges, sub-2px geometry may not occlude. The client is unaffected
-(still receives full-res runs). Startup-only; needs a restart to
-take effect.
-
 ### `gpu-priority`
 Default value: `high`
 
@@ -163,7 +153,6 @@ default when the driver lacks support.
 	"reprojection": {
 		"enabled": true,
 		"source-reverse-z": true,
-		"half-res-warp": false,
 		"gpu-priority": "high"
 	}
 }
