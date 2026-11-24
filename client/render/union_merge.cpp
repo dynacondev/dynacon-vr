@@ -1104,6 +1104,16 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 						break;
 					}
 					float nx = q.x / q.w, ny = q.y / q.w;
+					// Grazing near-plane corners (tiny positive w) project
+					// to huge finite NDC whose float→int cast is UB and
+					// would collapse the box: treat like behind-camera
+					// (fullscreen fallback). Threshold ≫ expanded frustum.
+					if (not std::isfinite(nx) or not std::isfinite(ny) or
+					    std::fabs(nx) > 8.f or std::fabs(ny) > 8.f)
+					{
+						behind = true;
+						break;
+					}
 					minx = std::min(minx, nx);
 					miny = std::min(miny, ny);
 					maxx = std::max(maxx, nx);
