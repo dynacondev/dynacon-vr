@@ -356,7 +356,7 @@ static void fill_param_2d(
 namespace wivrn
 {
 
-void foveation::compute_params(int slot, bool full_for_client)
+void foveation::compute_params(int slot)
 {
 	P & slot_last = this->last[slot];
 	auto e = yaw_pitch(gaze);
@@ -364,35 +364,23 @@ void foveation::compute_params(int slot, bool full_for_client)
 	if (manual_foveation.enabled)
 		e.y = manual_foveation.pitch;
 
-	// Fill one axis at one grid size, falling back to a single
-	// uniform run when the grid is already at/below foveated size.
-	// Identical to the old inline branches when full_for_client is
-	// false (centers are pure ALU either way).
-	auto fill_axis = [&](float center, size_t foveated_dim, size_t extent_dim, std::vector<uint16_t> & out) {
-		if (foveated_dim < extent_dim)
-			fill_param_2d(center, foveated_dim, extent_dim, out);
-		else
-			out = {uint16_t(extent_dim)};
-	};
-
 	for (size_t i = 0; i < 2; ++i)
 	{
 		const auto & fov = slot_last.fovs[i];
 
 		size_t extent_w = std::abs(slot_last.src[i].extent.w);
+		if (foveated_size.width < extent_w)
 		{
 			auto distance = manual_foveation.enabled ? manual_foveation.distance : convergence_distance;
 			auto angle_x = convergence_angle(distance, eye_x[i], -e.x);
 			auto center = angles_to_center(angle_x, fov.angle_left, fov.angle_right);
-			fill_axis(center, foveated_size.width, extent_w, params[slot][i].x);
-			// Full-res client runs on half-res warped frames: same gaze
-			// center, full grid — the client expands against full
-			// render size and never sees the halved grid.
-			if (full_for_client)
-				fill_axis(center, foveated_size.width, 2 * extent_w, full_params[slot][i].x);
+			fill_param_2d(center, foveated_size.width, extent_w, params[slot][i].x);
 		}
+		else
+			params[slot][i].x = {uint16_t(extent_w)};
 
 		size_t extent_h = std::abs(slot_last.src[i].extent.h);
+		if (foveated_size.height < extent_h)
 		{
 			auto angle_y = -e.y;
 			if (is_zero_quat(gaze) and not manual_foveation.enabled)
@@ -401,10 +389,10 @@ void foveation::compute_params(int slot, bool full_for_client)
 				angle_y += angle_offset;
 			}
 			auto center = angles_to_center(-angle_y, fov.angle_up, fov.angle_down);
-			fill_axis(center, foveated_size.height, extent_h, params[slot][i].y);
-			if (full_for_client)
-				fill_axis(center, foveated_size.height, 2 * extent_h, full_params[slot][i].y);
+			fill_param_2d(center, foveated_size.height, extent_h, params[slot][i].y);
 		}
+		else
+			params[slot][i].y = {uint16_t(extent_h)};
 	}
 }
 
@@ -530,8 +518,7 @@ void foveation::update_ubo(
         int slot,
         bool flip_y,
         std::array<xrt_rect, 2> src_rect,
-        std::array<xrt_fov, 2> src_fov,
-        bool warped)
+        std::array<xrt_fov, 2> src_fov)
 {
 	// Check if the last value is still valid. The cache is per slot:
 	// each slot owns its buffer, so a hit here always describes this
@@ -560,7 +547,7 @@ void foveation::update_ubo(
 	        .manual_foveation = manual_foveation,
 	};
 
-	compute_params(slot, half_res_warp and warped);
+	compute_params(slot);
 
 	ubo_data ubo;
 	for (size_t view = 0; view < 2; ++view)
@@ -619,10 +606,9 @@ std::array<to_headset::foveation_parameter, 2> foveation::foveate(
         std::array<vk::ImageView, 2> src,
         std::array<xrt_rect, 2> src_rect,
         std::array<xrt_fov, 2> src_fov,
-        bool alpha,
-        bool warped)
+        bool alpha)
 {
-	update_ubo(slot, flip_y, src_rect, src_fov, warped);
+	update_ubo(slot, flip_y, src_rect, src_fov);
 	auto ubo = gpu_buffers[slot].data<ubo_data>();
 
 	std::array src_image_info{
@@ -691,11 +677,6 @@ std::array<to_headset::foveation_parameter, 2> foveation::foveate(
 	             divide_and_round_up(foveated_size.height, 8),
 	             2);
 
-	// Half-res warped frames hand the client the separately computed
-	// full tiling (the shader tables above tile the half grid);
-	// everything else returns the shader params verbatim.
-	if (half_res_warp and warped)
-		return full_params[slot];
 	return params[slot];
 }
 } // namespace wivrn

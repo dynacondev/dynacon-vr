@@ -92,14 +92,13 @@ class foveation
 	std::array<P, num_slots> last;
 
 	// must hold lock on mutex to call it
-	void compute_params(int slot, bool full_for_client);
+	void compute_params(int slot);
 
 	void update_ubo(
 	        int slot,
 	        bool flip_y,
 	        std::array<xrt_rect, 2> src_rect,
-	        std::array<xrt_fov, 2> src_fov,
-	        bool warped);
+	        std::array<xrt_fov, 2> src_fov);
 
 public:
 	foveation(wivrn::vk_bundle &,
@@ -119,11 +118,7 @@ public:
 	        std::array<vk::ImageView, 2> src,
 	        std::array<xrt_rect, 2> src_rect,
 	        std::array<xrt_fov, 2> src_fov,
-	        bool alpha,
-	        // True when src is a warped frame in half-res mode: the
-	        // shader tables tile the half grid, but the returned client
-	        // runs tile full render size (separately computed).
-	        bool warped);
+	        bool alpha);
 
 	// Shared foveation tables for the depth packer: the same per-slot
 	// storage buffer color foveation uploads. Read-only; valid once
