@@ -131,7 +131,7 @@ private:
 	std::unordered_map<AHardwareBuffer *, std::shared_ptr<mapped_hardware_buffer>> hardware_buffer_map;
 	vk::raii::RenderPass renderpass = nullptr;
 
-	std::shared_ptr<ycbcr_generation> create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format);
+	std::shared_ptr<ycbcr_generation> create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & format_props);
 	std::shared_ptr<mapped_hardware_buffer> map_hardware_buffer(AImage *);
 
 public:

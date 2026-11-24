@@ -110,8 +110,12 @@ public:
 	};
 
 	// Virtual depth for the global verdict: decoded stream-3 SBS frame
-	// (single image, left eye x[0..w/2)), decoder-owned view +
-	// sampler, set every frame from the paired blit handle. valid=false
+	// (single image, left eye x[0..w/2)), handle-pinned view +
+	// sampler, set every frame from the paired blit handle. The sampler
+	// is the handle's own format generation (never the decoder's live
+	// one: decoders renegotiate, and a stale view sampled through a
+	// destroyed conversion segfaults Adreno in updateDescriptorSets).
+	// valid=false
 	// skips the verdict pass + barrier and applies merged directly
 	// (mask-only finish, pixel-identical to a cleared-to-1 verdict).
 	// ycbcr carries the view's
@@ -335,16 +339,17 @@ private:
 	vk::raii::RenderPass verdict_renderpass{nullptr};
 	// Verdict YCbCr immutable-sampler state (VUID-...-02738): the depth
 	// SBS view carries a conversion, so binding 1 needs an immutable
-	// sampler baked into the layout. The baked sampler is the decoder's
-	// live sampler (defoveator pattern): a separately built conversion
-	// proved unidentifiable to validation despite matching parameters,
-	// so the layout shares the decoder's object instead of owning one.
-	// Rebuilt when the incoming definition OR the decoder sampler handle
-	// changes (recreation hands out a new object; waitIdle'd like
-	// ensure()). Plain views (has_conversion=false) keep the mutable
-	// layout. Declaration order matters: layout outlives sets (reverse
-	// destruction). Non-owning alias: refreshed on every rebuild before
-	// any bind.
+	// sampler baked into the layout. The baked sampler is the paired
+	// handle's own generation sampler (pinned by the handle: same
+	// generation as the sampled view, always). A separately built
+	// conversion proved unidentifiable to validation despite matching
+	// parameters, so the layout shares the handle's object instead of
+	// owning one. Rebuilt when the incoming definition OR the handle
+	// sampler changes (renegotiation hands out a new generation;
+	// waitIdle'd like ensure()). Plain views (has_conversion=false)
+	// keep the mutable layout. Declaration order matters: layout
+	// outlives sets (reverse destruction). Non-owning alias: refreshed
+	// on every rebuild before any bind.
 	vk::Sampler verdict_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition verdict_ycbcr_built{};
 	// (Re)build the full verdict state for a conversion definition:

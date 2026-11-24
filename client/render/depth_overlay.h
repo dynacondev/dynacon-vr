@@ -158,8 +158,8 @@ public:
 	// is present (shared 0..2.046m ramp, far past 1020 black, no-window
 	// pixels keep the VR color). Null virt view records opaque black;
 	// null layer falls back to plain VR depth. YCbCr views ride the
-	// immutable-sampler path (verdict pattern: decoder-shared sampler,
-	// waitIdle'd rebuild).
+	// immutable-sampler path (verdict pattern: handle-generation
+	// sampler baked immutable, waitIdle'd rebuild).
 	void record_vr_raster(vk::raii::CommandBuffer & cmd, size_t image_index,
 	                      const std::array<vk::Extent2D, 2> & extents,
 	                      vk::ImageView virt_view, vk::Sampler virt_sampler,
@@ -170,7 +170,8 @@ public:
 	// VR-depth viz (decoder SBS, single image, GENERAL): green->red
 	// over 0..2.046m, far past 1020 black. Null view records opaque
 	// black. YCbCr views ride the immutable-sampler path (verdict
-	// pattern: decoder-shared sampler, waitIdle'd rebuild).
+	// pattern: handle-generation sampler baked immutable, waitIdle'd
+	// rebuild).
 	void record_virt(vk::raii::CommandBuffer & cmd, size_t image_index,
 	                 const std::array<vk::Extent2D, 2> & extents,
 	                 vk::ImageView virt_view, vk::Sampler virt_sampler,
@@ -217,12 +218,12 @@ private:
 	vk::raii::PipelineLayout raster_sensor_pipeline_layout{nullptr};
 	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
 	// VR+raster state (decoder SBS sampler2D + R16F layer + UBO): own
-	// layout + pool + set + pipeline. Converted views bake the decoder's
-	// live sampler as immutable (VUID-02738, verdict pattern); plain
-	// views keep the mutable layout. waitIdle'd rebuild, rare.
-	// Declaration order matters: layout outlives sets (reverse
-	// destruction). Non-owning alias: refreshed on every rebuild before
-	// any bind; a decoder-side sampler recreation rebuilds before the
+	// layout + pool + set + pipeline. Converted views bake the paired
+	// handle's generation sampler as immutable (VUID-02738, verdict
+	// pattern); plain views keep the mutable layout. waitIdle'd
+	// rebuild, rare. Declaration order matters: layout outlives sets
+	// (reverse destruction). Non-owning alias: refreshed on every
+	// rebuild before any bind; a generation change rebuilds before the
 	// next bind (handle comparison in ensure_vr_raster_layout).
 	vk::Sampler vr_raster_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition vr_raster_ycbcr_built{};
@@ -234,12 +235,12 @@ private:
 	vk::raii::PipelineLayout vr_raster_pipeline_layout{nullptr};
 	vk::raii::Pipeline vr_raster_pipeline{nullptr};
 	// VR-depth viz state (decoder SBS sampler2D + UBO): own layout +
-	// pool + set + pipeline. Converted views bake the decoder's live
-	// sampler as immutable (VUID-02738, verdict pattern); plain views
-	// keep the mutable layout. waitIdle'd rebuild, rare. Declaration
-	// order matters: layout outlives sets (reverse destruction).
-	// Non-owning alias: refreshed on every rebuild before any bind;
-	// a decoder-side sampler recreation rebuilds before the next bind
+	// pool + set + pipeline. Converted views bake the paired handle's
+	// generation sampler as immutable (VUID-02738, verdict pattern);
+	// plain views keep the mutable layout. waitIdle'd rebuild, rare.
+	// Declaration order matters: layout outlives sets (reverse
+	// destruction). Non-owning alias: refreshed on every rebuild before
+	// any bind; a generation change rebuilds before the next bind
 	// (handle comparison in ensure_virt_layout).
 	vk::Sampler virt_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition virt_ycbcr_built{};

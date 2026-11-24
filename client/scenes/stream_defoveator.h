@@ -37,7 +37,9 @@ class stream_defoveator
 
 	// Graphic pipeline
 	vk::raii::RenderPass renderpass = nullptr;
-	// No FREE_DESCRIPTOR_SET_BIT: sets are raw handles freed only by whole-pool destruction, never individually.
+	// No FREE_DESCRIPTOR_SET_BIT: sets are raw handles freed only by
+	// whole-pool destruction or reset_pipelines, never individually.
+	// Generation rebuilds retire everything through reset_pipelines.
 	vk::raii::DescriptorPool ds_pool = nullptr;
 	struct pipeline_t
 	{
@@ -45,6 +47,12 @@ class stream_defoveator
 		vk::DescriptorSet ds;
 		vk::raii::PipelineLayout layout = nullptr;
 		vk::raii::Pipeline pipeline = nullptr;
+		// Samplers baked into the immutable set layout (empty when no
+		// pipeline built yet): rebuilt on generation change, or new
+		// views would sample through a stale conversion (VUID-01948,
+		// Adreno fault). Mirrors the verdict layout discipline.
+		vk::Sampler baked_rgb = nullptr;
+		vk::Sampler baked_a = nullptr;
 	};
 	pipeline_t pipeline_rgb[view_count];
 	pipeline_t pipeline_a[view_count];

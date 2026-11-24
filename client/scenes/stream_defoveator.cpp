@@ -76,8 +76,19 @@ stream_defoveator::vertex * stream_defoveator::get_vertices(size_t view)
 stream_defoveator::pipeline_t & stream_defoveator::ensure_pipeline(size_t view, vk::Sampler rgb, vk::Sampler a)
 {
 	auto & target = a ? pipeline_a[view] : pipeline_rgb[view];
-	if (*target.pipeline)
+	if (*target.pipeline and target.baked_rgb == rgb and (not a or target.baked_a == a))
 		return target;
+
+	// New format generation (AHB renegotiation) with a live pipeline:
+	// retire everything — the raw sets die with the pool reset, and the
+	// baked immutable samplers die with their layouts. Drain first: the
+	// abandoned sets may still be read by the in-flight submission
+	// (renegotiation-rare, same hammer as the verdict layout rebuild).
+	if (*target.pipeline)
+	{
+		device.waitIdle();
+		reset_pipelines();
+	}
 
 	std::array samplers{rgb, a};
 	int32_t alpha = a ? 1 : 0;
@@ -190,6 +201,10 @@ stream_defoveator::pipeline_t & stream_defoveator::ensure_pipeline(size_t view, 
 	};
 
 	target.pipeline = device.createGraphicsPipeline(application::get_pipeline_cache(), pipeline_info);
+	// Pin the baked generation: the next ensure compares against the
+	// incoming samplers.
+	target.baked_rgb = rgb;
+	target.baked_a = a;
 	return target;
 }
 

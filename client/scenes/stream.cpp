@@ -2942,9 +2942,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										{
 											// Virtual depth for the global
 											// verdict: the paired stream-3
-											// frame (SBS, decoder-owned view
-											// + sampler), with the shared
-											// foveation tables for the
+											// frame (SBS, handle-pinned view
+											// + generation sampler), with the
+											// shared foveation tables for the
 											// packed-index lookup.
 											// Unpaired (not expected,
 											// decoder dead, ±1 miss) or VR

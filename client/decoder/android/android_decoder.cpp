@@ -349,6 +349,7 @@ void decoder::on_image_available(AImageReader * reader)
 		// Generation sampler for image_view (see blit_handle::sampler):
 		// pinned by vk_data, always the generation this view was baked
 		// with — even if the decoder renegotiated since.
+		assert(vk_data->generation);
 		handle->sampler = *vk_data->generation->sampler;
 
 		if (auto scene = weak_scene.lock())
@@ -359,25 +360,25 @@ void decoder::on_image_available(AImageReader * reader)
 	}
 }
 
-std::shared_ptr<decoder::ycbcr_generation> decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format)
+std::shared_ptr<decoder::ycbcr_generation> decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & format_props)
 {
-	assert(ahb_format.externalFormat != 0);
+	assert(format_props.externalFormat != 0);
 	spdlog::info("AndroidHardwareBufferProperties");
-	spdlog::info("  Vulkan format: {}", vk::to_string(ahb_format.format));
-	spdlog::info("  External format: {:#x}", ahb_format.externalFormat);
-	spdlog::info("  Format features: {}", vk::to_string(ahb_format.formatFeatures));
+	spdlog::info("  Vulkan format: {}", vk::to_string(format_props.format));
+	spdlog::info("  External format: {:#x}", format_props.externalFormat);
+	spdlog::info("  Format features: {}", vk::to_string(format_props.formatFeatures));
 	spdlog::info("  samplerYcbcrConversionComponents: ({}, {}, {}, {})",
-	             vk::to_string(ahb_format.samplerYcbcrConversionComponents.r),
-	             vk::to_string(ahb_format.samplerYcbcrConversionComponents.g),
-	             vk::to_string(ahb_format.samplerYcbcrConversionComponents.b),
-	             vk::to_string(ahb_format.samplerYcbcrConversionComponents.a));
-	spdlog::info("  Suggested YCbCr model: {}", vk::to_string(ahb_format.suggestedYcbcrModel));
-	spdlog::info("  Suggested YCbCr range: {}", vk::to_string(ahb_format.suggestedYcbcrRange));
-	spdlog::info("  Suggested X chroma offset: {}", vk::to_string(ahb_format.suggestedXChromaOffset));
-	spdlog::info("  Suggested Y chroma offset: {}", vk::to_string(ahb_format.suggestedYChromaOffset));
+	             vk::to_string(format_props.samplerYcbcrConversionComponents.r),
+	             vk::to_string(format_props.samplerYcbcrConversionComponents.g),
+	             vk::to_string(format_props.samplerYcbcrConversionComponents.b),
+	             vk::to_string(format_props.samplerYcbcrConversionComponents.a));
+	spdlog::info("  Suggested YCbCr model: {}", vk::to_string(format_props.suggestedYcbcrModel));
+	spdlog::info("  Suggested YCbCr range: {}", vk::to_string(format_props.suggestedYcbcrRange));
+	spdlog::info("  Suggested X chroma offset: {}", vk::to_string(format_props.suggestedXChromaOffset));
+	spdlog::info("  Suggested Y chroma offset: {}", vk::to_string(format_props.suggestedYChromaOffset));
 
 	vk::Filter yuv_filter;
-	if (ahb_format.formatFeatures & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter)
+	if (format_props.formatFeatures & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter)
 		yuv_filter = vk::Filter::eLinear;
 	else
 		yuv_filter = vk::Filter::eNearest;
@@ -386,15 +387,15 @@ std::shared_ptr<decoder::ycbcr_generation> decoder::create_sampler(const AHardwa
 	vk::StructureChain ycbcr_create_info{
 	        vk::SamplerYcbcrConversionCreateInfo{
 	                .format = vk::Format::eUndefined,
-	                .ycbcrModel = ahb_format.suggestedYcbcrModel,
-	                .ycbcrRange = ahb_format.suggestedYcbcrRange,
-	                .components = ahb_format.samplerYcbcrConversionComponents,
-	                .xChromaOffset = ahb_format.suggestedXChromaOffset,
-	                .yChromaOffset = ahb_format.suggestedYChromaOffset,
+	                .ycbcrModel = format_props.suggestedYcbcrModel,
+	                .ycbcrRange = format_props.suggestedYcbcrRange,
+	                .components = format_props.samplerYcbcrConversionComponents,
+	                .xChromaOffset = format_props.suggestedXChromaOffset,
+	                .yChromaOffset = format_props.suggestedYChromaOffset,
 	                .chromaFilter = yuv_filter,
 	        },
 	        vk::ExternalFormatANDROID{
-	                .externalFormat = ahb_format.externalFormat,
+	                .externalFormat = format_props.externalFormat,
 	        },
 	};
 
