@@ -1018,7 +1018,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        reprojector.get_views(slot),
 		        warp_rect,
 		        dst_fov,
-		        view_info.alpha);
+		        view_info.alpha,
+		        true); // warped source (half-res grid when configured)
 	}
 	else
 	{
@@ -1032,7 +1033,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        src,
 		        src_rect,
 		        src_fov,
-		        view_info.alpha);
+		        view_info.alpha,
+		        false); // straight from the app (full-res params either way)
 	}
 
 	// Virtual-depth pack (stream 3): foveated MIN-gather over the
