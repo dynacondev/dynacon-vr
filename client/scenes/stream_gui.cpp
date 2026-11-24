@@ -149,6 +149,12 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 	gm.gizmo_gpu_ms = timestamps.gizmo_gpu_time;
 	gm.mask_gpu_ms = timestamps.mask_gpu_time;
 	gm.merge_gpu_ms = timestamps.merge_gpu_time;
+	gm.um_layer_gpu_ms = timestamps.um_layer_gpu;
+	gm.um_verdict_gpu_ms = timestamps.um_verdict_gpu;
+	gm.um_apply_gpu_ms = timestamps.um_apply_gpu;
+	gm.um_base_ms = (float)(um_base_ms * 1e-3);
+	gm.um_merge_ms = (float)(um_merge_ms * 1e-3);
+	gm.um_finish_ms = (float)(um_finish_ms * 1e-3);
 	gm.cpu_time = application::get_cpu_time().count() * 1e-9f;
 	gm.bandwidth_rx = bandwidth_rx * 8;
 	gm.bandwidth_tx = bandwidth_tx * 8;
@@ -182,7 +188,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 		if (predicted_display_time - last_stats_log > 5'000'000'000LL)
 		{
 			last_stats_log = predicted_display_time;
-			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f} merge {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s (l/r/a/d {:.1f}/{:.1f}/{:.1f}/{:.1f}) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
+			spdlog::info("Stats: cpu={:.1f}ms gpu={:.1f}ms (defoveate {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f} merge {:.1f}]) rx/tx={:.0f}/{:.0f}Mbit/s (l/r/a/d {:.1f}/{:.1f}/{:.1f}/{:.1f}) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms votes/tags/draws={:.0f}/{:.0f}/{:.0f} fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms umcpu={:.2f}/{:.2f}/{:.2f}ms umgpu={:.2f}/{:.2f}/{:.2f}ms",
 			             gm.cpu_time * 1e3f,
 			             gm.gpu_time * 1e3f,
 			             gm.defoveate_gpu_ms * 1e3f,
@@ -210,7 +216,13 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             gm.gui_ms * 1e3f,
 			             gm.submit_ms * 1e3f,
 			             gm.gui_build_ms * 1e3f,
-			             gm.gui_submit_ms * 1e3f);
+			             gm.gui_submit_ms * 1e3f,
+			             gm.um_base_ms * 1e3f,
+			             gm.um_merge_ms * 1e3f,
+			             gm.um_finish_ms * 1e3f,
+			             gm.um_layer_gpu_ms * 1e3f,
+			             gm.um_verdict_gpu_ms * 1e3f,
+			             gm.um_apply_gpu_ms * 1e3f);
 			// Window maxima over the sample ring (~last 300 frames):
 			// single-frame stalls alias into scary single samples, so
 			// report what the worst frame in the window actually hit.
@@ -220,7 +232,7 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 					m = std::max(m, g.*field);
 				return m;
 			};
-			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f} merge {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms",
+			spdlog::info("StatsMax: cpu={:.1f}ms gpu={:.1f}ms (defmax {:.1f}ms mask {:.1f}ms [1st {:.1f} rest {:.1f} merge {:.1f}]) detect/solve/place={:.2f}/{:.2f}/{:.2f}ms mask r/e/b={:.2f}/{:.2f}/{:.2f}ms gizmo={:.2f}ms fence/gui/submit={:.2f}/{:.2f}/{:.2f}ms guibs={:.2f}/{:.2f}ms ummax={:.2f}/{:.2f}/{:.2f}ms",
 			             ring_max(&global_metric::cpu_time) * 1e3f,
 			             ring_max(&global_metric::gpu_time) * 1e3f,
 			             ring_max(&global_metric::defoveate_gpu_ms) * 1e3f,
@@ -239,7 +251,10 @@ void scenes::stream::accumulate_metrics(XrTime predicted_display_time, const std
 			             ring_max(&global_metric::gui_ms) * 1e3f,
 			             ring_max(&global_metric::submit_ms) * 1e3f,
 			             ring_max(&global_metric::gui_build_ms) * 1e3f,
-			             ring_max(&global_metric::gui_submit_ms) * 1e3f);
+			             ring_max(&global_metric::gui_submit_ms) * 1e3f,
+			             ring_max(&global_metric::um_layer_gpu_ms) * 1e3f,
+			             ring_max(&global_metric::um_verdict_gpu_ms) * 1e3f,
+			             ring_max(&global_metric::um_apply_gpu_ms) * 1e3f);
 		}
 	}
 

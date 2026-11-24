@@ -172,8 +172,12 @@ public:
 	// independently); two sets ping-pong by call parity so an
 	// inline-fallback record never rewrites the set a still-flight
 	// async command buffer reads.
+	// Split-timing tap: when pool != nullptr a TopOfPipe timestamp is
+	// written to qafter after the post-write barrier (GPU layer/merge/
+	// verdict/apply split spans, read by the scene).
 	bool record(vk::raii::CommandBuffer & cmd,
-	            vk::Extent2D extent, std::span<const input> inputs);
+	            vk::Extent2D extent, std::span<const input> inputs,
+	            const vk::raii::QueryPool * pool = nullptr, uint32_t qafter = 0);
 
 	// Global VR-occlusion finish: fused foveated-decode + exact verdict
 	// (common layer vs virtual depth, NEAREST/NEAREST, R8 at full merge
@@ -185,18 +189,22 @@ public:
 	bool record_finish(vk::raii::CommandBuffer & cmd,
 	                   size_t image_index,
 	                   vk::Extent2D extent,
-	                   const virt_input & virt_in);
+	                   const virt_input & virt_in,
+	                   const vk::raii::QueryPool * pool = nullptr, uint32_t qafter_verdict = 0);
 
 	// Stage 0 of the common depth layer (positives only): CLEAR the
 	// R16F intermediate (large-finite FAR) then MIN-blend every window
 	// draw with the geometry pipeline (linear meters out, near-wins,
 	// CULL_NONE like the silhouette raster). Runs before the feather
 	// groups record in the same command buffer; the verdict samples
-	// the layer after a barrier in record_finish. The CLEAR runs even
+	// the layer after a barrier in record_finish (split-timing tap:
+	// when pool != nullptr a TopOfPipe timestamp lands in qafter after
+	// the layer barrier). The CLEAR runs even
 	// with no draws (a LOAD of undefined contents would read as
 	// geometry and wrongly gate the verdict — fail-open demands the
 	// explicit FAR clear).
-	void record_base(vk::raii::CommandBuffer & cmd, std::span<const geom_draw> draws);
+	void record_base(vk::raii::CommandBuffer & cmd, std::span<const geom_draw> draws,
+	                 const vk::raii::QueryPool * pool = nullptr, uint32_t qafter = 0);
 
 	// (Re)upload one window soup under its key. Synchronous (device
 	// idle on replace); call when idle, e.g. on map change, not per

@@ -502,6 +502,15 @@ private:
 	int fid_votes = 0, fid_tags = 0;
 	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
 	int mask_draws = 0;
+	// Union-merge split timings (milliseconds, CPU record cost):
+	// common-layer base, merge record, finish (verdict + apply).
+	// Assigned per merge block (zeroed when the merge sits out).
+	double um_base_ms = 0, um_merge_ms = 0, um_finish_ms = 0;
+	// Split-query guard: true when the last recorded mask phase wrote
+	// the um split queries (qmerge+2..+4) — i.e. the merge actually
+	// recorded with a paired verdict. Read (one frame delayed, like
+	// mask_results_in_mask_pool) before interpreting the split spans.
+	bool merge_um_split_ready = false;
 	// Frame-phase waits (milliseconds): fence wait at frame top,
 	// draw_gui, and render_end (end_frame IPC). Assigned
 	// unconditionally on the render path each frame, so no reset needed.
@@ -530,6 +539,12 @@ private:
 		// TopOfPipe stamps don't drain prior fragment work, so a late
 		// producer inflates the *following* span — read spikes by
 		// span, not as exact per-pass costs.
+		// Merge-split taps (union_merge qmerge+2/+3/+4 = after layer
+		// base, after merge record, after verdict pass): inline
+		// main-pool q7/q8/q9, async mask-pool q5/q6/q7. Written only
+		// when the merge recorded with a paired verdict (guarded by
+		// merge_um_split_ready); merge-end reuses q6 (inline) / q4
+		// (async).
 		float defoveate_gpu_time = 0;
 		float gizmo_gpu_time = 0;
 		float mask_gpu_time = 0;
@@ -545,6 +560,16 @@ private:
 		// poll range never covers an unwritten query. Read spikes by
 		// span (TopOfPipe caveat).
 		float merge_gpu_time = 0;
+		// Union-merge split spans (seconds, TopOfPipe): written only
+		// when the merge recorded with a paired verdict (guarded by
+		// merge_um_split_ready, zeroed otherwise). qmerge+2 after the
+		// layer base, +3 after the merge record, +4 after the verdict
+		// pass. layer = q+2 - merge-start, verdict = q+4 - q+3, apply
+		// = merge-end - q+4. Merge record itself = merge_gpu_time
+		// minus all three.
+		float um_layer_gpu = 0;
+		float um_verdict_gpu = 0;
+		float um_apply_gpu = 0;
 	};
 
 	// Last successfully polled GPU timestamps: the query readback is a
@@ -577,6 +602,12 @@ private:
 		float mask_first_gpu_ms = 0;
 		float mask_rest_gpu_ms = 0;
 		float merge_gpu_ms = 0;
+		float um_layer_gpu_ms = 0;
+		float um_verdict_gpu_ms = 0;
+		float um_apply_gpu_ms = 0;
+		float um_base_ms = 0;
+		float um_merge_ms = 0;
+		float um_finish_ms = 0;
 		// Frame-phase waits (seconds): fence wait at frame top, GUI,
 		// and render_end submit (end_frame IPC). Names CPU stalls the
 		// section timers above can't see.

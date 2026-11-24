@@ -485,8 +485,11 @@ std::shared_ptr<scenes::stream> scenes::stream::create(std::unique_ptr<wivrn_ses
 	                .queryType = vk::QueryType::eTimestamp,
 	                // q0 start, q1 after first group, q2 end, q3/q4
 	                // merge bracket (stamped unconditionally,
-	                // zero span when the merge sits out).
-	                .queryCount = 5,
+	                // zero span when the merge sits out), q5/q6/q7
+	                // merge-split taps (after layer base, merge
+	                // record, verdict pass; guarded by
+	                // merge_um_split_ready).
+	                .queryCount = 8,
 	        });
 
 	self->wifi = application::get_wifi_lock().get_wifi_lock();
@@ -1125,6 +1128,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// read range follows it. Either way only written queries are
 		// read (never wait on an unwritten query).
 		bool mask_path = composition_layer_alpha_blend_supported and view_count == 2; // same condition as mask_frame below
+		// Union-merge split spans are per-frame by design (zero when the
+		// last mask phase wrote none); the totals above carry over per the
+		// existing poll convention. Zeroed here so a stale split can never
+		// masquerade as a live one when the merge sits out or runs unpaired.
+		last_gpu_timestamps.um_layer_gpu = 0;
+		last_gpu_timestamps.um_verdict_gpu = 0;
+		last_gpu_timestamps.um_apply_gpu = 0;
 		uint32_t main_qcount = use_async_masks ? 4 : (mask_path ? 7 : 5);
 		auto [res, timestamps2] = query_pool.getResults<uint64_t>(
 		        0,
@@ -1149,6 +1159,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// without the alpha-blend extension.
 				if (mask_path)
 					last_gpu_timestamps.merge_gpu_time = (timestamps2[6] - timestamps2[5]) * period;
+				// Split spans (q7 after layer base, q8 after merge record,
+				// q9 after verdict pass; merge end reuses q6). Written only
+				// when the merge recorded with a paired verdict.
+				if (mask_path and merge_um_split_ready)
+				{
+					auto [sres, stimestamps] = query_pool.getResults<uint64_t>(
+					        7,
+					        3,
+					        3 * sizeof(uint64_t),
+					        sizeof(uint64_t),
+					        vk::QueryResultFlagBits::e64);
+					if (sres == vk::Result::eSuccess)
+					{
+						last_gpu_timestamps.um_layer_gpu = (stimestamps[0] - timestamps2[5]) * period;
+						last_gpu_timestamps.um_verdict_gpu = (stimestamps[2] - stimestamps[1]) * period;
+						last_gpu_timestamps.um_apply_gpu = (timestamps2[6] - stimestamps[2]) * period;
+					}
+				}
 			}
 		}
 	}
@@ -1172,6 +1200,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			last_gpu_timestamps.mask_first_gpu_time = (mtimestamps[1] - mtimestamps[0]) * period;
 			last_gpu_timestamps.mask_rest_gpu_time = (mtimestamps[2] - mtimestamps[1]) * period;
 			last_gpu_timestamps.merge_gpu_time = (mtimestamps[4] - mtimestamps[3]) * period;
+			if (merge_um_split_ready)
+			{
+				auto [sres, stimestamps] = mask_query_pool.getResults<uint64_t>(
+					        5,
+					        3,
+					        3 * sizeof(uint64_t),
+					        sizeof(uint64_t),
+					        vk::QueryResultFlagBits::e64);
+				if (sres == vk::Result::eSuccess)
+				{
+					last_gpu_timestamps.um_layer_gpu = (stimestamps[0] - mtimestamps[3]) * period;
+					last_gpu_timestamps.um_verdict_gpu = (stimestamps[2] - stimestamps[1]) * period;
+					last_gpu_timestamps.um_apply_gpu = (mtimestamps[4] - stimestamps[2]) * period;
+				}
+			}
 		}
 	}
 
@@ -2734,6 +2777,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// (qmerge/qmerge+1) is stamped unconditionally so the poll
 				// range never covers an unwritten query on either pool.
 				rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qmerge);
+				// Union-merge split + CPU state: cleared every mask phase, set
+				// below only when the merge actually recorded (split queries
+				// live in whichever pool rec_pool aliases this frame).
+				merge_um_split_ready = false;
+				um_base_ms = um_merge_ms = um_finish_ms = 0;
 				// Self-healing reset: a held image here is definitionally
 				// leaked (submit always consumes it), so release before
 				// overwriting rather than dropping the handle.
@@ -2874,7 +2922,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								// (verdict submits merged directly, nothing
 								// samples the layer).
 								if (vr_depth_test)
-									merge_renderer->record_base(rec_cmd, layer_draws);
+								{
+									auto um_t0 = std::chrono::steady_clock::now();
+									merge_renderer->record_base(rec_cmd, layer_draws, &rec_pool, qmerge + 2);
+									um_base_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t0).count();
+								}
 								int merge_idx = -1;
 								try
 								{
@@ -2883,7 +2935,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									if (merge_idx >= 0)
 									{
 										vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
-										if (merge_renderer->record(rec_cmd, merge_ext, merge_inputs))
+										auto um_t1 = std::chrono::steady_clock::now();
+										bool um_recorded = merge_renderer->record(rec_cmd, merge_ext, merge_inputs, &rec_pool, qmerge + 3);
+										um_merge_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t1).count();
+										if (um_recorded)
 										{
 											// Virtual depth for the global
 											// verdict: the paired stream-3
@@ -2916,12 +2971,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 													virt.valid = true;
 												}
 											}
-											if (merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt))
+											auto um_t2 = std::chrono::steady_clock::now();
+											bool um_finished = merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt, &rec_pool, qmerge + 4);
+											um_finish_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t2).count();
+											if (um_finished)
 											{
 												merge_image = merge_idx;
 												merge_this_frame = true;
 												merge_idx = -1; // owned by the submit phase now
 												finished = true;
+												// Split queries are consumable iff the verdict ran:
+												// record_finish stamps qmerge+4 only on the paired
+												// path (mask-only frames skip the verdict pass).
+												// virt.valid implies view + sampler (set together
+												// above), matching do_verdict.
+												merge_um_split_ready = virt.valid;
 												if (virt.valid and not vr_occlusion_logged)
 												{
 													vr_occlusion_logged = true;
@@ -2981,7 +3045,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			mask_command_buffer.begin(vk::CommandBufferBeginInfo{
 			        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
 			});
-			mask_command_buffer.resetQueryPool(*mask_query_pool, 0, 5);
+			mask_command_buffer.resetQueryPool(*mask_query_pool, 0, 8);
 			mask_command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *mask_query_pool, 0);
 			record_masks_phase(mask_command_buffer, mask_query_pool, 1, 3);
 			mask_command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *mask_query_pool, 2);

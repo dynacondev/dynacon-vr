@@ -803,7 +803,8 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 }
 
 bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
-                                  vk::Extent2D extent, std::span<const input> inputs)
+                                  vk::Extent2D extent, std::span<const input> inputs,
+                                  const vk::raii::QueryPool * pool, uint32_t qafter)
 {
 	if (inputs.empty() or inputs.size() > max_inputs)
 		return false;
@@ -952,10 +953,13 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	                    {},
 	                    {},
 	                    out_barrier);
+	if (pool)
+		cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, **pool, qafter);
 	return true;
 }
 
-void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<const geom_draw> draws)
+void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<const geom_draw> draws,
+                                        const vk::raii::QueryPool * pool, uint32_t qafter)
 {
 	// Pending mesh uploads first (staging→device + VertexInput
 	// barrier), mirroring the feather renderer: uploads are rare
@@ -1023,6 +1027,8 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	                    {},
 	                    {},
 	                    barrier);
+	if (pool)
+		cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, **pool, qafter);
 }
 
 void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
@@ -1178,7 +1184,8 @@ void union_merge_renderer::ensure_verdict_layout(const wivrn::decoder::ycbcr_def
 bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
                                          size_t image_index,
                                          vk::Extent2D extent,
-                                         const virt_input & virt_in)
+                                         const virt_input & virt_in,
+                                         const vk::raii::QueryPool * pool, uint32_t qafter_verdict)
 {
 	if (image_index >= targets.size())
 		return false;
@@ -1316,6 +1323,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 		                    {},
 		                    {},
 		                    verdict_barrier);
+		if (pool)
+			cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, **pool, qafter_verdict);
 	}
 
 	// Apply pass into the acquired submit image. Verdict path:
