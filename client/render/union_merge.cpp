@@ -60,11 +60,10 @@ static_assert(sizeof(geom_push) == 128);
 // (length = 2*max_ratio-1, ratios are single digits), so 64 covers a
 // max ratio of 32 with wide headroom. Must match FOVEA_MAX_RUNS in
 // vr_verdict_mv.frag.glsl. SSBO layout (uint32s): header [render_w,
-// render_h, packed_w, packed_h, nx0, nx1, ny0, ny1, cx0, cx1, cy0,
-// cy1] (centers are the TRUE (count-1)/2, so a clamped tail still maps
-// its head exactly) then x0/x1/y0/y1 run arrays of kFoveaMaxRuns each.
+// render_h, packed_w, packed_h, nx0, nx1, ny0, ny1] then x0/x1/y0/y1
+// run arrays of kFoveaMaxRuns each.
 constexpr int kFoveaMaxRuns = 64;
-constexpr int kFoveaHeader = 12;
+constexpr int kFoveaHeader = 8;
 
 uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
 {
@@ -1013,7 +1012,7 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 	verdict_immutable_src = def.has_conversion ? generation_sampler : vk::Sampler{};
 	// Binding 0 (common layer, plain view) stays mutable; binding 1
 	// (virt) is immutable exactly when the view carries a conversion.
-	// Binding 2 (compact foveation runs) is a plain storage buffer,
+	// Binding 2 (foveation index maps) is a plain storage buffer,
 	// rewritten per verdict frame. The immutable handle is copied by
 	// layout creation (defoveator precedent: pointer to a local is fine).
 	vk::Sampler immutable = verdict_immutable_src;
@@ -1154,8 +1153,9 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	if (image_index >= targets.size())
 		return false;
 
-	// Single merge size: the submit image and the owned merged/layer/
-	// verdict targets all share it (ensure() rebuilds them together). The apply below reads extent, the verdict reads
+	// Single merge size: the submit image, the owned merged/layer/verdict
+	// targets and the verdict index maps all share it (ensure() rebuilds
+	// them together). The apply below reads extent, the verdict reads
 	// layer_extent_ — divergence would silently misalign the two.
 	assert(extent.width == layer_extent_.width and extent.height == layer_extent_.height);
 
@@ -1214,23 +1214,19 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 					// non-foveated fallback emits one element). The shader
 					// still handles count 0 (uniform fallback) if asserts
 					// are compiled out and an empty vector arrives.
-					assert(axes[a]->empty() or axes[a]->size() % 2 == 1);
-					size_t full = axes[a]->size();
-					size_t n = full;
+					assert(axes[a]->size() % 2 == 1);
+					size_t n = axes[a]->size();
 					if (n > (size_t)kFoveaMaxRuns)
 					{
 						static bool overflow_logged = false;
 						if (not overflow_logged)
 						{
 							overflow_logged = true;
-							spdlog::error("Union merge compact fovea: axis {} has {} runs, clamping to {} (tail maps wrong)", a, full, kFoveaMaxRuns);
+							spdlog::error("Union merge compact fovea: axis {} has {} runs, clamping to {} (tail maps wrong)", a, n, kFoveaMaxRuns);
 						}
 						n = kFoveaMaxRuns;
 					}
 					dst[4 + a] = (uint32_t)n;
-					// TRUE center of the unclamped runs: stored ratios stay
-					// exact for every uploaded run even past the clamp.
-					dst[8 + a] = full > 0 ? (uint32_t)((full - 1) / 2) : 0;
 					uint32_t * base = dst + kFoveaHeader + a * kFoveaMaxRuns;
 					for (size_t i = 0; i < n; ++i)
 						base[i] = (*axes[a])[i];

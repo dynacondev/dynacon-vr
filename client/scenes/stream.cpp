@@ -1587,8 +1587,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				break;
 			}
 			// Foveation params heap-copy: needed every frame now (the
-			// verdict uploads them as compact runs in record_finish).
-			// Cheap vector copies.
+			// verdict expands them into the packed-index SSBO in
+			// record_finish). Cheap vector copies.
 			for (size_t i = 0; i < view_count; ++i)
 			{
 				diag.last_extents[i] = extents[i];
@@ -2945,7 +2945,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											// frame (SBS, handle-pinned view
 											// + generation sampler), with the
 											// shared foveation tables for the
-											// compact-run decode.
+											// packed-index lookup.
 											// Unpaired (not expected,
 											// decoder dead, ±1 miss) or VR
 											// depth testing toggled off:
