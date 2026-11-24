@@ -95,6 +95,16 @@ void main()
 	int eye = int(gl_ViewIndex);
 	vec3 buv = vec3(uv, vi);
 	float l = texture(layer_tex, buv).r;
+	float layer_absent = step(65000.0, l);
+	// Empty-pixel fast path: every tap below (SSBO index fetch,
+	// YCbCr depth sample) is wasted where the layer is FAR-clear —
+	// for a small window that is ~all pixels. Exact: the reveal
+	// formula below forces reveal=1 whenever layer_absent=1.
+	if (layer_absent > 0.5)
+	{
+		out_color = vec4(1.0);
+		return;
+	}
 
 	// Merge pixel -> packed texel through the CPU-expanded tables
 	// (single domain: same normalized uv as the layer tap, so the
@@ -116,7 +126,6 @@ void main()
 	float vd = texture(virt_tex, vuv).g;
 
 	float virt_far = step(1020.5 / 1023.0, vd);
-	float layer_absent = step(65000.0, l);
 	float layer_far = step(2.041, l) * (1.0 - layer_absent);
 	float virt_m = vd * 2.046;
 	float vr_wins_near = (1.0 - virt_far) * (1.0 - step(l, virt_m));
