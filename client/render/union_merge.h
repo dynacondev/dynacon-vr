@@ -252,10 +252,11 @@ private:
 	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
-	// Single-attachment multiview renderpass (CLEAR/STORE/OPTIMAL:
+	// Single-attachment multiview renderpass (DONT_CARE/STORE/OPTIMAL:
 	// submitted image, keeps UBWC live like the feather groups) + MAX pipeline
 	// (fullscreen triangle, no vertex input, no blending — one write
 	// wins, the submit-time REPLACE builds the dst-alpha union).
+	// DONT_CARE: the fullscreen triangle overwrites every pixel.
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr};
 	// 8 static sampler2DArray bindings (see the shader): linear +

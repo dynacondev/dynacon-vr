@@ -431,12 +431,14 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	};
 	pipeline_layout = vk::raii::PipelineLayout(*device, layout_info);
 
-	// Single-attachment multiview renderpass (CLEAR/STORE/OPTIMAL:
+	// Single-attachment multiview renderpass (DONT_CARE/STORE/OPTIMAL:
 	// submitted image, keeps Adreno UBWC live like the feather groups).
+	// DONT_CARE is exact: the fullscreen triangle overwrites every
+	// pixel, so a CLEAR would only be a wasted fill.
 	vk::AttachmentDescription attachment{
 	        .format = format,
 	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eClear,
+	        .loadOp = vk::AttachmentLoadOp::eDontCare,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
 	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -857,14 +859,14 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	// Inheriting one would clip the merge (under-reveal) with no
 	// validation complaint.
 	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extent});
-	vk::ClearValue clear{};
-	clear.color.float32 = std::array<float, 4>{0, 0, 0, 0};
+	// DONT_CARE load: no clear values (the fullscreen triangle below
+	// overwrites every pixel in the render area).
 	vk::RenderPassBeginInfo begin{
 	        .renderPass = *renderpass,
 	        .framebuffer = *tgt.framebuffer,
 	        .renderArea = {.offset = {0, 0}, .extent = extent},
-	        .clearValueCount = 1,
-	        .pClearValues = &clear,
+	        .clearValueCount = 0,
+	        .pClearValues = nullptr,
 	};
 	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
@@ -1306,14 +1308,14 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	                        .maxDepth = 1,
 	                });
 	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extent});
-	vk::ClearValue clear{};
-	clear.color.float32 = std::array<float, 4>{0, 0, 0, 0};
+	// DONT_CARE load: no clear values (the fullscreen draw below
+	// overwrites every pixel in the render area).
 	vk::RenderPassBeginInfo begin{
 	        .renderPass = *renderpass,
 	        .framebuffer = *tgt.framebuffer,
 	        .renderArea = {.offset = {0, 0}, .extent = extent},
-	        .clearValueCount = 1,
-	        .pClearValues = &clear,
+	        .clearValueCount = 0,
+	        .pClearValues = nullptr,
 	};
 	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *apply_pipeline);
