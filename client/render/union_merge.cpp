@@ -168,10 +168,10 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	swapchain_ = xr::swapchain(inst, sess, *device, new_format, w, h, 1, 2);
 	spdlog::info("Union merge swapchain: {}x{} ({} images)", w, h, swapchain_.image_count());
 	init_pipelines(new_format);
-	// One multiview target per swapchain image: array color view +
-	// layers=1 framebuffer (the 2-layer routing comes from the
-	// multiview view mask, not the framebuffer); one draw broadcasts
-	// to both eyes.
+	// One multiview view per swapchain image: 2-layer array view
+	// (the 2-layer routing comes from the multiview view mask, not
+	// the framebuffer); one draw broadcasts to both eyes. The folded
+	// framebuffers below bind these views with the owned targets.
 	targets.clear();
 	for (vk::Image image: swapchain_.images())
 	{
@@ -189,22 +189,14 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        },
 		};
 		targets.back().view = vk::raii::ImageView(*device, iv_info);
-		vk::ImageView color_view = *targets.back().view;
-		vk::FramebufferCreateInfo fb_info{
-		        .renderPass = *renderpass,
-		        .attachmentCount = 1,
-		        .pAttachments = &color_view,
-		        .width = new_extent.width,
-		        .height = new_extent.height,
-		        .layers = 1,
-		};
-		targets.back().framebuffer = vk::raii::Framebuffer(*device, fb_info);
 	}
 	// Common depth layer + merged + verdict targets (owned images, not
 	// swapchain): all full merge res since the foveated verdict compares
 	// per-pixel. Rebuilt under the same waitIdle above; the mesh buffers
-	// survive (extent-independent).
-	auto make_owned = [&](vk::Format fmt, vk::Extent2D e, vk::ImageUsageFlags usage, vk::raii::RenderPass & rp) {
+	// survive (extent-independent). Only the layer keeps its own
+	// framebuffer (own renderpass); merged/verdict ride the per-image
+	// folded framebuffers built below (null renderpass = no FB).
+	auto make_owned = [&](vk::Format fmt, vk::Extent2D e, vk::ImageUsageFlags usage, vk::raii::RenderPass * rp) {
 		layer_target t;
 		vk::ImageCreateInfo image_info{
 		        .imageType = vk::ImageType::e2D,
@@ -239,22 +231,52 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        },
 		};
 		t.view_array = vk::raii::ImageView(*device, iv_info);
-		vk::ImageView view = *t.view_array;
-		vk::FramebufferCreateInfo fb_info{
-		        .renderPass = *rp,
-		        .attachmentCount = 1,
-		        .pAttachments = &view,
-		        .width = e.width,
-		        .height = e.height,
-		        .layers = 1,
-		};
-		t.framebuffer = vk::raii::Framebuffer(*device, fb_info);
+		if (rp)
+		{
+			vk::ImageView view = *t.view_array;
+			vk::FramebufferCreateInfo fb_info{
+			        .renderPass = **rp,
+			        .attachmentCount = 1,
+			        .pAttachments = &view,
+			        .width = e.width,
+			        .height = e.height,
+			        .layers = 1,
+			};
+			t.framebuffer = vk::raii::Framebuffer(*device, fb_info);
+		}
 		return t;
 	};
-	layer_ = make_owned(layer_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, geom_renderpass);
-	merged_ = make_owned(new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, renderpass);
-	verdict_ = make_owned(verdict_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, verdict_renderpass);
+	layer_ = make_owned(layer_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &geom_renderpass);
+	merged_ = make_owned(new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, nullptr);
+	verdict_ = make_owned(verdict_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, nullptr);
 	layer_extent_ = new_extent;
+	// Folded framebuffers, one per submit image (submit view varies):
+	// fold3 binds {merged, verdict, submit}, fold2 binds {merged,
+	// submit}. layers=1 (view masks route the eyes); attachments and
+	// order must match the fold RP definitions in init_pipelines.
+	fold3_fbs.clear();
+	fold2_fbs.clear();
+	for (auto & tgt: targets)
+	{
+		vk::ImageView views3[3] = {*merged_.view_array, *verdict_.view_array, *tgt.view};
+		fold3_fbs.emplace_back(*device, vk::FramebufferCreateInfo{
+		                                          .renderPass = *fold3_rp,
+		                                          .attachmentCount = 3,
+		                                          .pAttachments = views3,
+		                                          .width = new_extent.width,
+		                                          .height = new_extent.height,
+		                                          .layers = 1,
+		                                  });
+		vk::ImageView views2[2] = {*merged_.view_array, *tgt.view};
+		fold2_fbs.emplace_back(*device, vk::FramebufferCreateInfo{
+		                                         .renderPass = *fold2_rp,
+		                                         .attachmentCount = 2,
+		                                         .pAttachments = views2,
+		                                         .width = new_extent.width,
+		                                         .height = new_extent.height,
+		                                         .layers = 1,
+		                                 });
+	}
 	// Foveation index maps (SSBO pair, host-visible): per-eye packed
 	// index per merge pixel, [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s.
 	verdict_tables_bytes = vk::DeviceSize(2 * (new_extent.width + new_extent.height)) * sizeof(uint32_t);
@@ -433,58 +455,192 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	};
 	pipeline_layout = vk::raii::PipelineLayout(*device, layout_info);
 
-	// Single-attachment multiview renderpass (DONT_CARE/STORE/OPTIMAL:
-	// submitted image, keeps Adreno UBWC live like the feather groups).
-	// DONT_CARE is exact: the fullscreen triangle overwrites every
-	// pixel, so a CLEAR would only be a wasted fill.
-	vk::AttachmentDescription attachment{
-	        .format = format,
-	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eDontCare,
-	        .storeOp = vk::AttachmentStoreOp::eStore,
-	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	// One fullscreen pipeline per fold subpass (subpass index baked):
+	// identical stages/layout/state to the old split passes, only the
+	// renderpass + subpass differ.
+	auto make_fold_pipeline = [&](vk::PipelineShaderStageCreateInfo * stages,
+	                              vk::raii::PipelineLayout & layout,
+	                              vk::raii::RenderPass & rp, uint32_t subpass) {
+		return vk::raii::Pipeline(*device, *pipe_cache, vk::GraphicsPipelineCreateInfo{
+		                                                              .stageCount = 2,
+		                                                              .pStages = stages,
+		                                                              .pVertexInputState = &vertex_input,
+		                                                              .pInputAssemblyState = &input_assembly,
+		                                                              .pViewportState = &viewport_state,
+		                                                              .pRasterizationState = &rasterization,
+		                                                              .pMultisampleState = &multisample,
+		                                                              .pDepthStencilState = &depth_stencil,
+		                                                              .pColorBlendState = &blend,
+		                                                              .pDynamicState = &dynamic,
+		                                                              .layout = *layout,
+		                                                              .renderPass = *rp,
+		                                                              .subpass = subpass,
+		                                                      });
 	};
-	vk::AttachmentReference color_ref{
-	        .attachment = 0,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::SubpassDescription subpass{
-	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-	        .colorAttachmentCount = 1,
-	        .pColorAttachments = &color_ref,
-	};
-	uint32_t mv_view_mask = 0b11, mv_corr_mask = 0b11;
-	vk::RenderPassMultiviewCreateInfo mv_rp_info{
-	        .subpassCount = 1,
-	        .pViewMasks = &mv_view_mask,
-	        .correlationMaskCount = 1,
-	        .pCorrelationMasks = &mv_corr_mask,
-	};
-	vk::RenderPassCreateInfo renderpass_info{
-	        .pNext = &mv_rp_info,
-	        .attachmentCount = 1,
-	        .pAttachments = &attachment,
-	        .subpassCount = 1,
-	        .pSubpasses = &subpass,
-	};
-	renderpass = vk::raii::RenderPass(*device, renderpass_info);
 
-	vk::GraphicsPipelineCreateInfo pipeline_info{
-	        .stageCount = 2,
-	        .pStages = stages,
-	        .pVertexInputState = &vertex_input,
-	        .pInputAssemblyState = &input_assembly,
-	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &rasterization,
-	        .pMultisampleState = &multisample,
-	        .pDepthStencilState = &depth_stencil,
-	        .pColorBlendState = &blend,
-	        .pDynamicState = &dynamic,
-	        .layout = *pipeline_layout,
-	        .renderPass = *renderpass,
+	// Folded renderpasses (opt #8): merge→verdict→apply (paired) and
+	// merge→apply (mask-only) as subpasses of one RP each. Intermediates
+	// stay tile-resident (triple precedent: GENERAL attachments sampled
+	// across subpasses, subpass deps replace the split-pass barriers).
+	// All loads DONT_CARE (fullscreen overwrites); merged is
+	// DONT_CARE-stored (no consumer outside the RP — viz reads
+	// layer/verdict only); verdict STOREs + ends SHADER_READ_ONLY (the
+	// viz barrier assumes that layout; the RP-end transition provides
+	// it); submit STOREs + ends OPTIMAL (compositor unchanged). Merged
+	// crosses the verdict subpass unused, so s1 lists it preserved.
+	vk::AttachmentDescription fold3_attachments[3] = {
+	        {
+	                .format = format,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .loadOp = vk::AttachmentLoadOp::eDontCare,
+	                .storeOp = vk::AttachmentStoreOp::eDontCare,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	                .finalLayout = vk::ImageLayout::eGeneral,
+	        },
+	        {
+	                .format = verdict_format,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .loadOp = vk::AttachmentLoadOp::eDontCare,
+	                .storeOp = vk::AttachmentStoreOp::eStore,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	                .finalLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	        },
+	        {
+	                .format = format,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .loadOp = vk::AttachmentLoadOp::eDontCare,
+	                .storeOp = vk::AttachmentStoreOp::eStore,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	                .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	        },
 	};
-	pipeline = vk::raii::Pipeline(*device, *pipe_cache, pipeline_info);
+	vk::AttachmentReference fold3_refs[3] = {
+	        {.attachment = 0, .layout = vk::ImageLayout::eGeneral},
+	        {.attachment = 1, .layout = vk::ImageLayout::eGeneral},
+	        {.attachment = 2, .layout = vk::ImageLayout::eGeneral},
+	};
+	uint32_t fold3_preserve0 = 0; // merged survives the verdict subpass unused
+	vk::SubpassDescription fold3_subpasses[3] = {
+	        {
+	                .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	                .colorAttachmentCount = 1,
+	                .pColorAttachments = &fold3_refs[0],
+	        },
+	        {
+	                .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	                .colorAttachmentCount = 1,
+	                .pColorAttachments = &fold3_refs[1],
+	                .preserveAttachmentCount = 1,
+	                .pPreserveAttachments = &fold3_preserve0,
+	        },
+	        {
+	                .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	                .colorAttachmentCount = 1,
+	                .pColorAttachments = &fold3_refs[2],
+	        },
+	};
+	vk::SubpassDependency fold3_deps[2] = {
+	        {
+	                .srcSubpass = 0,
+	                .dstSubpass = 2,
+	                .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	                .dstStageMask = vk::PipelineStageFlagBits::eFragmentShader,
+	                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+	                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	        },
+	        {
+	                .srcSubpass = 1,
+	                .dstSubpass = 2,
+	                .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	                .dstStageMask = vk::PipelineStageFlagBits::eFragmentShader,
+	                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+	                .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	        },
+	};
+	uint32_t fold3_view_masks[3] = {0b11, 0b11, 0b11};
+	uint32_t fold3_corr_mask = 0b11;
+	vk::RenderPassMultiviewCreateInfo fold3_mv_info{
+	        .subpassCount = 3,
+	        .pViewMasks = fold3_view_masks,
+	        .correlationMaskCount = 1,
+	        .pCorrelationMasks = &fold3_corr_mask,
+	};
+	vk::RenderPassCreateInfo fold3_rp_info{
+	        .pNext = &fold3_mv_info,
+	        .attachmentCount = 3,
+	        .pAttachments = fold3_attachments,
+	        .subpassCount = 3,
+	        .pSubpasses = fold3_subpasses,
+	        .dependencyCount = 2,
+	        .pDependencies = fold3_deps,
+	};
+	fold3_rp = vk::raii::RenderPass(*device, fold3_rp_info);
+
+	vk::AttachmentDescription fold2_attachments[2] = {
+	        {
+	                .format = format,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .loadOp = vk::AttachmentLoadOp::eDontCare,
+	                .storeOp = vk::AttachmentStoreOp::eDontCare,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	                .finalLayout = vk::ImageLayout::eGeneral,
+	        },
+	        {
+	                .format = format,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .loadOp = vk::AttachmentLoadOp::eDontCare,
+	                .storeOp = vk::AttachmentStoreOp::eStore,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	                .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	        },
+	};
+	vk::AttachmentReference fold2_refs[2] = {
+	        {.attachment = 0, .layout = vk::ImageLayout::eGeneral},
+	        {.attachment = 1, .layout = vk::ImageLayout::eGeneral},
+	};
+	vk::SubpassDescription fold2_subpasses[2] = {
+	        {
+	                .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	                .colorAttachmentCount = 1,
+	                .pColorAttachments = &fold2_refs[0],
+	        },
+	        {
+	                .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+	                .colorAttachmentCount = 1,
+	                .pColorAttachments = &fold2_refs[1],
+	        },
+	};
+	vk::SubpassDependency fold2_dep{
+	        .srcSubpass = 0,
+	        .dstSubpass = 1,
+	        .srcStageMask = vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	        .dstStageMask = vk::PipelineStageFlagBits::eFragmentShader,
+	        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+	        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	};
+	uint32_t fold2_view_masks[2] = {0b11, 0b11};
+	uint32_t fold2_corr_mask = 0b11;
+	vk::RenderPassMultiviewCreateInfo fold2_mv_info{
+	        .subpassCount = 2,
+	        .pViewMasks = fold2_view_masks,
+	        .correlationMaskCount = 1,
+	        .pCorrelationMasks = &fold2_corr_mask,
+	};
+	vk::RenderPassCreateInfo fold2_rp_info{
+	        .pNext = &fold2_mv_info,
+	        .attachmentCount = 2,
+	        .pAttachments = fold2_attachments,
+	        .subpassCount = 2,
+	        .pSubpasses = fold2_subpasses,
+	        .dependencyCount = 1,
+	        .pDependencies = &fold2_dep,
+	};
+	fold2_rp = vk::raii::RenderPass(*device, fold2_rp_info);
+
+	// Merge subpass-0 pipelines (same stages/push layout as the old
+	// split merge; subpass index baked per RP).
+	fold_merge_pipeline = make_fold_pipeline(stages, pipeline_layout, fold3_rp, 0);
+	fold2_merge_pipeline = make_fold_pipeline(stages, pipeline_layout, fold2_rp, 0);
 
 	// Common depth layer format gate (see above): R16F must support
 	// COLOR_ATTACHMENT + BLEND on this device. No silent fallback.
@@ -611,42 +767,9 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	};
 	geom_pipeline = vk::raii::Pipeline(*device, *pipe_cache, geom_pipeline_info);
 
-	// Verdict renderpass (R8 binary, DONT_CARE/STORE/OPTIMAL,
-	// multiview): the fullscreen draw overwrites every pixel, so no
-	// CLEAR is needed. Runs only with paired depth; mask-only frames
-	// skip the pass entirely instead of clearing to 1.
-	vk::AttachmentDescription verdict_attachment{
-	        .format = verdict_format,
-	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eDontCare,
-	        .storeOp = vk::AttachmentStoreOp::eStore,
-	        .initialLayout = vk::ImageLayout::eUndefined,
-	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::AttachmentReference verdict_color_ref{
-	        .attachment = 0,
-	        .layout = vk::ImageLayout::eColorAttachmentOptimal,
-	};
-	vk::SubpassDescription verdict_subpass{
-	        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
-	        .colorAttachmentCount = 1,
-	        .pColorAttachments = &verdict_color_ref,
-	};
-	uint32_t verdict_view_mask = 0b11, verdict_corr_mask = 0b11;
-	vk::RenderPassMultiviewCreateInfo verdict_mv_rp_info{
-	        .subpassCount = 1,
-	        .pViewMasks = &verdict_view_mask,
-	        .correlationMaskCount = 1,
-	        .pCorrelationMasks = &verdict_corr_mask,
-	};
-	vk::RenderPassCreateInfo verdict_renderpass_info{
-	        .pNext = &verdict_mv_rp_info,
-	        .attachmentCount = 1,
-	        .pAttachments = &verdict_attachment,
-	        .subpassCount = 1,
-	        .pSubpasses = &verdict_subpass,
-	};
-	verdict_renderpass = vk::raii::RenderPass(*device, verdict_renderpass_info);
+	// (No standalone verdict renderpass: the verdict is subpass 1 of
+	// the folded fold3 RP above, its pipeline built by
+	// create_verdict_state below.)
 
 	// Verdict + apply sampler/descriptor state (static 2-slot CIS
 	// layouts for layer/virt, FRAG-only, same Adreno-safe pattern as
@@ -753,21 +876,9 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	        .pPushConstantRanges = nullptr,
 	};
 	apply_layout = vk::raii::PipelineLayout(*device, apply_layout_info);
-	vk::GraphicsPipelineCreateInfo apply_pipeline_info{
-	        .stageCount = 2,
-	        .pStages = apply_stages,
-	        .pVertexInputState = &vertex_input,
-	        .pInputAssemblyState = &input_assembly,
-	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &rasterization,
-	        .pMultisampleState = &multisample,
-	        .pDepthStencilState = &depth_stencil,
-	        .pColorBlendState = &blend,
-	        .pDynamicState = &dynamic,
-	        .layout = *apply_layout,
-	        .renderPass = *renderpass,
-	};
-	apply_pipeline = vk::raii::Pipeline(*device, *pipe_cache, apply_pipeline_info);
+	// Apply subpass pipelines (same shaders/layout as the old split
+	// apply; subpass index baked per folded RP).
+	fold_apply_pipeline = make_fold_pipeline(apply_stages, apply_layout, fold3_rp, 2);
 
 	// Mask-only apply: same vertex stage, renderpass and layout (the
 	// fragment shader samples binding 0 only; binding 1 is written
@@ -786,25 +897,13 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	                .pName = "main",
 	        },
 	};
-	vk::GraphicsPipelineCreateInfo apply_mask_pipeline_info{
-	        .stageCount = 2,
-	        .pStages = apply_mask_stages,
-	        .pVertexInputState = &vertex_input,
-	        .pInputAssemblyState = &input_assembly,
-	        .pViewportState = &viewport_state,
-	        .pRasterizationState = &rasterization,
-	        .pMultisampleState = &multisample,
-	        .pDepthStencilState = &depth_stencil,
-	        .pColorBlendState = &blend,
-	        .pDynamicState = &dynamic,
-	        .layout = *apply_layout,
-	        .renderPass = *renderpass,
-	};
-	apply_mask_pipeline = vk::raii::Pipeline(*device, *pipe_cache, apply_mask_pipeline_info);
+	fold2_maskapply_pipeline = make_fold_pipeline(apply_mask_stages, apply_layout, fold2_rp, 1);
 }
 
 bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
+                                  size_t image_index,
                                   vk::Extent2D extent, std::span<const input> inputs,
+                                  bool paired,
                                   const vk::raii::QueryPool * pool, uint32_t qafter)
 {
 	if (inputs.empty() or inputs.size() > max_inputs)
@@ -819,6 +918,11 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 		if (in.view_array == vk::ImageView{})
 			return false;
 	}
+	// The folded framebuffer is per submit image: validate before
+	// beginning anything (a begin without a matching end breaks the
+	// command buffer).
+	if (image_index >= targets.size())
+		return false;
 
 	// Write→read hazard (same command buffer): every input was just
 	// written as a color attachment and ends OPTIMAL. Transition to
@@ -896,7 +1000,13 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	}
 	device->updateDescriptorSets(writes, {});
 
-	auto & tgt = merged_;
+	// Folded subpass 0 (merge MAX into the owned attachment): begins the
+	// folded RP (fold3 paired, fold2 mask-only) and LEAVES IT OPEN —
+	// record_finish() continues with nextSubpass. The per-image FB
+	// carries {merged, verdict?, submit}; viewport/scissor are dynamic
+	// and persist across subpasses, so set once here.
+	fold_paired_ = paired;
+	auto & fb = paired ? fold3_fbs[image_index] : fold2_fbs[image_index];
 	cmd.setViewport(0, vk::Viewport{
 	                        .x = 0,
 	                        .y = 0,
@@ -914,14 +1024,14 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	// DONT_CARE load: no clear values (the fullscreen triangle below
 	// overwrites every pixel in the render area).
 	vk::RenderPassBeginInfo begin{
-	        .renderPass = *renderpass,
-	        .framebuffer = *tgt.framebuffer,
+	        .renderPass = paired ? *fold3_rp : *fold2_rp,
+	        .framebuffer = *fb,
 	        .renderArea = {.offset = {0, 0}, .extent = extent},
 	        .clearValueCount = 0,
 	        .pClearValues = nullptr,
 	};
 	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
-	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline);
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, paired ? *fold_merge_pipeline : *fold2_merge_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set, {});
 	// Active input count for the uniform tap early-out: identical for
 	// every invocation in the draw, so skipped taps never execute.
@@ -929,31 +1039,11 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	cmd.pushConstants<push>(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, push{.count = (int32_t)inputs.size()});
 	// Fullscreen triangle (blur.vert: 3 verts, no vertex buffers).
 	cmd.draw(3, 1, 0, 0);
-	cmd.endRenderPass();
-
-	// Post-write bookkeeping: merged ends SHADER_READ for the
-	// verdict apply below (same command buffer); the next record
-	// re-begins UNDEFINED+CLEAR, so no transition back is needed.
-	vk::ImageMemoryBarrier out_barrier{
-	        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-	        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-	        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-	        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	        .image = *merged_.image,
-	        .subresourceRange = {
-	                .aspectMask = vk::ImageAspectFlagBits::eColor,
-	                .levelCount = 1,
-	                .layerCount = 2,
-	        },
-	};
-	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-	                    vk::PipelineStageFlagBits::eFragmentShader,
-	                    {},
-	                    {},
-	                    {},
-	                    out_barrier);
+	// No endRenderPass, no merged barrier: the merged attachment is
+	// consumed by the apply subpass in-RP (subpass dependency covers
+	// the hazard) and by nothing outside it (DONT_CARE store). The
+	// timestamp stays in the open RP (legal: only reset/copy query
+	// commands are restricted inside a render pass instance).
 	if (pool)
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, **pool, qafter);
 	return true;
@@ -1039,7 +1129,7 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 	// references the set layout. Caller guarantees no in-flight readers
 	// (fresh object, or a waitIdle'd rebuild).
 	verdict_descriptor_sets.clear();
-	verdict_pipeline.clear();
+	fold_verdict_pipeline.clear();
 	verdict_layout.clear();
 	verdict_descriptor_layout.clear();
 	// Bake the paired handle's generation sampler as the immutable
@@ -1090,7 +1180,9 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 		verdict_descriptor_sets.emplace_back(std::move(device->allocateDescriptorSets(set_alloc)[0]));
 	}
 	// Pipeline bakes the set layout: rebuilt alongside it, never apart
-	// (binding fresh sets with a stale pipeline is a use error).
+	// (binding fresh sets with a stale pipeline is a use error). Fold
+	// subpass 1 (same RP the merge subpass 0 and apply subpass 2 run
+	// in); the YCbCr rebuild path only ever touches this pipeline.
 	vk::PipelineLayoutCreateInfo verdict_layout_info{
 	        .setLayoutCount = 1,
 	        .pSetLayouts = &*verdict_descriptor_layout,
@@ -1160,9 +1252,10 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 	        .pColorBlendState = &blend,
 	        .pDynamicState = &dynamic,
 	        .layout = *verdict_layout,
-	        .renderPass = *verdict_renderpass,
+	        .renderPass = *fold3_rp,
+	        .subpass = 1,
 	};
-	verdict_pipeline = vk::raii::Pipeline(*device, *pipe_cache, verdict_pipeline_info);
+	fold_verdict_pipeline = vk::raii::Pipeline(*device, *pipe_cache, verdict_pipeline_info);
 	verdict_ycbcr_built = def;
 }
 
@@ -1198,35 +1291,25 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	// layer_extent_ — divergence would silently misalign the two.
 	assert(extent.width == layer_extent_.width and extent.height == layer_extent_.height);
 
-	// Verdict pass at full merge res: fused foveated-decode + exact
-	// compare. Mask-only frames (!valid: toggle off, unpaired depth,
-	// transition frames) skip the pass + barrier entirely and apply
-	// merged directly below (pixel-identical to a cleared-to-1
-	// verdict). DONT_CARE load: the fullscreen draw overwrites every
-	// pixel, so no CLEAR is needed.
+	// Verdict + apply as folded subpasses of the RP record() began
+	// (fold3 paired, fold2 mask-only). Viewport/scissor were set once
+	// before subpass 0 and persist (dynamic state); nothing else
+	// records into this command buffer between the two calls, so they
+	// are still intact.
 	bool do_verdict = virt_in.valid and virt_in.view and virt_in.sampler;
+	// The begun RP must match this frame's path: record() received the
+	// same validity (stream.cpp derives both from one virt), so a
+	// mismatch means the pairing logic drifted — fail loudly in debug,
+	// never silently record the wrong subpass tail.
+	assert(do_verdict == fold_paired_);
+	fold_paired_ = false;
 	if (do_verdict)
 	{
-		vk::RenderPassBeginInfo verdict_begin{
-		        .renderPass = *verdict_renderpass,
-		        .framebuffer = *verdict_.framebuffer,
-		        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
-		        .clearValueCount = 0,
-		        .pClearValues = nullptr,
-		};
-		cmd.beginRenderPass(verdict_begin, vk::SubpassContents::eInline);
-		cmd.setViewport(0, vk::Viewport{
-		                        .x = 0,
-		                        .y = 0,
-		                        .width = (float)layer_extent_.width,
-		                        .height = (float)layer_extent_.height,
-		                        .minDepth = 0,
-		                        .maxDepth = 1,
-		                });
-		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
+		cmd.nextSubpass(vk::SubpassContents::eInline);
 			// YCbCr immutable-sampler layout (VUID-02738): rebuild when the
 			// view's conversion definition or the handle's generation
-			// sampler changes. waitIdle'd, rare.
+			// sampler changes. waitIdle'd, rare. Legal mid-RP: pipelines
+			// aren't in flight until bound in a submitted command buffer.
 			ensure_verdict_layout(virt_in.ycbcr, virt_in.sampler);
 			verdict_set_parity = !verdict_set_parity;
 			// Foveation index maps, CPU-expanded per frame into the
@@ -1301,32 +1384,22 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 			        .pBufferInfo = &tables_info,
 			});
 			device->updateDescriptorSets(vwrites, {});
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *verdict_pipeline);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *fold_verdict_pipeline);
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *verdict_layout, 0, vset, {});
 			cmd.draw(3, 1, 0, 0);
-		cmd.endRenderPass();
-		vk::ImageMemoryBarrier verdict_barrier{
-		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-		        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-		        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .image = *verdict_.image,
-		        .subresourceRange = {
-		                .aspectMask = vk::ImageAspectFlagBits::eColor,
-		                .levelCount = 1,
-		                .layerCount = 2,
-		        },
-		};
-		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-		                    vk::PipelineStageFlagBits::eFragmentShader,
-		                    {},
-		                    {},
-		                    {},
-		                    verdict_barrier);
+		// No endRenderPass, no verdict barrier: the verdict attachment
+		// is consumed by the apply subpass in-RP (subpass dependency
+		// covers the write→read hazard) and ends SHADER_READ_ONLY via
+		// the RP final-layout transition (the viz barrier assumes that
+		// layout). Timestamp stays in the open RP (see record()).
 		if (pool)
 			cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, **pool, qafter_verdict);
+		cmd.nextSubpass(vk::SubpassContents::eInline);
+	}
+	else
+	{
+		// Mask-only (fold2): subpass 0 merged → subpass 1 mask-apply.
+		cmd.nextSubpass(vk::SubpassContents::eInline);
 	}
 
 	// Apply pass into the acquired submit image. Verdict path:
@@ -1372,27 +1445,11 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	        .pImageInfo = &apply_verdict_info,
 	});
 	device->updateDescriptorSets(apply_writes, {});
-	auto & tgt = targets[image_index];
-	cmd.setViewport(0, vk::Viewport{
-	                        .x = 0,
-	                        .y = 0,
-	                        .width = (float)extent.width,
-	                        .height = (float)extent.height,
-	                        .minDepth = 0,
-	                        .maxDepth = 1,
-	                });
-	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extent});
-	// DONT_CARE load: no clear values (the fullscreen draw below
-	// overwrites every pixel in the render area).
-	vk::RenderPassBeginInfo begin{
-	        .renderPass = *renderpass,
-	        .framebuffer = *tgt.framebuffer,
-	        .renderArea = {.offset = {0, 0}, .extent = extent},
-	        .clearValueCount = 0,
-	        .pClearValues = nullptr,
-	};
-	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
-	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, do_verdict ? *apply_pipeline : *apply_mask_pipeline);
+	// Apply subpass (s2 paired, s1 mask-only): merged x verdict, or
+	// merged straight through. Same taps as the old split pass (both
+	// NEAREST, full-res); the attachments are tile-resident GENERAL
+	// images from the earlier subpasses, sampled read-only here.
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, do_verdict ? *fold_apply_pipeline : *fold2_maskapply_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *apply_layout, 0, aset, {});
 	cmd.draw(3, 1, 0, 0);
 	cmd.endRenderPass();

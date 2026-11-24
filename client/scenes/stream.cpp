@@ -2935,42 +2935,41 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									if (merge_idx >= 0)
 									{
 										vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
+										// Pairing decision FIRST: record() begins the folded
+										// renderpass (fold3 paired / fold2 mask-only), so the
+										// path is fixed here from the same virt that drives
+										// record_finish() below — one lookup, one verdict.
+										// Unpaired (not expected, decoder dead, ±1 miss) or
+										// VR depth testing toggled off: submits merged
+										// directly — today's neutral parity.
+										union_merge_renderer::virt_input virt{};
+										if (vr_depth_test)
+										{
+											if (auto & dh = current_blit_handles[depth_stream_index];
+											    dh and dh->image_view and depth_verdict_safe)
+											{
+												virt.view = dh->image_view;
+												virt.sampler = dh->sampler;
+												virt.ycbcr = dh->ycbcr;
+												// Exact tables for THIS depth frame (the
+												// depth shards carry their own view_info):
+												// no gaze-update skew vs the color copy.
+												virt.foveation = dh->view_info.foveation;
+												virt.render_w = diag.req_render_w;
+												virt.render_h = diag.req_render_h;
+												virt.packed_w = (uint16_t)(dh->extent.width / 2);
+												virt.packed_h = (uint16_t)dh->extent.height;
+												virt.valid = true;
+											}
+										}
 										auto um_t1 = std::chrono::steady_clock::now();
-										bool um_recorded = merge_renderer->record(rec_cmd, merge_ext, merge_inputs, &rec_pool, qmerge + 3);
+										bool um_recorded = merge_renderer->record(rec_cmd, (size_t)merge_idx, merge_ext, merge_inputs, virt.valid, &rec_pool, qmerge + 3);
 										um_merge_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t1).count();
 										if (um_recorded)
 										{
-											// Virtual depth for the global
-											// verdict: the paired stream-3
-											// frame (SBS, handle-pinned view
-											// + generation sampler), with the
-											// shared foveation tables for the
-											// packed-index lookup.
-											// Unpaired (not expected,
-											// decoder dead, ±1 miss) or VR
-											// depth testing toggled off:
-											// submits merged directly —
-											// today's neutral parity.
-											union_merge_renderer::virt_input virt{};
-											if (vr_depth_test)
-											{
-												if (auto & dh = current_blit_handles[depth_stream_index];
-												    dh and dh->image_view and depth_verdict_safe)
-												{
-													virt.view = dh->image_view;
-													virt.sampler = dh->sampler;
-													virt.ycbcr = dh->ycbcr;
-													// Exact tables for THIS depth frame (the
-													// depth shards carry their own view_info):
-													// no gaze-update skew vs the color copy.
-													virt.foveation = dh->view_info.foveation;
-													virt.render_w = diag.req_render_w;
-													virt.render_h = diag.req_render_h;
-													virt.packed_w = (uint16_t)(dh->extent.width / 2);
-													virt.packed_h = (uint16_t)dh->extent.height;
-													virt.valid = true;
-												}
-											}
+											// virt was built above (same object that fixed the
+											// folded path in record()): record_finish()
+											// asserts the pairing matches.
 											auto um_t2 = std::chrono::steady_clock::now();
 											bool um_finished = merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt, &rec_pool, qmerge + 4);
 											um_finish_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t2).count();
