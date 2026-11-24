@@ -609,12 +609,14 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	};
 	geom_pipeline = vk::raii::Pipeline(*device, *pipe_cache, geom_pipeline_info);
 
-	// Verdict renderpass (R8 binary, CLEAR/STORE/OPTIMAL, multiview):
-	// the no-virt fallback clears to 1 with no draw.
+	// Verdict renderpass (R8 binary, DONT_CARE/STORE/OPTIMAL,
+	// multiview): the fullscreen draw overwrites every pixel, so no
+	// CLEAR is needed. Runs only with paired depth; mask-only frames
+	// skip the pass entirely instead of clearing to 1.
 	vk::AttachmentDescription verdict_attachment{
 	        .format = verdict_format,
 	        .samples = vk::SampleCountFlagBits::e1,
-	        .loadOp = vk::AttachmentLoadOp::eClear,
+	        .loadOp = vk::AttachmentLoadOp::eDontCare,
 	        .storeOp = vk::AttachmentStoreOp::eStore,
 	        .initialLayout = vk::ImageLayout::eUndefined,
 	        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
@@ -764,6 +766,38 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	        .renderPass = *renderpass,
 	};
 	apply_pipeline = vk::raii::Pipeline(*device, *pipe_cache, apply_pipeline_info);
+
+	// Mask-only apply: same vertex stage, renderpass and layout (the
+	// fragment shader samples binding 0 only; binding 1 is never
+	// written or read on this path).
+	auto apply_mask_frag = load_shader(*device, "vr_apply_mask_mv.frag");
+	vk::PipelineShaderStageCreateInfo apply_mask_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **apply_mask_frag,
+	                .pName = "main",
+	        },
+	};
+	vk::GraphicsPipelineCreateInfo apply_mask_pipeline_info{
+	        .stageCount = 2,
+	        .pStages = apply_mask_stages,
+	        .pVertexInputState = &vertex_input,
+	        .pInputAssemblyState = &input_assembly,
+	        .pViewportState = &viewport_state,
+	        .pRasterizationState = &rasterization,
+	        .pMultisampleState = &multisample,
+	        .pDepthStencilState = &depth_stencil,
+	        .pColorBlendState = &blend,
+	        .pDynamicState = &dynamic,
+	        .layout = *apply_layout,
+	        .renderPass = *renderpass,
+	};
+	apply_mask_pipeline = vk::raii::Pipeline(*device, *pipe_cache, apply_mask_pipeline_info);
 }
 
 bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
@@ -1140,134 +1174,138 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	assert(extent.width == layer_extent_.width and extent.height == layer_extent_.height);
 
 	// Verdict pass at full merge res: fused foveated-decode + exact
-	// compare when a depth frame paired, else a CLEAR to 1 (submit
-	// merged directly — today's neutral parity, pixel-identical).
-	vk::ClearValue verdict_clear{};
-	verdict_clear.color.float32 = std::array<float, 4>{1, 0, 0, 0};
-	vk::RenderPassBeginInfo verdict_begin{
-	        .renderPass = *verdict_renderpass,
-	        .framebuffer = *verdict_.framebuffer,
-	        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
-	        .clearValueCount = 1,
-	        .pClearValues = &verdict_clear,
-	};
-	cmd.beginRenderPass(verdict_begin, vk::SubpassContents::eInline);
-	cmd.setViewport(0, vk::Viewport{
-	                        .x = 0,
-	                        .y = 0,
-	                        .width = (float)layer_extent_.width,
-	                        .height = (float)layer_extent_.height,
-	                        .minDepth = 0,
-	                        .maxDepth = 1,
-	                });
-	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
-	if (virt_in.valid and virt_in.view and virt_in.sampler)
+	// compare. Mask-only frames (!valid: toggle off, unpaired depth,
+	// transition frames) skip the pass + barrier entirely and apply
+	// merged directly below (pixel-identical to a cleared-to-1
+	// verdict). DONT_CARE load: the fullscreen draw overwrites every
+	// pixel, so no CLEAR is needed.
+	bool do_verdict = virt_in.valid and virt_in.view and virt_in.sampler;
+	if (do_verdict)
 	{
-		// YCbCr immutable-sampler layout (VUID-02738): rebuild when the
-		// view's conversion definition or the decoder sampler handle
-		// changes. waitIdle'd, rare.
-		ensure_verdict_layout(virt_in.ycbcr, virt_in.sampler);
-		verdict_set_parity = !verdict_set_parity;
-		// Foveation index maps, CPU-expanded per frame into the
-		// ping-ponged SSBO (depth_overlay UBO discipline: memcpy +
-		// flush, rewritten before the draw that reads them). Merge->render
-		// scale baked in; packed dims from the paired depth frame.
-		auto & tables = verdict_tables[verdict_set_parity ? 1 : 0];
-		{
-			const int W = (int)layer_extent_.width, H = (int)layer_extent_.height;
-			const int render_w = virt_in.render_w, render_h = virt_in.render_h;
-			const int packed_w = virt_in.packed_w, packed_h = virt_in.packed_h;
-			assert(W > 0 and H > 0);
-			verdict_map_scratch.resize((size_t)2 * (W + H));
-			uint32_t * map = verdict_map_scratch.data();
-			for (int eye = 0; eye < 2; ++eye)
+		vk::RenderPassBeginInfo verdict_begin{
+		        .renderPass = *verdict_renderpass,
+		        .framebuffer = *verdict_.framebuffer,
+		        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
+		        .clearValueCount = 0,
+		        .pClearValues = nullptr,
+		};
+		cmd.beginRenderPass(verdict_begin, vk::SubpassContents::eInline);
+		cmd.setViewport(0, vk::Viewport{
+		                        .x = 0,
+		                        .y = 0,
+		                        .width = (float)layer_extent_.width,
+		                        .height = (float)layer_extent_.height,
+		                        .minDepth = 0,
+		                        .maxDepth = 1,
+		                });
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
+			// YCbCr immutable-sampler layout (VUID-02738): rebuild when the
+			// view's conversion definition or the decoder sampler handle
+			// changes. waitIdle'd, rare.
+			ensure_verdict_layout(virt_in.ycbcr, virt_in.sampler);
+			verdict_set_parity = !verdict_set_parity;
+			// Foveation index maps, CPU-expanded per frame into the
+			// ping-ponged SSBO (depth_overlay UBO discipline: memcpy +
+			// flush, rewritten before the draw that reads them). Merge->render
+			// scale baked in; packed dims from the paired depth frame.
+			auto & tables = verdict_tables[verdict_set_parity ? 1 : 0];
 			{
-				// Server invariant: compute_params always emits odd,
-				// non-empty runs (fill_param_2d ends count*2-1; the
-				// non-foveated fallback emits one element).
-				assert(virt_in.foveation[eye].x.size() % 2 == 1);
-				assert(virt_in.foveation[eye].y.size() % 2 == 1);
-				expand_foveation_axis(virt_in.foveation[eye].x, render_w, W, packed_w, map + eye * W);
-				expand_foveation_axis(virt_in.foveation[eye].y, render_h, H, packed_h, map + 2 * W + eye * H);
+				const int W = (int)layer_extent_.width, H = (int)layer_extent_.height;
+				const int render_w = virt_in.render_w, render_h = virt_in.render_h;
+				const int packed_w = virt_in.packed_w, packed_h = virt_in.packed_h;
+				assert(W > 0 and H > 0);
+				verdict_map_scratch.resize((size_t)2 * (W + H));
+				uint32_t * map = verdict_map_scratch.data();
+				for (int eye = 0; eye < 2; ++eye)
+				{
+					// Server invariant: compute_params always emits odd,
+					// non-empty runs (fill_param_2d ends count*2-1; the
+					// non-foveated fallback emits one element).
+					assert(virt_in.foveation[eye].x.size() % 2 == 1);
+					assert(virt_in.foveation[eye].y.size() % 2 == 1);
+					expand_foveation_axis(virt_in.foveation[eye].x, render_w, W, packed_w, map + eye * W);
+					expand_foveation_axis(virt_in.foveation[eye].y, render_h, H, packed_h, map + 2 * W + eye * H);
+				}
+				std::memcpy(tables.map(), map, verdict_map_scratch.size() * sizeof(uint32_t));
+				tables.unmap();
+				// Non-coherent host-visible memory: flush, or the GPU reads
+				// stale tables forever (depth_overlay precedent).
+				vmaFlushAllocation(vk_allocator::instance(), tables, 0, verdict_map_scratch.size() * sizeof(uint32_t));
 			}
-			std::memcpy(tables.map(), map, verdict_map_scratch.size() * sizeof(uint32_t));
-			tables.unmap();
-			// Non-coherent host-visible memory: flush, or the GPU reads
-			// stale tables forever (depth_overlay precedent).
-			vmaFlushAllocation(vk_allocator::instance(), tables, 0, verdict_map_scratch.size() * sizeof(uint32_t));
-		}
-		vk::DescriptorSet vset = *verdict_descriptor_sets[verdict_set_parity ? 1 : 0];
-		vk::DescriptorImageInfo layer_info{
-		        .sampler = *sampler_nearest,
-		        .imageView = *layer_.view_array,
-		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+			vk::DescriptorSet vset = *verdict_descriptor_sets[verdict_set_parity ? 1 : 0];
+			vk::DescriptorImageInfo layer_info{
+			        .sampler = *sampler_nearest,
+			        .imageView = *layer_.view_array,
+			        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+			};
+			// Decoder SBS image: GENERAL layout at frame top (same
+			// steady-state discipline as the video path). The write sampler
+			// is ignored when the layout baked an immutable one (defoveator
+			// pattern); pass the live decoder sampler either way.
+			vk::DescriptorImageInfo virt_info{
+			        .sampler = virt_in.sampler,
+			        .imageView = virt_in.view,
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
+			vk::DescriptorBufferInfo tables_info{
+			        .buffer = vk::Buffer(tables),
+			        .offset = 0,
+			        .range = verdict_tables_bytes,
+			};
+			std::vector<vk::WriteDescriptorSet> vwrites;
+			vwrites.reserve(3);
+			vwrites.push_back(vk::WriteDescriptorSet{
+			        .dstSet = vset,
+			        .dstBinding = 0,
+			        .descriptorCount = 1,
+			        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+			        .pImageInfo = &layer_info,
+			});
+			vwrites.push_back(vk::WriteDescriptorSet{
+			        .dstSet = vset,
+			        .dstBinding = 1,
+			        .descriptorCount = 1,
+			        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+			        .pImageInfo = &virt_info,
+			});
+			vwrites.push_back(vk::WriteDescriptorSet{
+			        .dstSet = vset,
+			        .dstBinding = 2,
+			        .descriptorCount = 1,
+			        .descriptorType = vk::DescriptorType::eStorageBuffer,
+			        .pBufferInfo = &tables_info,
+			});
+			device->updateDescriptorSets(vwrites, {});
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *verdict_pipeline);
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *verdict_layout, 0, vset, {});
+			cmd.draw(3, 1, 0, 0);
+		cmd.endRenderPass();
+		vk::ImageMemoryBarrier verdict_barrier{
+		        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+		        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .image = *verdict_.image,
+		        .subresourceRange = {
+		                .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                .levelCount = 1,
+		                .layerCount = 2,
+		        },
 		};
-		// Decoder SBS image: GENERAL layout at frame top (same
-		// steady-state discipline as the video path). The write sampler
-		// is ignored when the layout baked an immutable one (defoveator
-		// pattern); pass the live decoder sampler either way.
-		vk::DescriptorImageInfo virt_info{
-		        .sampler = virt_in.sampler,
-		        .imageView = virt_in.view,
-		        .imageLayout = vk::ImageLayout::eGeneral,
-		};
-		vk::DescriptorBufferInfo tables_info{
-		        .buffer = vk::Buffer(tables),
-		        .offset = 0,
-		        .range = verdict_tables_bytes,
-		};
-		std::vector<vk::WriteDescriptorSet> vwrites;
-		vwrites.reserve(3);
-		vwrites.push_back(vk::WriteDescriptorSet{
-		        .dstSet = vset,
-		        .dstBinding = 0,
-		        .descriptorCount = 1,
-		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-		        .pImageInfo = &layer_info,
-		});
-		vwrites.push_back(vk::WriteDescriptorSet{
-		        .dstSet = vset,
-		        .dstBinding = 1,
-		        .descriptorCount = 1,
-		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-		        .pImageInfo = &virt_info,
-		});
-		vwrites.push_back(vk::WriteDescriptorSet{
-		        .dstSet = vset,
-		        .dstBinding = 2,
-		        .descriptorCount = 1,
-		        .descriptorType = vk::DescriptorType::eStorageBuffer,
-		        .pBufferInfo = &tables_info,
-		});
-		device->updateDescriptorSets(vwrites, {});
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *verdict_pipeline);
-		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *verdict_layout, 0, vset, {});
-		cmd.draw(3, 1, 0, 0);
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                    vk::PipelineStageFlagBits::eFragmentShader,
+		                    {},
+		                    {},
+		                    {},
+		                    verdict_barrier);
 	}
-	cmd.endRenderPass();
-	vk::ImageMemoryBarrier verdict_barrier{
-	        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-	        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
-	        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
-	        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	        .image = *verdict_.image,
-	        .subresourceRange = {
-	                .aspectMask = vk::ImageAspectFlagBits::eColor,
-	                .levelCount = 1,
-	                .layerCount = 2,
-	        },
-	};
-	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-	                    vk::PipelineStageFlagBits::eFragmentShader,
-	                    {},
-	                    {},
-	                    {},
-	                    verdict_barrier);
 
-	// Apply pass into the acquired submit image: merged (NEAREST) x
-	// verdict (NEAREST, already full-res — no upscale). RGB zero; the
+	// Apply pass into the acquired submit image. Verdict path:
+	// merged (NEAREST) x verdict (NEAREST, already full-res — no
+	// upscale). Mask-only path (no verdict pass above): merged straight
+	// through (one tap, pixel-identical to x1). RGB zero; the
 	// submit-time REPLACE preserves dst color.
 	apply_set_parity = !apply_set_parity;
 	vk::DescriptorSet aset = *apply_descriptor_sets[apply_set_parity ? 1 : 0];
@@ -1276,13 +1314,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	        .imageView = *merged_.view_array,
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
-	vk::DescriptorImageInfo apply_verdict_info{
-	        .sampler = *sampler_nearest,
-	        .imageView = *verdict_.view_array,
-	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-	};
 	std::vector<vk::WriteDescriptorSet> apply_writes;
-	apply_writes.reserve(2);
+	apply_writes.reserve(do_verdict ? 2 : 1);
 	apply_writes.push_back(vk::WriteDescriptorSet{
 	        .dstSet = aset,
 	        .dstBinding = 0,
@@ -1290,13 +1323,21 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 	        .pImageInfo = &merged_info,
 	});
-	apply_writes.push_back(vk::WriteDescriptorSet{
-	        .dstSet = aset,
-	        .dstBinding = 1,
-	        .descriptorCount = 1,
-	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	        .pImageInfo = &apply_verdict_info,
-	});
+	if (do_verdict)
+	{
+		vk::DescriptorImageInfo apply_verdict_info{
+		        .sampler = *sampler_nearest,
+		        .imageView = *verdict_.view_array,
+		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		};
+		apply_writes.push_back(vk::WriteDescriptorSet{
+		        .dstSet = aset,
+		        .dstBinding = 1,
+		        .descriptorCount = 1,
+		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		        .pImageInfo = &apply_verdict_info,
+		});
+	}
 	device->updateDescriptorSets(apply_writes, {});
 	auto & tgt = targets[image_index];
 	cmd.setViewport(0, vk::Viewport{
@@ -1318,7 +1359,7 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	        .pClearValues = nullptr,
 	};
 	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
-	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *apply_pipeline);
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, do_verdict ? *apply_pipeline : *apply_mask_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *apply_layout, 0, aset, {});
 	cmd.draw(3, 1, 0, 0);
 	cmd.endRenderPass();

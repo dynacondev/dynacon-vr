@@ -173,9 +173,10 @@ public:
 	// Global VR-occlusion finish: fused foveated-decode + exact verdict
 	// (common layer vs virtual depth, NEAREST/NEAREST, R8 at full merge
 	// res) then the apply (merged alpha x verdict, both NEAREST) into
-	// both eye layers of the acquired submit image. !virt.valid clears
-	// the verdict to 1 and applies (submit merged directly: today's
-	// neutral parity).
+	// both eye layers of the acquired submit image. !virt.valid (toggle
+	// off, unpaired depth, transition frames) skips the verdict
+	// renderpass + barrier entirely and applies merged directly
+	// (pixel-identical to a cleared-to-1 verdict, one tap).
 	bool record_finish(vk::raii::CommandBuffer & cmd,
 	                   size_t image_index,
 	                   vk::Extent2D extent,
@@ -366,6 +367,11 @@ private:
 	bool apply_set_parity = false;
 	vk::raii::PipelineLayout apply_layout{nullptr};
 	vk::raii::Pipeline apply_pipeline{nullptr};
+	// Mask-only apply (merged alpha straight to the submit image, no
+	// verdict tap): same renderpass + layout as the verdict apply
+	// (binding 1 unused), taken when no virtual-depth frame paired.
+	// Pixel-identical to verdict-clear-to-1 x merged with one tap.
+	vk::raii::Pipeline apply_mask_pipeline{nullptr};
 	// NEAREST + ClampToEdge (layer tap in the verdict, merged tap in
 	// the apply: both inputs are already filtered). The verdict runs
 	// at full merge res and multiplies directly in the apply (both
