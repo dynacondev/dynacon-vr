@@ -540,11 +540,11 @@ private:
 		// producer inflates the *following* span — read spikes by
 		// span, not as exact per-pass costs.
 		// Merge-split taps (union_merge qmerge+2/+3/+4 = after layer
-		// base, after merge record, after verdict pass): inline
+		// base, after verdict pass, after merge subpass): inline
 		// main-pool q7/q8/q9, async mask-pool q5/q6/q7. Written only
 		// when the merge recorded with a paired verdict (guarded by
 		// merge_um_split_ready); merge-end reuses q6 (inline) / q4
-		// (async).
+		// (async). The merge-record span (q8-q7 inline) stays dark.
 		float defoveate_gpu_time = 0;
 		float gizmo_gpu_time = 0;
 		float mask_gpu_time = 0;
@@ -555,7 +555,8 @@ private:
 		float mask_first_gpu_time = 0;
 		float mask_rest_gpu_time = 0;
 		// Merge span: async = mask-pool q3/q4, inline =
-		// main-pool q5/q6. One fullscreen full-res pass. Stamped
+		// main-pool q5/q6. Layer raster + verdict RP + fold (merge +
+		// apply). Stamped
 		// unconditionally (zero span when the merge sits out) so the
 		// poll range never covers an unwritten query. Read spikes by
 		// span (TopOfPipe caveat).
@@ -563,10 +564,10 @@ private:
 		// Union-merge split spans (seconds, TopOfPipe): written only
 		// when the merge recorded with a paired verdict (guarded by
 		// merge_um_split_ready, zeroed otherwise). qmerge+2 after the
-		// layer base, +3 after the merge record, +4 after the verdict
-		// pass. layer = q+2 - merge-start, verdict = q+4 - q+3, apply
-		// = merge-end - q+4. Merge record itself = merge_gpu_time
-		// minus all three.
+		// layer base, +3 after the verdict pass, +4 after the merge
+		// subpass. layer = q+2 - merge-start, verdict = q+3 - q+2,
+		// apply = merge-end - q+4. The merge subpass (q+4 - q+3)
+		// stays dark.
 		float um_layer_gpu = 0;
 		float um_verdict_gpu = 0;
 		float um_apply_gpu = 0;

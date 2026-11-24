@@ -1159,9 +1159,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// without the alpha-blend extension.
 				if (mask_path)
 					last_gpu_timestamps.merge_gpu_time = (timestamps2[6] - timestamps2[5]) * period;
-				// Split spans (q7 after layer base, q8 after merge record,
-				// q9 after verdict pass; merge end reuses q6). Written only
-				// when the merge recorded with a paired verdict.
+				// Split spans (q7 after layer base, q8 after verdict pass,
+				// q9 after merge subpass; merge end reuses q6). Written
+				// only when the merge recorded with a paired verdict.
 				if (mask_path and merge_um_split_ready)
 				{
 					auto [sres, stimestamps] = query_pool.getResults<uint64_t>(
@@ -2938,10 +2938,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									if (merge_idx >= 0)
 									{
 										vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
-										// Pairing decision FIRST: record() begins the folded
-										// renderpass (fold3 paired / fold2 mask-only), so the
-										// path is fixed here from the same virt that drives
-										// record_finish() below — one lookup, one verdict.
+										// Pairing decision FIRST: the verdict runs ahead
+										// of the fold in record_verdict(), so the same
+										// virt drives record_verdict() and record_finish()
+										// below — one lookup, one verdict.
 										// Unpaired (not expected, decoder dead, ±1 miss) or
 										// VR depth testing toggled off: submits merged
 										// directly — today's neutral parity.

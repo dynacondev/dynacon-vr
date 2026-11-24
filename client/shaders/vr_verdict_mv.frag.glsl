@@ -23,11 +23,13 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Foveated virtual-depth decode + exact global verdict at FULL merge
-// res. One fullscreen pass, no intermediate depth canvas: the verdict
-// compares the uniform raster layer against the foveated SBS depth
-// through the shared foveation tables (same tables as color: same
-// gaze center and source size on every depth-carrying warped frame).
+// Foveated virtual-depth decode + exact global verdict at HALF merge
+// res (uniform half: quarter pixels, exact 2x NEAREST broadcast back
+// to full res in the apply). One fullscreen pass, no intermediate
+// depth canvas: the verdict compares the uniform raster layer against
+// the foveated SBS depth through the shared foveation tables (same
+// tables as color: same gaze center and source size on every
+// depth-carrying warped frame).
 //
 // layer_tex: R16F common layer (linear meters, MIN of the positive
 // window draws, FAR clear 65504 reads as absent). NEAREST: sampled at
@@ -48,10 +50,10 @@ layout(location = 0) out vec4 out_color;
 // by construction.
 //
 // Tables: CPU-expanded per frame from the shared compact runs into a
-// direct packed-index map per merge pixel, merge->render scale baked
-// in. Layout: [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s, W/H = merge
-// extent. SSBO (not UBO): the expanded map exceeds the guaranteed
-// maxUniformBufferRange.
+// direct packed-index map per loop pixel (merge->render scale baked
+// in at half res). Layout: [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s,
+// W/H = half merge extent. SSBO (not UBO): the expanded map exceeds
+// the guaranteed maxUniformBufferRange.
 //
 // SBS encoding: 10-bit 2mm/LSB luma, valid codes 0-1020 (0-2.040m);
 // holes, sky and beyond-range pin to 1023 (far); 1021-1023 is a guard

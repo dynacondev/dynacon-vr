@@ -229,7 +229,7 @@ public:
 	}
 
 	// Borrowed debug-viz views of the owned common-layer and verdict
-	// targets (2-layer arrays, full merge res). Raw handles, same-frame
+	// targets (2-layer arrays; layer + verdict live at half res now). Raw handles, same-frame
 	// use only; null when never built. Images end SHADER_READ_ONLY
 	// after the mask-phase barriers, so the viz pass needs only an
 	// execution barrier on the async path (same-queue ordering).
@@ -341,8 +341,8 @@ private:
 	// verdict apply has a stable input.
 	layer_target merged_;
 	// Binary verdict (R8, uniform half res): fused foveated-decode +
-	// compare output, multiplied directly by the apply (no upscale:
-	// the compare already runs at submit res).
+	// compare output, upsampled 2x NEAREST (exact broadcast) by the
+	// apply.
 	layer_target verdict_;
 	// Full merge res (== extent_): merged target + submit image.
 	vk::Extent2D layer_extent_{0, 0};
@@ -406,10 +406,11 @@ private:
 	vk::Rect2D verdict_box_{{0, 0}, {0, 0}};
 	bool verdict_box_empty_ = true;
 	// Foveation index maps (SSBO pair, ping-ponged with the verdict
-	// sets): per-eye packed-texel index per full-res merge pixel,
+	// sets): per-eye packed-texel index per half-res loop pixel,
 	// CPU-expanded from the shared foveation runs with the
 	// merge->render scale baked in. Layout: [x0(W)] [x1(W)] [y0(H)]
-	// [y1(H)] uint32s, W/H = merge extent. Host-visible, rewritten
+	// [y1(H)] uint32s, W/H = half merge extent. Host-visible,
+	// rewritten
 	// every verdict frame (depth_overlay UBO discipline: memcpy +
 	// vmaFlushAllocation under the same waitIdle'd ownership as the
 	// targets); ping-ponged so an inline record never rewrites what

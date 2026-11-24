@@ -24,13 +24,14 @@ layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
 // Verdict apply: merged contributor alpha (full res, NEAREST — the
-// feather bands are already filtered) times the full-res binary
-// verdict (NEAREST — the compare already runs at submit res, so no
-// upscale of any kind). No push. RGB stays zero (downstream the
-// REPLACE blend preserves dst color and the veil bias touches alpha
-// only, same as the plain merge it replaces). Always paired: the
-// mask-only path (unpaired depth) takes vr_apply_mask_mv instead and
-// never binds this pipeline.
+// feather bands are already filtered) times the half-res binary
+// verdict (NEAREST — sampling a half-res texture at full-res uv is an
+// exact 2x broadcast: texel floor(uv*half) = floor(k/2) per full-res
+// pixel k, so no filter and no extra tap). No push. RGB stays zero
+// (downstream the REPLACE blend preserves dst color and the veil bias
+// touches alpha only, same as the plain merge it replaces). Always
+// paired: the mask-only path (unpaired depth) takes
+// vr_apply_mask_mv instead and never binds this pipeline.
 layout(set = 0, binding = 0) uniform sampler2DArray merged_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray verdict_tex;
 

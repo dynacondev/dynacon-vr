@@ -198,12 +198,12 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		};
 		targets.back().view = vk::raii::ImageView(*device, iv_info);
 	}
-	// Common depth layer + merged + verdict targets (owned images, not
-	// swapchain): all full merge res since the foveated verdict compares
-	// per-pixel. Rebuilt under the same waitIdle above; the mesh buffers
-	// survive (extent-independent). Only the layer keeps its own
-	// framebuffer (own renderpass); merged/verdict ride the per-image
-	// folded framebuffers built below (null renderpass = no FB).
+	// Owned targets (not swapchain): layer + verdict at uniform half
+	// res (opt #U), merged at full merge res. Rebuilt under the same
+	// waitIdle above; the mesh buffers survive (extent-independent).
+	// The layer and verdict keep their own framebuffers (own RPs);
+	// merged rides the per-image fold framebuffer (null renderpass =
+	// no FB).
 	auto make_owned = [&](vk::Format fmt, vk::Extent2D e, vk::ImageUsageFlags usage, vk::raii::RenderPass * rp) {
 		layer_target t;
 		vk::ImageCreateInfo image_info{
@@ -276,7 +276,7 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		                                 });
 	}
 	// Foveation index maps (SSBO pair, host-visible): per-eye packed
-	// index per merge pixel, [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s.
+	// index per half-res loop pixel, same layout as the shader reads.
 	verdict_tables_bytes = vk::DeviceSize(2 * (half_extent.width + half_extent.height)) * sizeof(uint32_t);
 	for (auto & t: verdict_tables)
 	{
@@ -1065,7 +1065,7 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	cmd.endRenderPass();
 
 	// Write→read hazard (same command buffer): the layer is sampled by
-	// the verdict in record_finish below.
+	// the verdict in record_verdict below.
 	vk::ImageMemoryBarrier barrier{
 	        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
 	        .dstAccessMask = vk::AccessFlagBits::eShaderRead,
@@ -1148,9 +1148,9 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 		verdict_descriptor_sets.emplace_back(std::move(device->allocateDescriptorSets(set_alloc)[0]));
 	}
 	// Pipeline bakes the set layout: rebuilt alongside it, never apart
-	// (binding fresh sets with a stale pipeline is a use error). Fold
-	// subpass 1 (same RP the merge subpass 0 and apply subpass 2 run
-	// in); the YCbCr rebuild path only ever touches this pipeline.
+	// (binding fresh sets with a stale pipeline is a use error). The
+	// YCbCr rebuild path only ever touches this pipeline (standalone
+	// verdict RP, subpass 0).
 	vk::PipelineLayoutCreateInfo verdict_layout_info{
 	        .setLayoutCount = 1,
 	        .pSetLayouts = &*verdict_descriptor_layout,
