@@ -1497,6 +1497,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				mask_fov[i] = live_views[i].fov;
 			}
 		}
+		else
+		{
+			// One-shot adb note: mask_pose (and the 6DOF warp target that
+			// rides it) is stale server pose until the next valid locate.
+			static bool live_locate_warned = false;
+			if (not live_locate_warned)
+			{
+				live_locate_warned = true;
+				spdlog::warn("Live locate invalid, mask/warp poses ride stale server pose until it recovers");
+			}
+		}
 		live_views_for_gui = std::move(live_views);
 	}
 
@@ -3590,16 +3601,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// Explicit finite-far GL frustum (LESS, clear 1):
 							// scene::projection_matrix is reversed-Z infinite
 							// and does not match sensor D semantics, so it
-							// stays out of this pass entirely.
+							// stays out of this pass entirely. Y row carries
+							// the same Vulkan negation as scene's builder
+							// (2/(b-t)); near/far are display-side only
+							// (sensor range lives in sens_nf).
 							auto finite_perspective = [](XrFovf fov, float n, float f) {
 								float l = n * tanf(fov.angleLeft);
 								float r = n * tanf(fov.angleRight);
 								float b = n * tanf(fov.angleDown);
-								float t = tanf(fov.angleUp);
+								float t = n * tanf(fov.angleUp);
 								return glm::mat4{
 								        {2 * n / (r - l), 0, 0, 0},
-								        {0, 2 * n / (t - b), 0, 0},
-								        {(r + l) / (r - l), (t + b) / (t - b), -(f + n) / (f - n), -1},
+								        {0, 2 * n / (b - t), 0, 0},
+								        {(r + l) / (r - l), (t + b) / (b - t), -(f + n) / (f - n), -1},
 								        {0, 0, -2 * f * n / (f - n), 0},
 								};
 							};

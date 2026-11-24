@@ -637,23 +637,34 @@ void depth_overlay_renderer::init_warp()
 	        },
 	};
 
-	// One vec2 UV per native sensor texel; index draws the grid.
+	// One vec4 per corner: xy = corner UV (texture space, for the
+	// interpolated re-tap varying), zw = owning texel id (exact small
+	// integers: the vertex fetch below is deterministic texelFetch,
+	// never a rounding-defined NEAREST tap on a texel boundary).
 	vk::VertexInputBindingDescription vertex_bind{
 	        .binding = 0,
-	        .stride = sizeof(float) * 2,
+	        .stride = sizeof(float) * 4,
 	        .inputRate = vk::VertexInputRate::eVertex,
 	};
-	vk::VertexInputAttributeDescription vertex_attr{
-	        .location = 0,
-	        .binding = 0,
-	        .format = vk::Format::eR32G32Sfloat,
-	        .offset = 0,
+	vk::VertexInputAttributeDescription vertex_attrs[2] = {
+	        {
+	                .location = 0,
+	                .binding = 0,
+	                .format = vk::Format::eR32G32Sfloat,
+	                .offset = 0,
+	        },
+	        {
+	                .location = 1,
+	                .binding = 0,
+	                .format = vk::Format::eR32G32Sfloat,
+	                .offset = sizeof(float) * 2,
+	        },
 	};
 	vk::PipelineVertexInputStateCreateInfo vertex_input{
 	        .vertexBindingDescriptionCount = 1,
 	        .pVertexBindingDescriptions = &vertex_bind,
-	        .vertexAttributeDescriptionCount = 1,
-	        .pVertexAttributeDescriptions = &vertex_attr,
+	        .vertexAttributeDescriptionCount = 2,
+	        .pVertexAttributeDescriptions = vertex_attrs,
 	};
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly{
 	        .topology = vk::PrimitiveTopology::eTriangleList,
@@ -701,7 +712,12 @@ void depth_overlay_renderer::init_warp()
 
 	// Own set layout: sensor sampler (vertex fetch + fragment re-tap),
 	// warp UBO (vertex only), frame-params UBO (fragment ramp).
-	warp_set.clear();
+	// Clear the framebuffers first: they reference the color views that
+	// ensure() is about to destroy (this runs inside ensure's waitIdle,
+	// before targets.clear()).
+	warp_targets.clear();
+	for (auto & s: warp_sets)
+		s.clear();
 	warp_pipeline.clear();
 	warp_pipeline_layout.clear();
 	vk::DescriptorSetLayoutBinding bindings[3] = {
@@ -729,12 +745,12 @@ void depth_overlay_renderer::init_warp()
 	                                                                   .pBindings = bindings,
 	                                                           });
 	vk::DescriptorPoolSize pool_sizes[2] = {
-	        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1},
-	        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 2},
+	        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 2},
+	        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 4},
 	};
 	warp_pool = vk::raii::DescriptorPool(*device, vk::DescriptorPoolCreateInfo{
 	                                                              .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-	                                                              .maxSets = 1,
+	                                                              .maxSets = 2,
 	                                                              .poolSizeCount = 2,
 	                                                              .pPoolSizes = pool_sizes,
 	                                                      });
@@ -743,15 +759,21 @@ void depth_overlay_renderer::init_warp()
 	        .descriptorSetCount = 1,
 	        .pSetLayouts = &*warp_layout,
 	};
-	auto sets = vk::raii::DescriptorSets(*device, alloc_info);
-	warp_set = std::move(sets.front());
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		auto sets = vk::raii::DescriptorSets(*device, alloc_info);
+		warp_sets[eye] = std::move(sets.front());
+	}
 
-	if (not warp_ubo or warp_ubo.info().size < sizeof(warp_ubo_data))
+	// Two UBO slots (one per eye): both draws in one command buffer must
+	// read their own matrices (host writes complete before submit, so a
+	// rewritten single slot would show eye 1 to both draws).
+	if (not warp_ubo or warp_ubo.info().size < 2 * sizeof(warp_ubo_data))
 	{
 		warp_ubo = buffer_allocation(
 		        *device,
 		        vk::BufferCreateInfo{
-		                .size = sizeof(warp_ubo_data),
+		                .size = 2 * sizeof(warp_ubo_data),
 		                .usage = vk::BufferUsageFlagBits::eUniformBuffer,
 		        },
 		        VmaAllocationCreateInfo{
@@ -909,13 +931,18 @@ void depth_overlay_renderer::ensure_warp_mesh(uint32_t sens_w, uint32_t sens_h)
 	// fragment re-tap keeps every value truthful.
 	const size_t cols = (size_t)sens_w + 1, rows = (size_t)sens_h + 1;
 	std::vector<float> verts;
-	verts.reserve(cols * rows * 2);
+	verts.reserve(cols * rows * 4);
 	for (size_t j = 0; j < rows; ++j)
 	{
 		for (size_t i = 0; i < cols; ++i)
 		{
+			// Corner UV for coverage; owning texel clamped inside so
+			// the vertex fetch below is an exact texelFetch (a corner
+			// sits on a 4-way boundary and belongs to no texel).
 			verts.push_back((float)i / (float)sens_w);
 			verts.push_back(1.0f - (float)j / (float)sens_h);
+			verts.push_back((float)(i < sens_w ? i : sens_w - 1));
+			verts.push_back((float)(j < sens_h ? j : sens_h - 1));
 		}
 	}
 	std::vector<uint32_t> indices;
@@ -979,6 +1006,8 @@ void depth_overlay_renderer::record_sensor_reproject(vk::raii::CommandBuffer & c
 
 	upload_viz_params(params);
 
+	// Fill both UBO slots and write both sets up front: no set is ever
+	// updated after bind, and each draw reads its own slot.
 	vk::DescriptorImageInfo image_info{
 	        .sampler = *sampler,
 	        .imageView = sensor_view,
@@ -986,43 +1015,58 @@ void depth_overlay_renderer::record_sensor_reproject(vk::raii::CommandBuffer & c
 	        // (acquire is the sync point); keep whatever layout it is in.
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
-	vk::DescriptorBufferInfo warp_buffer_info{
-	        .buffer = vk::Buffer(warp_ubo),
-	        .offset = 0,
-	        .range = sizeof(warp_ubo_data),
-	};
 	vk::DescriptorBufferInfo params_buffer_info{
 	        .buffer = vk::Buffer(ubo),
 	        .offset = 0,
 	        .range = sizeof(frame_params),
 	};
-	std::array<vk::WriteDescriptorSet, 3> writes = {{
-	        {
-	                .dstSet = *warp_set,
-	                .dstBinding = 0,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .pImageInfo = &image_info,
-	        },
-	        {
-	                .dstSet = *warp_set,
-	                .dstBinding = 1,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eUniformBuffer,
-	                .pBufferInfo = &warp_buffer_info,
-	        },
-	        {
-	                .dstSet = *warp_set,
-	                .dstBinding = 2,
-	                .descriptorCount = 1,
-	                .descriptorType = vk::DescriptorType::eUniformBuffer,
-	                .pBufferInfo = &params_buffer_info,
-	        },
-	}};
-	device->updateDescriptorSets(writes, nullptr);
+	{
+		uint8_t * slots = reinterpret_cast<uint8_t *>(warp_ubo.map());
+		for (uint32_t eye = 0; eye < 2; ++eye)
+		{
+			warp_ubo_data data{};
+			std::memcpy(data.disp_vp, warp.disp_vp[eye].data(), sizeof(data.disp_vp));
+			std::memcpy(data.sens_mount, warp.sens_mount[eye].data(), sizeof(data.sens_mount));
+			std::memcpy(data.sens_tan, warp.sens_tan[eye].data(), sizeof(data.sens_tan));
+			data.sens_nf[0] = warp.sens_nf[eye][0];
+			data.sens_nf[1] = warp.sens_nf[eye][1];
+			std::memcpy(slots + eye * sizeof(data), &data, sizeof(data));
+
+			vk::DescriptorBufferInfo warp_buffer_info{
+			        .buffer = vk::Buffer(warp_ubo),
+			        .offset = eye * sizeof(warp_ubo_data),
+			        .range = sizeof(warp_ubo_data),
+			};
+			std::array<vk::WriteDescriptorSet, 3> writes = {{
+			        {
+			                .dstSet = *warp_sets[eye],
+			                .dstBinding = 0,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+			                .pImageInfo = &image_info,
+			        },
+			        {
+			                .dstSet = *warp_sets[eye],
+			                .dstBinding = 1,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eUniformBuffer,
+			                .pBufferInfo = &warp_buffer_info,
+			        },
+			        {
+			                .dstSet = *warp_sets[eye],
+			                .dstBinding = 2,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eUniformBuffer,
+			                .pBufferInfo = &params_buffer_info,
+			        },
+			}};
+			device->updateDescriptorSets(writes, nullptr);
+		}
+		warp_ubo.unmap();
+		vmaFlushAllocation(vk_allocator::instance(), warp_ubo, 0, 2 * sizeof(warp_ubo_data));
+	}
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *warp_pipeline);
-	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *warp_pipeline_layout, 0, *warp_set, {});
 	cmd.bindVertexBuffers(0, (vk::Buffer)warp_vertex_buffer, (vk::DeviceSize)0);
 	cmd.bindIndexBuffer((vk::Buffer)warp_index_buffer, 0, vk::IndexType::eUint32);
 
@@ -1038,16 +1082,7 @@ void depth_overlay_renderer::record_sensor_reproject(vk::raii::CommandBuffer & c
 
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
-		warp_ubo_data data{};
-		std::memcpy(data.disp_vp, warp.disp_vp[eye].data(), sizeof(data.disp_vp));
-		std::memcpy(data.sens_mount, warp.sens_mount[eye].data(), sizeof(data.sens_mount));
-		std::memcpy(data.sens_tan, warp.sens_tan[eye].data(), sizeof(data.sens_tan));
-		data.sens_nf[0] = warp.sens_nf[eye][0];
-		data.sens_nf[1] = warp.sens_nf[eye][1];
-		std::memcpy(warp_ubo.map(), &data, sizeof(data));
-		warp_ubo.unmap();
-		vmaFlushAllocation(vk_allocator::instance(), warp_ubo, 0, sizeof(data));
-
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *warp_pipeline_layout, 0, *warp_sets[eye], {});
 		cmd.pushConstants<warp_push>(*warp_pipeline_layout,
 		                             vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
 		                             0,
