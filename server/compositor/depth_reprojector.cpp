@@ -214,9 +214,8 @@ vk::raii::Pipeline make_pipeline(
 namespace wivrn
 {
 
-depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, bool reverse_z, bool half_res_warp) :
+depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, bool reverse_z) :
         reverse_z(reverse_z),
-        half_res_warp(half_res_warp),
         extent(target_size),
         color_sampler(make_sampler(vk, vk::Filter::eLinear, "reproject color sampler")),
         depth_sampler(make_sampler(vk, vk::Filter::eNearest, "reproject depth sampler"))

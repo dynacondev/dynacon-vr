@@ -770,13 +770,6 @@ configuration::configuration()
 					else
 						U_LOG_W("reprojection.source-reverse-z must be a boolean, ignoring");
 				}
-				if (auto jt = it->find("half-res-warp"); jt != it->end())
-				{
-					if (jt->is_boolean())
-						reprojection.half_res_warp = jt->get<bool>();
-					else
-						U_LOG_W("reprojection.half-res-warp must be a boolean, ignoring");
-				}
 				if (auto jt = it->find("gpu-priority"); jt != it->end())
 				{
 					if (not jt->is_string())

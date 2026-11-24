@@ -199,14 +199,6 @@ struct configuration
 		// this, so the default encodes the pipeline assumption;
 		// normal-Z apps set it false explicitly.
 		bool source_reverse_z = true;
-		// Half-resolution warp grid: splat/pull/fill/pack run at half
-		// linear res (quarter threads, center-tap source sampling).
-		// Opt-in, default off: full-res warp preserves app detail
-		// (see warp_extent()), this trades quality (fovea softening,
-		// ±2px depth edges, sub-2px geometry may not occlude) for
-		// low-end GPU headroom. Startup-only like the rest here.
-		// Server-local: the client still receives full-res runs.
-		bool half_res_warp = false;
 		// Device-global queue priority for our compositor, transfer
 		// and encode queues: high prefers our submits when the app
 		// saturates the GPU. This is the only lever that arbitrates
