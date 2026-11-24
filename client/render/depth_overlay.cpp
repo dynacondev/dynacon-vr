@@ -641,30 +641,25 @@ void depth_overlay_renderer::init_warp()
 	// interpolated re-tap varying), zw = owning texel id (exact small
 	// integers: the vertex fetch below is deterministic texelFetch,
 	// never a rounding-defined NEAREST tap on a texel boundary).
+	// Single vec4 attribute: two vec2 attributes would leave the
+	// shader's zw defaulted to (0,1), collapsing every vertex to one
+	// texel (total holes + misplaced survivors).
 	vk::VertexInputBindingDescription vertex_bind{
 	        .binding = 0,
 	        .stride = sizeof(float) * 4,
 	        .inputRate = vk::VertexInputRate::eVertex,
 	};
-	vk::VertexInputAttributeDescription vertex_attrs[2] = {
-	        {
-	                .location = 0,
-	                .binding = 0,
-	                .format = vk::Format::eR32G32Sfloat,
-	                .offset = 0,
-	        },
-	        {
-	                .location = 1,
-	                .binding = 0,
-	                .format = vk::Format::eR32G32Sfloat,
-	                .offset = sizeof(float) * 2,
-	        },
+	vk::VertexInputAttributeDescription vertex_attr{
+	        .location = 0,
+	        .binding = 0,
+	        .format = vk::Format::eR32G32B32A32Sfloat,
+	        .offset = 0,
 	};
 	vk::PipelineVertexInputStateCreateInfo vertex_input{
 	        .vertexBindingDescriptionCount = 1,
 	        .pVertexBindingDescriptions = &vertex_bind,
-	        .vertexAttributeDescriptionCount = 2,
-	        .pVertexAttributeDescriptions = vertex_attrs,
+	        .vertexAttributeDescriptionCount = 1,
+	        .pVertexAttributeDescriptions = &vertex_attr,
 	};
 	vk::PipelineInputAssemblyStateCreateInfo input_assembly{
 	        .topology = vk::PrimitiveTopology::eTriangleList,
