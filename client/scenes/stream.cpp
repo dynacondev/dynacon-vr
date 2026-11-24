@@ -1667,6 +1667,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// layer, verdict) sample already-acquired frames, no provider.
 		bool have_depth_frame = false;
 		xr::environment_depth::frame shared_depth{};
+		// Capture-anchored submit pose for the sensor viz (baseline
+		// non-reprojected view): headset pose at the depth image's own
+		// capture_time, located below. The runtime's rotation-only warp
+		// then corrects the capture->display head motion; the fixed
+		// headset<->sensor extrinsic is a static offset, never swim.
+		// Falls back to the acquire-time (predicted) depth pose, loudly.
+		std::array<XrPosef, view_count> capture_pose{};
+		bool have_capture_pose = false;
 		bool want_depth = debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor;
 		if (want_depth)
 		{
@@ -1688,10 +1696,64 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (env_depth->ready())
 				{
 					env_depth->start();
-					// Live acquire: sensor pose rides predicted time.
+					// Acquire at predicted time: the returned depth pose
+					// rides predicted time (spec). The sensor viz submit
+					// below re-anchors to capture time (capture_pose).
 					bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, shared_depth);
 					if (got_depth)
+					{
 						have_depth_frame = true;
+						// Sensor-viz submit pose: headset at the depth
+						// image's capture time. No depth-sensor query at a
+						// past time exists (or is needed): the single
+						// timestamp is the one riding the image we render.
+						if (debug_viz == debug_viz_mode::sensor)
+						{
+							const char * fallback_reason = nullptr;
+							if (shared_depth.capture_time == 0)
+								fallback_reason = "no capture timestamp (v1 runtime)";
+							else
+							{
+								try
+								{
+									auto [cap_flags, cap_views] = session.locate_views(viewconfig, shared_depth.capture_time, application::space(xr::spaces::world));
+									if (cap_views.size() == view_count and (cap_flags & XR_VIEW_STATE_POSITION_VALID_BIT) and
+									    (cap_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+									{
+										for (size_t i = 0; i < view_count; ++i)
+											capture_pose[i] = cap_views[i].pose;
+										have_capture_pose = true;
+									}
+									else
+										fallback_reason = "capture locate pose invalid";
+								}
+								catch (const std::system_error &)
+								{
+									fallback_reason = "capture locate threw";
+								}
+							}
+							// Fallback is adb-visible: change-triggered +
+							// heartbeat while active.
+							static bool last_had_pose = true;
+							static XrTime last_pose_log = 0;
+							XrTime now = instance.now();
+							if (fallback_reason)
+							{
+								if (last_had_pose or now - last_pose_log > 5'000'000'000LL)
+								{
+									last_pose_log = now;
+									spdlog::warn("Sensor viz: capture-pose unavailable ({}), submitting predicted depth pose (swims under head motion)", fallback_reason);
+								}
+								last_had_pose = false;
+							}
+							else if (not last_had_pose)
+							{
+								last_had_pose = true;
+								last_pose_log = now;
+								spdlog::info("Sensor viz: capture-pose submit restored");
+							}
+						}
+					}
 					else
 						depth_status = "waiting for depth data";
 				}
@@ -3963,8 +4025,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// submitted pose, so it must ride the timebase the viz content
 		// was generated in — not the live head pose. VR depth / layer
 		// / verdict are server-timebased (same warp as the video and
-		// mask layers, including sync's per-eye live fallback);
-		// the sensor viz rides the depth frame's own capture pose.
+		// mask layers, including sync's per-eye live fallback); the
+		// sensor viz submits the headset pose at the depth image's own
+		// capture_time (capture_pose above) with the sensor frustum, so
+		// the rotation-only warp corrects capture->display head motion.
+		// Predicted depth pose is the logged fallback (swims).
 		// Submitting live would present stale pixels as fresh
 		// (swim/misalign under head motion).
 		if (depth_image >= 0 and depth_overlay)
@@ -3973,7 +4038,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			const XrFovf * viz_fov = sync_fov.data();
 			if (debug_viz == debug_viz_mode::sensor)
 			{
-				viz_pose = shared_depth.pose;
+				viz_pose = have_capture_pose ? capture_pose.data() : shared_depth.pose;
 				viz_fov = shared_depth.fov;
 			}
 			std::array<XrCompositionLayerProjectionView, view_count> depth_views;
