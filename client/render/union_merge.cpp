@@ -155,7 +155,11 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	device->waitIdle();
 	// Free the descriptor sets while their pool is still alive:
 	// init_pipelines below recreates the pool, which implicitly frees
-	// (destroys the use of) any sets still held.
+	// (destroys the use of) any sets still held. Fold framebuffers go
+	// first: they reference views rebuilt below (waitIdle'd, so no
+	// in-flight use — this just removes the transient dangle).
+	fold3_fbs.clear();
+	fold2_fbs.clear();
 	descriptor_sets.clear();
 	verdict_descriptor_sets.clear();
 	apply_descriptor_sets.clear();
@@ -1299,9 +1303,16 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	bool do_verdict = virt_in.valid and virt_in.view and virt_in.sampler;
 	// The begun RP must match this frame's path: record() received the
 	// same validity (stream.cpp derives both from one virt), so a
-	// mismatch means the pairing logic drifted — fail loudly in debug,
-	// never silently record the wrong subpass tail.
+	// mismatch means the pairing logic drifted. Fail closed in release
+	// (end the open RP, refuse the frame) rather than recording the
+	// wrong subpass tail into it.
 	assert(do_verdict == fold_paired_);
+	if (do_verdict != fold_paired_)
+	{
+		spdlog::error("Union merge fold pairing drift (paired={} do_verdict={}), dropping frame", fold_paired_, do_verdict);
+		cmd.endRenderPass();
+		return false;
+	}
 	fold_paired_ = false;
 	if (do_verdict)
 	{
@@ -1412,7 +1423,11 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	vk::DescriptorImageInfo merged_info{
 	        .sampler = *sampler_nearest,
 	        .imageView = *merged_.view_array,
-	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	        // GENERAL, not SHADER_READ: the folded attachments stay
+	        // GENERAL throughout the RP (triple precedent: sampled
+	        // across subpasses, no transition). Declaring SHADER_READ
+	        // here would mismatch the actual layout at draw time.
+	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	std::vector<vk::WriteDescriptorSet> apply_writes;
 	apply_writes.reserve(2);
@@ -1435,7 +1450,11 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	vk::DescriptorImageInfo apply_verdict_info{
 	        .sampler = *sampler_nearest,
 	        .imageView = *verdict_.view_array,
-	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	        // GENERAL, not SHADER_READ: see merged_info above. (Mask-only
+	        // frames write this binding but never sample it — the mask
+	        // shader declares binding 0 only — so the layout is moot
+	        // there, but paired frames sample it as GENERAL.)
+	        .imageLayout = vk::ImageLayout::eGeneral,
 	};
 	apply_writes.push_back(vk::WriteDescriptorSet{
 	        .dstSet = aset,
