@@ -168,6 +168,11 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	// above suppressing recovery forever against stale targets.
 	vk::Format new_format = format;
 	vk::Extent2D new_extent{(uint32_t)w, (uint32_t)h};
+	// Uniform-half working res (opt #U) must divide evenly: the
+	// apply's 2x NEAREST upscale is exact only for even dims. Merge
+	// dims are 64-aligned, so this always holds; assert it loudly.
+	assert(w % 2 == 0 and h % 2 == 0);
+	vk::Extent2D half_extent{(uint32_t)w / 2, (uint32_t)h / 2};
 	swapchain_ = xr::swapchain(inst, sess, *device, new_format, w, h, 1, 2);
 	spdlog::info("Union merge swapchain: {}x{} ({} images)", w, h, swapchain_.image_count());
 	init_pipelines(new_format);
@@ -249,10 +254,11 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		}
 		return t;
 	};
-	layer_ = make_owned(layer_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &geom_renderpass);
+	layer_ = make_owned(layer_format, half_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &geom_renderpass);
 	merged_ = make_owned(new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, nullptr);
-	verdict_ = make_owned(verdict_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &verdict_rp);
+	verdict_ = make_owned(verdict_format, half_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &verdict_rp);
 	layer_extent_ = new_extent;
+	half_extent_ = half_extent;
 	// Folded framebuffer, one per submit image (submit view varies):
 	// {merged, submit}. Attachments and order must match the fold RP
 	// definition in init_pipelines.
@@ -271,7 +277,7 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	}
 	// Foveation index maps (SSBO pair, host-visible): per-eye packed
 	// index per merge pixel, [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s.
-	verdict_tables_bytes = vk::DeviceSize(2 * (new_extent.width + new_extent.height)) * sizeof(uint32_t);
+	verdict_tables_bytes = vk::DeviceSize(2 * (half_extent.width + half_extent.height)) * sizeof(uint32_t);
 	for (auto & t: verdict_tables)
 	{
 		t = buffer_allocation(
@@ -287,8 +293,8 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        "union merge verdict tables");
 	}
 	spdlog::info("Union merge layer targets: layer {}x{} merged {}x{} verdict {}x{} tables {}B",
-	             new_extent.width, new_extent.height, new_extent.width, new_extent.height,
-	             new_extent.width, new_extent.height, verdict_tables_bytes);
+	             half_extent.width, half_extent.height, new_extent.width, new_extent.height,
+	             half_extent.width, half_extent.height, verdict_tables_bytes);
 	// Commit only after the whole rebuild succeeded (see above).
 	format_ = new_format;
 	extent_ = new_extent;
@@ -1001,16 +1007,18 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 		if (empty or behind)
 		{
 			verdict_box_empty_ = empty and not behind;
-			verdict_box_ = behind ? vk::Rect2D{{0, 0}, layer_extent_}
+			verdict_box_ = behind ? vk::Rect2D{{0, 0}, half_extent_}
 			                      : vk::Rect2D{{0, 0}, {0, 0}};
 		}
 		else
 		{
-			const float W = (float)layer_extent_.width, H = (float)layer_extent_.height;
+			// Half-res working pixels (opt #U): the verdict loop below runs
+		// at half res, so the box is mapped there directly.
+		const float W = (float)half_extent_.width, H = (float)half_extent_.height;
 			int32_t px0 = std::max<int32_t>(0, (int32_t)((minx * 0.5f + 0.5f) * W) - 2);
 			int32_t py0 = std::max<int32_t>(0, (int32_t)((miny * 0.5f + 0.5f) * H) - 2);
-			int32_t px1 = std::min<int32_t>((int32_t)layer_extent_.width, (int32_t)((maxx * 0.5f + 0.5f) * W) + 2);
-			int32_t py1 = std::min<int32_t>((int32_t)layer_extent_.height, (int32_t)((maxy * 0.5f + 0.5f) * H) + 2);
+			int32_t px1 = std::min<int32_t>((int32_t)half_extent_.width, (int32_t)((maxx * 0.5f + 0.5f) * W) + 2);
+			int32_t py1 = std::min<int32_t>((int32_t)half_extent_.height, (int32_t)((maxy * 0.5f + 0.5f) * H) + 2);
 			verdict_box_empty_ = (px1 <= px0) or (py1 <= py0);
 			verdict_box_ = verdict_box_empty_ ? vk::Rect2D{{0, 0}, {0, 0}}
 			                                  : vk::Rect2D{{px0, py0}, {(uint32_t)(px1 - px0), (uint32_t)(py1 - py0)}};
@@ -1025,7 +1033,7 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	vk::RenderPassBeginInfo begin{
 	        .renderPass = *geom_renderpass,
 	        .framebuffer = *layer_.framebuffer,
-	        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
+	        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
 	        .clearValueCount = 1,
 	        .pClearValues = &clear,
 	};
@@ -1033,15 +1041,15 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	cmd.setViewport(0, vk::Viewport{
 	                        .x = 0,
 	                        .y = 0,
-	                        .width = (float)layer_extent_.width,
-	                        .height = (float)layer_extent_.height,
+	                        .width = (float)half_extent_.width,
+	                        .height = (float)half_extent_.height,
 	                        .minDepth = 0,
 	                        .maxDepth = 1,
 	                });
 	// Full-layer scissor, set explicitly: prior passes in this command
 	// buffer may leave narrowed boxes behind (per-draw unions). The
-	// raster covers the whole layer by design.
-	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
+	// raster covers the whole (half-res) layer by design.
+	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *geom_pipeline);
 	for (const auto & d: draws)
 	{
@@ -1252,7 +1260,7 @@ void union_merge_renderer::record_verdict(vk::raii::CommandBuffer & cmd,
 	vk::RenderPassBeginInfo begin{
 	        .renderPass = *verdict_rp,
 	        .framebuffer = *verdict_.framebuffer,
-	        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
+	        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
 	        .clearValueCount = 1,
 	        .pClearValues = &verdict_clear,
 	};
@@ -1260,14 +1268,14 @@ void union_merge_renderer::record_verdict(vk::raii::CommandBuffer & cmd,
 	cmd.setViewport(0, vk::Viewport{
 	                        .x = 0,
 	                        .y = 0,
-	                        .width = (float)layer_extent_.width,
-	                        .height = (float)layer_extent_.height,
+	                        .width = (float)half_extent_.width,
+	                        .height = (float)half_extent_.height,
 	                        .minDepth = 0,
 	                        .maxDepth = 1,
 	                });
-	// Fullscreen scissor default; narrowed to the content box for the
-	// draw when non-empty (opt #A).
-	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
+	// Full-layer scissor default; narrowed to the content box for the
+	// draw when non-empty (opt #A, box already in half pixels).
+	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
 	// Content-box verdict: draw only the box — outside it the CLEAR
 	// above already wrote reveal-1, exact. Empty box skips the update
 	// + draw entirely (SSBO expand included); the timestamp below
@@ -1288,7 +1296,7 @@ void union_merge_renderer::record_verdict(vk::raii::CommandBuffer & cmd,
 		// scale baked in; packed dims from the paired depth frame.
 		auto & tables = verdict_tables[verdict_set_parity ? 1 : 0];
 		{
-			const int W = (int)layer_extent_.width, H = (int)layer_extent_.height;
+			const int W = (int)half_extent_.width, H = (int)half_extent_.height;
 			const int render_w = virt_in.render_w, render_h = virt_in.render_h;
 			const int packed_w = virt_in.packed_w, packed_h = virt_in.packed_h;
 			assert(W > 0 and H > 0);

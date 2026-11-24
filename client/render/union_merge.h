@@ -257,9 +257,11 @@ public:
 			return *verdict_.view_array;
 		return {};
 	}
+	// Half-res working size (the layer raster + verdict target live
+	// here; viz upsamples by sampling).
 	vk::Extent2D debug_layer_extent() const
 	{
-		return layer_extent_;
+		return half_extent_;
 	}
 
 private:
@@ -321,7 +323,7 @@ private:
 	// framebuffers live in fold_fbs below).
 	std::vector<target> targets;
 
-	// Common depth layer (R16F linear meters, full merge res): one
+	// Common depth layer (R16F linear meters, uniform half res): one
 	// owned 2-layer image + array view + layers=1 framebuffer (view mask
 	// routes both eyes), rebuilt in ensure() alongside the swapchain
 	// targets above. MIN-blended by record_base, sampled by the verdict.
@@ -338,15 +340,18 @@ private:
 	// MAXes contributors here instead of the submit image, so the
 	// verdict apply has a stable input.
 	layer_target merged_;
-	// Binary verdict (R8, full merge res): fused foveated-decode +
+	// Binary verdict (R8, uniform half res): fused foveated-decode +
 	// compare output, multiplied directly by the apply (no upscale:
 	// the compare already runs at submit res).
 	layer_target verdict_;
-	// Full merge res (== extent_): layer, merged and verdict all render
-	// here. The raster layer used to be half res with an upsampled
-	// verdict; foveated depth needs per-pixel precision, so the compare
-	// moved up to full res and the upscale is gone.
+	// Full merge res (== extent_): merged target + submit image.
 	vk::Extent2D layer_extent_{0, 0};
+	// Uniform half working res (opt #U): the layer raster + verdict
+	// loop + verdict target all run here (quarter pixels). The layer
+	// and verdict are compared texel-to-texel in this domain; the
+	// apply upsamples the verdict 2x NEAREST (exact broadcast).
+	// Always even (asserted in ensure: merge dims are 64-aligned).
+	vk::Extent2D half_extent_{0, 0};
 
 	// Geometry raster: R16F MIN-blend pipeline (CLEAR/STORE/OPTIMAL,
 	// CULL_NONE like the silhouette raster) + VERT-only MVP-pair push
