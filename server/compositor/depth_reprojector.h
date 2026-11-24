@@ -79,7 +79,7 @@ struct vk_bundle;
 class depth_reprojector
 {
 public:
-	depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, bool reverse_z);
+	depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, bool reverse_z, bool half_res_warp);
 
 	// Warps one eye's layer images (generation pose/params) to
 	// dst_pose/dst_fov, recording into cmd. Slot selects the commit's
@@ -132,6 +132,15 @@ private:
 	// reverse-Z sources are converted in the splat pass. Read once
 	// here so the hot path never touches the config.
 	const bool reverse_z;
+	// Half-res warp grid (config half-res-warp, startup-only): the
+	// grid covers the same frustum at half linear res, so every warp
+	// thread handles a 2x2 group from a single center tap (splat
+	// (2i+1, 2j+1) via NEAREST — deterministic, but sub-2px geometry
+	// may not splat). Pull's LINEAR center tap is the exact 2x2 box
+	// average. Passes scale with the grid automatically (extent-driven
+	// dispatches/clears); fill radius and bgmax cell are halved via
+	// specialization constants to preserve visual scale.
+	const bool half_res_warp;
 	const vk::Extent2D extent;
 
 	vk::raii::Sampler color_sampler = nullptr;

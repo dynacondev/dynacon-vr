@@ -55,6 +55,17 @@ class foveation
 	// copy would hand slot A's metadata to slot B's frame.
 	static constexpr size_t num_slots = 2;
 	std::array<std::array<to_headset::foveation_parameter, 2>, num_slots> params;
+	// Full-res client runs for half-res warp frames (same type): the
+	// shader tables above tile the half warp grid, but the client
+	// expands runs against full render size — so warped frames in
+	// half-res mode hand the client this separately computed full
+	// tiling instead. Straight frames never touch it (their params
+	// already tile full res).
+	std::array<std::array<to_headset::foveation_parameter, 2>, num_slots> full_params;
+	// Half-res warp grid (config half-res-warp, startup-only): enables
+	// the full_params path for warped frames. Straight frames are
+	// unaffected either way.
+	const bool half_res_warp;
 
 	vk::raii::Sampler sampler;
 
@@ -91,7 +102,8 @@ class foveation
 
 public:
 	foveation(wivrn::vk_bundle &,
-	          vk::Extent3D foveated_size);
+	          vk::Extent3D foveated_size,
+	          bool half_res_warp);
 
 	void update_tracking(const from_headset::tracking &);
 	void update_foveation_center_override(const from_headset::override_foveation_center &);

@@ -345,6 +345,16 @@ vk::Extent3D render_extent(const wivrn::from_headset::headset_info_packet & info
 vk::Extent2D warp_extent(const wivrn::from_headset::headset_info_packet & info)
 {
 	const auto re = render_extent(info);
+	// Opt-in escape hatch (half-res-warp config, default off): quarter
+	// the warp threads at documented quality cost. The client is
+	// unaffected: foveation still hands it full-res runs (see
+	// foveation::foveate), only the server-side warp grid shrinks.
+	if (wivrn::configuration().reprojection.half_res_warp)
+	{
+		U_LOG_I("half-res warp grid %dx%d (render %dx%d)",
+		        re.width / 2, re.height / 2, re.width, re.height);
+		return {re.width / 2, re.height / 2};
+	}
 	return {re.width, re.height};
 }
 
@@ -1477,11 +1487,12 @@ compositor::compositor(wivrn_session & session) :
         frame_rate(settings[0].fps),
         pacer(U_TIME_1S_IN_NS / frame_rate),
         squasher(vk, render_extent(session.get_info())),
-        foveation(vk, images[0].image.info().extent),
+        foveation(vk, images[0].image.info().extent, wivrn::configuration().reprojection.half_res_warp),
         reprojector(
                 vk,
                 warp_extent(session.get_info()),
-                cached_reprojection_switches().source_reverse_z),
+                cached_reprojection_switches().source_reverse_z,
+                wivrn::configuration().reprojection.half_res_warp),
         packer(vk),
         depth_reprojection_enabled(cached_reprojection_switches().enabled)
         // depth_images left default-constructed (empty) here and filled
