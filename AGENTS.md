@@ -2,6 +2,17 @@
 
 Lab notebook for coding agents working on this repo. Append lessons that cost real device round-trips.
 
+## Decoder YCbCr generations: views must pin the conversion they were baked with (Quest 3, Nov 2026)
+
+- Symptom: SIGSEGV (`SEGV_MAPERR`, tiny fault addr) inside Adreno `vkUpdateDescriptorSets`, on the first depth-paired frame after a mid-run AHB format renegotiation. Tombstone backtrace pointed at `union_merge::record_finish`'s apply update — but the writes were byte-identical to the working build and validation-silent, which misdirected toward the mask path for a full audit round.
+- Cause: pre-existing decoder lifecycle, not the mask code. `android_decoder::map_hardware_buffer` (decoder thread) destroyed `ycbcr_conversion`/`ycbcr_sampler` and cleared `hardware_buffer_map` on format change, while in-flight blit handles still referenced views baked with the dead conversion (`blit_handle::image_view` is a non-owning handle; `mapped_hardware_buffer` ownership via `vk_data` kept views alive but nothing kept the conversion). The render thread additionally read `decoder->sampler()` unlocked — both a data race and a dangling handle. A stale pre-renegotiation frame paired via the ±1 fallback then segfaulted the driver resolving the dead conversion (a mere mismatch would be VUID-01948, not a SEGV — the SEGV proves use-after-free).
+- Fix (`client/decoder/android_decoder.*`, `decoder.h`): per-format-generation shared ownership — `ycbcr_generation { conversion, sampler }` held by each mapped buffer and transitively by each blit handle; `blit_handle::sampler` carries the frame's own generation; the render thread never touches decoder-owned sampler state (`decoder::sampler()` virtual deleted). Stale frames now sample as merely-old depth. Same pattern applied to the defoveator (`stream_defoveator`: track baked samplers per pipeline, rebuild on generation change — it previously baked the first sampler forever) and to the call sites (`dh->sampler` everywhere, incl. video color/alpha + viz).
+- Rules:
+  1. Never store a decoder-owned Vulkan object in a longer-lived structure and never read one cross-thread without a generation pin: AHB renegotiation destroys conversion + sampler + views at any format change.
+  2. When a tombstone blames `updateDescriptorSets` with identical-to-working writes, suspect the objects behind the handles (destroyed conversion / dangling view), not the write structs — and check whether a renegotiation just happened (`decoded image size` + `verdict layout rebuilt` within ~100ms of the crash is the fingerprint).
+  3. Validation-silent + release-only-SEGV on this path means use-after-free, not a usage error: VVL would have named a mismatch (01948); it named nothing.
+- Residual (known, out of scope): `v4l2_decoder`'s destructor bypasses its own `held_by_vulkan` guard (source-change path throws correctly); Quest uses the android path. `stream_defoveator`'s pool has zero headroom (`maxSets = 4` = max live) — any future alloc-before-free reordering throws `OutOfPoolMemory`.
+
 ## Fullscreen black + per-frame "Invalid pose submitted": check GUI quads first (Quest 3)
 
 - Symptom: persistent full-frame black (video *and* overlay GUI gone), log shows `Invalid pose submitted` every frame, recovery as soon as GUI hides. Head tracking fine, no swapchain/LUT errors. First found via a combo dropdown whose popup overlapped the tooltip-strip viewport.
