@@ -112,8 +112,9 @@ public:
 	// Virtual depth for the global verdict: decoded stream-3 SBS frame
 	// (single image, left eye x[0..w/2)), decoder-owned view +
 	// sampler, set every frame from the paired blit handle. valid=false
-	// clears the verdict to 1 and applies merged directly (today's
-	// neutral parity, pixel-identical). ycbcr carries the view's
+	// skips the verdict pass + barrier and applies merged directly
+	// (mask-only finish, pixel-identical to a cleared-to-1 verdict).
+	// ycbcr carries the view's
 	// conversion definition (Android AHB depth); the verdict layout
 	// bakes an identically defined immutable sampler from it
 	// (VUID-VkWriteDescriptorSet-descriptorType-02738).

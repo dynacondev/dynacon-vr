@@ -28,9 +28,9 @@ layout(location = 0) out vec4 out_color;
 // verdict (NEAREST — the compare already runs at submit res, so no
 // upscale of any kind). No push. RGB stays zero (downstream the
 // REPLACE blend preserves dst color and the veil bias touches alpha
-// only, same as the plain merge it replaces). When no virtual-depth
-// frame paired, the verdict is cleared to 1 and this submits merged
-// directly (today's neutral parity, pixel-identical).
+// only, same as the plain merge it replaces). Always paired: the
+// mask-only path (unpaired depth) takes vr_apply_mask_mv instead and
+// never binds this pipeline.
 layout(set = 0, binding = 0) uniform sampler2DArray merged_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray verdict_tex;
 

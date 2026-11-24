@@ -3536,7 +3536,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					case debug_viz_mode::verdict:
 					{
-						if (merge_renderer and merge_this_frame)
+						// The verdict image only exists when the verdict
+						// pass ran this frame (paired depth); mask-only
+						// finishes skip it, so there is nothing to sample
+						// (an UNDEFINED read would be a layout mismatch).
+						if (merge_renderer and merge_this_frame and merge_um_split_ready)
 						{
 							depth_overlay->record_verdict(command_buffer, (size_t)depth_image, depth_ext,
 							                              merge_renderer->verdict_image(), merge_renderer->verdict_view_array(),
@@ -3548,7 +3552,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						{
 							depth_overlay->record_verdict(command_buffer, (size_t)depth_image, depth_ext,
 							                              vk::Image{}, vk::ImageView{}, vk::Image{}, vk::ImageView{}, params);
-							depth_status = "waiting for merge (no windows placed or merge sat out)";
+							if (merge_renderer and merge_this_frame)
+								depth_status = "verdict unavailable (VR depth testing off or depth unpaired)";
+							else
+								depth_status = "waiting for merge (no windows placed or merge sat out)";
 						}
 						break;
 					}
