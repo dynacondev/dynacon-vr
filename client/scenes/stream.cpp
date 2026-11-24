@@ -1675,6 +1675,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Falls back to the acquire-time (predicted) depth pose, loudly.
 		std::array<XrPosef, view_count> capture_pose{};
 		bool have_capture_pose = false;
+		// Depth-camera pose at capture time (D_cap): rigid headset->sensor
+		// offset measured at predicted time, applied to the headset at
+		// capture. Required input for the 6DOF warp (translation enters).
+		std::array<XrPosef, view_count> dcap_pose{};
+		bool have_dcap_pose = false;
 		bool want_depth = debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor;
 		if (want_depth)
 		{
@@ -1752,6 +1757,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								last_pose_log = now;
 								spdlog::info("Sensor viz: capture-pose submit restored");
 							}
+						}
+						// Depth-camera at capture (D_cap): the rigid
+						// headset->sensor offset is fixed, so measure it at
+						// predicted time (both known) and apply it to the
+						// headset at capture. Translation enters the 6DOF
+						// warp, so the offset cannot be waived here (unlike
+						// the rotation-only submit path).
+						if (have_capture_pose)
+						{
+							for (size_t i = 0; i < view_count; ++i)
+							{
+								glm::quat qp(mask_pose[i].orientation.w, mask_pose[i].orientation.x, mask_pose[i].orientation.y, mask_pose[i].orientation.z);
+								glm::vec3 pp(mask_pose[i].position.x, mask_pose[i].position.y, mask_pose[i].position.z);
+								glm::quat qd(shared_depth.pose[i].orientation.w, shared_depth.pose[i].orientation.x, shared_depth.pose[i].orientation.y,
+								             shared_depth.pose[i].orientation.z);
+								glm::vec3 pd(shared_depth.pose[i].position.x, shared_depth.pose[i].position.y, shared_depth.pose[i].position.z);
+								glm::quat qc(capture_pose[i].orientation.w, capture_pose[i].orientation.x, capture_pose[i].orientation.y,
+								             capture_pose[i].orientation.z);
+								glm::vec3 pc(capture_pose[i].position.x, capture_pose[i].position.y, capture_pose[i].position.z);
+								glm::quat q_off = glm::inverse(qp) * qd;
+								glm::vec3 p_off = glm::inverse(qp) * (pd - pp);
+								glm::quat q_cap = qc * q_off;
+								glm::vec3 p_cap = pc + qc * p_off;
+								dcap_pose[i].orientation = {q_cap.x, q_cap.y, q_cap.z, q_cap.w};
+								dcap_pose[i].position = {p_cap.x, p_cap.y, p_cap.z};
+							}
+							have_dcap_pose = true;
 						}
 					}
 					else
@@ -3549,19 +3581,81 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						params.near_z = shared_depth.near_z;
 						params.far_z = shared_depth.far_z;
-						depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
-						                      env_depth->depth_view(shared_depth.swapchain_index), params);
-						// Capture age forensics: which timebase this frame
-						// rode (v1 runtimes report no timestamp: gated).
-						if (shared_depth.capture_time != 0)
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms",
-							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
-							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6);
+						// 6DOF warp (default on): forward-warp the native
+						// sensor texels into the display eye at predicted
+						// time; submit follows with the predicted pose. Off =
+						// 3DOF baseline below (direct tap, capture submit).
+						if (sensor_reproject_6dof and have_dcap_pose)
+						{
+							// Explicit finite-far GL frustum (LESS, clear 1):
+							// scene::projection_matrix is reversed-Z infinite
+							// and does not match sensor D semantics, so it
+							// stays out of this pass entirely.
+							auto finite_perspective = [](XrFovf fov, float n, float f) {
+								float l = n * tanf(fov.angleLeft);
+								float r = n * tanf(fov.angleRight);
+								float b = n * tanf(fov.angleDown);
+								float t = tanf(fov.angleUp);
+								return glm::mat4{
+								        {2 * n / (r - l), 0, 0, 0},
+								        {0, 2 * n / (t - b), 0, 0},
+								        {(r + l) / (r - l), (t + b) / (t - b), -(f + n) / (f - n), -1},
+								        {0, 0, -2 * f * n / (f - n), 0},
+								};
+							};
+							depth_overlay_renderer::reproject_params warp{};
+							warp.sens_w = env_depth->depth_width();
+							warp.sens_h = env_depth->depth_height();
+							for (uint32_t view = 0; view < view_count; ++view)
+							{
+								glm::mat4 vp = finite_perspective(mask_fov[view], 0.05f, 30.0f) * scene::view_matrix(mask_pose[view]);
+								for (int c = 0; c < 4; ++c)
+									for (int r = 0; r < 4; ++r)
+										warp.disp_vp[view][c * 4 + r] = vp[c][r];
+								glm::quat q(dcap_pose[view].orientation.w, dcap_pose[view].orientation.x, dcap_pose[view].orientation.y,
+								            dcap_pose[view].orientation.z);
+								glm::vec3 p(dcap_pose[view].position.x, dcap_pose[view].position.y, dcap_pose[view].position.z);
+								glm::mat4 mount = glm::translate(glm::mat4(1), p) * glm::mat4_cast(q);
+								for (int c = 0; c < 4; ++c)
+									for (int r = 0; r < 4; ++r)
+										warp.sens_mount[view][c * 4 + r] = mount[c][r];
+								warp.sens_tan[view] = {tanf(shared_depth.fov[view].angleLeft), tanf(shared_depth.fov[view].angleRight),
+								                       tanf(shared_depth.fov[view].angleDown), tanf(shared_depth.fov[view].angleUp)};
+								warp.sens_nf[view] = {shared_depth.near_z, shared_depth.far_z};
+							}
+							std::array<vk::Extent2D, 2> half_ext;
+							for (uint32_t view = 0; view < view_count; ++view)
+								half_ext[view] = {(uint32_t)extents[view].width / 2, (uint32_t)extents[view].height / 2};
+							depth_overlay->record_sensor_reproject(command_buffer, (size_t)depth_image, half_ext,
+							                                       env_depth->depth_view(shared_depth.swapchain_index), warp, params);
+							// Capture age forensics: the warp consumed this
+							// latency (v1 runtimes report no timestamp: gated).
+							if (shared_depth.capture_time != 0)
+								depth_status = fmt::format("6dof {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms",
+								                           env_depth->depth_width(), env_depth->depth_height(),
+								                           (double)shared_depth.near_z, (double)shared_depth.far_z,
+								                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6);
+							else
+								depth_status = fmt::format("6dof {}x{} near {:.2f}m far {:.2f}m",
+								                           env_depth->depth_width(), env_depth->depth_height(),
+								                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+						}
 						else
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
-							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+						{
+							depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
+							                      env_depth->depth_view(shared_depth.swapchain_index), params);
+							// Capture age forensics: which timebase this frame
+							// rode (v1 runtimes report no timestamp: gated).
+							if (shared_depth.capture_time != 0)
+								depth_status = fmt::format("3dof {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms",
+								                           env_depth->depth_width(), env_depth->depth_height(),
+								                           (double)shared_depth.near_z, (double)shared_depth.far_z,
+								                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6);
+							else
+								depth_status = fmt::format("3dof {}x{} near {:.2f}m far {:.2f}m",
+								                           env_depth->depth_width(), env_depth->depth_height(),
+								                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+						}
 						break;
 					}
 					case debug_viz_mode::vr_depth:
@@ -4026,24 +4120,43 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// was generated in — not the live head pose. VR depth / layer
 		// / verdict are server-timebased (same warp as the video and
 		// mask layers, including sync's per-eye live fallback); the
-		// sensor viz submits the headset pose at the depth image's own
-		// capture_time (capture_pose above) with the sensor frustum, so
-		// the rotation-only warp corrects capture->display head motion.
-		// Predicted depth pose is the logged fallback (swims).
-		// Submitting live would present stale pixels as fresh
-		// (swim/misalign under head motion).
+		// 6DOF sensor warp submits the predicted eye (content is already
+		// in display-eye space/time), while the 3DOF baseline submits
+		// the headset pose at the depth image's own capture_time with
+		// the sensor frustum (runtime rotation-only warp then corrects
+		// capture->display head motion). Predicted depth pose is the
+		// logged fallback (swims).
 		if (depth_image >= 0 and depth_overlay)
 		{
+			// Gate identical to the record dispatch above: warp path only
+			// when it actually rendered (tickbox on + D_cap available).
+			bool reprojected = debug_viz == debug_viz_mode::sensor and sensor_reproject_6dof and have_dcap_pose;
 			const XrPosef * viz_pose = sync_pose.data();
 			const XrFovf * viz_fov = sync_fov.data();
 			if (debug_viz == debug_viz_mode::sensor)
 			{
-				viz_pose = have_capture_pose ? capture_pose.data() : shared_depth.pose;
-				viz_fov = shared_depth.fov;
+				if (reprojected)
+				{
+					viz_pose = mask_pose.data();
+					viz_fov = mask_fov.data();
+				}
+				else
+				{
+					viz_pose = have_capture_pose ? capture_pose.data() : shared_depth.pose;
+					viz_fov = shared_depth.fov;
+				}
 			}
 			std::array<XrCompositionLayerProjectionView, view_count> depth_views;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
+				XrExtent2Di rect = extents[view];
+				if (reprojected)
+				{
+					// Half-extent quadrant the warp rendered into
+					// (identical integer division as the record site).
+					rect.width /= 2;
+					rect.height /= 2;
+				}
 				depth_views[view] = {
 				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
 				        .pose = viz_pose[view],
@@ -4052,7 +4165,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				                .swapchain = depth_overlay->swapchain(),
 				                .imageRect = {
 				                        .offset = {0, 0},
-				                        .extent = extents[view],
+				                        .extent = rect,
 				                },
 				                .imageArrayIndex = view,
 				        },

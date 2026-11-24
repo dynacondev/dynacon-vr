@@ -1240,6 +1240,10 @@ void scenes::stream::gui_passthrough()
 			spdlog::info("Debug viz: {}", debug_viz_mode_name(debug_viz));
 		}
 	}
+	ImGui::BeginDisabled(debug_viz != debug_viz_mode::sensor);
+	if (ImGui::Checkbox(_S("6DoF sensor reprojection (warp to predicted)"), &sensor_reproject_6dof))
+		spdlog::info("Sensor viz: {}", sensor_reproject_6dof ? "6DoF warp, predicted submit" : "3DoF direct tap, capture submit");
+	ImGui::EndDisabled();
 	if (env_depth_probed and not env_depth_supported and debug_viz == debug_viz_mode::sensor)
 		ImGui::Text("%s", _S("Environment depth not supported on this headset"));
 	ImGui::BeginDisabled(debug_viz == debug_viz_mode::none);

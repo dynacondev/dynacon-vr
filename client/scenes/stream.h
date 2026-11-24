@@ -880,6 +880,11 @@ private:
 	bool env_depth_supported = false;
 	debug_viz_mode debug_viz = debug_viz_mode::none;
 	bool debug_viz_show_vr = false; // viz background: VR video instead of passthrough
+	// 6DOF sensor warp (default on): forward-warp the native sensor
+	// texels into the display eye at predicted time and submit with the
+	// predicted pose. Off = 3DOF baseline (direct tap, capture-posed
+	// submit, runtime warps capture->display). A/B tickbox.
+	bool sensor_reproject_6dof = true;
 	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1 (all modes)
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the
