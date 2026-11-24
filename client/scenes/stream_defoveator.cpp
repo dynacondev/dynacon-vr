@@ -80,14 +80,15 @@ stream_defoveator::pipeline_t & stream_defoveator::ensure_pipeline(size_t view, 
 		return target;
 
 	// New format generation (AHB renegotiation) with a live pipeline:
-	// retire everything — the raw sets die with the pool reset, and the
-	// baked immutable samplers die with their layouts. Drain first: the
-	// abandoned sets may still be read by the in-flight submission
-	// (renegotiation-rare, same hammer as the verdict layout rebuild).
+	// retire just this view's state — its layout baked the old
+	// immutable samplers. Drain first: this set may still be read by
+	// the in-flight submission (renegotiation-rare, same hammer as the
+	// verdict layout rebuild). Other views' recorded binds are
+	// untouched (their sets/layouts/pipelines are separate objects).
 	if (*target.pipeline)
 	{
 		device.waitIdle();
-		reset_pipelines();
+		target = {};
 	}
 
 	std::array samplers{rgb, a};
@@ -109,12 +110,11 @@ stream_defoveator::pipeline_t & stream_defoveator::ensure_pipeline(size_t view, 
 	        .pBindings = layout_binding.data(),
 	});
 
-	target.ds = device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
+	target.ds = std::move(device.allocateDescriptorSets(vk::DescriptorSetAllocateInfo{
 	        .descriptorPool = *ds_pool,
 	        .descriptorSetCount = 1,
 	        .pSetLayouts = &*target.descriptor_set_layout,
-	})[0]
-	                    .release();
+	})[0]);
 
 	// pipeline layout
 	vk::PushConstantRange pc_range{
@@ -255,6 +255,7 @@ stream_defoveator::stream_defoveator(
 	};
 
 	ds_pool = device.createDescriptorPool(vk::DescriptorPoolCreateInfo{
+	        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
 	        .maxSets = view_count * 2,
 	        .poolSizeCount = 1,
 	        .pPoolSizes = &pool_size,
@@ -445,7 +446,7 @@ void stream_defoveator::defoveate(vk::raii::CommandBuffer & command_buffer,
 
 		std::array descriptor_writes{
 		        vk::WriteDescriptorSet{
-		                .dstSet = pipeline.ds,
+		                .dstSet = *pipeline.ds,
 		                .dstBinding = 0,
 		                .descriptorCount = input.sampler_a ? 2u : 1u,
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -470,7 +471,7 @@ void stream_defoveator::defoveate(vk::raii::CommandBuffer & command_buffer,
 
 		command_buffer.beginRenderPass(begin_info, vk::SubpassContents::eInline);
 		command_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, *pipeline.pipeline);
-		command_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline.layout, 0, pipeline.ds, {});
+		command_buffer.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline.layout, 0, *pipeline.ds, {});
 		command_buffer.pushConstants<vert_pc>(*pipeline.layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0, pc);
 		command_buffer.bindVertexBuffers(0, vk::Buffer(buffer), vertices_size * view);
 		command_buffer.draw(required_vertices(foveation[view]), 1, 0, 0);

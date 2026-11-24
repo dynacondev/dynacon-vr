@@ -20,7 +20,7 @@
 
 // VR-depth viz with the composited raster pasted on top: samples the
 // decoded SBS virtual-depth frame (single image, both eyes side by
-// side) with the decoder's own sampler and maps 0..2.046m green->red
+// side) with the frame handle's own generation sampler and maps 0..2.046m green->red
 // (far past 1020 reads black, same decode convention as the verdict:
 // green channel, 2mm/LSB, server clamp + guard band), then replaces
 // every pixel where the owned R16F common depth layer holds a window

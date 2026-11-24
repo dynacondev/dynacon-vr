@@ -120,7 +120,7 @@ public:
 	// (mask-only finish, pixel-identical to a cleared-to-1 verdict).
 	// ycbcr carries the view's
 	// conversion definition (Android AHB depth); the verdict layout
-	// bakes an identically defined immutable sampler from it
+	// shares the handle's generation sampler as its immutable sampler
 	// (VUID-VkWriteDescriptorSet-descriptorType-02738).
 	// foveation carries the SHARED color runs (identical tables:
 	// same source size, center and transport as color on every

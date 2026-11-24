@@ -605,10 +605,10 @@ void depth_overlay_renderer::create_virt_state(const wivrn::decoder::ycbcr_defin
 	virt_pipeline.clear();
 	virt_pipeline_layout.clear();
 	virt_layout.clear();
-	// Bake the decoder's live sampler as the immutable sampler (a
-	// separately built conversion proved unidentifiable to validation
-	// despite matching parameters, so the layout shares the decoder's
-	// object instead of owning one).
+	// Bake the handle's generation sampler as immutable (a separately
+	// built conversion proved unidentifiable to validation despite
+	// matching parameters, so the layout shares the handle's object
+	// instead of owning one).
 	virt_immutable_src = def.has_conversion ? decoder_sampler : vk::Sampler{};
 	vk::Sampler immutable = virt_immutable_src;
 	vk::DescriptorSetLayoutBinding bindings[2] = {
@@ -730,17 +730,17 @@ void depth_overlay_renderer::create_virt_state(const wivrn::decoder::ycbcr_defin
 
 void depth_overlay_renderer::ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
 {
-	// Rebuild when the definition changes OR the decoder sampler was
-	// recreated (same params, new object: the baked immutable handle
-	// must track the live object). Plain layouts don't bake a sampler,
-	// so only converted state compares handles.
+	// Rebuild when the definition changes OR the handle sampler is a
+	// new generation (the baked immutable handle must track the sampled
+	// generation). Plain layouts don't bake a sampler, so only
+	// converted state compares handles.
 	if (virt_ycbcr_built == def and (not def.has_conversion or virt_immutable_src == decoder_sampler))
 		return;
 	// Depth format change (rare: renegotiation only): retire prior
 	// submissions before rebuilding what they may still read.
 	device->waitIdle();
 	create_virt_state(def, decoder_sampler);
-	spdlog::info("Depth overlay virt layout rebuilt (YCbCr {}, decoder-shared immutable sampler)", def.has_conversion ? "immutable" : "plain");
+	spdlog::info("Depth overlay virt layout rebuilt (YCbCr {}, handle-generation immutable sampler)", def.has_conversion ? "immutable" : "plain");
 }
 
 void depth_overlay_renderer::create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
@@ -753,10 +753,10 @@ void depth_overlay_renderer::create_vr_raster_state(const wivrn::decoder::ycbcr_
 	vr_raster_pipeline.clear();
 	vr_raster_pipeline_layout.clear();
 	vr_raster_layout.clear();
-	// Bake the decoder's live sampler as the immutable sampler for the
-	// SBS binding (a separately built conversion proved unidentifiable
-	// to validation despite matching parameters, so the layout shares
-	// the decoder's object instead of owning one). The layer binding
+	// Bake the handle's generation sampler as the immutable sampler
+	// for the SBS binding (a separately built conversion proved
+	// unidentifiable to validation despite matching parameters, so the
+	// layout shares the handle's object instead of owning one). The layer binding
 	// stays mutable (plain R16F array view).
 	vr_raster_immutable_src = def.has_conversion ? decoder_sampler : vk::Sampler{};
 	vk::Sampler immutable = vr_raster_immutable_src;
@@ -885,17 +885,17 @@ void depth_overlay_renderer::create_vr_raster_state(const wivrn::decoder::ycbcr_
 
 void depth_overlay_renderer::ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
 {
-	// Rebuild when the definition changes OR the decoder sampler was
-	// recreated (same params, new object: the baked immutable handle
-	// must track the live object). Plain layouts don't bake a sampler,
-	// so only converted state compares handles.
+	// Rebuild when the definition changes OR the handle sampler is a
+	// new generation (the baked immutable handle must track the sampled
+	// generation). Plain layouts don't bake a sampler, so only
+	// converted state compares handles.
 	if (vr_raster_ycbcr_built == def and (not def.has_conversion or vr_raster_immutable_src == decoder_sampler))
 		return;
 	// Depth format change (rare: renegotiation only): retire prior
 	// submissions before rebuilding what they may still read.
 	device->waitIdle();
 	create_vr_raster_state(def, decoder_sampler);
-	spdlog::info("Depth overlay VR+raster layout rebuilt (YCbCr {}, decoder-shared immutable sampler)", def.has_conversion ? "immutable" : "plain");
+	spdlog::info("Depth overlay VR+raster layout rebuilt (YCbCr {}, handle-generation immutable sampler)", def.has_conversion ? "immutable" : "plain");
 }
 
 namespace

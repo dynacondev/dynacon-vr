@@ -650,7 +650,7 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 
 	// Verdict + apply sampler/descriptor state (static 2-slot CIS
 	// layouts for layer/virt, FRAG-only, same Adreno-safe pattern as
-	// the merge): verdict reads layer NEAREST + SBS virt (decoder
+	// the merge): verdict reads layer NEAREST + SBS virt (handle-generation
 	// sampler); apply reads merged NEAREST + verdict NEAREST (both
 	// plain texture() taps at full res — no upscale, filter matters).
 	vk::SamplerCreateInfo nearest_info{
@@ -1041,11 +1041,11 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 	verdict_pipeline.clear();
 	verdict_layout.clear();
 	verdict_descriptor_layout.clear();
-	// Bake the decoder's live sampler as the immutable sampler
-	// (defoveator pattern): a separately built conversion proved
-	// unidentifiable to validation despite matching parameters, so the
-	// layout shares the decoder's object. verdict_immutable_src tracks
-	// what the layout was baked with; a decoder-side sampler change
+	// Bake the paired handle's generation sampler as the immutable
+	// sampler: a separately built conversion proved unidentifiable to
+	// validation despite matching parameters, so the layout shares the
+	// handle's object instead of owning one. verdict_immutable_src
+	// tracks what the layout was baked with; a generation change
 	// rebuilds before the next bind.
 	verdict_immutable_src = def.has_conversion ? decoder_sampler : vk::Sampler{};
 	// Binding 0 (common layer, plain view) stays mutable; binding 1
@@ -1167,10 +1167,11 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 
 void union_merge_renderer::ensure_verdict_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
 {
-	// Rebuild when the definition changes OR the decoder sampler was
-	// recreated (same params, new object: the baked immutable handle
-	// must track the live object). Plain layouts don't bake a sampler,
-	// so only converted state compares handles.
+	// Rebuild when the definition changes OR the handle sampler is a
+	// new generation (renegotiation hands out a new object: the baked
+	// immutable handle must track the sampled generation). Plain
+	// layouts don't bake a sampler, so only converted state compares
+	// handles.
 	if (verdict_ycbcr_built == def and (not def.has_conversion or verdict_immutable_src == decoder_sampler))
 		return;
 	// Depth format change (rare: renegotiation only): retire prior
@@ -1178,7 +1179,7 @@ void union_merge_renderer::ensure_verdict_layout(const wivrn::decoder::ycbcr_def
 	// rebuilding what they may still read.
 	device->waitIdle();
 	create_verdict_state(def, decoder_sampler);
-	spdlog::info("Union merge verdict layout rebuilt (YCbCr {}, decoder-shared immutable sampler)", def.has_conversion ? "immutable" : "plain");
+	spdlog::info("Union merge verdict layout rebuilt (YCbCr {}, handle-generation immutable sampler)", def.has_conversion ? "immutable" : "plain");
 }
 
 bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
@@ -1223,8 +1224,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 		                });
 		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
 			// YCbCr immutable-sampler layout (VUID-02738): rebuild when the
-			// view's conversion definition or the decoder sampler handle
-			// changes. waitIdle'd, rare.
+			// view's conversion definition or the handle's generation
+			// sampler changes. waitIdle'd, rare.
 			ensure_verdict_layout(virt_in.ycbcr, virt_in.sampler);
 			verdict_set_parity = !verdict_set_parity;
 			// Foveation index maps, CPU-expanded per frame into the
@@ -1263,8 +1264,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 			};
 			// Decoder SBS image: GENERAL layout at frame top (same
 			// steady-state discipline as the video path). The write sampler
-			// is ignored when the layout baked an immutable one (defoveator
-			// pattern); pass the live decoder sampler either way.
+			// is ignored when the layout baked an immutable one; pass the
+			// handle's generation sampler either way.
 			vk::DescriptorImageInfo virt_info{
 			        .sampler = virt_in.sampler,
 			        .imageView = virt_in.view,

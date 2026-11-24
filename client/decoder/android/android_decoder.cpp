@@ -316,6 +316,11 @@ void decoder::on_image_available(AImageReader * reader)
 
 		auto vk_data = map_hardware_buffer(image.get());
 
+		// Pin the generation before the move below (moved-from
+		// shared_ptr reads as null).
+		auto generation = vk_data->generation;
+		assert(generation);
+
 		auto handle = std::make_shared<android_blit_handle>(
 		        info->feedback,
 		        info->view_info,
@@ -347,10 +352,9 @@ void decoder::on_image_available(AImageReader * reader)
 		        : vk::Filter::eNearest;
 
 		// Generation sampler for image_view (see blit_handle::sampler):
-		// pinned by vk_data, always the generation this view was baked
-		// with — even if the decoder renegotiated since.
-		assert(vk_data->generation);
-		handle->sampler = *vk_data->generation->sampler;
+		// pinned by the handle's vk_data, always the generation this
+		// view was baked with — even if the decoder renegotiated since.
+		handle->sampler = *generation->sampler;
 
 		if (auto scene = weak_scene.lock())
 			scene->push_blit_handle(accumulator, std::move(handle));
