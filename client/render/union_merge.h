@@ -358,8 +358,8 @@ private:
 	// its set layout, so the two are never rebuilt apart).
 	// Caller guarantees no in-flight readers: fresh object, or a
 	// waitIdle'd rebuild.
-	void create_verdict_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
-	void ensure_verdict_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void create_verdict_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
+	void ensure_verdict_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
 	vk::raii::DescriptorSetLayout verdict_descriptor_layout{nullptr};
 	vk::raii::DescriptorPool verdict_descriptor_pool{nullptr};
 	std::vector<vk::raii::DescriptorSet> verdict_descriptor_sets;

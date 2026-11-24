@@ -595,7 +595,7 @@ void depth_overlay_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_
 	}
 }
 
-void depth_overlay_renderer::create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
+void depth_overlay_renderer::create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
 {
 	// Full teardown in dependency order (verdict pattern): sets
 	// reference pool + set layout, pipeline references pipeline layout,
@@ -609,7 +609,7 @@ void depth_overlay_renderer::create_virt_state(const wivrn::decoder::ycbcr_defin
 	// built conversion proved unidentifiable to validation despite
 	// matching parameters, so the layout shares the handle's object
 	// instead of owning one).
-	virt_immutable_src = def.has_conversion ? decoder_sampler : vk::Sampler{};
+	virt_immutable_src = def.has_conversion ? generation_sampler : vk::Sampler{};
 	vk::Sampler immutable = virt_immutable_src;
 	vk::DescriptorSetLayoutBinding bindings[2] = {
 	        {
@@ -728,22 +728,22 @@ void depth_overlay_renderer::create_virt_state(const wivrn::decoder::ycbcr_defin
 	virt_ycbcr_built = def;
 }
 
-void depth_overlay_renderer::ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
+void depth_overlay_renderer::ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
 {
 	// Rebuild when the definition changes OR the handle sampler is a
 	// new generation (the baked immutable handle must track the sampled
 	// generation). Plain layouts don't bake a sampler, so only
 	// converted state compares handles.
-	if (virt_ycbcr_built == def and (not def.has_conversion or virt_immutable_src == decoder_sampler))
+	if (virt_ycbcr_built == def and (not def.has_conversion or virt_immutable_src == generation_sampler))
 		return;
 	// Depth format change (rare: renegotiation only): retire prior
 	// submissions before rebuilding what they may still read.
 	device->waitIdle();
-	create_virt_state(def, decoder_sampler);
+	create_virt_state(def, generation_sampler);
 	spdlog::info("Depth overlay virt layout rebuilt (YCbCr {}, handle-generation immutable sampler)", def.has_conversion ? "immutable" : "plain");
 }
 
-void depth_overlay_renderer::create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
+void depth_overlay_renderer::create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
 {
 	// Full teardown in dependency order (verdict pattern): sets
 	// reference pool + set layout, pipeline references pipeline layout,
@@ -758,7 +758,7 @@ void depth_overlay_renderer::create_vr_raster_state(const wivrn::decoder::ycbcr_
 	// unidentifiable to validation despite matching parameters, so the
 	// layout shares the handle's object instead of owning one). The layer binding
 	// stays mutable (plain R16F array view).
-	vr_raster_immutable_src = def.has_conversion ? decoder_sampler : vk::Sampler{};
+	vr_raster_immutable_src = def.has_conversion ? generation_sampler : vk::Sampler{};
 	vk::Sampler immutable = vr_raster_immutable_src;
 	vk::DescriptorSetLayoutBinding bindings[3] = {
 	        {
@@ -883,18 +883,18 @@ void depth_overlay_renderer::create_vr_raster_state(const wivrn::decoder::ycbcr_
 	vr_raster_ycbcr_built = def;
 }
 
-void depth_overlay_renderer::ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
+void depth_overlay_renderer::ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
 {
 	// Rebuild when the definition changes OR the handle sampler is a
 	// new generation (the baked immutable handle must track the sampled
 	// generation). Plain layouts don't bake a sampler, so only
 	// converted state compares handles.
-	if (vr_raster_ycbcr_built == def and (not def.has_conversion or vr_raster_immutable_src == decoder_sampler))
+	if (vr_raster_ycbcr_built == def and (not def.has_conversion or vr_raster_immutable_src == generation_sampler))
 		return;
 	// Depth format change (rare: renegotiation only): retire prior
 	// submissions before rebuilding what they may still read.
 	device->waitIdle();
-	create_vr_raster_state(def, decoder_sampler);
+	create_vr_raster_state(def, generation_sampler);
 	spdlog::info("Depth overlay VR+raster layout rebuilt (YCbCr {}, handle-generation immutable sampler)", def.has_conversion ? "immutable" : "plain");
 }
 
@@ -1251,13 +1251,13 @@ void depth_overlay_renderer::record_virt(vk::raii::CommandBuffer & cmd, size_t i
 	if (have_data)
 	{
 		// YCbCr immutable-sampler layout (VUID-02738): rebuild when the
-		// view's conversion definition or the decoder sampler handle
-		// changes. waitIdle'd, rare.
+		// view's conversion definition or the handle's generation
+		// sampler changes. waitIdle'd, rare.
 		ensure_virt_layout(ycbcr, virt_sampler);
 		// Decoder SBS image: GENERAL layout at frame top (same
 		// steady-state discipline as the video path). The write sampler
 		// is ignored when the layout baked an immutable one; pass the
-		// live decoder sampler either way.
+		// handle's generation sampler either way.
 		vk::DescriptorImageInfo image_info{
 		        .sampler = virt_sampler,
 		        .imageView = virt_view,
@@ -1350,13 +1350,13 @@ void depth_overlay_renderer::record_vr_raster(vk::raii::CommandBuffer & cmd, siz
 	if (have_data)
 	{
 		// YCbCr immutable-sampler layout (VUID-02738): rebuild when the
-		// view's conversion definition or the decoder sampler handle
-		// changes. waitIdle'd, rare.
+		// view's conversion definition or the handle's generation
+		// sampler changes. waitIdle'd, rare.
 		ensure_vr_raster_layout(ycbcr, virt_sampler);
 		// Decoder SBS image: GENERAL layout at frame top (same
 		// steady-state discipline as the video path). The write sampler
 		// is ignored when the layout baked an immutable one; pass the
-		// live decoder sampler either way.
+		// handle's generation sampler either way.
 		vk::DescriptorImageInfo virt_info{
 		        .sampler = virt_sampler,
 		        .imageView = virt_view,

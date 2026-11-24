@@ -77,9 +77,9 @@ public:
 		vk::ImageLayout & current_layout;
 		vk::Semaphore semaphore = nullptr;
 		uint64_t * semaphore_val = nullptr;
-		// Generation sampler for image_view: the decoder's sampler for
-		// the format generation this frame was mapped with, set once
-		// before the handle is published and immutable after. Kept alive by the decoder-specific payload
+		// Generation sampler for image_view: the sampler of the format
+		// generation this frame was mapped with, set once before the
+		// handle is published and immutable after. Kept alive by the by the decoder-specific payload
 		// (android: vk_data pins the generation that owns the sampler
 		// + conversion). The render thread must use THIS, never a
 		// decoder-owned sampler: decoders recreate their live sampler

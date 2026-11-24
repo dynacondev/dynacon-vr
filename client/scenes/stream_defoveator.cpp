@@ -308,11 +308,9 @@ void stream_defoveator::reset_pipelines()
 		p = {};
 	for (auto & p: pipeline_a)
 		p = {};
-	// The sets above are raw handles abandoned on reset (never freed
-	// individually by design): return their capacity to the pool, or the
-	// next lifetime's re-ensures allocate past maxSets and throw
-	// OutOfPoolMemory. Resetting is safe here: every pipeline (the only
-	// set holders) was just destroyed.
+	// The sets above are freed individually by the p = {} assignments
+	// (FREE pool); return the whole pool's capacity too, so a later
+	// lifetime never allocates past maxSets into OutOfPoolMemory.
 	ds_pool.reset();
 }
 

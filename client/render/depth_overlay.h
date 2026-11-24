@@ -227,8 +227,8 @@ private:
 	// next bind (handle comparison in ensure_vr_raster_layout).
 	vk::Sampler vr_raster_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition vr_raster_ycbcr_built{};
-	void create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
-	void ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
+	void ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
 	vk::raii::DescriptorSetLayout vr_raster_layout{nullptr};
 	vk::raii::DescriptorPool vr_raster_pool{nullptr};
 	vk::raii::DescriptorSet vr_raster_set{nullptr};
@@ -244,8 +244,8 @@ private:
 	// (handle comparison in ensure_virt_layout).
 	vk::Sampler virt_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition virt_ycbcr_built{};
-	void create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
-	void ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler);
+	void create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
+	void ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
 	vk::raii::DescriptorSetLayout virt_layout{nullptr};
 	vk::raii::DescriptorPool virt_pool{nullptr};
 	vk::raii::DescriptorSet virt_set{nullptr};

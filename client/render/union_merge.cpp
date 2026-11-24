@@ -1031,7 +1031,7 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, **pool, qafter);
 }
 
-void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
+void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
 {
 	// Full teardown in dependency order: sets reference pool + set
 	// layout, pipeline references pipeline layout, pipeline layout
@@ -1047,7 +1047,7 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 	// handle's object instead of owning one. verdict_immutable_src
 	// tracks what the layout was baked with; a generation change
 	// rebuilds before the next bind.
-	verdict_immutable_src = def.has_conversion ? decoder_sampler : vk::Sampler{};
+	verdict_immutable_src = def.has_conversion ? generation_sampler : vk::Sampler{};
 	// Binding 0 (common layer, plain view) stays mutable; binding 1
 	// (virt) is immutable exactly when the view carries a conversion.
 	// Binding 2 (foveation index maps) is a plain storage buffer,
@@ -1165,20 +1165,20 @@ void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_defi
 	verdict_ycbcr_built = def;
 }
 
-void union_merge_renderer::ensure_verdict_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler decoder_sampler)
+void union_merge_renderer::ensure_verdict_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
 {
 	// Rebuild when the definition changes OR the handle sampler is a
 	// new generation (renegotiation hands out a new object: the baked
 	// immutable handle must track the sampled generation). Plain
 	// layouts don't bake a sampler, so only converted state compares
 	// handles.
-	if (verdict_ycbcr_built == def and (not def.has_conversion or verdict_immutable_src == decoder_sampler))
+	if (verdict_ycbcr_built == def and (not def.has_conversion or verdict_immutable_src == generation_sampler))
 		return;
 	// Depth format change (rare: renegotiation only): retire prior
 	// submissions (including the verdict's own previous frame) before
 	// rebuilding what they may still read.
 	device->waitIdle();
-	create_verdict_state(def, decoder_sampler);
+	create_verdict_state(def, generation_sampler);
 	spdlog::info("Union merge verdict layout rebuilt (YCbCr {}, handle-generation immutable sampler)", def.has_conversion ? "immutable" : "plain");
 }
 
