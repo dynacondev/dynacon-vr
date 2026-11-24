@@ -1165,6 +1165,17 @@ void scenes::stream::gui_passthrough()
 	wivrn::ui::page_header(_S("Passthrough"), _S("QR marker tracking and alignment."));
 	gui_fiducial_status();
 
+	ImGui::SeparatorText(_S("VR occlusion"));
+	if (ImGui::Checkbox(_S("VR depth testing"), &vr_depth_test))
+	{
+		spdlog::info("VR depth testing {}", vr_depth_test ? "enabled" : "disabled (mask only, verdict submits merged directly)");
+		if (vr_depth_test)
+			vr_occlusion_logged = false; // re-log on re-engagement
+	}
+	ImGui::Text("%s", _S("Off = passthrough mask only (no VR-vs-depth compare). Skips the depth-layer raster + verdict passes."));
+	if (not vr_depth_test)
+		ImGui::Text("%s", _S("Layer/verdict viz views show stale-or-cleared targets while depth testing is off."));
+
 	ImGui::SeparatorText(_S("Fiducial marker debugging"));
 	ImGui::Checkbox(_S("Marker debug overlays"), &debug_overlays);
 	ImGui::BeginDisabled(not debug_overlays);

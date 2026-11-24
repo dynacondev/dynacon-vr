@@ -2868,8 +2868,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								// Common depth layer first (stage 0): CLEAR +
 								// near-wins raster of every positive window
 								// into the half-res layer. Skipped only when
-								// the merge sits out (nothing consumes it).
-								merge_renderer->record_base(rec_cmd, layer_draws);
+								// the merge sits out (nothing consumes it),
+								// or when VR depth testing is toggled off
+								// (verdict submits merged directly, nothing
+								// samples the layer).
+								if (vr_depth_test)
+									merge_renderer->record_base(rec_cmd, layer_draws);
 								int merge_idx = -1;
 								try
 								{
@@ -2887,10 +2891,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											// foveation tables for the
 											// packed-index lookup.
 											// Unpaired (not expected,
-											// decoder dead, ±1 miss)
+											// decoder dead, ±1 miss) or VR
+											// depth testing toggled off:
 											// submits merged directly —
 											// today's neutral parity.
 											union_merge_renderer::virt_input virt{};
+											if (vr_depth_test)
 											if (auto & dh = current_blit_handles[depth_stream_index];
 											    dh and dh->image_view and depth_verdict_safe)
 											{

@@ -704,6 +704,12 @@ private:
 	std::map<std::string, std::string> layer_mesh_hashes;
 	// One-shot log when the VR verdict first engages (virt paired).
 	bool vr_occlusion_logged = false;
+	// Passthrough-tab toggle: VR depth testing on/off. Off skips both
+	// halves of the depth test (the rastered common layer CLEAR/draws
+	// and the depth-stream side of the verdict, which then submits
+	// merged directly) while the MAX merge + apply + submit stay
+	// intact. Session-only, render-thread only, default on.
+	bool vr_depth_test = true;
 	// Layout gate for the async verdict sample (see depth block): the
 	// fused verdict samples the decoder SBS image as GENERAL. The
 	// frame-top transition executes on the main command buffer, which
