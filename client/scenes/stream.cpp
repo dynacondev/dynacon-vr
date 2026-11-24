@@ -549,30 +549,30 @@ void scenes::stream::on_focused()
 	        device,
 	        swapchain_format,
 	        3600,
-	        1200);
+	        1280);
 
 	std::vector<imgui_context::viewport> vps{
 	        {
 	                // Main window
 	                .space = xr::spaces::world,
 	                // Position and orientation are set at each frame
-	                .size = {1.2, 0.6666},
+	                .size = {1.2, 0.72},
 	                .vp_origin = {0, 0},
-	                .vp_size = {1800, 1000},
+	                .vp_size = {1800, 1080},
 	        },
 	        {
 	                .space = xr::spaces::world,
 	                .size = {1.2, 0.1333},
-	                .vp_origin = {0, 1000},
+	                .vp_origin = {0, 1080},
 	                .vp_size = {1800, 200},
 	                .tooltip_viewport = true,
 	        },
 	        {
 	                // popup window for combos and modals, tracks the main panel each frame at the same pixel density
 	                .space = xr::spaces::world,
-	                .size = {1.2, 0.6666},
+	                .size = {1.2, 0.72},
 	                .vp_origin = {1800, 0},
-	                .vp_size = {1800, 1000},
+	                .vp_size = {1800, 1080},
 	        },
 	};
 
