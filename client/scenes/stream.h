@@ -885,6 +885,9 @@ private:
 	// predicted pose. Off = 3DOF baseline (direct tap, capture-posed
 	// submit, runtime warps capture->display). A/B tickbox.
 	bool sensor_reproject_6dof = true;
+	// Warp mesh-placement debug: UV-as-color instead of the depth ramp
+	// (bypasses decode + anti-streak discard; proves vertex placement).
+	bool sensor_warp_uv_debug = false;
 	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1 (all modes)
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the

@@ -201,8 +201,13 @@ public:
 		std::array<std::array<float, 4>, 2> sens_tan{};
 		// Sensor near, far (meters) per eye.
 		std::array<std::array<float, 2>, 2> sens_nf{};
-		// Native sensor grid the mesh is keyed on (rebuild on change).
+		// Sensor grid key the mesh is rebuilt on (recompute only when
+		// the runtime hands a different depth size).
 		uint32_t sens_w = 0, sens_h = 0;
+		// UV-placement debug instead of the false-color ramp (mesh
+		// vertices land via the same path; depth decode + discard
+		// bypassed). Set from the scene tickbox per frame.
+		bool uv_debug = false;
 	};
 	void record_sensor_reproject(vk::raii::CommandBuffer & cmd, size_t image_index,
 	                             const std::array<vk::Extent2D, 2> & half_extents,
@@ -288,6 +293,8 @@ private:
 	// even though only the half-extent quadrant renders), per-eye
 	// warp-UBO upload, and the native-texel grid mesh (rebuilt when the
 	// sensor extent changes — in practice never, waitIdle'd like ensure).
+	// warp_uv_pipeline shares everything but swaps the fragment for the
+	// UV-placement debug view (same vertex shader, layout, renderpass).
 	void init_warp();
 	void ensure_warp_targets();
 	void ensure_warp_mesh(uint32_t sens_w, uint32_t sens_h);
@@ -300,6 +307,7 @@ private:
 	vk::raii::PipelineLayout warp_pipeline_layout{nullptr};
 	vk::raii::RenderPass warp_renderpass{nullptr};
 	vk::raii::Pipeline warp_pipeline{nullptr};
+	vk::raii::Pipeline warp_uv_pipeline{nullptr};
 	buffer_allocation warp_ubo;
 	image_allocation warp_depth_image;
 	vk::raii::ImageView warp_depth_view{nullptr};

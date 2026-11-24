@@ -3645,6 +3645,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							depth_overlay_renderer::reproject_params warp{};
 							warp.sens_w = env_depth->depth_width();
 							warp.sens_h = env_depth->depth_height();
+							warp.uv_debug = sensor_warp_uv_debug;
 							for (uint32_t view = 0; view < view_count; ++view)
 							{
 								glm::mat4 vp = finite_perspective(mask_fov[view], 0.05f, 30.0f) * scene::view_matrix(mask_pose[view]);
@@ -3665,6 +3666,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							std::array<vk::Extent2D, 2> half_ext;
 							for (uint32_t view = 0; view < view_count; ++view)
 								half_ext[view] = {(uint32_t)extents[view].width / 2, (uint32_t)extents[view].height / 2};
+							// Anchor liveness forensics (throttled): the gizmo
+							// proves mask_pose moves, but prove the warp fill
+							// sees it — absolute mask position plus the
+							// display matrix translation it produced.
+							{
+								static XrTime last_anchor_log = 0;
+								XrTime anchor_now = instance.now();
+								if (anchor_now - last_anchor_log > 2'000'000'000LL)
+								{
+									last_anchor_log = anchor_now;
+									spdlog::info("Sensor warp anchor: mask ({:+.2f},{:+.2f},{:+.2f}) dispT ({:+.2f},{:+.2f},{:+.2f})",
+									             mask_pose[0].position.x, mask_pose[0].position.y, mask_pose[0].position.z,
+									             warp.disp_vp[0][12], warp.disp_vp[0][13], warp.disp_vp[0][14]);
+								}
+							}
 							depth_overlay->record_sensor_reproject(command_buffer, (size_t)depth_image, half_ext,
 							                                       env_depth->depth_view(shared_depth.swapchain_index), warp, params);
 							// Capture age forensics: the warp consumed this
