@@ -320,9 +320,11 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	                                                                 .pBindings = bindings,
 	                                                         });
 	// Linear + ClampToEdge (feather sampler precedent): the bilinear
-	// tap IS the upscale for half/quarter-res inputs. maxLod 0, no
-	// mipmap chain on swapchain images. NEVER nearest here: it would
-	// alias the feather band.
+	// tap IS the upscale for half/quarter-res inputs. NEAREST takes
+	// over in record() when every input matches the merge extent
+	// (tier-0 1:1 copy: exact, one tap). maxLod 0, no
+	// mipmap chain on swapchain images. NEVER linear-for-full-res by
+	// accident: the 4-tap bilinear of a 1:1 copy is pure waste.
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eLinear,
 	        .minFilter = vk::Filter::eLinear,
@@ -852,6 +854,20 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	// legal; max() over duplicates is neutral). Ping-pong parity:
 	// the other set may still be read by a prior in-flight command
 	// buffer (inline fallback while the async CB flies).
+	// 1:1 fast path: every input already at merge res means the
+	// bilinear upscale is an exact copy — sample NEAREST (1 tap, same
+	// values). Any mismatch (tiered half/quarter inputs, unknown
+	// extent) stays LINEAR so the feather band still filters.
+	bool all_fullres = true;
+	for (auto & in: inputs)
+	{
+		if (in.extent.width != extent.width or in.extent.height != extent.height)
+		{
+			all_fullres = false;
+			break;
+		}
+	}
+	vk::Sampler merge_sampler = all_fullres ? *sampler_nearest : *sampler;
 	set_parity = !set_parity;
 	vk::DescriptorSet set = *descriptor_sets[set_parity ? 1 : 0];
 	vk::DescriptorImageInfo infos[max_inputs];
@@ -859,7 +875,7 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	{
 		auto & in = inputs[std::min<size_t>(i, inputs.size() - 1)];
 		infos[i] = vk::DescriptorImageInfo{
-		        .sampler = *sampler,
+		        .sampler = merge_sampler,
 		        .imageView = in.view_array,
 		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		};

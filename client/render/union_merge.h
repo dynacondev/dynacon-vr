@@ -85,6 +85,10 @@ public:
 	// One merge input: a just-recorded contributor image plus its
 	// multiview array view (both layers, BORROWED from the owning
 	// feather renderer — same-frame use only, never cached here).
+	// extent is the contributor image size: when every input matches
+	// the merge extent the bilinear upscale is an exact 1:1 copy, so
+	// the merge takes the NEAREST path (1 tap instead of 4). Zero
+	// extent (unknown) forces the safe LINEAR path.
 	// All contributors end COLOR_ATTACHMENT_OPTIMAL and transition to
 	// SHADER_READ_ONLY for the merge; every next record re-begins
 	// UNDEFINED+CLEAR, so no transition back is needed.
@@ -92,6 +96,7 @@ public:
 	{
 		vk::Image image;
 		vk::ImageView view_array;
+		vk::Extent2D extent{0, 0};
 	};
 
 	// One common-layer draw: which uploaded mesh plus per-eye MVPs on

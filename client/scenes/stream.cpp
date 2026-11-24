@@ -2815,6 +2815,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								out.push_back(union_merge_renderer::input{
 								        .image = img,
 								        .view_array = g.renderer->submitted_view_array(img),
+								        .extent = {(uint32_t)g.swapchain.width(), (uint32_t)g.swapchain.height()},
 								});
 								return true;
 							};
