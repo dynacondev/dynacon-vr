@@ -200,3 +200,38 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   earlier under validation is usually the validator catching the bug
   upstream, not a new bug — compare write sites (01948 names the
   binding), not just timestamps.
+
+## Verdict opt #7 revert: cached SSBO loads beat per-pixel run walks (Quest 3, Nov 2026)
+
+- Compact-run verdict (shader walks foveation runs, no CPU expand, ~1KB
+  SSBO) was valid on device but regressed `umgpu` verdict ~2.7ms to
+  ~4.5-6.4ms across many paired samples. Reverted (`464148d9` +
+  `48c207a8`), tree back to byte-identical pre-#7.
+- Why: the old 2 random SSBO loads/px were already cheap (34KB map
+  written once, streams through cache once per frame). The walk added
+  per-pixel trip-count divergence (warps spanning run boundaries
+  serialize) plus an integer divide per axis — Adreno emulates it.
+- Rule: `umcpu` decides whether CPU work is worth killing — it was
+  0.02-0.05ms before AND after, so the expand was never the cost.
+  Never trade 2 cached loads for per-pixel search on this GPU without
+  device numbers; the "uniform-ish ALU" prediction ignored divergence.
+- The verdict's remaining cost is the full-res pass itself (layer tap +
+  YCbCr conversion tap + R8 write, x2 eyes) — bandwidth territory (#8
+  fold), not ALU.
+
+## Depth has no plain Y-plane view on the client (Quest 3, Nov 2026)
+
+- Opt #9 (raw R16 tap of the depth Y plane) is blocked as framed — do
+  not retry without new evidence. The staging image's plain R16 views
+  (`compositor.cpp` `out_y`) never cross the encode; the client sees
+  only the H.265 Main10 decode via MediaCodec (opaque PRIVATE
+  AImageReader). Device log proves the import: Vulkan format
+  `Undefined`, external format `0x28e`, so every view of the image must
+  carry a YCbCr conversion — a conversion-free R16 plane view of a
+  UNDEFINED-format image is spec-illegal (no compatible plain format).
+- Switching the AImageReader off PRIVATE to get a Vulkan-mappable RGB
+  format would add a full-res decoder-side conversion, lose the
+  zero-copy import, and risk the 10-bit codes — expected net loss.
+- Even hypothetically, the prize is small: the verdict taps virt once
+  per surviving pixel already; the conversion-hardware delta on one tap
+  is minor next to the pass's read+write bandwidth.
