@@ -770,8 +770,9 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	apply_pipeline = vk::raii::Pipeline(*device, *pipe_cache, apply_pipeline_info);
 
 	// Mask-only apply: same vertex stage, renderpass and layout (the
-	// fragment shader samples binding 0 only; binding 1 is never
-	// written or read on this path).
+	// fragment shader samples binding 0 only; binding 1 is written
+	// but never sampled on this path — the full-footprint write in
+	// record_finish keeps Adreno off the partial-write fault).
 	auto apply_mask_frag = load_shader(*device, "vr_apply_mask_mv.frag");
 	vk::PipelineShaderStageCreateInfo apply_mask_stages[2] = {
 	        {
@@ -1341,7 +1342,7 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	std::vector<vk::WriteDescriptorSet> apply_writes;
-	apply_writes.reserve(do_verdict ? 2 : 1);
+	apply_writes.reserve(2);
 	apply_writes.push_back(vk::WriteDescriptorSet{
 	        .dstSet = aset,
 	        .dstBinding = 0,
@@ -1349,21 +1350,27 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 	        .pImageInfo = &merged_info,
 	});
-	if (do_verdict)
-	{
-		vk::DescriptorImageInfo apply_verdict_info{
-		        .sampler = *sampler_nearest,
-		        .imageView = *verdict_.view_array,
-		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
-		};
-		apply_writes.push_back(vk::WriteDescriptorSet{
-		        .dstSet = aset,
-		        .dstBinding = 1,
-		        .descriptorCount = 1,
-		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-		        .pImageInfo = &apply_verdict_info,
-		});
-	}
+	// Full footprint on every update, paired or mask-only: binding 1
+	// carries the verdict view even when the bound pipeline never
+	// samples it (mask pipeline declares binding 0 only; the layout
+	// still declares both, so the write is valid). Partial writes
+	// across frames (binding 0 alone, then 0+1 on the first paired
+	// frame) fault Adreno inside updateDescriptorSets on release
+	// (validation-silent; suspected first-touch bookkeeping for the
+	// newly-written binding) — writing both bindings from the start
+	// avoids that path entirely.
+	vk::DescriptorImageInfo apply_verdict_info{
+	        .sampler = *sampler_nearest,
+	        .imageView = *verdict_.view_array,
+	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	};
+	apply_writes.push_back(vk::WriteDescriptorSet{
+	        .dstSet = aset,
+	        .dstBinding = 1,
+	        .descriptorCount = 1,
+	        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	        .pImageInfo = &apply_verdict_info,
+	});
 	device->updateDescriptorSets(apply_writes, {});
 	auto & tgt = targets[image_index];
 	cmd.setViewport(0, vk::Viewport{

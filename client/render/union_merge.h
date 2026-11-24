@@ -388,8 +388,9 @@ private:
 	vk::raii::Pipeline apply_pipeline{nullptr};
 	// Mask-only apply (merged alpha straight to the submit image, no
 	// verdict tap): same renderpass + layout as the verdict apply
-	// (binding 1 unused), taken when no virtual-depth frame paired.
-	// Pixel-identical to verdict-clear-to-1 x merged with one tap.
+	// (binding 1 written but never sampled), taken when no
+	// virtual-depth frame paired. Pixel-identical to verdict-clear-to-1
+	// x merged with one tap.
 	vk::raii::Pipeline apply_mask_pipeline{nullptr};
 	// NEAREST + ClampToEdge (layer tap in the verdict, merged tap in
 	// the apply: both inputs are already filtered). The verdict runs
