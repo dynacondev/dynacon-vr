@@ -51,15 +51,18 @@ layout(location = 0) out vec4 out_color;
 // expand, no 2*(W+H) index map). Layout of t[] (uint32s):
 //   t[0..3] = render_w, render_h, packed_w, packed_h
 //   t[4..7] = per-axis run counts [nx0, nx1, ny0, ny1]
-//   x0 runs @ 8, x1 @ 8+MAX, y0 @ 8+2*MAX, y1 @ 8+3*MAX
+//   t[8..11] = per-axis run centers [cx0, cx1, cy0, cy1] (===
+//     (count-1)/2 unclamped: the ratio of a stored run depends on the
+//     TRUE center, so a clamped tail still maps its head exactly)
+//   x0 runs @ 12, x1 @ 12+MAX, y0 @ 12+2*MAX, y1 @ 12+3*MAX
 // (MAX = FOVEA_MAX_RUNS below, must match kFoveaMaxRuns in
 // union_merge.cpp). Runs describe packed texels: entry i holds n_i
 // texels covering n_i * ratio_i render pixels (ratio_i =
-// |center-i|+1, center = count/2, middle run 1:1) — the shared color
-// tables, same as the old expand path. Empty axis (count 0) falls
-// back to a uniform map over the packed size (straight /
-// pre-foveation data). SSBO (not UBO/push): kept as a buffer so the
-// verdict descriptor layout is unchanged; contents are ~1KB, not 34KB.
+// |center-i|+1, middle run 1:1) — the shared color tables, same as
+// the old expand path. Empty axis (count 0) falls back to a uniform
+// map over the packed size (straight / pre-foveation data). SSBO
+// (not UBO/push): kept as a buffer so the verdict descriptor layout
+// is unchanged; contents are ~1KB, not 34KB.
 //
 // SBS encoding: 10-bit 2mm/LSB luma, valid codes 0-1020 (0-2.040m);
 // holes, sky and beyond-range pin to 1023 (far); 1021-1023 is a guard
@@ -100,16 +103,16 @@ layout(set = 0, binding = 2) readonly buffer Fovea
 // Fixed run capacity per axis (must match kFoveaMaxRuns in
 // union_merge.cpp).
 #define FOVEA_MAX_RUNS 64
-#define FOVEA_HDR 8
+#define FOVEA_HDR 12
 
-// Merge pixel -> packed texel through the compact runs. Replicates
-// expand_foveation_axis (union_merge.cpp) exactly: uniform
+// Merge pixel -> packed texel through the compact runs. Replicates the
+// old CPU expand (union_merge.cpp, pre-compact-run) exactly: uniform
 // merge->render floor, then the render->packed walk (run i covers
 // runs[i]*ratio_i render pixels at ratio_i = |center-i|+1). Returns
 // the packed index clamped to [0, packed_n-1]; undershoot (runs
 // covering fewer than render_n pixels) pads with the last texel,
 // all-zero runs read 0 — same as the old r2p pad.
-int fovea_axis(int u, int render_n, int merge_n, int packed_n, int count, int base)
+int fovea_axis(int u, int render_n, int merge_n, int packed_n, int count, int center, int base)
 {
 	if (render_n <= 0 || merge_n <= 0)
 		return 0;
@@ -122,7 +125,6 @@ int fovea_axis(int u, int render_n, int merge_n, int packed_n, int count, int ba
 	}
 	int r = u * render_n / merge_n;
 	r = min(r, render_n - 1);
-	int center = count / 2;
 	int pos = 0;
 	int packed = 0;
 	for (int i = 0; i < FOVEA_MAX_RUNS; ++i)
@@ -176,8 +178,10 @@ void main()
 	int packed_h = int(t[3]);
 	int nx = int(t[4 + eye]);
 	int ny = int(t[6 + eye]);
-	int px = fovea_axis(dst_texel.x, render_w, W, packed_w, nx, FOVEA_HDR + eye * FOVEA_MAX_RUNS);
-	int py = fovea_axis(dst_texel.y, render_h, H, packed_h, ny, FOVEA_HDR + 2 * FOVEA_MAX_RUNS + eye * FOVEA_MAX_RUNS);
+	int cx = int(t[8 + eye]);
+	int cy = int(t[10 + eye]);
+	int px = fovea_axis(dst_texel.x, render_w, W, packed_w, nx, cx, FOVEA_HDR + eye * FOVEA_MAX_RUNS);
+	int py = fovea_axis(dst_texel.y, render_h, H, packed_h, ny, cy, FOVEA_HDR + 2 * FOVEA_MAX_RUNS + eye * FOVEA_MAX_RUNS);
 
 	// Texel-center UV into the SBS frame (row 0 = scene top on the
 	// wire, matching the tables' top-down packed rows).
