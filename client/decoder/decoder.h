@@ -77,6 +77,18 @@ public:
 		vk::ImageLayout & current_layout;
 		vk::Semaphore semaphore = nullptr;
 		uint64_t * semaphore_val = nullptr;
+		// Generation sampler for image_view (plain handle): the
+		// decoder's sampler for the format generation this frame was
+		// mapped with, set once before the handle is published and
+		// immutable after. Kept alive by the decoder-specific payload
+		// (android: vk_data pins the generation that owns the sampler
+		// + conversion). The render thread must use THIS, never a
+		// decoder-owned sampler: decoders recreate their live sampler
+		// on format renegotiation (decoder thread), so reading it
+		// per-frame is both a data race and a use-after-free vector
+		// (stale view + destroyed conversion reads as garbage and
+		// segfaults Adreno in updateDescriptorSets).
+		vk::Sampler sampler = nullptr;
 #if WIVRN_USE_V4L2
 		// DMA-buf images from V4L2 require queue-family ownership
 		// transfers between Vulkan and external engine
@@ -103,8 +115,6 @@ public:
 	virtual void frame_completed(
 	        const from_headset::feedback & feedback,
 	        const to_headset::video_stream_data_shard::view_info_t & view_info) = 0;
-
-	virtual vk::Sampler sampler() = 0;
 
 	static const std::vector<wivrn::video_codec_capability> & supported_codecs();
 	static bool supports_10bit(wivrn::video_codec codec);

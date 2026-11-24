@@ -95,11 +95,6 @@ public:
 
 	void push_shard(wivrn::to_headset::video_stream_data_shard &&);
 
-	vk::Sampler sampler()
-	{
-		return decoder_->sampler();
-	}
-
 	using blit_handle = decoder::blit_handle;
 
 private:

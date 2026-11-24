@@ -65,14 +65,30 @@ class decoder : public wivrn::decoder
 public:
 	struct mapped_hardware_buffer;
 
+	// One YCbCr format generation: conversion + sampler for a single
+	// AHB format. Shared by every mapped buffer with that format and
+	// by every blit handle mapped from them, so a renegotiation
+	// (decoder thread) can install a new generation while in-flight
+	// frames keep the old one alive — instead of destroying the
+	// conversion out from under live views (Adreno SEGV in
+	// updateDescriptorSets on the next verdict using a stale view).
+	struct ycbcr_generation
+	{
+		vk::raii::SamplerYcbcrConversion conversion = nullptr;
+		vk::raii::Sampler sampler = nullptr;
+	};
+
 private:
 	uint8_t stream_index;
 
 	vk::raii::Device & device;
 
 	vk::AndroidHardwareBufferFormatPropertiesANDROID ahb_format;
-	vk::raii::SamplerYcbcrConversion ycbcr_conversion = nullptr;
-	vk::raii::Sampler ycbcr_sampler = nullptr;
+	// Live generation (decoder thread only, under hbm_mutex). The
+	// render thread must never read this per-frame: it races with
+	// renegotiation and may dangle. Use blit_handle::sampler (pinned
+	// by the handle's own vk_data) instead.
+	std::shared_ptr<ycbcr_generation> current_ycbcr;
 
 	std::mutex hbm_mutex;
 	std::shared_ptr<AImageReader> image_reader;
@@ -115,7 +131,7 @@ private:
 	std::unordered_map<AHardwareBuffer *, std::shared_ptr<mapped_hardware_buffer>> hardware_buffer_map;
 	vk::raii::RenderPass renderpass = nullptr;
 
-	void create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format);
+	std::shared_ptr<ycbcr_generation> create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format);
 	std::shared_ptr<mapped_hardware_buffer> map_hardware_buffer(AImage *);
 
 public:
@@ -132,11 +148,6 @@ public:
 	void frame_completed(
 	        const wivrn::from_headset::feedback & feedback,
 	        const wivrn::to_headset::video_stream_data_shard::view_info_t & view_info) override;
-
-	vk::Sampler sampler() override
-	{
-		return *ycbcr_sampler;
-	}
 
 	static void supported_codecs(std::vector<wivrn::video_codec> &);
 };

@@ -238,6 +238,9 @@ void raw_decoder::frame_completed(
 		handle->ycbcr.y_chroma_offset = vk::ChromaLocation::eCositedEven;
 		handle->ycbcr.chroma_filter = vk::Filter::eNearest;
 	}
+	// Stable for the decoder's lifetime (built once in the ctor), so a
+	// plain copy is generation-correct.
+	handle->sampler = *sampler_;
 
 	auto res = device.waitForFences(*fence, true, UINT64_MAX);
 	if (res != vk::Result::eSuccess)

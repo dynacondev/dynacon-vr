@@ -1367,7 +1367,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// colour image
 			images[i] = {
 			        .rgb = blit_handle->image_view,
-			        .sampler_rgb = decoders[i].decoder->sampler(),
+			        .sampler_rgb = blit_handle->sampler,
 			        .rect_rgb = {
 			                .extent = blit_handle->extent,
 			        },
@@ -1380,7 +1380,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			for (int j = 0; j < view_count; ++j)
 			{
 				images[j].a = blit_handle->image_view;
-				images[j].sampler_a = decoders[i].decoder->sampler();
+				images[j].sampler_a = blit_handle->sampler;
 				images[j].rect_a = vk::Rect2D{
 				        // in full size pixels
 				        .offset = {
@@ -2958,7 +2958,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 												    dh and dh->image_view and depth_verdict_safe)
 												{
 													virt.view = dh->image_view;
-													virt.sampler = decoders[depth_stream_index].decoder->sampler();
+													virt.sampler = dh->sampler;
 													virt.ycbcr = dh->ycbcr;
 													// Exact tables for THIS depth frame (the
 													// depth shards carry their own view_info):
@@ -3502,7 +3502,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					case debug_viz_mode::vr_depth:
 					{
 						auto & dh = current_blit_handles[depth_stream_index];
-						vk::Sampler samp = decoders[depth_stream_index].decoder ? decoders[depth_stream_index].decoder->sampler() : vk::Sampler{};
+						vk::Sampler samp = dh ? dh->sampler : vk::Sampler{};
 						if (dh and dh->image_view and samp)
 						{
 							depth_overlay->record_virt(command_buffer, (size_t)depth_image, depth_ext,
@@ -3587,7 +3587,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					case debug_viz_mode::vr_raster:
 					{
 						auto & dh = current_blit_handles[depth_stream_index];
-						vk::Sampler samp = decoders[depth_stream_index].decoder ? decoders[depth_stream_index].decoder->sampler() : vk::Sampler{};
+						vk::Sampler samp = dh ? dh->sampler : vk::Sampler{};
 						bool have_virt = (bool)dh and (bool)dh->image_view and (bool)samp;
 						bool have_layer = merge_renderer and merge_this_frame;
 						if (have_virt)

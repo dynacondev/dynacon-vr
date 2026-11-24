@@ -908,6 +908,12 @@ void decoder::submit_capture(unsigned int capture_index, uint64_t timestamp)
 	handle->ycbcr.x_chroma_offset = vk::ChromaLocation::eCositedEven;
 	handle->ycbcr.y_chroma_offset = vk::ChromaLocation::eCositedEven;
 	handle->ycbcr.chroma_filter = vk::Filter::eNearest;
+	// Generation sampler for the handle's view. Safe to copy here:
+	// teardown_capture_queue throws while any capture buffer is held
+	// by Vulkan, so the sampler cannot be destroyed out from under a
+	// live handle (unlike the android path, which renegotiates freely
+	// and pins generations per buffer instead).
+	handle->sampler = *ycbcr_sampler;
 	if (auto scene = weak_scene.lock())
 		scene->push_blit_handle(accumulator, std::move(handle));
 }

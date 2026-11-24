@@ -45,6 +45,12 @@ struct wivrn::android::decoder::mapped_hardware_buffer
 	vk::Extent2D extent{};
 	vk::raii::ImageView image_view = nullptr;
 	vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+	// Format generation this buffer was mapped with: pins the
+	// conversion + sampler the view was baked with, so a decoder-side
+	// renegotiation can install a new generation while in-flight
+	// frames keep the old one alive (never destroy a conversion out
+	// from under a live view).
+	std::shared_ptr<decoder::ycbcr_generation> generation = nullptr;
 };
 
 namespace
@@ -340,6 +346,11 @@ void decoder::on_image_available(AImageReader * reader)
 		        ? vk::Filter::eLinear
 		        : vk::Filter::eNearest;
 
+		// Generation sampler for image_view (see blit_handle::sampler):
+		// pinned by vk_data, always the generation this view was baked
+		// with — even if the decoder renegotiated since.
+		handle->sampler = *vk_data->generation->sampler;
+
 		if (auto scene = weak_scene.lock())
 			scene->push_blit_handle(accumulator, std::move(handle));
 	}
@@ -348,7 +359,7 @@ void decoder::on_image_available(AImageReader * reader)
 	}
 }
 
-void decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format)
+std::shared_ptr<decoder::ycbcr_generation> decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format)
 {
 	assert(ahb_format.externalFormat != 0);
 	spdlog::info("AndroidHardwareBufferProperties");
@@ -391,7 +402,8 @@ void decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::Andro
 	ycbcr_create_info.get<vk::SamplerYcbcrConversionCreateInfo>().ycbcrRange = vk::SamplerYcbcrRange::eItuFull;
 	ycbcr_create_info.get<vk::SamplerYcbcrConversionCreateInfo>().ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr709;
 
-	ycbcr_conversion = vk::raii::SamplerYcbcrConversion(device, ycbcr_create_info.get<vk::SamplerYcbcrConversionCreateInfo>());
+	auto generation = std::make_shared<ycbcr_generation>();
+	generation->conversion = vk::raii::SamplerYcbcrConversion(device, ycbcr_create_info.get<vk::SamplerYcbcrConversionCreateInfo>());
 
 	// Create VkSampler
 	vk::StructureChain sampler_info{
@@ -413,11 +425,12 @@ void decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::Andro
 	                .unnormalizedCoordinates = VK_FALSE,
 	        },
 	        vk::SamplerYcbcrConversionInfo{
-	                .conversion = *ycbcr_conversion,
+	                .conversion = *generation->conversion,
 	        },
 	};
 
-	ycbcr_sampler = vk::raii::Sampler(device, sampler_info.get());
+	generation->sampler = vk::raii::Sampler(device, sampler_info.get());
+	return generation;
 }
 
 std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AImage * image)
@@ -432,11 +445,15 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 
 	auto [properties, format_properties] = device.getAndroidHardwareBufferPropertiesANDROID<vk::AndroidHardwareBufferPropertiesANDROID, vk::AndroidHardwareBufferFormatPropertiesANDROID>(*hardware_buffer);
 
-	if (!*ycbcr_sampler || memcmp(&ahb_format, &format_properties, sizeof(format_properties)))
+	if (!current_ycbcr || memcmp(&ahb_format, &format_properties, sizeof(format_properties)))
 	{
 		memcpy(&ahb_format, &format_properties, sizeof(format_properties));
 		spdlog::info("decoded image size: {}x{}", buffer_desc.width, buffer_desc.height);
-		create_sampler(buffer_desc, ahb_format);
+		// Install first, then drop the old map: buffers created below
+		// pin the new generation, in-flight handles keep the old one
+		// alive through their own pins (never destroy a conversion
+		// while a view baked with it may still be sampled).
+		current_ycbcr = create_sampler(buffer_desc, ahb_format);
 		hardware_buffer_map.clear();
 		// TODO tell the reprojector to recreate the pipeline
 	}
@@ -501,7 +518,7 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 	                },
 	        },
 	        vk::SamplerYcbcrConversionInfo{
-	                .conversion = *ycbcr_conversion,
+	                .conversion = *current_ycbcr->conversion,
 	        },
 	};
 
@@ -513,6 +530,10 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 	handle->vimage = std::move(vimage);
 	handle->image_view = std::move(image_view);
 	handle->memory = std::move(memory);
+	// Pin the generation the view was baked with: the view holds a
+	// baked reference to this conversion, so it must outlive the
+	// decoder's next renegotiation.
+	handle->generation = current_ycbcr;
 	handle->extent = vk::Extent2D{
 	        .width = buffer_desc.width,
 	        .height = buffer_desc.height,
