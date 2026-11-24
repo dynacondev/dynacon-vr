@@ -1488,8 +1488,16 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	// (validation-silent; suspected first-touch bookkeeping for the
 	// newly-written binding) — writing both bindings from the start
 	// avoids that path entirely.
+	// Verdict tap filter (soft edge): LINEAR, not NEAREST. The
+	// half-res verdict tap IS the 2x upscale, and a tent filter turns
+	// the 2px stairstep (plus any 1px upscale-classification fringe)
+	// into a smooth ~2px reveal ramp instead of crawling binary edges.
+	// This interpolates the post-decision binary mask (pure alpha
+	// blending), never depths: no halo possible. Flat areas are
+	// bit-identical (all taps agree). The sampler is the long-lived
+	// merge sampler; the full-footprint write pattern is unchanged.
 	vk::DescriptorImageInfo apply_verdict_info{
-	        .sampler = *sampler_nearest,
+	        .sampler = *sampler,
 	        .imageView = *verdict_.view_array,
 	        // SHADER_READ: the verdict is written by its own RP ahead
 	        // of the fold (ends SHADER_READ + access barrier in
