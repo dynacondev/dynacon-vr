@@ -396,6 +396,15 @@ private:
 	vk::raii::PipelineLayout verdict_layout{nullptr};
 	// Fold3 subpass-1 pipeline (rebuilt with the layout above).
 	vk::raii::Pipeline fold_verdict_pipeline{nullptr};
+	// Verdict content box (opt #A): conservative both-eyes pixel union
+	// of the layer draws, computed in record_base from the same
+	// meshes/MVPs it rasterizes (mirrors the frustum-skip projections
+	// + feather's pass_scissor). The verdict subpass clears to
+	// reveal-1 and draws only this box — outside it the layer is
+	// CLEAR-far by construction, so reveal-1 is exact. Empty (no draws
+	// or all skipped) skips the verdict draw entirely.
+	vk::Rect2D verdict_box_{{0, 0}, {0, 0}};
+	bool verdict_box_empty_ = true;
 	// Foveation index maps (SSBO pair, ping-ponged with the verdict
 	// sets): per-eye packed-texel index per full-res merge pixel,
 	// CPU-expanded from the shared foveation runs with the

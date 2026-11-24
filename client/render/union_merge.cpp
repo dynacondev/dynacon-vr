@@ -504,7 +504,11 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	        {
 	                .format = verdict_format,
 	                .samples = vk::SampleCountFlagBits::e1,
-	                .loadOp = vk::AttachmentLoadOp::eDontCare,
+	                // CLEAR to reveal-1 (opt #A): the verdict subpass draws
+	                // only the content box; outside it every pixel is
+	                // layer-absent, so reveal-1 is exact. No separate clear
+	                // pass — the RP load op does it at begin.
+	                .loadOp = vk::AttachmentLoadOp::eClear,
 	                .storeOp = vk::AttachmentStoreOp::eStore,
 	                .initialLayout = vk::ImageLayout::eUndefined,
 	                .finalLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -1025,14 +1029,20 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	// Inheriting one would clip the merge (under-reveal) with no
 	// validation complaint.
 	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extent});
-	// DONT_CARE load: no clear values (the fullscreen triangle below
-	// overwrites every pixel in the render area).
+	// DONT_CARE loads on merged/submit: the fullscreen triangles below
+	// overwrite every pixel in the render area. Verdict (paired only)
+	// clears to reveal-1 (opt #A content box): the load op runs at RP
+	// begin, before subpass 0 touches the other attachments. Clear
+	// values are indexed by attachment (verdict is attachment 1), so
+	// the count covers it — same shape as the feather triple.
+	vk::ClearValue fold_clears[3]{};
+	fold_clears[1].color.float32 = std::array<float, 4>{1, 1, 1, 1};
 	vk::RenderPassBeginInfo begin{
 	        .renderPass = paired ? *fold3_rp : *fold2_rp,
 	        .framebuffer = *fb,
 	        .renderArea = {.offset = {0, 0}, .extent = extent},
-	        .clearValueCount = 0,
-	        .pClearValues = nullptr,
+	        .clearValueCount = paired ? 3u : 0u,
+	        .pClearValues = paired ? fold_clears : nullptr,
 	};
 	cmd.beginRenderPass(begin, vk::SubpassContents::eInline);
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, paired ? *fold_merge_pipeline : *fold2_merge_pipeline);
@@ -1060,6 +1070,68 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	// barrier), mirroring the feather renderer: uploads are rare
 	// (map-change only), so this is a no-op most frames.
 	flush_uploads(cmd);
+
+	// Verdict content box (opt #A): both-eyes NDC union of the mesh
+	// AABBs under the draw MVPs, +2px rasterization margin, clamped to
+	// the layer extent. Mirrors the draw loop's skip conditions below,
+	// so the box covers every pixel the draws can write; outside it
+	// the layer stays CLEAR-far and reveal-1 is exact. Any
+	// behind-camera corner falls back to fullscreen (a crossing
+	// triangle still rasterizes) — same rule as feather's
+	// pass_scissor. The fullscreen layer raster below is untouched
+	// (viz samples it whole).
+	{
+		float minx = 1e30f, miny = 1e30f, maxx = -1e30f, maxy = -1e30f;
+		bool empty = true, behind = false;
+		for (const auto & d: draws)
+		{
+			auto mit = layer_meshes.find(d.mesh);
+			if (mit == layer_meshes.end() or mit->second.index_count == 0)
+				continue;
+			const glm::vec3 & mn = mit->second.aabb_min;
+			const glm::vec3 & mx = mit->second.aabb_max;
+			for (uint32_t view = 0; view < 2 and not behind; ++view)
+			{
+				for (int corner = 0; corner < 8; ++corner)
+				{
+					glm::vec4 c((corner & 1) ? mx.x : mn.x,
+					            (corner & 2) ? mx.y : mn.y,
+					            (corner & 4) ? mx.z : mn.z, 1);
+					glm::vec4 q = d.mvp[view] * c;
+					if (q.w <= 0)
+					{
+						behind = true;
+						break;
+					}
+					float nx = q.x / q.w, ny = q.y / q.w;
+					minx = std::min(minx, nx);
+					miny = std::min(miny, ny);
+					maxx = std::max(maxx, nx);
+					maxy = std::max(maxy, ny);
+					empty = false;
+				}
+			}
+			if (behind)
+				break;
+		}
+		if (empty or behind)
+		{
+			verdict_box_empty_ = empty and not behind;
+			verdict_box_ = behind ? vk::Rect2D{{0, 0}, layer_extent_}
+			                      : vk::Rect2D{{0, 0}, {0, 0}};
+		}
+		else
+		{
+			const float W = (float)layer_extent_.width, H = (float)layer_extent_.height;
+			int32_t px0 = std::max<int32_t>(0, (int32_t)((minx * 0.5f + 0.5f) * W) - 2);
+			int32_t py0 = std::max<int32_t>(0, (int32_t)((miny * 0.5f + 0.5f) * H) - 2);
+			int32_t px1 = std::min<int32_t>((int32_t)layer_extent_.width, (int32_t)((maxx * 0.5f + 0.5f) * W) + 2);
+			int32_t py1 = std::min<int32_t>((int32_t)layer_extent_.height, (int32_t)((maxy * 0.5f + 0.5f) * H) + 2);
+			verdict_box_empty_ = (px1 <= px0) or (py1 <= py0);
+			verdict_box_ = verdict_box_empty_ ? vk::Rect2D{{0, 0}, {0, 0}}
+			                                  : vk::Rect2D{{px0, py0}, {(uint32_t)(px1 - px0), (uint32_t)(py1 - py0)}};
+		}
+	}
 
 	// Even with no draws the CLEAR runs: a LOAD of undefined contents
 	// would read as geometry and wrongly gate the verdict — fail-open
@@ -1317,6 +1389,14 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	if (do_verdict)
 	{
 		cmd.nextSubpass(vk::SubpassContents::eInline);
+		// Content-box verdict (opt #A): draw only the box — outside it
+		// the CLEAR above already wrote reveal-1, exact. Empty box
+		// skips the update + draw entirely (SSBO expand included);
+		// the +4 timestamp below still stamps so the split poll stays
+		// valid.
+		if (not verdict_box_empty_)
+		{
+			cmd.setScissor(0, verdict_box_);
 			// YCbCr immutable-sampler layout (VUID-02738): rebuild when the
 			// view's conversion definition or the handle's generation
 			// sampler changes. waitIdle'd, rare. Legal mid-RP: pipelines
@@ -1398,6 +1478,7 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *fold_verdict_pipeline);
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *verdict_layout, 0, vset, {});
 			cmd.draw(3, 1, 0, 0);
+		} // else: empty box — verdict stays CLEAR(1), exact for all-absent.
 		// No endRenderPass, no verdict barrier: the verdict attachment
 		// is consumed by the apply subpass in-RP (subpass dependency
 		// covers the write→read hazard) and ends SHADER_READ_ONLY via
@@ -1406,6 +1487,9 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 		if (pool)
 			cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, **pool, qafter_verdict);
 		cmd.nextSubpass(vk::SubpassContents::eInline);
+		// Fullscreen scissor restored: the apply taps merged over the
+		// whole image (the verdict subpass above narrowed it).
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = extent});
 	}
 	else
 	{
