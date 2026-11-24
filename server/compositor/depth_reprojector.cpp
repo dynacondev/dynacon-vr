@@ -570,16 +570,26 @@ bool depth_reprojector::reproject(
 	math_matrix_4x4_inverse(&dst_view, &dst_inv_v);
 
 	reproject_splat_ubo splat_data{};
-	math_matrix_4x4_multiply(&render_inv_v, &render_inv_p, &splat_data.render_inv_vp);
-	math_matrix_4x4_multiply(&dst_proj, &dst_view, &splat_data.warp_vp);
+	// Fold the clip->clip product on the CPU (one mat4-vector per
+	// thread instead of two): world = render_inv * clip, then target
+	// = warp_vp * world, so target = (warp_vp * render_inv) * clip.
+	xrt_matrix_4x4 render_inv_vp, warp_vp;
+	math_matrix_4x4_multiply(&render_inv_v, &render_inv_p, &render_inv_vp);
+	math_matrix_4x4_multiply(&dst_proj, &dst_view, &warp_vp);
+	math_matrix_4x4_multiply(&warp_vp, &render_inv_vp, &splat_data.clip_to_target);
 	std::memcpy(splat_data.depth_rect, depth_rect.data(), sizeof(splat_data.depth_rect));
 	splat_data.depth_flip = flip_depth ? 1.f : 0.f;
 	splat_data.src_reverse_z = reverse_z ? 1.f : 0.f;
 	upload_ubo(splat_ubo[slot][view], splat_data);
 
 	reproject_pull_ubo pull_data{};
-	math_matrix_4x4_multiply(&dst_inv_v, &dst_inv_p, &pull_data.dst_inv);
-	math_matrix_4x4_multiply(&src_proj, &src_view, &pull_data.src_vp);
+	// Fold the clip->clip product on the CPU (one mat4-vector per
+	// thread instead of two): world = dst_inv * clip, then source =
+	// src_vp * world, so source = (src_vp * dst_inv) * clip.
+	xrt_matrix_4x4 dst_inv, src_vp;
+	math_matrix_4x4_multiply(&dst_inv_v, &dst_inv_p, &dst_inv);
+	math_matrix_4x4_multiply(&src_proj, &src_view, &src_vp);
+	math_matrix_4x4_multiply(&src_vp, &dst_inv, &pull_data.dst_to_src);
 	std::memcpy(pull_data.color_rect, color_rect.data(), sizeof(pull_data.color_rect));
 	pull_data.color_flip = flip_color ? 1.f : 0.f;
 	upload_ubo(pull_ubo[slot][view], pull_data);

@@ -26,32 +26,32 @@
 #include <vulkan/vulkan_raii.hpp>
 
 // UBO mirror of server/compositor/shaders/reproject_splat.comp:
-// source clip -> world -> target clip, plus depth sampling params.
+// source clip -> target clip, plus depth sampling params.
 // mat4 arrays are column-major on both sides: xrt_matrix_4x4::v copies
-// straight across. The inverse-view * inverse-projection product is
-// folded on the CPU.
+// straight across. The clip->clip product is folded on the CPU (one
+// mat4-vector per thread instead of two).
 struct reproject_splat_ubo
 {
-	xrt_matrix_4x4 render_inv_vp;
-	xrt_matrix_4x4 warp_vp;
+	xrt_matrix_4x4 clip_to_target;
 	float depth_rect[4]; // normalized depth sub-image: x, y, w, h
 	float depth_flip; // 1 = mirror rows (Vulkan-ordered source)
 	float src_reverse_z; // 1 = reverse-Z source (convert 1-z)
 	float pad[2];
 };
-static_assert(sizeof(reproject_splat_ubo) == 160);
+static_assert(sizeof(reproject_splat_ubo) == 96);
 
 // UBO mirror of server/compositor/shaders/reproject_pull.comp:
-// target clip -> world -> source clip, plus color sampling params.
+// target clip -> source clip, plus color sampling params.
+// The clip->clip product is folded on the CPU (one mat4-vector per
+// thread instead of two).
 struct reproject_pull_ubo
 {
-	xrt_matrix_4x4 dst_inv;
-	xrt_matrix_4x4 src_vp;
+	xrt_matrix_4x4 dst_to_src;
 	float color_rect[4]; // normalized color sub-image: x, y, w, h
 	float color_flip; // 1 = mirror rows (Vulkan-ordered source)
 	float pad[3];
 };
-static_assert(sizeof(reproject_pull_ubo) == 160);
+static_assert(sizeof(reproject_pull_ubo) == 96);
 
 namespace wivrn
 {
