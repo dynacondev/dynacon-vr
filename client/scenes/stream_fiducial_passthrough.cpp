@@ -1172,7 +1172,7 @@ void scenes::stream::gui_passthrough()
 		if (vr_depth_test)
 			vr_occlusion_logged = false; // re-log on re-engagement
 	}
-	ImGui::Text("%s", _S("Off = passthrough mask only (no VR-vs-depth compare). Skips the depth-layer raster + verdict passes."));
+	ImGui::Text("%s", _S("Off = passthrough mask only (no VR-vs-depth compare). Skips the depth-layer raster + verdict compare (verdict still clears to neutral)."));
 	if (not vr_depth_test)
 		ImGui::Text("%s", _S("Layer/verdict viz views show stale-or-cleared targets while depth testing is off."));
 

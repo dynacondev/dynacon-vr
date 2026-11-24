@@ -2900,20 +2900,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 											{
 												if (auto & dh = current_blit_handles[depth_stream_index];
 												    dh and dh->image_view and depth_verdict_safe)
-											{
-												virt.view = dh->image_view;
-												virt.sampler = decoders[depth_stream_index].decoder->sampler();
-												virt.ycbcr = dh->ycbcr;
-												// Exact tables for THIS depth frame (the
-												// depth shards carry their own view_info):
-												// no gaze-update skew vs the color copy.
-												virt.foveation = dh->view_info.foveation;
-												virt.render_w = diag.req_render_w;
-												virt.render_h = diag.req_render_h;
-												virt.packed_w = (uint16_t)(dh->extent.width / 2);
-												virt.packed_h = (uint16_t)dh->extent.height;
-												virt.valid = true;
-											}
+												{
+													virt.view = dh->image_view;
+													virt.sampler = decoders[depth_stream_index].decoder->sampler();
+													virt.ycbcr = dh->ycbcr;
+													// Exact tables for THIS depth frame (the
+													// depth shards carry their own view_info):
+													// no gaze-update skew vs the color copy.
+													virt.foveation = dh->view_info.foveation;
+													virt.render_w = diag.req_render_w;
+													virt.render_h = diag.req_render_h;
+													virt.packed_w = (uint16_t)(dh->extent.width / 2);
+													virt.packed_h = (uint16_t)dh->extent.height;
+													virt.valid = true;
+												}
 											}
 											if (merge_renderer->record_finish(rec_cmd, (size_t)merge_idx, merge_ext, virt))
 											{
