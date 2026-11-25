@@ -3681,14 +3681,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						else
 						{
-							// Same half canvas as the warp path (plumbing
-							// parity: the A/B differs only in content+pose,
-							// never in rect size). The 2x NEAREST downsample
-							// loses nothing for a debug view.
-							std::array<vk::Extent2D, 2> half_ext;
-							for (uint32_t view = 0; view < view_count; ++view)
-								half_ext[view] = {depth_ext[view].width / 2, depth_ext[view].height / 2};
-							depth_overlay->record(command_buffer, (size_t)depth_image, half_ext,
+							depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
 							                      env_depth->depth_view(shared_depth.swapchain_index), params);
 							// Capture age forensics: which timebase this frame
 							// rode (v1 runtimes report no timestamp: gated).
@@ -4177,10 +4170,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// Gate identical to the record dispatch above: warp path only
 			// when it actually rendered (tickbox on + D_cap available).
 			bool reprojected = debug_viz == debug_viz_mode::sensor and sensor_reproject_6dof and have_dcap_pose;
-			// Half canvas for the whole sensor mode (both branches render
-			// the top-left quadrant): proves the submit plumbing identical
-			// so the tickbox A/B isolates content+pose only.
-			bool half_canvas = debug_viz == debug_viz_mode::sensor;
 			const XrPosef * viz_pose = sync_pose.data();
 			const XrFovf * viz_fov = sync_fov.data();
 			if (debug_viz == debug_viz_mode::sensor)
@@ -4200,10 +4189,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
 				XrExtent2Di rect = extents[view];
-				if (half_canvas)
+				if (reprojected)
 				{
-					// Half-extent quadrant both sensor paths render into
-					// (identical integer division as the record sites).
+					// Half-extent quadrant the warp rendered into
+					// (identical integer division as the record site).
 					rect.width /= 2;
 					rect.height /= 2;
 				}
