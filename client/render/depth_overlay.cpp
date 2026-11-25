@@ -932,15 +932,10 @@ void depth_overlay_renderer::ensure_warp_mesh(uint32_t sens_w, uint32_t sens_h)
 			// Corner UV for coverage; owning texel clamped inside so
 			// the vertex fetch below is an exact texelFetch (a corner
 			// sits on a 4-way boundary and belongs to no texel).
-			// Row mirror: texture v=1 is the frustum top (pinned by
-			// the direct tap's 1-v flip rendering upright), i.e.
-			// texelFetch row h-1 — while mesh row j=0 is the top.
-			size_t ti = i < sens_w ? i : sens_w - 1;
-			size_t tj = j < sens_h ? j : sens_h - 1;
 			verts.push_back((float)i / (float)sens_w);
 			verts.push_back(1.0f - (float)j / (float)sens_h);
-			verts.push_back((float)ti);
-			verts.push_back((float)(sens_h - 1 - tj));
+			verts.push_back((float)(i < sens_w ? i : sens_w - 1));
+			verts.push_back((float)(j < sens_h ? j : sens_h - 1));
 		}
 	}
 	std::vector<uint32_t> indices;

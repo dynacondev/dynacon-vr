@@ -80,14 +80,5 @@ void main()
 	                w.sens_tan.z + v_suv.y * (w.sens_tan.w - w.sens_tan.z),
 	                -1.0);
 	vec4 world = w.sens_mount * vec4(dir * s, 1.0);
-	vec4 clip = w.disp_vp * world;
-	if (clip.w <= 0.0)
-	{
-		// Behind the display eye (straddling triangle): collapse
-		// rather than smear across the near plane; the hole stays far.
-		v_depth = 0.0;
-		gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-		return;
-	}
-	gl_Position = clip;
+	gl_Position = w.disp_vp * world;
 }
