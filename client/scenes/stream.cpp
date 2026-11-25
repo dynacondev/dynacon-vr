@@ -1793,30 +1793,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								glm::vec3 p_cap = pc + qc * p_off;
 								dcap_pose[i].orientation = {q_cap.x, q_cap.y, q_cap.z, q_cap.w};
 								dcap_pose[i].position = {p_cap.x, p_cap.y, p_cap.z};
-								if (i == 0)
-								{
-									// Warp forensics (throttled): jointly decides
-									// stuck-provider (age grows, swidx static),
-									// clamped past-locate (age stable, delta ~0
-									// under motion), and offset-convention bugs
-									// (mount-off not cm-scale). Read two lines
-									// seconds apart while moving the head.
-									static XrTime last_warp_log = 0;
-									XrTime now = instance.now();
-									if (now - last_warp_log > 2'000'000'000LL)
-									{
-										last_warp_log = now;
-										float dot = std::clamp(glm::dot(qc, qp), -1.0f, 1.0f);
-										float ang_deg = 2.0f * std::acos(dot) * 180.0f / 3.14159265f;
-										float pos_cm = glm::length(pc - pp) * 100.0f;
-										float off_cm = glm::length(p_off) * 100.0f;
-										double age_ms = shared_depth.capture_time != 0 ?
-										        (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6 :
-										        -1.0;
-										spdlog::info("Sensor warp forensics: age {:.1f}ms cap-pred {:.2f}deg {:.1f}cm mount-off {:.1f}cm swidx {}",
-										             age_ms, ang_deg, pos_cm, off_cm, shared_depth.swapchain_index);
-									}
-								}
 							}
 							have_dcap_pose = true;
 						}
@@ -3622,14 +3598,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// 3DOF baseline below (direct tap, capture submit).
 						if (sensor_reproject_6dof and have_dcap_pose)
 						{
-							// Explicit finite-far frustum (LESS, clear 1, Vulkan
-							// NDC z in [0,1]): scene::projection_matrix is
-							// reversed-Z infinite and does not match sensor D
-							// semantics, so it stays out of this pass
-							// entirely. Y row carries the same Vulkan
-							// negation as scene's builder (2/(b-t));
-							// near/far are display-side only (sensor range
-							// lives in sens_nf).
+							// Explicit finite-far GL frustum (LESS, clear 1):
+							// scene::projection_matrix is reversed-Z infinite
+							// and does not match sensor D semantics, so it
+							// stays out of this pass entirely. Y row carries
+							// the same Vulkan negation as scene's builder
+							// (2/(b-t)); near/far are display-side only
+							// (sensor range lives in sens_nf).
 							auto finite_perspective = [](XrFovf fov, float n, float f) {
 								float l = n * tanf(fov.angleLeft);
 								float r = n * tanf(fov.angleRight);
@@ -3638,8 +3613,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								return glm::mat4{
 								        {2 * n / (r - l), 0, 0, 0},
 								        {0, 2 * n / (b - t), 0, 0},
-								        {(r + l) / (r - l), (t + b) / (b - t), -f / (f - n), -1},
-								        {0, 0, -f * n / (f - n), 0},
+								        {(r + l) / (r - l), (t + b) / (b - t), -(f + n) / (f - n), -1},
+								        {0, 0, -2 * f * n / (f - n), 0},
 								};
 							};
 							depth_overlay_renderer::reproject_params warp{};
