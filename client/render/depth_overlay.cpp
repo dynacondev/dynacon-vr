@@ -714,7 +714,6 @@ void depth_overlay_renderer::init_warp()
 	for (auto & s: warp_sets)
 		s.clear();
 	warp_pipeline.clear();
-	warp_uv_pipeline.clear();
 	warp_pipeline_layout.clear();
 	vk::DescriptorSetLayoutBinding bindings[3] = {
 	        {
@@ -849,40 +848,6 @@ void depth_overlay_renderer::init_warp()
 	        .renderPass = *warp_renderpass,
 	};
 	warp_pipeline = vk::raii::Pipeline(*device, nullptr, pipeline_info);
-
-	// UV-placement debug twin: identical vertex processing, fragment
-	// outputs interpolated sensor UV as color (no depth decode, no
-	// discard). Same layout, renderpass and push shape.
-	{
-		auto wuv_frag = load_shader(*device, "sensor_reproject_uv.frag");
-		vk::PipelineShaderStageCreateInfo uv_stages[2] = {
-		        {
-		                .stage = vk::ShaderStageFlagBits::eVertex,
-		                .module = **wvert,
-		                .pName = "main",
-		        },
-		        {
-		                .stage = vk::ShaderStageFlagBits::eFragment,
-		                .module = **wuv_frag,
-		                .pName = "main",
-		        },
-		};
-		vk::GraphicsPipelineCreateInfo uv_pipeline_info{
-		        .stageCount = 2,
-		        .pStages = uv_stages,
-		        .pVertexInputState = &vertex_input,
-		        .pInputAssemblyState = &input_assembly,
-		        .pViewportState = &viewport_state,
-		        .pRasterizationState = &rasterization,
-		        .pMultisampleState = &multisample,
-		        .pDepthStencilState = &depth_stencil,
-		        .pColorBlendState = &blend,
-		        .pDynamicState = &dynamic,
-		        .layout = *warp_pipeline_layout,
-		        .renderPass = *warp_renderpass,
-		};
-		warp_uv_pipeline = vk::raii::Pipeline(*device, nullptr, uv_pipeline_info);
-	}
 }
 
 void depth_overlay_renderer::ensure_warp_targets()
@@ -1099,7 +1064,7 @@ void depth_overlay_renderer::record_sensor_reproject(vk::raii::CommandBuffer & c
 		vmaFlushAllocation(vk_allocator::instance(), warp_ubo, 0, 2 * sizeof(warp_ubo_data));
 	}
 
-	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, warp.uv_debug ? *warp_uv_pipeline : *warp_pipeline);
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *warp_pipeline);
 	cmd.bindVertexBuffers(0, (vk::Buffer)warp_vertex_buffer, (vk::DeviceSize)0);
 	cmd.bindIndexBuffer((vk::Buffer)warp_index_buffer, 0, vk::IndexType::eUint32);
 
