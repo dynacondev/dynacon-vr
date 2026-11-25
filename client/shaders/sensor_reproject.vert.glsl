@@ -25,7 +25,7 @@
 // Matrices live here in the vertex stage (proven path); the fragment
 // stays scalar + taps (Adreno rule: no mat3/mat4 in fragment).
 
-layout(location = 0) in vec4 in_data; // xy: corner UV (texture space), zw: owning texel id
+layout(location = 0) in vec2 in_uv;
 
 // Texture space: v = 1 is the frustum top (matches depth_viz's 1-v flip:
 // the framebuffer top samples texture row 1). slope_y = b + v*(t-b).
@@ -60,12 +60,8 @@ float linearize_depth(float d_norm, float n, float f)
 
 void main()
 {
-	// Deterministic vertex fetch: the owning texel id is exact (small
-	// integers), so texelFetch never rounds — a NEAREST tap exactly on
-	// a corner UV would be driver-defined (4-way boundary jitter).
-	ivec2 t = ivec2(int(in_data.z), int(in_data.w));
-	float d = texelFetch(sensor_tex, ivec3(t, push.eye), 0).r;
-	v_suv = in_data.xy;
+	v_suv = in_uv;
+	float d = texture(sensor_tex, vec3(in_uv, float(push.eye))).x;
 	if (d >= 0.9999)
 	{
 		// No-return texel: collapse behind the far plane (clipped away,
@@ -76,8 +72,8 @@ void main()
 	}
 	float s = linearize_depth(d, w.sens_nf.x, w.sens_nf.y);
 	v_depth = s;
-	vec3 dir = vec3(w.sens_tan.x + v_suv.x * (w.sens_tan.y - w.sens_tan.x),
-	                w.sens_tan.z + v_suv.y * (w.sens_tan.w - w.sens_tan.z),
+	vec3 dir = vec3(w.sens_tan.x + in_uv.x * (w.sens_tan.y - w.sens_tan.x),
+	                w.sens_tan.z + in_uv.y * (w.sens_tan.w - w.sens_tan.z),
 	                -1.0);
 	vec4 world = w.sens_mount * vec4(dir * s, 1.0);
 	gl_Position = w.disp_vp * world;

@@ -293,10 +293,7 @@ private:
 	void ensure_warp_mesh(uint32_t sens_w, uint32_t sens_h);
 	vk::raii::DescriptorSetLayout warp_layout{nullptr};
 	vk::raii::DescriptorPool warp_pool{nullptr};
-	// One set per eye: each draw must read its own UBO slot (a single
-	// set rewritten between draws would alias, and updating a set after
-	// bind is invalid — all writes happen before any bind).
-	std::array<vk::raii::DescriptorSet, 2> warp_sets;
+	vk::raii::DescriptorSet warp_set{nullptr};
 	vk::raii::PipelineLayout warp_pipeline_layout{nullptr};
 	vk::raii::RenderPass warp_renderpass{nullptr};
 	vk::raii::Pipeline warp_pipeline{nullptr};
