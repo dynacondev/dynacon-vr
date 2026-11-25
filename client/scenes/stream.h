@@ -881,6 +881,16 @@ private:
 	debug_viz_mode debug_viz = debug_viz_mode::none;
 	bool debug_viz_show_vr = false; // viz background: VR video instead of passthrough
 	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1 (all modes)
+	// Pause the sensor stream: freeze the last acquired sensor frame
+	// (rolling buffer of depth 1, updated only while a sensor-driven
+	// viz mode is active) and keep submitting it instead of fresh
+	// acquires. Lets head motion drive the runtime rotation-warp from
+	// a fixed capture pose for careful reprojection inspection.
+	bool debug_pause_sensor = false;
+	xr::environment_depth::frame frozen_depth{};
+	std::array<XrPosef, view_count> frozen_capture_pose{};
+	bool frozen_have_capture_pose = false;
+	bool frozen_depth_valid = false;
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe

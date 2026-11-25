@@ -1238,6 +1238,15 @@ void scenes::stream::gui_passthrough()
 		{
 			debug_viz = (debug_viz_mode)viz;
 			spdlog::info("Debug viz: {}", debug_viz_mode_name(debug_viz));
+			// Pause only freezes sensor frames: disarm when leaving
+			// the sensor modes so an old frozen frame never silently
+			// re-arms on return (frozen buffer is also dropped with
+			// the provider in the render path).
+			if (debug_pause_sensor and debug_viz != debug_viz_mode::sensor and debug_viz != debug_viz_mode::raster_vs_sensor)
+			{
+				debug_pause_sensor = false;
+				spdlog::info("Depth sensor pause cleared (left sensor viz mode)");
+			}
 		}
 	}
 	if (env_depth_probed and not env_depth_supported and debug_viz == debug_viz_mode::sensor)
@@ -1248,6 +1257,15 @@ void scenes::stream::gui_passthrough()
 	float depth_pct = debug_depth_opacity * 100;
 	if (ImGui::SliderFloat(_S("Overlay opacity"), &depth_pct, 0, 100, "%.0f%%"))
 		debug_depth_opacity = std::clamp(depth_pct / 100, 0.f, 1.f);
+	ImGui::BeginDisabled(debug_viz != debug_viz_mode::sensor and debug_viz != debug_viz_mode::raster_vs_sensor);
+	if (ImGui::Checkbox(_S("Pause depth sensor (freeze last frame)"), &debug_pause_sensor))
+	{
+		if (debug_pause_sensor and not frozen_depth_valid)
+			spdlog::info("Depth sensor pause armed (waiting for first frame)");
+		else
+			spdlog::info("Depth sensor {}", debug_pause_sensor ? "paused (frozen frame)" : "resumed (live)");
+	}
+	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 	if (not depth_status.empty() and debug_viz != debug_viz_mode::none)
 		ImGui::Text("%s: %s", _S("Viz status"), depth_status.c_str());

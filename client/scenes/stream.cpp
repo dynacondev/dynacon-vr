@@ -1666,6 +1666,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// record paths (async + inline). Other viz modes (VR depth,
 		// layer, verdict) sample already-acquired frames, no provider.
 		bool have_depth_frame = false;
+		bool depth_frozen = false;
 		xr::environment_depth::frame shared_depth{};
 		// Capture-anchored submit pose for the sensor viz (baseline
 		// non-reprojected view): headset pose at the depth image's own
@@ -1695,67 +1696,101 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				env_depth->ensure();
 				if (env_depth->ready())
 				{
-					env_depth->start();
-					// Acquire at predicted time: the returned depth pose
-					// rides predicted time (spec). The sensor viz submit
-					// below re-anchors to capture time (capture_pose).
-					bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, shared_depth);
-					if (got_depth)
+					// Paused: reuse the frozen frame instead of a fresh
+					// acquire (single acquire per frame is the spec
+					// limit, zero is allowed). The provider is stopped
+					// while frozen so the runtime can't advance the
+					// depth images behind our back: without an acquire
+					// as a sync point a running provider may overwrite
+					// the frozen image (device-verified pending). The
+					// frozen capture pose keeps riding submit, so head
+					// motion after the freeze drives the runtime
+					// rotation-warp from a fixed capture time. Falls
+					// through to a fresh acquire until the buffer is
+					// seeded.
+					if (debug_pause_sensor and frozen_depth_valid)
 					{
+						if (env_depth->started())
+							env_depth->stop();
+						shared_depth = frozen_depth;
+						capture_pose = frozen_capture_pose;
+						have_capture_pose = frozen_have_capture_pose;
 						have_depth_frame = true;
-						// Sensor-viz submit pose: headset at the depth
-						// image's capture time. No depth-sensor query at a
-						// past time exists (or is needed): the single
-						// timestamp is the one riding the image we render.
-						if (debug_viz == debug_viz_mode::sensor)
-						{
-							const char * fallback_reason = nullptr;
-							if (shared_depth.capture_time == 0)
-								fallback_reason = "no capture timestamp (v1 runtime)";
-							else
-							{
-								try
-								{
-									auto [cap_flags, cap_views] = session.locate_views(viewconfig, shared_depth.capture_time, application::space(xr::spaces::world));
-									if (cap_views.size() == view_count and (cap_flags & XR_VIEW_STATE_POSITION_VALID_BIT) and
-									    (cap_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
-									{
-										for (size_t i = 0; i < view_count; ++i)
-											capture_pose[i] = cap_views[i].pose;
-										have_capture_pose = true;
-									}
-									else
-										fallback_reason = "capture locate pose invalid";
-								}
-								catch (const std::system_error &)
-								{
-									fallback_reason = "capture locate threw";
-								}
-							}
-							// Fallback is adb-visible: change-triggered +
-							// heartbeat while active.
-							static bool last_had_pose = true;
-							static XrTime last_pose_log = 0;
-							XrTime now = instance.now();
-							if (fallback_reason)
-							{
-								if (last_had_pose or now - last_pose_log > 5'000'000'000LL)
-								{
-									last_pose_log = now;
-									spdlog::warn("Sensor viz: capture-pose unavailable ({}), submitting predicted depth pose (swims under head motion)", fallback_reason);
-								}
-								last_had_pose = false;
-							}
-							else if (not last_had_pose)
-							{
-								last_had_pose = true;
-								last_pose_log = now;
-								spdlog::info("Sensor viz: capture-pose submit restored");
-							}
-						}
+						depth_frozen = true;
 					}
 					else
-						depth_status = "waiting for depth data";
+					{
+						env_depth->start();
+						// Acquire at predicted time: the returned depth pose
+						// rides predicted time (spec). The sensor viz submit
+						// below re-anchors to capture time (capture_pose).
+						bool got_depth = env_depth->acquire(application::space(xr::spaces::world), frame_state.predictedDisplayTime, shared_depth);
+						if (got_depth)
+						{
+							have_depth_frame = true;
+							// Sensor-viz submit pose: headset at the depth
+							// image's capture time. No depth-sensor query at a
+							// past time exists (or is needed): the single
+							// timestamp is the one riding the image we render.
+							if (debug_viz == debug_viz_mode::sensor)
+							{
+								const char * fallback_reason = nullptr;
+								if (shared_depth.capture_time == 0)
+									fallback_reason = "no capture timestamp (v1 runtime)";
+								else
+								{
+									try
+									{
+										auto [cap_flags, cap_views] = session.locate_views(viewconfig, shared_depth.capture_time, application::space(xr::spaces::world));
+										if (cap_views.size() == view_count and (cap_flags & XR_VIEW_STATE_POSITION_VALID_BIT) and
+										    (cap_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+										{
+											for (size_t i = 0; i < view_count; ++i)
+												capture_pose[i] = cap_views[i].pose;
+											have_capture_pose = true;
+										}
+										else
+											fallback_reason = "capture locate pose invalid";
+									}
+									catch (const std::system_error &)
+									{
+										fallback_reason = "capture locate threw";
+									}
+								}
+								// Fallback is adb-visible: change-triggered +
+								// heartbeat while active.
+								static bool last_had_pose = true;
+								static XrTime last_pose_log = 0;
+								XrTime now = instance.now();
+								if (fallback_reason)
+								{
+									if (last_had_pose or now - last_pose_log > 5'000'000'000LL)
+									{
+										last_pose_log = now;
+										spdlog::warn("Sensor viz: capture-pose unavailable ({}), submitting predicted depth pose (swims under head motion)", fallback_reason);
+									}
+									last_had_pose = false;
+								}
+								else if (not last_had_pose)
+								{
+									last_had_pose = true;
+									last_pose_log = now;
+									spdlog::info("Sensor viz: capture-pose submit restored");
+								}
+							}
+							// Rolling buffer of depth 1: refreshed on
+							// every successful acquire while a sensor viz
+							// mode is active (this block only runs then).
+							frozen_depth = shared_depth;
+							frozen_capture_pose = capture_pose;
+							frozen_have_capture_pose = have_capture_pose;
+							frozen_depth_valid = true;
+						}
+						else if (debug_pause_sensor and not frozen_depth_valid)
+							depth_status = "waiting for depth data (pause armed, no frozen frame yet)";
+						else
+							depth_status = "waiting for depth data";
+					}
 				}
 				else
 					depth_status = "depth provider unavailable";
@@ -1765,6 +1800,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			env_depth->stop();
 			depth_status.clear();
+			// Drop the frozen sample with the provider: its
+			// swapchain_index belongs to the stopped session and
+			// must never be submitted as if fresh on re-enter.
+			frozen_depth_valid = false;
 		}
 
 		// Fresh frame accumulators for the Statistics plots (filled by
@@ -3524,7 +3563,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			if (not depth_overlay)
 				depth_overlay = std::make_unique<depth_overlay_renderer>(device);
-			depth_overlay->ensure(instance, session, swapchain.format(), swapchain.width(), swapchain.height());
+			// Half-res viz submit: the false-color ramp carries no
+			// high-frequency detail, so quarter pixels for quarter fill.
+			depth_overlay->ensure(instance, session, swapchain.format(),
+			                      (swapchain.width() + 1) / 2, (swapchain.height() + 1) / 2);
 			if ((debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor) and not have_depth_frame)
 			{
 				// No overlay this frame (status already set by the
@@ -3540,7 +3582,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// ramps are hardcoded 0..2.046m in-shader).
 				std::array<vk::Extent2D, 2> depth_ext;
 				for (uint32_t view = 0; view < view_count; ++view)
-					depth_ext[view] = {(uint32_t)extents[view].width, (uint32_t)extents[view].height};
+					depth_ext[view] = {((uint32_t)extents[view].width + 1) / 2, ((uint32_t)extents[view].height + 1) / 2};
 				switch (debug_viz)
 				{
 					case debug_viz_mode::none:
@@ -3681,7 +3723,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						break;
 					}
 				}
+				// Paused sensor frames keep submitting the frozen sample
+				// while predicted time advances, so the age grows as the
+				// head moves — the reprojection inspection signal.
+				if (depth_frozen and (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
+					depth_status += " [PAUSED]";
 			}
+			else if (depth_frozen and (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
+				depth_status = "overlay swapchain busy, skipped frame [PAUSED]";
 			else
 				depth_status = "overlay swapchain busy, skipped frame";
 		}
@@ -4044,6 +4093,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			std::array<XrCompositionLayerProjectionView, view_count> depth_views;
 			for (uint32_t view = 0; view < view_count; ++view)
 			{
+				// Half-res viz image: imageRect matches the halved
+				// record extents above; the runtime upscales.
+				XrExtent2Di half_extent{
+				        (extents[view].width + 1) / 2,
+				        (extents[view].height + 1) / 2,
+				};
 				depth_views[view] = {
 				        .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
 				        .pose = viz_pose[view],
@@ -4052,7 +4107,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				                .swapchain = depth_overlay->swapchain(),
 				                .imageRect = {
 				                        .offset = {0, 0},
-				                        .extent = extents[view],
+				                        .extent = half_extent,
 				                },
 				                .imageArrayIndex = view,
 				        },
