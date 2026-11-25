@@ -707,7 +707,7 @@ void depth_overlay_renderer::init_warp()
 	vk::DynamicState dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
 	vk::PipelineDynamicStateCreateInfo dynamic{
 	        .dynamicStateCount = 2,
-	        .pDynamicStates = dynamics,
+	        .pDynamics = dynamics,
 	};
 
 	// Own set layout: sensor sampler (vertex fetch + fragment re-tap),
@@ -759,9 +759,11 @@ void depth_overlay_renderer::init_warp()
 	        .descriptorSetCount = 1,
 	        .pSetLayouts = &*warp_layout,
 	};
-	warp_sets.clear();
 	for (uint32_t eye = 0; eye < 2; ++eye)
-		warp_sets.emplace_back(std::move(device->allocateDescriptorSets(alloc_info)[0]));
+	{
+		auto sets = vk::raii::DescriptorSets(*device, alloc_info);
+		warp_sets[eye] = std::move(sets.front());
+	}
 
 	// Two UBO slots (one per eye): both draws in one command buffer must
 	// read their own matrices (host writes complete before submit, so a

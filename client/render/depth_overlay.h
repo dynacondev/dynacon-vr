@@ -296,7 +296,7 @@ private:
 	// One set per eye: each draw must read its own UBO slot (a single
 	// set rewritten between draws would alias, and updating a set after
 	// bind is invalid — all writes happen before any bind).
-	std::vector<vk::raii::DescriptorSet> warp_sets;
+	std::array<vk::raii::DescriptorSet, 2> warp_sets;
 	vk::raii::PipelineLayout warp_pipeline_layout{nullptr};
 	vk::raii::RenderPass warp_renderpass{nullptr};
 	vk::raii::Pipeline warp_pipeline{nullptr};
