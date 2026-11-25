@@ -181,35 +181,6 @@ public:
 	// Release the acquired image (after submit, before endFrame).
 	void release();
 
-	// 6DOF sensor reprojection record (debug viz): forward-warps the
-	// native sensor texels (one mesh vertex per texel) into the display
-	// eye at predicted time, false-colored like the direct tap
-	// (NEAREST throughout: true outcomes, no invented depths).
-	// Missing/no-data and streak-discarded pixels stay cleared = far
-	// (no hole-filling). Renders into the top-left half-extent quadrant
-	// of the acquired image (half res = the future compare working
-	// res); the caller submits that quadrant with the predicted eye
-	// pose/fov. The warp runs per eye (sensor layer = eye).
-	struct reproject_params
-	{
-		// Display clip-from-world at predicted time, column-major.
-		std::array<std::array<float, 16>, 2> disp_vp{};
-		// World-from-sensor-eye at capture time (D_cap, full 6DOF),
-		// column-major.
-		std::array<std::array<float, 16>, 2> sens_mount{};
-		// tan(angleLeft, angleRight, angleDown, angleUp) per eye.
-		std::array<std::array<float, 4>, 2> sens_tan{};
-		// Sensor near, far (meters) per eye.
-		std::array<std::array<float, 2>, 2> sens_nf{};
-		// Native sensor grid the mesh is keyed on (rebuild on change).
-		uint32_t sens_w = 0, sens_h = 0;
-	};
-	void record_sensor_reproject(vk::raii::CommandBuffer & cmd, size_t image_index,
-	                             const std::array<vk::Extent2D, 2> & half_extents,
-	                             vk::ImageView sensor_view,
-	                             const reproject_params & warp,
-	                             const frame_params & params);
-
 	xr::swapchain & swapchain()
 	{
 		return swapchain_;
@@ -281,30 +252,6 @@ private:
 	vk::raii::PipelineLayout virt_pipeline_layout{nullptr};
 	vk::raii::Pipeline virt_pipeline{nullptr};
 
-	// 6DOF sensor warp state: own set layout (sensor sampler shared with
-	// the direct tap, warp UBO for the vertex stage, frame-params UBO
-	// for the fragment ramp), dedicated renderpass with a depth
-	// attachment (nearest-wins for overlapping splats; framebuffer-sized
-	// even though only the half-extent quadrant renders), per-eye
-	// warp-UBO upload, and the native-texel grid mesh (rebuilt when the
-	// sensor extent changes — in practice never, waitIdle'd like ensure).
-	void init_warp();
-	void ensure_warp_targets();
-	void ensure_warp_mesh(uint32_t sens_w, uint32_t sens_h);
-	vk::raii::DescriptorSetLayout warp_layout{nullptr};
-	vk::raii::DescriptorPool warp_pool{nullptr};
-	vk::raii::DescriptorSet warp_set{nullptr};
-	vk::raii::PipelineLayout warp_pipeline_layout{nullptr};
-	vk::raii::RenderPass warp_renderpass{nullptr};
-	vk::raii::Pipeline warp_pipeline{nullptr};
-	buffer_allocation warp_ubo;
-	image_allocation warp_depth_image;
-	vk::raii::ImageView warp_depth_view{nullptr};
-	uint32_t warp_mesh_w = 0, warp_mesh_h = 0;
-	buffer_allocation warp_vertex_buffer;
-	buffer_allocation warp_index_buffer;
-	uint32_t warp_index_count = 0;
-
 	xr::swapchain swapchain_;
 	vk::Format format_ = vk::Format::eUndefined;
 	vk::Extent2D extent_{0, 0};
@@ -316,11 +263,4 @@ private:
 	};
 	// [image][eye], parallel to the swapchain image list.
 	std::vector<std::array<target, 2>> targets;
-	struct warp_target
-	{
-		vk::raii::Framebuffer framebuffer{nullptr};
-	};
-	// [image][eye] warp framebuffers: share targets' color views, so
-	// declared after targets (dies first). Parallel to targets.
-	std::vector<std::array<warp_target, 2>> warp_targets;
 };
