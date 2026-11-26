@@ -36,7 +36,7 @@ struct push
 } // namespace
 
 static_assert(sizeof(depth_overlay_renderer::frame_params) == 16);
-static_assert(sizeof(depth_overlay_renderer::sensor_warp_params) == 176);
+static_assert(sizeof(depth_overlay_renderer::sensor_warp_params) == 256);
 
 depth_overlay_renderer::depth_overlay_renderer(vk::raii::Device & device) : device(&device) {}
 
@@ -241,8 +241,8 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		        "depth overlay");
 	}
 
-	// Separate warp-params buffer (176 B): the frame_params buffer above
-	// stays 16 B for the existing paths.
+	// Separate warp-params buffer (256 B): the 16 B frame_params buffer above
+	// stays untouched for the existing paths.
 	if (not warp_ubo or warp_ubo.info().size < sizeof(sensor_warp_params))
 	{
 		warp_ubo = buffer_allocation(

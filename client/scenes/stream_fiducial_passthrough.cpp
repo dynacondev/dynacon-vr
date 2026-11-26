@@ -1267,6 +1267,10 @@ void scenes::stream::gui_passthrough()
 	}
 	if (ImGui::Checkbox(_S("Custom 3DOF warp (vs runtime)"), &debug_custom_3dof))
 		spdlog::info("Depth viz warp {}", debug_custom_3dof ? "custom 3DOF" : "runtime");
+	ImGui::BeginDisabled(not debug_custom_3dof);
+	if (ImGui::Checkbox(_S("6DOF translation (vs 3DOF)"), &debug_6dof))
+		spdlog::info("Depth viz warp refinement {}", debug_6dof ? "6DOF" : "3DOF");
+	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 	if (not depth_status.empty() and debug_viz != debug_viz_mode::none)

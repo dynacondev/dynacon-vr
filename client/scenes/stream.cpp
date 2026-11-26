@@ -3646,9 +3646,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				std::array<vk::Extent2D, 2> depth_ext;
 				for (uint32_t view = 0; view < view_count; ++view)
 					depth_ext[view] = {((uint32_t)extents[view].width + 1) / 2, ((uint32_t)extents[view].height + 1) / 2};
-				// Custom 3DOF warp params: R_eye = Qc^-1 * Qd per eye
-				// (capture -> predicted display, translation ignored:
-				// rotation-only, the runtime timewarp copy). FROM is the
+				// Custom warp params: R_eye = Qc^-1 * Qd per eye plus
+				// t = Qd^-1 * (pc - pd) (capture -> predicted display,
+				// the runtime timewarp copy with translation). FROM is the
 				// headset pose at capture in both sensor modes (the
 				// sensor frustum is projected through it, i.e. the
 				// headset<->sensor rotational extrinsic is assumed
@@ -3698,6 +3698,47 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						warp_params.near_z = shared_depth.near_z;
 						warp_params.far_z = shared_depth.far_z;
 						warp_params.opacity = debug_depth_opacity;
+						// 6DOF translation: qd^-1 * (pc - pd) per eye,
+						// capture->display in display-eye space (matches
+						// the c2d transpose in-shader).
+						uint32_t sens_w = env_depth ? env_depth->depth_width() : 0;
+						uint32_t sens_h = env_depth ? env_depth->depth_height() : 0;
+						for (uint32_t eye = 0; eye < view_count; ++eye)
+						{
+							const XrPosef & from = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
+							const XrPosef & to = mask_pose[eye];
+							glm::quat qc(from.orientation.w, from.orientation.x, from.orientation.y, from.orientation.z);
+							glm::quat qd(to.orientation.w, to.orientation.x, to.orientation.y, to.orientation.z);
+							glm::vec3 pc(from.position.x, from.position.y, from.position.z);
+							glm::vec3 pd(to.position.x, to.position.y, to.position.z);
+							glm::vec3 t = glm::inverse(qd) * (pc - pd);
+							warp_params.trans[eye][0] = t.x;
+							warp_params.trans[eye][1] = t.y;
+							warp_params.trans[eye][2] = t.z;
+							warp_params.trans[eye][3] = 0;
+							// Refine step cap: 8 sensor texels in tangent
+							// units; display texel pitch from the (halved)
+							// record extents, for the accept gate.
+							float sens_pitch = 0;
+							if (sens_w > 0 and sens_h > 0)
+							{
+								float spx = (warp_params.sens_tan[eye][1] - warp_params.sens_tan[eye][0]) / (float)sens_w;
+								float spy = (warp_params.sens_tan[eye][3] - warp_params.sens_tan[eye][2]) / (float)sens_h;
+								sens_pitch = std::max(spx, spy);
+							}
+							float dpx = (warp_params.disp_tan[eye][1] - warp_params.disp_tan[eye][0]) /
+							          std::max((float)depth_ext[eye].width, 1.0f);
+							float dpy = (warp_params.disp_tan[eye][3] - warp_params.disp_tan[eye][2]) /
+							          std::max((float)depth_ext[eye].height, 1.0f);
+							warp_params.misc[eye][0] = 8.0f * sens_pitch;
+							warp_params.misc[eye][1] = std::max(dpx, dpy);
+							warp_params.misc[eye][2] = 0;
+							warp_params.misc[eye][3] = 0;
+						}
+						warp_params.tune[0] = 1.5f; // accept gate, display texels
+						warp_params.tune[1] = 1.5f; // silhouette depth ratio
+						warp_params.tune[2] = debug_6dof ? 2.0f : 0.0f;
+						warp_params.tune[3] = 0;
 					}
 				}
 				switch (debug_viz)
@@ -3870,7 +3911,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// when content was recorded: waiting/busy frames stay clean).
 				if (viz_content_recorded and
 				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
-					depth_status += used_custom_3dof ? " [custom3dof]" : " [runtime]";
+				{
+					if (used_custom_3dof)
+						depth_status += debug_6dof ? " [custom6dof]" : " [custom3dof]";
+					else
+						depth_status += " [runtime]";
+				}
 			}
 			else if (depth_frozen and (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
 				depth_status = "overlay swapchain busy, skipped frame [PAUSED]";

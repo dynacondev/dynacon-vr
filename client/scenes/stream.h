@@ -897,6 +897,10 @@ private:
 	// and submit at the predicted pose. Off = direct tap + runtime warp
 	// (today's behavior) for A/B.
 	bool debug_custom_3dof = true;
+	// 6DOF translation refinement on top of the custom warp (fixed-point
+	// gather iteration, holes/no-data render as FAR). Off = 3DOF seed
+	// only. Zero translation reduces to the 3DOF tap.
+	bool debug_6dof = true;
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe

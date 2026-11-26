@@ -167,9 +167,12 @@ public:
 	                      vk::Image layer_image, vk::ImageView layer_view,
 	                      const frame_params & params);
 
-	// Custom 3DOF rotation-only warp params (std140): per-eye rotation
-	// rows (R = Qc^-1 * Qd) plus sensor/display frustum tangents.
-	// 176 bytes, 16-aligned.
+	// Custom 3DOF/6DOF rotation (+translation) warp params (std140):
+	// per-eye rotation rows (R = Qc^-1 * Qd) plus frustum tangents.
+	// 6DOF adds the display-eye origin in capture-eye space (trans)
+	// plus per-eye step/pitch scales (misc) and global tuning (tune:
+	// accept-gate texels, silhouette ratio, iteration count, reserved).
+	// 256 bytes, 16-aligned.
 	struct sensor_warp_params
 	{
 		float rot_rows[2][3][4]; // [eye][row]: xyz = rotation row, w unused
@@ -179,6 +182,12 @@ public:
 		float far_z = 10.f;
 		float opacity = 0.3f;
 		float pad = 0;
+		float trans[2][4]; // [eye]: xyz = capture->display translation in display-eye
+		                   // space, qd^-1 * (pc - pd); w unused
+		float misc[2][4];  // [eye]: x = refine step cap (capture-tangent units),
+		                   // y = display texel pitch (tangent units), z/w reserved
+		float tune[4]; // x = accept gate (display texels), y = silhouette ratio,
+		               // z = refinement enable (0 = 3DOF seed, 2 = iterate), w reserved
 	};
 
 	// Sensor viz through the custom 3DOF warp (sensor_3dof_warp.frag):
@@ -253,7 +262,7 @@ private:
 	vk::raii::PipelineLayout raster_sensor_pipeline_layout{nullptr};
 	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
 	vk::raii::Pipeline raster_sensor_warp_pipeline{nullptr}; // custom 3DOF sensor tap
-	// Custom-warp UBO (sensor_warp_params, 176 B): separate allocation
+	// Custom-warp UBO (sensor_warp_params, 256 B): separate allocation
 	// so the 16 B frame_params buffer above stays untouched. Written
 	// per warp record + flushed (non-coherent pattern, see upload).
 	buffer_allocation warp_ubo;
