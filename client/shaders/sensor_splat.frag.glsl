@@ -18,28 +18,19 @@
 
 #version 450
 
-// Splat pass-through fragment: stores the splatted planar display depth
-// (meters) into the transient R16F image. No sampling, no UBO — the
-// depth test already resolved visibility. Blending off (replace).
-// Verdict from the TL provoking vertex: 1 = discard (no-data or
-// behind-camera: honest FAR hole), 2 = flat background stretch
-// (disocclusion covered by the quad-max depth, never foreground),
-// else the smooth interpolated depth.
+// Splat pass-through fragment: stores the flat quad-max planar display
+// depth (meters, from the TL provoking vertex) into the transient R16F
+// image. Quads with no valid in-front corner arrive as <= 0 and discard
+// to honest FAR holes (no-data/behind-camera). No sampling, no UBO —
+// the depth test already resolved visibility. Blending off (replace).
 
-layout(location = 0) in float v_depth;
-layout(location = 1) flat in int v_flag;
-layout(location = 2) flat in float v_bgmax;
+layout(location = 0) flat in float v_bg;
 
 layout(location = 0) out float out_depth;
 
 void main()
 {
-	if (v_flag == 1)
+	if (v_bg <= 0.0)
 		discard;
-	if (v_flag == 2)
-	{
-		out_depth = v_bgmax;
-		return;
-	}
-	out_depth = v_depth;
+	out_depth = v_bg;
 }

@@ -28,14 +28,16 @@
 // no invented depths). Axis-aligned true edges between differing
 // texels therefore coincide with straight mesh edges instead of
 // zigzagging around texel centers. Each vertex rigid-transforms
-// capture->display and projects with a finite display frustum. The TL
-// vertex of each quad (provoking vertex for both triangles) emits the
-// quad verdict over its four corners' depths: smooth interpolate when
-// clean, discard on no-data/behind-camera (honest FAR holes), flat
-// display-space corner-max background stretch on a depth step so
-// disocclusions read as background instead of rubber-sheet stretches.
-// Kept quads interpolate smoothly (shared vertices compute bit-identical
-// positions, so no T-cracks) and the hardware depth test resolves
+// capture->display and projects with a finite display frustum. Every
+// quad emits its flat corner-max display depth from the TL vertex
+// (provoking vertex for both triangles): the max is background by
+// construction on a depth step, so disocclusions read as background
+// instead of rubber-sheet stretches, and approximately the surface
+// elsewhere. (A sub-texel foreground wire sharing its quad with
+// background reads as background: the max erases it.) Quads with no valid in-front corner (no-data/behind-camera
+// only) emit <= 0 and the fragment stage discards them to honest FAR
+// holes. Shared vertices compute bit-identical positions, so no
+// T-cracks, and the hardware depth test resolves
 // overlaps nearest-wins. texelFetch with integer bounds keeps the Y-flip
 // exact and sidesteps vertex-stage sampler questions.
 //
@@ -51,7 +53,6 @@ layout(set = 0, binding = 1) uniform splat_params
 	vec4 disp_tan[2]; // per eye display (target) frustum tangents: L, R, U, D
 	vec2 near_far;
 	float opacity;
-	float cull_ratio; // max/min depth ratio over a quad before background stretch
 	vec4 trans[2]; // per eye: capture->display translation in display-eye space
 } u;
 
@@ -62,9 +63,7 @@ layout(push_constant) uniform pc
 	int sens_h;
 } push;
 
-layout(location = 0) out float v_depth;
-layout(location = 1) flat out int v_flag;
-layout(location = 2) flat out float v_bgmax;
+layout(location = 0) flat out float v_bg;
 
 float linearize_depth(float d_norm, float n, float f)
 {
@@ -106,12 +105,12 @@ void main()
 	// of clamp and Y-flip gives the same result here (the flip maps the
 	// ±1-extended range onto itself), but clamp-then-flip keeps the
 	// texture row H-1-py on the framebuffer edge row by construction.
-	// Note the verdict side effect: clamping also spreads a border
-	// texel's depth into every window touching that border, so a no-data
-	// top/left edge texel discards up to 4 quads (interior parity is 4
-	// before and after; bottom/right are unchanged). Border vertices
+	// Note the replication side effect: clamping also shares a border
+	// texel's depth with every window touching that border. A no-data
+	// corner is skipped, so quads survive on their remaining valid
+	// corners; only all-invalid windows discard. Border vertices
 	// (cx = W or cy = H) extrapolate one corner past the frustum edge;
-	// their verdicts are never read (no quad down-right of them), so
+	// their flat values are never read (no quad down-right of them), so
 	// finite-but-outside is fine.
 	float xs[4];
 	float ys[4];
@@ -133,53 +132,32 @@ void main()
 		ds[k] = texelFetch(depth_tex, ivec3(px, H - 1 - py, e), 0).r;
 	}
 
-	// Quad verdict over the four corners' depths: 0 = smooth interpolate,
-	// 1 = discard (no-data or behind-camera: honest FAR hole),
-	// 2 = background stretch (depth step: emit the flat corner-max so
-	// background covers the disocclusion, never foreground). Decision
-	// logic unchanged from the center grid; only the sampling window
-	// moved (up-left-shifted corner window instead of the own-texel
-	// neighborhood). Positions always stay valid; the fragment stage
-	// applies the verdict.
-	bool unusable = false;
-	bool behind = false;
-	float zmin = 1e30;
-	float zmax = 0.0;
-	float zbmax = 0.0; // display-space quad max, for background stretch
+	// No per-quad decision: every quad with a valid in-front corner emits
+	// its flat corner-max display depth. That max is background by
+	// construction on a depth step (so disocclusions read as background,
+	// never foreground) and approximately the surface elsewhere. Quads
+	// whose corners behind the display eye contribute nothing; quads
+	// with no valid in-front corner at all (no-data/behind-camera only)
+	// emit <= 0 and the fragment stage discards them to honest FAR
+	// holes. Positions always stay valid.
+	float zbmax = 0.0; // display-space corner max, for the flat background
 	for (int k = 0; k < 4; ++k)
 	{
-		// Far-clamped so sky pixels can't produce NaN steps or blow
-		// up the stretch ratio.
-		if (ds[k] >= 0.9999)
-		{
-			unusable = true;
-		}
-		else
+		// Far-clamped so sky pixels can't produce NaN steps.
+		if (ds[k] < 0.9999)
 		{
 			float z = min(linearize_depth(ds[k], n, f), 20.0);
-			zmin = min(zmin, z);
-			zmax = max(zmax, z);
 			vec3 Xd = c2d_mul(e, vec3(xs[k], ys[k], -1.0) * z) + u.trans[e].xyz;
-			if (Xd.z >= -1e-6)
-				behind = true;
-			else
+			if (Xd.z < -1e-6)
 				zbmax = max(zbmax, -Xd.z);
 		}
 	}
-	if (unusable || behind)
-		v_flag = 1;
-	else if (zmax / max(zmin, 1e-6) > u.cull_ratio)
-		v_flag = 2;
-	else
-		v_flag = 0;
-	// Stretched pixels carry display-space depth (like the smooth path's
-	// v_depth), not the capture-space quad max.
-	v_bgmax = zbmax;
+	v_bg = zbmax;
 
-	// Own corner reprojected (kept triangles interpolate these; stretched
-	// triangles ignore it for the flat background, discarded triangles
-	// never reach the fragment shader). The own paired depth is the
-	// offset-0 corner sample above.
+	// Own corner reprojected. Shared vertices compute bit-identical
+	// positions, so no T-cracks; the hardware depth test resolves
+	// overlaps nearest-wins. The own paired depth is the offset-0
+	// corner sample above.
 	float ox = st.x + (st.y - st.x) * float(cx) / float(W);
 	float oy = st.z + (st.w - st.z) * float(cy) / float(H);
 	float z = min(linearize_depth(ds[0], n, f), 20.0);
@@ -191,5 +169,4 @@ void main()
 	float near = u.near_far.x;
 	float far = 50.0;
 	gl_Position = vec4((2.0 * du - 1.0) * d, (2.0 * dv - 1.0) * d, far * (d - near) / (far - near), d);
-	v_depth = d;
 }

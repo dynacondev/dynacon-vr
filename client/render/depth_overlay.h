@@ -179,7 +179,7 @@ public:
 		float near_z = 0.1f;
 		float far_z = 10.f;
 		float opacity = 0.3f;
-		float cull_ratio = 1.5f; // max/min quad depth ratio before background stretch
+		float pad = 0; // explicit std140 pad: keeps trans 16-aligned (frame_params precedent)
 		float trans[2][4]; // [eye]: xyz = qd^-1 * (pc - pd); w unused
 	};
 
@@ -299,15 +299,15 @@ private:
 	buffer_allocation splat_ubo;
 	void upload_splat_params(const splat_warp_params & params);
 	// Pass 1 shared by both splat records: splat the sensor mesh into
-	// the transient R16F image (edge-culled, depth-tested). Leaves the
+	// the transient R16F image (flat-splat, depth-tested). Leaves the
 	// temp ready for a same-CB barrier to SHADER_READ_ONLY.
 	// Index buffer over the sensor texel corners ((sens_w+1)x(sens_h+1)
 	// vertices, sens_w*sens_h quads, two TL-first triangles per quad;
-	// TL-first order is load-bearing for the flat verdict flag, whose
-	// provoking vertex is always the first). Edge replication spreads
-	// border-texel verdicts one quad outward top/left (a no-data edge
-	// texel there discards up to 4 quads; bottom/right only 1 — no quads
-	// exist past those borders). Res-keyed (sensor dims arrive per
+	// TL-first order is load-bearing for the flat background depth, whose
+	// provoking vertex is always the first). Edge replication shares a
+	// border texel's depth with neighboring windows (a no-data corner is
+	// skipped, so quads survive on their remaining valid corners; only
+	// all-invalid windows discard). Res-keyed (sensor dims arrive per
 	// frame); rebuilt waitIdle'd on change.
 	buffer_allocation splat_index;
 	int32_t splat_idx_w = 0;

@@ -22,9 +22,9 @@
 // depth (R16F, meters, display space) against the owned R16F common
 // depth layer. Green = agree, red ramp = |layer - sensor| over 0..2m.
 // No-data on either side (layer FAR >= 65000, splat clear 65504) reads
-// opaque black. Stretched edge quads participate as background depth,
-// so disocclusions compare instead of quarantining; only no-data and
-// behind-camera quads leave FAR seams. Standard 4-byte eye push,
+// opaque black. Flat quads participate as background depth, so
+// disocclusions compare instead of quarantining; only fully-invalid
+// windows (no-data/behind-camera in all four corners) leave FAR seams. Standard 4-byte eye push,
 // like all viz fragment shaders.
 
 layout(location = 0) in vec2 v_uv;
