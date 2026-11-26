@@ -22,9 +22,12 @@
 // (sensor_3dof_warp.frag twin): the layer is tapped directly by output
 // UV (no pose involved: its content is server-rasterized), the runtime
 // D16 sensor is gathered capture->predicted with fixed-point 6DOF
-// refinement when tune.z >= 0.5 (3DOF seed only otherwise). Compare ramp,
-// no-data treatment and linearization match raster_sensor_viz.frag:
-// failed warp pixels read as sensor no-return (opaque black).
+// refinement when tune.z >= 0.5 (3DOF seed only otherwise). The 6DOF seed
+// is min-dilated over a ±4 sensor-texel cross (≈, max-pitch axis);
+// acceptance is convergence-only.
+// Compare ramp, no-data treatment and linearization match
+// raster_sensor_viz.frag: failed warp pixels read as sensor no-return
+// (opaque black).
 //
 // Plain scalar math only (no mat3/ternary on this driver path).
 
@@ -46,8 +49,8 @@ layout(set = 0, binding = 2) uniform warp_params
 	float pad;
 	vec4 trans[2]; // per eye: display-eye origin in capture-eye space
 	vec4 misc[2];  // per eye: x = refine step cap, y = display texel pitch
-	vec4 tune;     // x = accept gate (texels), y = silhouette ratio,
-	               // z = iteration count (0 = 3DOF seed only), w reserved
+	vec4 tune;     // x = accept gate (texels), y = reserved,
+	               // z = refinement enable (0 = 3DOF seed, 2 = iterate), w reserved
 } u;
 
 layout(push_constant) uniform pc
@@ -108,12 +111,91 @@ float warp_depth(int e, float xt, float yt, out bool ok)
 		ok = true;
 		return z;
 	}
-	// 6DOF: iterate in capture space (far clamped so sky pixels
-	// can't produce NaN steps), accept in display space.
-	float zc = min(z, 20.0);
+	// 6DOF: min-dilated seed. Start the walk from the near surface
+	// when the neighborhood straddles an edge: background depths are
+	// translation-insensitive fixed points, so a background seed at a
+	// truth-foreground pixel converges wrong with err ~0 and no
+	// straddle (guards blind by construction). Relocation is
+	// load-bearing (value alone still traps). Arms individually
+	// guarded: the sampler is clamp-to-edge. Ties keep the center.
+	// Iterate in capture space (far clamped so sky pixels can't
+	// produce NaN steps), accept in display space.
+	float arm = u.misc[e].x * 0.5;
+	float bx = xs;
+	float by = ys;
+	float bz = z;
+	{
+		float ax = xs + arm;
+		float au = (ax - st.x) / (st.y - st.x);
+		if (au >= 0.0 && au <= 1.0)
+		{
+			float sa = texture(sensor_tex, vec3(au, 1.0 - sv, float(e))).r;
+			if (sa < 0.9999)
+			{
+				float az = linearize_depth(sa, u.near_far.x, u.near_far.y);
+				if (az < bz)
+				{
+					bx = ax;
+					bz = az;
+				}
+			}
+		}
+	}
+	{
+		float ax = xs - arm;
+		float au = (ax - st.x) / (st.y - st.x);
+		if (au >= 0.0 && au <= 1.0)
+		{
+			float sa = texture(sensor_tex, vec3(au, 1.0 - sv, float(e))).r;
+			if (sa < 0.9999)
+			{
+				float az = linearize_depth(sa, u.near_far.x, u.near_far.y);
+				if (az < bz)
+				{
+					bx = ax;
+					bz = az;
+				}
+			}
+		}
+	}
+	{
+		float ay = ys + arm;
+		float av = (st.z - ay) / (st.z - st.w);
+		if (av >= 0.0 && av <= 1.0)
+		{
+			float sa = texture(sensor_tex, vec3(su, 1.0 - av, float(e))).r;
+			if (sa < 0.9999)
+			{
+				float az = linearize_depth(sa, u.near_far.x, u.near_far.y);
+				if (az < bz)
+				{
+					by = ay;
+					bz = az;
+				}
+			}
+		}
+	}
+	{
+		float ay = ys - arm;
+		float av = (st.z - ay) / (st.z - st.w);
+		if (av >= 0.0 && av <= 1.0)
+		{
+			float sa = texture(sensor_tex, vec3(su, 1.0 - av, float(e))).r;
+			if (sa < 0.9999)
+			{
+				float az = linearize_depth(sa, u.near_far.x, u.near_far.y);
+				if (az < bz)
+				{
+					by = ay;
+					bz = az;
+				}
+			}
+		}
+	}
+	xs = bx;
+	ys = by;
+	float zc = min(bz, 20.0);
 	vec3 Xc = vec3(xs, ys, -1.0) * zc;
-	float zmin = zc;
-	float zmax = zc;
 	float stp = u.misc[e].x;
 	for (int k = 0; k < 2; ++k)
 	{
@@ -132,8 +214,6 @@ float warp_depth(int e, float xt, float yt, out bool ok)
 		if (s >= 0.9999)
 			return 0.0;
 		z = min(linearize_depth(s, u.near_far.x, u.near_far.y), 20.0);
-		zmin = min(zmin, z);
-		zmax = max(zmax, z);
 		Xc = vec3(xs, ys, -1.0) * z;
 	}
 	vec3 Xd = c2d_mul(e, Xc) + u.trans[e].xyz;
@@ -141,8 +221,6 @@ float warp_depth(int e, float xt, float yt, out bool ok)
 		return 0.0;
 	float err = length(vec2(xt - Xd.x / (-Xd.z), yt - Xd.y / (-Xd.z))) / max(u.misc[e].y, 1e-9);
 	if (err > u.tune.x)
-		return 0.0;
-	if (zmax / max(zmin, 1e-6) > u.tune.y)
 		return 0.0;
 	ok = true;
 	return max(-Xd.z, 1e-6);

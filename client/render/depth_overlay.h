@@ -171,7 +171,7 @@ public:
 	// per-eye rotation rows (R = Qc^-1 * Qd) plus frustum tangents.
 	// 6DOF adds the display-eye origin in capture-eye space (trans)
 	// plus per-eye step/pitch scales (misc) and global tuning (tune:
-	// accept-gate texels, silhouette ratio, iteration count, reserved).
+	// accept-gate texels, reserved, refinement enable, reserved).
 	// 256 bytes, 16-aligned.
 	struct sensor_warp_params
 	{
@@ -186,7 +186,7 @@ public:
 		                   // space, qd^-1 * (pc - pd); w unused
 		float misc[2][4];  // [eye]: x = refine step cap (capture-tangent units),
 		                   // y = display texel pitch (tangent units), z/w reserved
-		float tune[4]; // x = accept gate (display texels), y = silhouette ratio,
+		float tune[4]; // x = accept gate (display texels), y = reserved,
 		               // z = refinement enable (0 = 3DOF seed, 2 = iterate), w reserved
 	};
 

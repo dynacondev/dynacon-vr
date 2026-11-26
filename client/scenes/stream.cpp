@@ -3730,13 +3730,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							          std::max((float)depth_ext[eye].width, 1.0f);
 							float dpy = (warp_params.disp_tan[eye][3] - warp_params.disp_tan[eye][2]) /
 							          std::max((float)depth_ext[eye].height, 1.0f);
-							warp_params.misc[eye][0] = 8.0f * sens_pitch;
+							warp_params.misc[eye][0] = 8.0f * sens_pitch; // step cap AND min-seed diameter (shader halves it)
 							warp_params.misc[eye][1] = std::max(dpx, dpy);
 							warp_params.misc[eye][2] = 0;
 							warp_params.misc[eye][3] = 0;
 						}
 						warp_params.tune[0] = 1.5f; // accept gate, display texels
-						warp_params.tune[1] = 1.5f; // silhouette depth ratio
+						warp_params.tune[1] = 0;    // reserved (silhouette ratio retired)
 						warp_params.tune[2] = debug_6dof ? 2.0f : 0.0f;
 						warp_params.tune[3] = 0;
 					}
