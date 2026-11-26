@@ -2404,8 +2404,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				layer_draws.clear();
 				copy_occluder_draws.clear();
 				copy_volume_draws.clear();
-				copy_max_dilate = 0;
-				copy_max_bias = 0;
 				{
 					float lm_x = 2.f / (float)mw;
 					float lm_y = 2.f / (float)mh;
@@ -2480,11 +2478,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							if (bounds and not box_visible(bounds->first, bounds->second, mvp))
 								continue;
 							copy_volume_draws.push_back({oid, mvp});
-							// Config values are floats; round (don't
-							// truncate: 2.9 dilate means 3) then clamp.
-							int d = (int)lroundf(ost.def.dilate_px);
-							copy_max_dilate = std::max(copy_max_dilate, std::min(std::max(d, 0), 8));
-							copy_max_bias = std::max(copy_max_bias, ost.def.depth_bias_m);
 						}
 					}
 				}
@@ -2503,7 +2496,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					auto um_t0 = std::chrono::steady_clock::now();
 					merge_renderer->record_base(rec_cmd, layer_draws, &rec_pool, qmerge + 2);
 					if (depth_volume_active and depth_volumes_visible)
-						merge_renderer->record_copy(rec_cmd, copy_occluder_draws, copy_volume_draws, copy_max_dilate);
+						merge_renderer->record_copy(rec_cmd, copy_occluder_draws, copy_volume_draws, depth_dilate_px);
 					um_base_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t0).count();
 				}
 				// Sensor heightfield for the depth reveal (sync-eye grid,
@@ -2992,7 +2985,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						reveal_params.sensor_view = depth_overlay->heightfield_view();
 						reveal_params.copy_view = merge_renderer->copy_view_array();
-						reveal_params.bias = copy_max_bias;
+						reveal_params.bias = depth_bias_m;
 						if (reveal_params.sensor_view and reveal_params.copy_view)
 							reveal = &reveal_params;
 					}
@@ -3469,7 +3462,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					auto wsensor = depth_overlay->heightfield_view();
 					auto wcopy = merge_renderer->copy_view_array();
 					if (wsensor and wcopy)
-						merge_renderer->record_depth_writeback(rec_cmd, wsensor, wcopy, copy_max_bias);
+						merge_renderer->record_depth_writeback(rec_cmd, wsensor, wcopy, depth_bias_m);
 				}
 				// Merge: MAX-combine every active contributor
 				// (hidden first, then feather groups in map order, then

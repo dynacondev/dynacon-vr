@@ -482,14 +482,6 @@ Each `passthrough` entry has:
   layer and inherit each layer's feathering, while zones fade by
   distance instead (see `transition-distance`) and hidden cutouts are
   hard-edged (composited through the shared merged layer).
-- `dilate-px`: sensor-copy dilate radius in half-res texels
-  (`3d-depth-passthrough` only, default `2`, clamped to `0..8`). MIN-expands
-  known occluders (windows + hidden) so the single sensor compare tolerates
-  ±texel sensor noise; the volume back wall stays exact (rastered after).
-- `depth-bias-m`: sensor-compare depth bias in meters
-  (`3d-depth-passthrough` only, default `0`). Added to the merged copy
-  (windows + hidden + volume back wall) before the `sensor < copy + bias` test.
-  Negative values tighten the test (sensor must beat the copy by more).
 - `transition-distance`: boundary fade width in meters
   (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
   scene cross-fades over ± this distance around the zone surface

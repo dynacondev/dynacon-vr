@@ -1175,6 +1175,16 @@ void scenes::stream::gui_passthrough()
 	if (not vr_depth_test)
 		ImGui::Text("%s", _S("Layer/verdict viz views show stale targets while depth testing is off."));
 
+	ImGui::SeparatorText(_S("Depth passthrough"));
+	int dilate = depth_dilate_px;
+	if (ImGui::SliderInt(_S("Sensor dilate (texels)"), &dilate, 0, 8))
+		depth_dilate_px = std::clamp(dilate, 0, 8);
+	ImGui::Text("%s", _S("Widens known geometry (windows + hidden) over sensor noise; the volume back wall stays exact."));
+	float dbias = depth_bias_m;
+	if (ImGui::SliderFloat(_S("Depth bias (m)"), &dbias, -0.05f, 0.25f, "%.3f"))
+		depth_bias_m = dbias;
+	ImGui::Text("%s", _S("Added to the merged copy before the sensor test; guards z-fighting on coincident geometry."));
+
 	ImGui::SeparatorText(_S("Fiducial marker debugging"));
 	ImGui::Checkbox(_S("Marker debug overlays"), &debug_overlays);
 	ImGui::BeginDisabled(not debug_overlays);

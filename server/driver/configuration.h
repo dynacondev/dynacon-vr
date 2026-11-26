@@ -127,18 +127,6 @@ struct configuration
 		// 3d-passthrough-hidden (warned + ignored). 3d-depth-passthrough
 		// defaults to 12 (tier-1/half) when unconfigured.
 		float feather_px = 24;
-		// Sensor-copy dilate radius in half-res texels (3d-depth-passthrough
-		// only): MIN-expands known occluders (windows + hidden) over FAR so
-		// the single sensor compare tolerates ±texel sensor noise. The
-		// volume back wall itself stays exact (rastered after the dilate).
-		// Default 2, clamped to 0..8. Ignored for other types (warned).
-		float dilate_px = 2;
-		// Sensor-compare depth bias in meters (3d-depth-passthrough only):
-		// added to the merged copy (windows + hidden + volume back wall)
-		// before the `sensor < copy + bias` test, so known geometry coincident
-		// with the sensor doesn't z-fight. Default 0. Ignored for other
-		// types (warned).
-		float depth_bias_m = 0;
 		// Boundary fade width in meters (3d-boundary(-reversed) only):
 		// the scene cross-fades over +/- this distance around the mesh
 		// surface (symmetric smoothstep, 0.5 at the surface). 0 = hard

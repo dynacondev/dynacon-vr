@@ -569,23 +569,6 @@ configuration::configuration()
 					// Depth volumes default to 12px (tier-1/half) when unconfigured.
 					o.feather_px = 12;
 				}
-				if (item.contains("dilate-px"))
-				{
-					if (not is_depth)
-						U_LOG_W("passthrough object \"%s\": dilate-px is only accepted for 3d-depth-passthrough, ignoring", o.id.c_str());
-					else
-					{
-						float d = item["dilate-px"];
-						o.dilate_px = std::clamp(d, 0.f, 8.f);
-					}
-				}
-				if (item.contains("depth-bias-m"))
-				{
-					if (not is_depth)
-						U_LOG_W("passthrough object \"%s\": depth-bias-m is only accepted for 3d-depth-passthrough, ignoring", o.id.c_str());
-					else
-						o.depth_bias_m = item["depth-bias-m"];
-				}
 				if (item.contains("transition-distance"))
 				{
 					if (not is_boundary)

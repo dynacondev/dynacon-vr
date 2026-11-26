@@ -573,8 +573,6 @@ void wivrn_session::send_fiducial_map()
 		        .orientation = entry.orientation,
 		        .scale = entry.scale,
 		        .feather_px = entry.feather_px,
-		        .dilate_px = entry.dilate_px,
-		        .depth_bias_m = entry.depth_bias_m,
 		        .transition_distance_m = entry.transition_distance_m,
 		        .proximity_radius_m = entry.proximity_radius_m,
 		        .hand_proximity_radius_m = entry.hand_proximity_radius_m,
