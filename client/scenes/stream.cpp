@@ -56,6 +56,12 @@
 using namespace wivrn;
 using namespace beman::inplace_vector;
 
+// Locked-in flow lead (device-validated): the depth content is ~20ms
+// newer than its capture timestamp (negative extra time: the UBO
+// displacements point backward along head motion; the shader
+// subtracts them).
+static constexpr double kFlowExtraMs = -20.0;
+
 // clang-format off
 static const std::unordered_map<std::string, device_id> device_ids = {
 	{"/user/hand/left/input/dpad_up/click",       device_id::DPAD_UP_CLICK},
@@ -933,6 +939,21 @@ bool scenes::stream::is_gui_interactable() const
 	return is_interactable(gui_status);
 }
 
+bool scenes::stream::status_rebuild_due(XrTime now)
+{
+	static XrTime built_for_frame = 0; // predictedDisplayTime of the last build
+	static XrTime last_build_time = 0;
+	static debug_viz_mode last_mode = debug_viz_mode::none;
+	if (now == built_for_frame)
+		return true; // same frame already building: suffix sites ride along
+	if (debug_viz == last_mode and now >= last_build_time and now - last_build_time <= 250'000'000LL)
+		return false;
+	last_mode = debug_viz;
+	last_build_time = now;
+	built_for_frame = now;
+	return true;
+}
+
 void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 {
 	const auto & config = application::get_config();
@@ -1688,7 +1709,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				else
 				{
 					spdlog::info("environment depth unsupported on this headset");
-					depth_status = "environment depth unsupported on this headset";
+					if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "environment depth unsupported on this headset"; }
 				}
 			}
 			if (env_depth)
@@ -1818,13 +1839,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 						}
 						else if (debug_pause_sensor and not frozen_depth_valid)
-							depth_status = "waiting for depth data (pause armed, no frozen frame yet)";
+						{
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for depth data (pause armed, no frozen frame yet)"; }
+						}
 						else
-							depth_status = "waiting for depth data";
+						{
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for depth data"; }
+						}
 					}
 				}
 				else
-					depth_status = "depth provider unavailable";
+				{
+					if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "depth provider unavailable"; }
+				}
 			}
 		}
 		else if (env_depth and env_depth->started())
@@ -3639,14 +3666,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					splat_sens_h = (int)env_depth->depth_height();
 					if (splat_sens_w <= 0 or splat_sens_h <= 0)
 						have_splat = false;
-					// Locked-in flow correction (device-validated): the depth
-					// content is ~20ms newer than its capture timestamp, so
-					// shift each texel forward along head motion by a fixed
+					// Locked-in flow correction (device-validated): shift
+					// each texel forward along head motion by a fixed
 					// 20ms of the latest sensor-sample finite-difference
-					// velocity (negative extra time: the UBO displacements
-					// point backward along head motion; the shader
-					// subtracts them). Always applied.
-					constexpr double kFlowExtraMs = -20.0;
+					// velocity. Always applied.
 					double flow_extra_s = kFlowExtraMs * 1e-3;
 					std::array<glm::vec3, view_count> flow_vel_w{};
 					std::array<glm::vec3, view_count> flow_om_w{};
@@ -3668,7 +3691,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
 								glm::quat q_old(oldest.pose[eye].orientation.w, oldest.pose[eye].orientation.x,
 								                oldest.pose[eye].orientation.y, oldest.pose[eye].orientation.z);
-								glm::quat dq = glm::normalize(q_new * glm::inverse(glm::normalize(q_old)));
+								// Runtime quats are unit: one normalize of the
+								// delta suffices.
+								glm::quat dq = glm::normalize(q_new * glm::inverse(q_old));
 								if (dq.w < 0.f)
 									dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
 								float cos_half = std::clamp(dq.w, -1.f, 1.f);
@@ -3679,6 +3704,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 						}
 					}
+					// Frustum tangents are static per frustum (sensor: per
+					// provider; display: per mask fov), so cache the
+					// tanf results keyed on the fov values. Render
+					// thread only (function statics, precedent below).
+					static std::array<XrFovf, view_count> last_sens_fov{};
+					static std::array<std::array<float, 4>, view_count> sens_tan_cache{};
+					static std::array<XrFovf, view_count> last_disp_fov{};
+					static std::array<std::array<float, 4>, view_count> disp_tan_cache{};
+					auto fov_changed = [](const XrFovf & a, const XrFovf & b) {
+						return a.angleLeft != b.angleLeft or a.angleRight != b.angleRight or
+						       a.angleUp != b.angleUp or a.angleDown != b.angleDown;
+					};
 					for (uint32_t eye = 0; eye < view_count; ++eye)
 					{
 						const XrPosef & from = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
@@ -3723,21 +3760,30 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						splat_params.trans[eye][2] = t.z;
 						splat_params.trans[eye][3] = 0;
 						const XrFovf & sf = shared_depth.fov[eye];
-						splat_params.sens_tan[eye][0] = tanf(sf.angleLeft);
-						splat_params.sens_tan[eye][1] = tanf(sf.angleRight);
-						splat_params.sens_tan[eye][2] = tanf(sf.angleUp);
-						splat_params.sens_tan[eye][3] = tanf(sf.angleDown);
+						if (fov_changed(sf, last_sens_fov[eye]))
+						{
+							sens_tan_cache[eye] = {tanf(sf.angleLeft), tanf(sf.angleRight),
+							                       tanf(sf.angleUp), tanf(sf.angleDown)};
+							last_sens_fov[eye] = sf;
+						}
 						const XrFovf & df = mask_fov[eye];
-						splat_params.disp_tan[eye][0] = tanf(df.angleLeft);
-						splat_params.disp_tan[eye][1] = tanf(df.angleRight);
-						splat_params.disp_tan[eye][2] = tanf(df.angleUp);
-						splat_params.disp_tan[eye][3] = tanf(df.angleDown);
+						if (fov_changed(df, last_disp_fov[eye]))
+						{
+							disp_tan_cache[eye] = {tanf(df.angleLeft), tanf(df.angleRight),
+							                       tanf(df.angleUp), tanf(df.angleDown)};
+							last_disp_fov[eye] = df;
+						}
+						for (int k = 0; k < 4; ++k)
+						{
+							splat_params.sens_tan[eye][k] = sens_tan_cache[eye][k];
+							splat_params.disp_tan[eye][k] = disp_tan_cache[eye][k];
+						}
 					}
 					if (have_splat)
 					{
-					splat_params.near_z = shared_depth.near_z;
-					splat_params.far_z = shared_depth.far_z;
-					splat_params.opacity = debug_depth_opacity;
+						splat_params.near_z = shared_depth.near_z;
+						splat_params.far_z = shared_depth.far_z;
+						splat_params.opacity = debug_depth_opacity;
 					}
 				}
 				switch (debug_viz)
@@ -3759,17 +3805,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
 							                      env_depth->depth_view(shared_depth.swapchain_index), params);
 						viz_content_recorded = true;
-						// Capture age forensics: which timebase this frame
+						// Capture age readout: which timebase this frame
 						// rode (v1 runtimes report no timestamp: gated).
 						if (shared_depth.capture_time != 0)
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms",
+						{
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms",
 							                           env_depth->depth_width(), env_depth->depth_height(),
 							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
-							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6);
+							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6); }
+						}
 						else
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
+						{
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
 							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z); }
+						}
 						break;
 					}
 					case debug_viz_mode::vr_depth:
@@ -3780,13 +3830,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						{
 							depth_overlay->record_virt(command_buffer, (size_t)depth_image, depth_ext,
 							                           dh->image_view, samp, dh->ycbcr, params);
-							depth_status = fmt::format("VR depth live {}x{}", dh->extent.width, dh->extent.height);
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = fmt::format("VR depth live {}x{}", dh->extent.width, dh->extent.height); }
 						}
 						else
 						{
 							depth_overlay->record_virt(command_buffer, (size_t)depth_image, depth_ext,
 							                           vk::ImageView{}, vk::Sampler{}, wivrn::decoder::ycbcr_definition{}, params);
-							depth_status = "waiting for VR depth stream";
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for VR depth stream"; }
 						}
 						break;
 					}
@@ -3797,13 +3847,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							depth_overlay->record_layer(command_buffer, (size_t)depth_image, depth_ext,
 							                            merge_renderer->layer_image(), merge_renderer->layer_view_array(), params);
 							auto le = merge_renderer->debug_layer_extent();
-							depth_status = fmt::format("composited layer live {}x{}", le.width, le.height);
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = fmt::format("composited layer live {}x{}", le.width, le.height); }
 						}
 						else
 						{
 							depth_overlay->record_layer(command_buffer, (size_t)depth_image, depth_ext,
 							                            vk::Image{}, vk::ImageView{}, params);
-							depth_status = "waiting for merge (no windows placed or merge sat out)";
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for merge (no windows placed or merge sat out)"; }
 						}
 						break;
 					}
@@ -3819,16 +3869,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							                              merge_renderer->verdict_image(), merge_renderer->verdict_view_array(),
 							                              merge_renderer->layer_image(), merge_renderer->layer_view_array(), params);
 							auto le = merge_renderer->debug_layer_extent();
-							depth_status = fmt::format("verdict live {}x{}", le.width, le.height);
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = fmt::format("verdict live {}x{}", le.width, le.height); }
 						}
 						else
 						{
 							depth_overlay->record_verdict(command_buffer, (size_t)depth_image, depth_ext,
 							                              vk::Image{}, vk::ImageView{}, vk::Image{}, vk::ImageView{}, params);
 							if (merge_renderer and merge_this_frame)
-								depth_status = "verdict unavailable (VR depth testing off or depth unpaired)";
+							{
+								if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "verdict unavailable (VR depth testing off or depth unpaired)"; }
+							}
 							else
-								depth_status = "waiting for merge (no windows placed or merge sat out)";
+							{
+								if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for merge (no windows placed or merge sat out)"; }
+							}
 						}
 						break;
 					}
@@ -3858,16 +3912,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								                                    env_depth->depth_view(shared_depth.swapchain_index), params);
 							viz_content_recorded = true;
 							auto le = merge_renderer->debug_layer_extent();
-							depth_status = fmt::format("raster vs sensor live {}x{} sensor {}x{} near {:.2f}m far {:.2f}m",
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = fmt::format("raster vs sensor live {}x{} sensor {}x{} near {:.2f}m far {:.2f}m",
 							                           le.width, le.height,
 							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z); }
 						}
 						else
 						{
 							depth_overlay->record_raster_sensor(command_buffer, (size_t)depth_image, depth_ext,
 							                                    vk::Image{}, vk::ImageView{}, vk::ImageView{}, params);
-							depth_status = "waiting for merge (no windows placed or merge sat out)";
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for merge (no windows placed or merge sat out)"; }
 						}
 						break;
 					}
@@ -3887,18 +3941,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							if (have_layer)
 							{
 								auto le = merge_renderer->debug_layer_extent();
-								depth_status = fmt::format("VR+raster live {}x{} layer {}x{}", dh->extent.width, dh->extent.height,
-								                           le.width, le.height);
+								if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = fmt::format("VR+raster live {}x{} layer {}x{}", dh->extent.width, dh->extent.height,
+								                           le.width, le.height); }
 							}
 							else
-								depth_status = fmt::format("VR depth live {}x{} (no raster: merge sat out)", dh->extent.width, dh->extent.height);
+							{
+								if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = fmt::format("VR depth live {}x{} (no raster: merge sat out)", dh->extent.width, dh->extent.height); }
+							}
 						}
 						else
 						{
 							depth_overlay->record_vr_raster(command_buffer, (size_t)depth_image, depth_ext,
 							                               vk::ImageView{}, vk::Sampler{}, wivrn::decoder::ycbcr_definition{},
 							                               vk::Image{}, vk::ImageView{}, params);
-							depth_status = "waiting for VR depth stream";
+							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for VR depth stream"; }
 						}
 						break;
 					}
@@ -3907,50 +3963,31 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// while predicted time advances, so the age grows as the
 				// head moves — the reprojection inspection signal.
 				if (depth_frozen and (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
-					depth_status += " [PAUSED]";
+				{
+					if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status += " [PAUSED]"; }
+				}
 				// A/B tag: which warp produced this frame's content (only
 				// when content was recorded: waiting/busy frames stay clean).
 				if (viz_content_recorded and
 				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
 				{
 					if (used_custom_splat)
-						depth_status += " [splat]";
+					{
+						if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status += " [splat]"; }
+					}
 					else
-						depth_status += " [runtime]";
+					{
+						if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status += " [runtime]"; }
+					}
 				}
 			}
 			else if (depth_frozen and (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
-				depth_status = "overlay swapchain busy, skipped frame [PAUSED]";
-			else
-				depth_status = "overlay swapchain busy, skipped frame";
-			// Human readout throttle: the strings above rebuild at frame
-			// rate (a fmt::format heap churn per frame); publish at most
-			// every 250ms, immediately on mode change. The frozen-age
-			// readout still advances, in quarter-second steps.
 			{
-				static std::string published;
-				static XrTime last_publish = 0;
-				static debug_viz_mode last_published_mode = debug_viz_mode::none;
-				if (debug_viz != last_published_mode)
-				{
-					// Mode change always republishes (even when the
-					// string is unchanged, so the gate below can't go
-					// stale and fire early on the next change).
-					last_published_mode = debug_viz;
-					if (depth_status != published)
-					{
-						published = depth_status;
-						last_publish = frame_state.predictedDisplayTime;
-					}
-				}
-				else if (depth_status != published and
-				         (frame_state.predictedDisplayTime < last_publish or
-				          frame_state.predictedDisplayTime - last_publish > 250'000'000LL))
-				{
-					published = depth_status;
-					last_publish = frame_state.predictedDisplayTime;
-				}
-				depth_status = published;
+				if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "overlay swapchain busy, skipped frame [PAUSED]"; }
+			}
+			else
+			{
+				if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "overlay swapchain busy, skipped frame"; }
 			}
 		}
 

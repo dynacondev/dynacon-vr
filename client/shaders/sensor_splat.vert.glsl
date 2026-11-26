@@ -151,6 +151,8 @@ void main()
 	float du = (Xd0.x / (-Xd0.z) - dt.x) / (dt.y - dt.x);
 	float dv = (dt.z - Xd0.y / (-Xd0.z)) / (dt.z - dt.w);
 	float near = u.near_far.x;
+	// Projection depth range (ordering only for the D16 depth test;
+	// content clamps to 20m at emission above, well inside this).
 	float far = 50.0;
 	gl_Position = vec4((2.0 * du - 1.0) * d, (2.0 * dv - 1.0) * d, far * (d - near) / (far - near), d);
 }

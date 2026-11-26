@@ -260,7 +260,7 @@ private:
 	// opaque black at opacity when have_data is false and no draw).
 	void draw_viz_eyes(vk::raii::CommandBuffer & cmd, vk::PipelineLayout layout, vk::Pipeline pipeline,
 	                   vk::DescriptorSet set, const std::array<vk::Extent2D, 2> & extents, size_t image_index,
-	                   float near_z, float far_z, float opacity, bool have_data);
+	                   const viz_params & params, bool have_data);
 	// Fullscreen-triangle pass-2 pipeline against an explicit layout
 	// (base 1-image, two-image, or converted immutable): shared vertex
 	// input/assembly/viewport/raster/multisample/blend/dynamic state,
@@ -339,6 +339,13 @@ private:
 	void splat_pass1(vk::raii::CommandBuffer & cmd,
 	                 vk::ImageView depth_view,
 	                 int sens_w, int sens_h);
+	// Pass-1 shared by both splat records: upload warp params, splat
+	// the sensor mesh into the transient R16F image, then order the
+	// write before the same-CB pass-2 tap.
+	void splat_pass1_and_barrier(vk::raii::CommandBuffer & cmd,
+	                             vk::ImageView sensor_view,
+	                             const splat_warp_params & params,
+	                             int sens_w, int sens_h);
 	void ensure_splat_targets();
 	// VR+raster converted state (decoder SBS sampler2D immutable + R16F
 	// layer + plain sampling): built on demand for converted views only.
@@ -352,7 +359,14 @@ private:
 	// ensure_vr_raster_layout).
 	vk::Sampler vr_raster_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition vr_raster_ycbcr_built{};
-	void create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
+	// Converted YCbCr state builder shared by the VR-depth (1-image)
+	// and VR+raster (2-image) converted paths; with_layer selects the
+	// member family. waitIdle'd caller only. def by value: retire
+	// resets the tracked member the tail-call aliases pass by ref.
+	void create_converted_state(wivrn::decoder::ycbcr_definition def, vk::Sampler generation_sampler, bool with_layer);
+	// Tear down one converted family (dependency order); also resets
+	// its built-definition/immutable-sampler tracking.
+	void retire_converted_state(bool with_layer);
 	void ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
 	vk::raii::DescriptorSetLayout vr_raster_layout{nullptr};
 	vk::raii::DescriptorPool vr_raster_pool{nullptr};
@@ -371,7 +385,6 @@ private:
 	// ensure_virt_layout).
 	vk::Sampler virt_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition virt_ycbcr_built{};
-	void create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
 	void ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
 	vk::raii::DescriptorSetLayout virt_layout{nullptr};
 	vk::raii::DescriptorPool virt_pool{nullptr};

@@ -911,6 +911,12 @@ private:
 	};
 	std::deque<flow_sample> flow_samp_history{}; // oldest front; cap 2 (newest pair only)
 	std::string depth_status;         // UI status line, refreshed per frame
+	// Status rebuild gate: the human readout strings are rebuilt at
+	// most every 250ms (a fmt::format heap churn per frame otherwise),
+	// immediately on viz-mode change. Suffix sites in the same frame
+	// chain through (first call per frame stamps, later calls ride).
+	// Render thread only.
+	bool status_rebuild_due(XrTime now);
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe
 	// optimistic so the canvas exists when the probe lands; runtimes

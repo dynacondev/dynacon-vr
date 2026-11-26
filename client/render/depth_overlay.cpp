@@ -760,9 +760,9 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 	// rebuild them against the new one (plain views need nothing — the
 	// shared pipelines above are fresh). waitIdle'd by the caller.
 	if (*virt_layout)
-		create_virt_state(virt_ycbcr_built, virt_immutable_src);
+		create_converted_state(virt_ycbcr_built, virt_immutable_src, false);
 	if (*vr_raster_layout)
-		create_vr_raster_state(vr_raster_ycbcr_built, vr_raster_immutable_src);
+		create_converted_state(vr_raster_ycbcr_built, vr_raster_immutable_src, true);
 }
 
 void depth_overlay_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_index,
@@ -794,12 +794,12 @@ void depth_overlay_renderer::record(vk::raii::CommandBuffer & cmd, size_t image_
 
 	// Fresh CLEAR images every frame: no barrier, no layout history.
 	draw_viz_eyes(cmd, *pipeline_layout, *pipeline, *descriptor_set, extents, image_index,
-	              params.near_z, params.far_z, params.opacity, true);
+	              params, true);
 }
 
 void depth_overlay_renderer::draw_viz_eyes(vk::raii::CommandBuffer & cmd, vk::PipelineLayout layout, vk::Pipeline pipeline,
                                            vk::DescriptorSet set, const std::array<vk::Extent2D, 2> & extents, size_t image_index,
-                                           float near_z, float far_z, float opacity, bool have_data)
+                                           const viz_params & params, bool have_data)
 {
 	if (image_index >= targets.size())
 		return;
@@ -813,7 +813,7 @@ void depth_overlay_renderer::draw_viz_eyes(vk::raii::CommandBuffer & cmd, vk::Pi
 		auto & tgt = targets[image_index][eye];
 		if (have_data)
 			cmd.pushConstants<viz_push>(layout, vk::ShaderStageFlagBits::eFragment, 0,
-			                            viz_push{(int32_t)eye, near_z, far_z, opacity});
+			                            viz_push{(int32_t)eye, params.near_z, params.far_z, params.opacity});
 		cmd.setViewport(0, vk::Viewport{
 		                        .x = 0,
 		                        .y = 0,
@@ -826,7 +826,7 @@ void depth_overlay_renderer::draw_viz_eyes(vk::raii::CommandBuffer & cmd, vk::Pi
 		vk::ClearValue clear{};
 		clear.color.float32.fill(0);
 		if (not have_data)
-			clear = black_clear(opacity);
+			clear = black_clear(params.opacity);
 		vk::RenderPassBeginInfo begin_info{
 		        .renderPass = *renderpass,
 		        .framebuffer = *tgt.framebuffer,
@@ -842,40 +842,64 @@ void depth_overlay_renderer::draw_viz_eyes(vk::raii::CommandBuffer & cmd, vk::Pi
 }
 
 
-void depth_overlay_renderer::create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
+void depth_overlay_renderer::retire_converted_state(bool with_layer)
 {
-	// Converted views only (plain views use virt_plain_pipeline on the
-	// shared 1-image layout). Full teardown in dependency order: sets
-	// reference pool + set layout, pipeline references pipeline layout,
-	// pipeline layout references the set layout. Caller guarantees no
-	// in-flight readers (a waitIdle'd rebuild).
-	virt_set.clear();
-	virt_pipeline.clear();
-	virt_pipeline_layout.clear();
-	virt_layout.clear();
+	// Teardown in dependency order: sets reference pool + set layout,
+	// pipelines reference the pipeline layout. Pool destruction follows
+	// the set (an abandoned set would strand it).
+	auto & set = with_layer ? vr_raster_set : virt_set;
+	auto & pipeline = with_layer ? vr_raster_pipeline : virt_pipeline;
+	auto & pipeline_layout = with_layer ? vr_raster_pipeline_layout : virt_pipeline_layout;
+	auto & layout = with_layer ? vr_raster_layout : virt_layout;
+	auto & pool = with_layer ? vr_raster_pool : virt_pool;
+	auto & built = with_layer ? vr_raster_ycbcr_built : virt_ycbcr_built;
+	auto & immutable_src = with_layer ? vr_raster_immutable_src : virt_immutable_src;
+	set.clear();
+	pipeline.clear();
+	pipeline_layout.clear();
+	layout.clear();
+	pool.clear();
+	built = wivrn::decoder::ycbcr_definition{};
+	immutable_src = vk::Sampler{};
+}
+
+void depth_overlay_renderer::create_converted_state(wivrn::decoder::ycbcr_definition def, vk::Sampler generation_sampler, bool with_layer)
+{
+	// Converted views only (plain views use the shared pipelines on the
+	// shared layouts). Caller guarantees no in-flight readers (a
+	// waitIdle'd rebuild).
+	retire_converted_state(with_layer);
 	// Bake the handle's generation sampler as immutable (a separately
 	// built conversion proved unidentifiable to validation despite
 	// matching parameters, so the layout shares the handle's object
-	// instead of owning one).
-	virt_immutable_src = generation_sampler;
-	vk::Sampler immutable = virt_immutable_src;
-	vk::DescriptorSetLayoutBinding bindings[1] = {
+	// instead of owning one). The second (layer) binding stays mutable
+	// (plain R16F array view).
+	auto & immutable_src = with_layer ? vr_raster_immutable_src : virt_immutable_src;
+	immutable_src = generation_sampler;
+	vk::Sampler immutable = immutable_src;
+	vk::DescriptorSetLayoutBinding bindings[2] = {
 	        {
 	                .binding = 0,
 	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 	                .descriptorCount = 1,
 	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-	                // Converted-only entry (plain views early-out in
-	                // ensure_virt_layout, so the ternary is gone).
 	                .pImmutableSamplers = &immutable,
 	        },
+	        {
+	                .binding = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
+	        },
 	};
-	virt_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
-	                                                                   .bindingCount = 1,
+	const uint32_t binding_count = with_layer ? 2 : 1;
+	auto & layout = with_layer ? vr_raster_layout : virt_layout;
+	layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
+	                                                                   .bindingCount = binding_count,
 	                                                                   .pBindings = bindings,
 	                                                           });
 	vk::DescriptorPoolSize pool_sizes[1] = {
-	        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1},
+	        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = binding_count},
 	};
 	vk::DescriptorPoolCreateInfo pool_info{
 	        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
@@ -883,30 +907,35 @@ void depth_overlay_renderer::create_virt_state(const wivrn::decoder::ycbcr_defin
 	        .poolSizeCount = 1,
 	        .pPoolSizes = pool_sizes,
 	};
-	virt_pool = vk::raii::DescriptorPool(*device, pool_info);
+	auto & pool = with_layer ? vr_raster_pool : virt_pool;
+	pool = vk::raii::DescriptorPool(*device, pool_info);
+	auto & set = with_layer ? vr_raster_set : virt_set;
 	vk::DescriptorSetAllocateInfo set_alloc{
-	        .descriptorPool = *virt_pool,
+	        .descriptorPool = *pool,
 	        .descriptorSetCount = 1,
-	        .pSetLayouts = &*virt_layout,
+	        .pSetLayouts = &*layout,
 	};
 	auto sets = vk::raii::DescriptorSets(*device, set_alloc);
-	virt_set = std::move(sets.front());
+	set = std::move(sets.front());
 	// Pipeline bakes the set layout: rebuilt alongside it, never apart.
 	// Reuses the 16 B viz_push range.
-	vk::PushConstantRange virt_push{
+	vk::PushConstantRange push{
 	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
 	        .offset = 0,
 	        .size = sizeof(viz_push),
 	};
-	vk::PipelineLayoutCreateInfo virt_layout_info{
+	vk::PipelineLayoutCreateInfo layout_info{
 	        .setLayoutCount = 1,
-	        .pSetLayouts = &*virt_layout,
+	        .pSetLayouts = &*layout,
 	        .pushConstantRangeCount = 1,
-	        .pPushConstantRanges = &virt_push,
+	        .pPushConstantRanges = &push,
 	};
-	virt_pipeline_layout = vk::raii::PipelineLayout(*device, virt_layout_info);
-	virt_pipeline = make_pass2_pipeline("vr_depth_viz.frag", *virt_pipeline_layout);
-	virt_ycbcr_built = def;
+	auto & pipeline_layout = with_layer ? vr_raster_pipeline_layout : virt_pipeline_layout;
+	pipeline_layout = vk::raii::PipelineLayout(*device, layout_info);
+	auto & pipeline = with_layer ? vr_raster_pipeline : virt_pipeline;
+	pipeline = make_pass2_pipeline(with_layer ? "vr_raster_viz.frag" : "vr_depth_viz.frag", *pipeline_layout);
+	auto & built = with_layer ? vr_raster_ycbcr_built : virt_ycbcr_built;
+	built = def;
 }
 
 void depth_overlay_renderer::ensure_virt_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
@@ -918,13 +947,7 @@ void depth_overlay_renderer::ensure_virt_layout(const wivrn::decoder::ycbcr_defi
 		if (*virt_layout)
 		{
 			device->waitIdle();
-			virt_set.clear();
-			virt_pipeline.clear();
-			virt_pipeline_layout.clear();
-			virt_layout.clear();
-			virt_pool.clear();
-			virt_ycbcr_built = wivrn::decoder::ycbcr_definition{};
-			virt_immutable_src = vk::Sampler{};
+			retire_converted_state(false);
 		}
 		return;
 	}
@@ -936,83 +959,8 @@ void depth_overlay_renderer::ensure_virt_layout(const wivrn::decoder::ycbcr_defi
 	// Depth format change (rare: renegotiation only): retire prior
 	// submissions before rebuilding what they may still read.
 	device->waitIdle();
-	create_virt_state(def, generation_sampler);
+	create_converted_state(def, generation_sampler, false);
 	spdlog::info("Depth overlay virt layout rebuilt (YCbCr immutable, handle-generation sampler)");
-}
-
-
-void depth_overlay_renderer::create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
-{
-	// Converted views only (plain views use vr_raster_plain_pipeline on
-	// the shared two-image layout). Full teardown in dependency order:
-	// sets reference pool + set layout, pipeline references pipeline
-	// layout, pipeline layout references the set layout. Caller
-	// guarantees no in-flight readers (a waitIdle'd rebuild).
-	vr_raster_set.clear();
-	vr_raster_pipeline.clear();
-	vr_raster_pipeline_layout.clear();
-	vr_raster_layout.clear();
-	// Bake the handle's generation sampler as the immutable sampler
-	// for the SBS binding (a separately built conversion proved
-	// unidentifiable to validation despite matching parameters, so the
-	// layout shares the handle's object instead of owning one). The
-	// layer binding stays mutable (plain R16F array view).
-	vr_raster_immutable_src = generation_sampler;
-	vk::Sampler immutable = vr_raster_immutable_src;
-	vk::DescriptorSetLayoutBinding bindings[2] = {
-	        {
-	                .binding = 0,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = 1,
-	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-	                // Converted-only entry (plain views early-out in
-	                // ensure_vr_raster_layout, so the ternary is gone).
-	                .pImmutableSamplers = &immutable,
-	        },
-	        {
-	                .binding = 1,
-	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-	                .descriptorCount = 1,
-	                .stageFlags = vk::ShaderStageFlagBits::eFragment,
-	        },
-	};
-	vr_raster_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
-	                                                                          .bindingCount = 2,
-	                                                                          .pBindings = bindings,
-	                                                                  });
-	vk::DescriptorPoolSize pool_sizes[1] = {
-	        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 2},
-	};
-	vk::DescriptorPoolCreateInfo pool_info{
-	        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-	        .maxSets = 1,
-	        .poolSizeCount = 1,
-	        .pPoolSizes = pool_sizes,
-	};
-	vr_raster_pool = vk::raii::DescriptorPool(*device, pool_info);
-	vk::DescriptorSetAllocateInfo set_alloc{
-	        .descriptorPool = *vr_raster_pool,
-	        .descriptorSetCount = 1,
-	        .pSetLayouts = &*vr_raster_layout,
-	};
-	auto sets = vk::raii::DescriptorSets(*device, set_alloc);
-	vr_raster_set = std::move(sets.front());
-	// Pipeline bakes the set layout: rebuilt alongside it, never apart.
-	// Reuses the 16 B viz_push range.
-	vk::PushConstantRange vr_push{
-	        .stageFlags = vk::ShaderStageFlagBits::eFragment,
-	        .offset = 0,
-	        .size = sizeof(viz_push),
-	};
-	vk::PipelineLayoutCreateInfo vr_layout_info{
-	        .setLayoutCount = 1,
-	        .pSetLayouts = &*vr_raster_layout,
-	        .pushConstantRangeCount = 1,
-	        .pPushConstantRanges = &vr_push,
-	};
-	vr_raster_pipeline_layout = vk::raii::PipelineLayout(*device, vr_layout_info);
-	vr_raster_pipeline = make_pass2_pipeline("vr_raster_viz.frag", *vr_raster_pipeline_layout);
-	vr_raster_ycbcr_built = def;
 }
 
 void depth_overlay_renderer::ensure_vr_raster_layout(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
@@ -1025,13 +973,7 @@ void depth_overlay_renderer::ensure_vr_raster_layout(const wivrn::decoder::ycbcr
 		if (*vr_raster_layout)
 		{
 			device->waitIdle();
-			vr_raster_set.clear();
-			vr_raster_pipeline.clear();
-			vr_raster_pipeline_layout.clear();
-			vr_raster_layout.clear();
-			vr_raster_pool.clear();
-			vr_raster_ycbcr_built = wivrn::decoder::ycbcr_definition{};
-			vr_raster_immutable_src = vk::Sampler{};
+			retire_converted_state(true);
 		}
 		return;
 	}
@@ -1043,9 +985,10 @@ void depth_overlay_renderer::ensure_vr_raster_layout(const wivrn::decoder::ycbcr
 	// Depth format change (rare: renegotiation only): retire prior
 	// submissions before rebuilding what they may still read.
 	device->waitIdle();
-	create_vr_raster_state(def, generation_sampler);
+	create_converted_state(def, generation_sampler, true);
 	spdlog::info("Depth overlay VR+raster layout rebuilt (YCbCr immutable, handle-generation sampler)");
 }
+
 
 void depth_overlay_renderer::upload_splat_params(const splat_warp_params & params)
 {
@@ -1188,6 +1131,16 @@ void depth_overlay_renderer::ensure_splat_index(int sens_w, int sens_h)
 	spdlog::info("Depth splat index: {}x{} ({} tris)", sens_w, sens_h, quads_w * quads_h * 2);
 }
 
+void depth_overlay_renderer::splat_pass1_and_barrier(vk::raii::CommandBuffer & cmd,
+                                                         vk::ImageView sensor_view,
+                                                         const splat_warp_params & params,
+                                                         int sens_w, int sens_h)
+{
+	upload_splat_params(params);
+	splat_pass1(cmd, sensor_view, sens_w, sens_h);
+	splat_read_barrier(cmd, vk::Image(splat_image));
+}
+
 void depth_overlay_renderer::record_sensor_splat(vk::raii::CommandBuffer & cmd, size_t image_index,
                                                  const std::array<vk::Extent2D, 2> & extents,
                                                  vk::ImageView depth_view,
@@ -1197,9 +1150,7 @@ void depth_overlay_renderer::record_sensor_splat(vk::raii::CommandBuffer & cmd, 
 	if (image_index >= targets.size() or sens_w <= 0 or sens_h <= 0)
 		return;
 
-	upload_splat_params(params);
-	splat_pass1(cmd, depth_view, sens_w, sens_h);
-	splat_read_barrier(cmd, vk::Image(splat_image));
+	splat_pass1_and_barrier(cmd, depth_view, params, sens_w, sens_h);
 
 	// Pass 2: false-color the splatted depth (base 1-image set, splat
 	// transient sampled in place of the sensor view).
@@ -1222,7 +1173,7 @@ void depth_overlay_renderer::record_sensor_splat(vk::raii::CommandBuffer & cmd, 
 
 	// Fresh CLEAR images every frame: no barrier, no layout history.
 	draw_viz_eyes(cmd, *pipeline_layout, *splat_colorize_pipeline, *descriptor_set, extents, image_index,
-	              params.near_z, params.far_z, params.opacity, true);
+	              viz_params{params.near_z, params.far_z, params.opacity}, true);
 }
 
 
@@ -1265,7 +1216,7 @@ void depth_overlay_renderer::record_layer(vk::raii::CommandBuffer & cmd, size_t 
 	}
 
 	draw_viz_eyes(cmd, *pipeline_layout, *layer_pipeline, *descriptor_set, extents, image_index,
-	              params.near_z, params.far_z, params.opacity, have_data);
+	              params, have_data);
 }
 
 
@@ -1323,7 +1274,7 @@ void depth_overlay_renderer::record_verdict(vk::raii::CommandBuffer & cmd, size_
 	}
 
 	draw_viz_eyes(cmd, *twoimg_pipeline_layout, *verdict_pipeline, *twoimg_set, extents, image_index,
-	              params.near_z, params.far_z, params.opacity, have_data);
+	              params, have_data);
 }
 
 
@@ -1381,7 +1332,7 @@ void depth_overlay_renderer::record_raster_sensor(vk::raii::CommandBuffer & cmd,
 	}
 
 	draw_viz_eyes(cmd, *twoimg_pipeline_layout, *raster_sensor_pipeline, *twoimg_set, extents, image_index,
-	              params.near_z, params.far_z, params.opacity, have_data);
+	              params, have_data);
 }
 
 
@@ -1395,12 +1346,7 @@ void depth_overlay_renderer::record_raster_splat(vk::raii::CommandBuffer & cmd, 
 	if (image_index >= targets.size() or sens_w <= 0 or sens_h <= 0)
 		return;
 
-	upload_splat_params(params);
-	splat_pass1(cmd, sensor_view, sens_w, sens_h);
-
-	// Order the transient R16F write before the pass-2 compare (same
-	// command buffer).
-	splat_read_barrier(cmd, vk::Image(splat_image));
+	splat_pass1_and_barrier(cmd, sensor_view, params, sens_w, sens_h);
 	{
 		// Pack valid images front for the cross-CB read barrier. The
 		// sensor view rides no barrier (the runtime hands the acquired
@@ -1446,7 +1392,7 @@ void depth_overlay_renderer::record_raster_splat(vk::raii::CommandBuffer & cmd, 
 	}
 
 	draw_viz_eyes(cmd, *twoimg_pipeline_layout, *splat_compare_pipeline, *twoimg_set, extents, image_index,
-	              params.near_z, params.far_z, params.opacity, have_data);
+	              viz_params{params.near_z, params.far_z, params.opacity}, have_data);
 }
 
 
@@ -1489,15 +1435,15 @@ void depth_overlay_renderer::record_virt(vk::raii::CommandBuffer & cmd, size_t i
 		device->updateDescriptorSets(writes, nullptr);
 		if (ycbcr.has_conversion)
 			draw_viz_eyes(cmd, *virt_pipeline_layout, *virt_pipeline, *virt_set, extents, image_index,
-			              params.near_z, params.far_z, params.opacity, true);
+			              params, true);
 		else
 			draw_viz_eyes(cmd, *pipeline_layout, *virt_plain_pipeline, *descriptor_set, extents, image_index,
-			              params.near_z, params.far_z, params.opacity, true);
+			              params, true);
 		return;
 	}
 
 	draw_viz_eyes(cmd, *pipeline_layout, *virt_plain_pipeline, *descriptor_set, extents, image_index,
-	              params.near_z, params.far_z, params.opacity, false);
+	              params, false);
 }
 
 
@@ -1576,13 +1522,13 @@ void depth_overlay_renderer::record_vr_raster(vk::raii::CommandBuffer & cmd, siz
 		device->updateDescriptorSets(writes, nullptr);
 		if (ycbcr.has_conversion)
 			draw_viz_eyes(cmd, *vr_raster_pipeline_layout, *vr_raster_pipeline, *vr_raster_set, extents, image_index,
-			              params.near_z, params.far_z, params.opacity, true);
+			              params, true);
 		else
 			draw_viz_eyes(cmd, *twoimg_pipeline_layout, *vr_raster_plain_pipeline, *twoimg_set, extents, image_index,
-			              params.near_z, params.far_z, params.opacity, true);
+			              params, true);
 		return;
 	}
 
 	draw_viz_eyes(cmd, *twoimg_pipeline_layout, *vr_raster_plain_pipeline, *twoimg_set, extents, image_index,
-	              params.near_z, params.far_z, params.opacity, false);
+	              params, false);
 }

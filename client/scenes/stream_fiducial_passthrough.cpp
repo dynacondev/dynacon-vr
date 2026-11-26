@@ -1199,40 +1199,31 @@ void scenes::stream::gui_passthrough()
 	{
 		int viz = (int)debug_viz;
 		bool viz_changed = false;
-		if (ImGui::RadioButton(_S("None"), viz == (int)debug_viz_mode::none) and viz != (int)debug_viz_mode::none)
+		// Untranslated keys (translated at use): storing gettext_noop
+		// literals keeps them visible to xgettext (tools/update_messages.sh
+		// extracts _S:1/gettext_noop:1 literals; _S(variable) would not
+		// be extracted). _S returns a pointer into a temporary, so it
+		// cannot back a static table — it is called at use below.
+		static const struct viz_mode_entry
 		{
-			viz = (int)debug_viz_mode::none;
-			viz_changed = true;
-		}
-		if (ImGui::RadioButton(_S("Depth Sensor"), viz == (int)debug_viz_mode::sensor) and viz != (int)debug_viz_mode::sensor)
+			debug_viz_mode mode;
+			const char * label;
+		} viz_modes[] = {
+		        {debug_viz_mode::none, gettext_noop("None")},
+		        {debug_viz_mode::sensor, gettext_noop("Depth Sensor")},
+		        {debug_viz_mode::vr_depth, gettext_noop("VR Depth")},
+		        {debug_viz_mode::layer, gettext_noop("Composited Depth")},
+		        {debug_viz_mode::verdict, gettext_noop("VR vs Passthrough")},
+		        {debug_viz_mode::raster_vs_sensor, gettext_noop("Raster vs Sensor")},
+		        {debug_viz_mode::vr_raster, gettext_noop("VR + Raster")},
+		};
+		for (const auto & e : viz_modes)
 		{
-			viz = (int)debug_viz_mode::sensor;
-			viz_changed = true;
-		}
-		if (ImGui::RadioButton(_S("VR Depth"), viz == (int)debug_viz_mode::vr_depth) and viz != (int)debug_viz_mode::vr_depth)
-		{
-			viz = (int)debug_viz_mode::vr_depth;
-			viz_changed = true;
-		}
-		if (ImGui::RadioButton(_S("Composited Depth"), viz == (int)debug_viz_mode::layer) and viz != (int)debug_viz_mode::layer)
-		{
-			viz = (int)debug_viz_mode::layer;
-			viz_changed = true;
-		}
-		if (ImGui::RadioButton(_S("VR vs Passthrough"), viz == (int)debug_viz_mode::verdict) and viz != (int)debug_viz_mode::verdict)
-		{
-			viz = (int)debug_viz_mode::verdict;
-			viz_changed = true;
-		}
-		if (ImGui::RadioButton(_S("Raster vs Sensor"), viz == (int)debug_viz_mode::raster_vs_sensor) and viz != (int)debug_viz_mode::raster_vs_sensor)
-		{
-			viz = (int)debug_viz_mode::raster_vs_sensor;
-			viz_changed = true;
-		}
-		if (ImGui::RadioButton(_S("VR + Raster"), viz == (int)debug_viz_mode::vr_raster) and viz != (int)debug_viz_mode::vr_raster)
-		{
-			viz = (int)debug_viz_mode::vr_raster;
-			viz_changed = true;
+			if (ImGui::RadioButton(_S(e.label), viz == (int)e.mode) and viz != (int)e.mode)
+			{
+				viz = (int)e.mode;
+				viz_changed = true;
+			}
 		}
 		if (viz_changed)
 		{
