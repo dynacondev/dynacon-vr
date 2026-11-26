@@ -24,6 +24,10 @@
 #include <openxr/openxr_platform.h>
 #include <spdlog/spdlog.h>
 
+#ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
+static bool query_depth_properties(xr::instance & inst, xr::system & sys, XrSystemEnvironmentDepthPropertiesMETA & out);
+#endif
+
 xr::environment_depth::environment_depth(instance & inst_, session & sess_, system & sys, vk::raii::Device & device_) :
         inst(&inst_),
         sess(&sess_),
@@ -42,6 +46,7 @@ xr::environment_depth::environment_depth(instance & inst_, session & sess_, syst
         xrStartEnvironmentDepthProviderMETA(inst_.get_proc<PFN_xrStartEnvironmentDepthProviderMETA>("xrStartEnvironmentDepthProviderMETA")),
         xrStopEnvironmentDepthProviderMETA(inst_.get_proc<PFN_xrStopEnvironmentDepthProviderMETA>("xrStopEnvironmentDepthProviderMETA")),
         xrAcquireEnvironmentDepthImageMETA(inst_.get_proc<PFN_xrAcquireEnvironmentDepthImageMETA>("xrAcquireEnvironmentDepthImageMETA")),
+        xrSetEnvironmentDepthHandRemovalMETA(inst_.get_proc<PFN_xrSetEnvironmentDepthHandRemovalMETA>("xrSetEnvironmentDepthHandRemovalMETA")),
         provider(provider_handle{xrDestroyEnvironmentDepthProviderMETA}),
         swapchain(swapchain_handle{xrDestroyEnvironmentDepthSwapchainMETA})
 #endif
@@ -49,6 +54,11 @@ xr::environment_depth::environment_depth(instance & inst_, session & sess_, syst
 	// Extension procs load above (init list, marker_tracker idiom), so
 	// callers must gate construction on supported(): with the extension
 	// enabled and advertised, every proc must exist.
+#ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
+	XrSystemEnvironmentDepthPropertiesMETA props;
+	if (query_depth_properties(inst_, sys, props))
+		supports_hand_removal_ = props.supportsHandRemoval == XR_TRUE;
+#endif
 }
 
 #ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
@@ -105,6 +115,10 @@ void xr::environment_depth::ensure()
 		return;
 	}
 	provider = provider_handle(prov, xrDestroyEnvironmentDepthProviderMETA);
+	// Fresh provider: the runtime default is disabled, so re-assert on
+	// the next set_hand_removal (a recreated handle would otherwise keep
+	// a stale sticky-true and skip the runtime set).
+	hand_removal_enabled = false;
 
 	XrEnvironmentDepthSwapchainCreateInfoMETA swap_info{
 	        .type = XR_TYPE_ENVIRONMENT_DEPTH_SWAPCHAIN_CREATE_INFO_META,
@@ -203,6 +217,41 @@ void xr::environment_depth::stop()
 		spdlog::warn("environment_depth: stop failed: {}", xr::to_string(res));
 	else
 		spdlog::info("environment_depth: provider stopped");
+#endif
+}
+
+void xr::environment_depth::set_hand_removal(bool enabled)
+{
+#ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
+	if (enabled == hand_removal_enabled)
+		return;
+	if (not supports_hand_removal_)
+	{
+		// One-shot: callers drive this per frame, the runtime never will.
+		static bool logged = false;
+		if (not logged)
+		{
+			logged = true;
+			spdlog::info("environment_depth: hand removal unsupported on this runtime, staying disabled");
+		}
+		hand_removal_enabled = false;
+		return;
+	}
+	if (not ready())
+		return; // provider torn down (swapchain recreate): retry next frame
+	XrEnvironmentDepthHandRemovalSetInfoMETA info{
+	        .type = XR_TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META,
+	        .enabled = enabled ? XR_TRUE : XR_FALSE,
+	};
+	if (XrResult res = xrSetEnvironmentDepthHandRemovalMETA(provider, &info); res != XR_SUCCESS)
+	{
+		spdlog::warn("environment_depth: set_hand_removal({}) failed: {}", enabled, xr::to_string(res));
+		return;
+	}
+	hand_removal_enabled = enabled;
+	spdlog::info("environment_depth: hand removal {}", enabled ? "enabled" : "disabled");
+#else
+	(void)enabled;
 #endif
 }
 
