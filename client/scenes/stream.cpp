@@ -2198,28 +2198,86 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					else
 						++hit;
 				}
-				// Common depth-layer draws: one per placed positive, model
-				// matrix from the fused placement, per-eye server MVPs
-				// (same timebase as the silhouettes). Conservative
-				// frustum skip with a 1px margin at full res (no feather
-				// bleed: the layer is crisp, the feather band lives in
-				// the alpha).
+				// Sensor-copy mesh sync (hidden occluders + depth volumes):
+				// same hash-change discipline as the layer store above.
+				// Gated on depth volumes (memory hygiene: hidden soups
+				// already live in the feather renderer); the stale-erase
+				// loops below run unconditionally so removal always frees.
+				if (depth_volume_active)
+				{
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+							continue;
+						auto mh = copy_occluder_hashes.find(oid);
+						if (mh == copy_occluder_hashes.end() or mh->second != ost.soup_hash)
+						{
+							merge_renderer->set_occluder_mesh(oid, ost.soup);
+							copy_occluder_hashes[oid] = ost.soup_hash;
+						}
+					}
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-depth-passthrough" or not ost.soup_ready or not ost.fused.placed)
+							continue;
+						auto mh = copy_volume_hashes.find(oid);
+						if (mh == copy_volume_hashes.end() or mh->second != ost.soup_hash)
+						{
+							merge_renderer->set_volume_mesh(oid, ost.soup);
+							copy_volume_hashes[oid] = ost.soup_hash;
+						}
+					}
+				}
+				for (auto hit = copy_occluder_hashes.begin(); hit != copy_occluder_hashes.end();)
+				{
+					auto oit = passthrough_objects.find(hit->first);
+					bool member = depth_volume_active and oit != passthrough_objects.end() and oit->second.soup_ready and
+					        oit->second.fused.placed and oit->second.def.type == "3d-passthrough-hidden";
+					if (not member)
+					{
+						merge_renderer->remove_occluder_mesh(hit->first);
+						hit = copy_occluder_hashes.erase(hit);
+					}
+					else
+						++hit;
+				}
+				for (auto hit = copy_volume_hashes.begin(); hit != copy_volume_hashes.end();)
+				{
+					auto oit = passthrough_objects.find(hit->first);
+					bool member = depth_volume_active and oit != passthrough_objects.end() and oit->second.soup_ready and
+					        oit->second.fused.placed and oit->second.def.type == "3d-depth-passthrough";
+					if (not member)
+					{
+						merge_renderer->remove_volume_mesh(hit->first);
+						hit = copy_volume_hashes.erase(hit);
+					}
+					else
+						++hit;
+				}
+				// Common depth-layer draws + sensor-copy draws: one per placed
+				// object of the matching type, model matrix from the fused
+				// placement, per-eye server MVPs (same timebase as the
+				// silhouettes). Conservative frustum skip with a 1px margin
+				// at full res (no feather bleed: the layers are crisp, the
+				// feather band lives in the alpha). Copy lists (hidden
+				// occluders + depth volumes) build only while a depth volume
+				// is placed; the record below consumes them.
 				layer_draws.clear();
+				copy_occluder_draws.clear();
+				copy_volume_draws.clear();
+				copy_max_dilate = 0;
 				{
 					float lm_x = 2.f / (float)mw;
 					float lm_y = 2.f / (float)mh;
-					auto layer_visible = [&](const std::string & mesh, const std::array<glm::mat4, 2> & mvp) {
-						auto bounds = merge_renderer->layer_mesh_bounds(mesh);
-						if (not bounds)
-							return true;
+					auto box_visible = [&](const glm::vec3 & mn, const glm::vec3 & mx, const std::array<glm::mat4, 2> & mvp) {
 						for (uint32_t view = 0; view < 2; ++view)
 						{
 							bool any_front = false, any_behind = false, any_inside = false;
 							for (int corner = 0; corner < 8; ++corner)
 							{
-								glm::vec4 c((corner & 1) ? bounds->second.x : bounds->first.x,
-								            (corner & 2) ? bounds->second.y : bounds->first.y,
-								            (corner & 4) ? bounds->second.z : bounds->first.z, 1);
+								glm::vec4 c((corner & 1) ? mx.x : mn.x,
+								            (corner & 2) ? mx.y : mn.y,
+								            (corner & 4) ? mx.z : mn.z, 1);
 								glm::vec4 q = mvp[view] * c;
 								if (q.w < 0)
 								{
@@ -2236,23 +2294,72 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						return false;
 					};
-					for (auto & [oid, ost]: passthrough_objects)
-					{
-						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
-							continue;
+					auto place_model = [&](const passthrough_object_state & ost) {
 						const auto & fu = ost.fused;
 						glm::quat q(fu.world_pose.orientation.w, fu.world_pose.orientation.x,
 						            fu.world_pose.orientation.y, fu.world_pose.orientation.z);
 						glm::vec3 t(fu.world_pose.position.x, fu.world_pose.position.y, fu.world_pose.position.z);
-						glm::mat4 model = glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
-						                  glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+						return glm::translate(glm::mat4(1), t) * glm::mat4_cast(q) *
+						       glm::scale(glm::mat4(1), glm::vec3(fu.world_scale.x, fu.world_scale.y, fu.world_scale.z));
+					};
+					auto place_mvp = [&](const passthrough_object_state & ost) {
+						glm::mat4 model = place_model(ost);
 						std::array<glm::mat4, 2> mvp;
 						for (uint32_t view = 0; view < view_count; ++view)
 							mvp[view] = server_mvp[view] * model;
-						if (not layer_visible(oid, mvp))
+						return mvp;
+					};
+					for (auto & [oid, ost]: passthrough_objects)
+					{
+						if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+							continue;
+						std::array<glm::mat4, 2> mvp = place_mvp(ost);
+						auto bounds = merge_renderer->layer_mesh_bounds(oid);
+						if (bounds and not box_visible(bounds->first, bounds->second, mvp))
 							continue;
 						layer_draws.push_back({oid, mvp});
 					}
+					if (depth_volume_active)
+					{
+						for (auto & [oid, ost]: passthrough_objects)
+						{
+							if (ost.def.type != "3d-passthrough-hidden" or not ost.soup_ready or not ost.fused.placed)
+								continue;
+							std::array<glm::mat4, 2> mvp = place_mvp(ost);
+							auto bounds = merge_renderer->occluder_mesh_bounds(oid);
+							if (bounds and not box_visible(bounds->first, bounds->second, mvp))
+								continue;
+							copy_occluder_draws.push_back({oid, mvp});
+						}
+						for (auto & [oid, ost]: passthrough_objects)
+						{
+							if (ost.def.type != "3d-depth-passthrough" or not ost.soup_ready or not ost.fused.placed)
+								continue;
+							std::array<glm::mat4, 2> mvp = place_mvp(ost);
+							auto bounds = merge_renderer->volume_mesh_bounds(oid);
+							if (bounds and not box_visible(bounds->first, bounds->second, mvp))
+								continue;
+							copy_volume_draws.push_back({oid, mvp});
+							int d = (int)ost.def.dilate_px;
+							copy_max_dilate = std::max(copy_max_dilate, std::min(std::max(d, 0), 8));
+						}
+					}
+				}
+				// Common layer + sensor copy record (before any feather
+				// group): the verdict and the feather depth compare both
+				// sample these, so they lead the mask phase in the same
+				// command buffer (barriers inside order the later readers).
+				// Skipped with the depth test off (nothing samples them;
+				// the merge applies merged directly). um_base_ms covers
+				// base + copy (the copy only runs with depth volumes).
+				um_base_ms = 0;
+				if (vr_depth_test)
+				{
+					auto um_t0 = std::chrono::steady_clock::now();
+					merge_renderer->record_base(rec_cmd, layer_draws, &rec_pool, qmerge + 2);
+					if (depth_volume_active)
+						merge_renderer->record_copy(rec_cmd, copy_occluder_draws, copy_volume_draws, copy_max_dilate);
+					um_base_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t0).count();
 				}
 				// Debug-only cutout group (no objects): lets the marker
 				// window punch with a fiducials-only config. Claimed
@@ -2962,7 +3069,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// below only when the merge actually recorded (split queries
 				// live in whichever pool rec_pool aliases this frame).
 				merge_um_split_ready = false;
-				um_base_ms = um_merge_ms = um_finish_ms = 0;
+				um_merge_ms = um_finish_ms = 0;
 				// Self-healing reset: a held image here is definitionally
 				// leaked (submit always consumes it), so release before
 				// overwriting rather than dropping the handle.
@@ -3095,19 +3202,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 							if (merge_ok and not merge_inputs.empty())
 							{
-								// Common depth layer first (stage 0): CLEAR +
-								// near-wins raster of every positive window
-								// into the full-res layer. Skipped only when
-								// the merge sits out (nothing consumes it),
-								// or when VR depth testing is toggled off
-								// (verdict submits merged directly, nothing
-								// samples the layer).
-								if (vr_depth_test)
-								{
-									auto um_t0 = std::chrono::steady_clock::now();
-									merge_renderer->record_base(rec_cmd, layer_draws, &rec_pool, qmerge + 2);
-									um_base_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t0).count();
-								}
+								// (Common layer + sensor copy were recorded
+								// ahead of the feather loop above so the
+								// feather depth compare can sample them.)
 								int merge_idx = -1;
 								try
 								{

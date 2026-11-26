@@ -735,6 +735,16 @@ private:
 	// clear(). Render thread only.
 	std::vector<union_merge_renderer::geom_draw> layer_draws;
 	std::map<std::string, std::string> layer_mesh_hashes;
+	// Sensor-copy working buffers (rebuilt every mask frame when a depth
+	// volume is placed): hidden occluders (all placed, no proximity gate)
+	// + depth-volume back walls, same timebase as layer_draws. Dilate is
+	// the max dilate_px over the placed volumes (already 0..8 clamped at
+	// parse). Capacity survives clear(). Render thread only.
+	std::vector<union_merge_renderer::geom_draw> copy_occluder_draws;
+	std::vector<union_merge_renderer::geom_draw> copy_volume_draws;
+	std::map<std::string, std::string> copy_occluder_hashes;
+	std::map<std::string, std::string> copy_volume_hashes;
+	int copy_max_dilate = 0;
 	// One-shot log when the VR verdict first engages (virt paired).
 	bool vr_occlusion_logged = false;
 	// Passthrough-tab toggle: VR depth testing on/off. Off skips both

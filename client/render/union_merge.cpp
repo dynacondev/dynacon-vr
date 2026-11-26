@@ -162,6 +162,10 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	descriptor_sets.clear();
 	verdict_descriptor_sets.clear();
 	apply_descriptor_sets.clear();
+	dilate_sets.clear();
+	copy_load_fb.clear();
+	copy_dilate_fb.clear();
+	copy_tmp_dilate_fb.clear();
 	// format_/extent_ commit AFTER the fallible rebuild below: if the
 	// swapchain or pipeline construction throws, the old values stay
 	// and the next active frame retries instead of the early-out
@@ -256,9 +260,55 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		}
 		return t;
 	};
-	layer_ = make_owned(layer_format, half_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &geom_renderpass);
+	layer_ = make_owned(layer_format, half_extent,
+	                     vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+	                             vk::ImageUsageFlagBits::eTransferSrc,
+	                     &geom_renderpass);
 	merged_ = make_owned(new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, nullptr);
 	verdict_ = make_owned(verdict_format, half_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &verdict_rp);
+	// Sensor-compare copy + dilate scratch (R16F half res): sampled by
+	// the feather compare, written by record_copy below. TRANSFER_SRC
+	// (layer clone) + TRANSFER_DST (copy receive) on top of the
+	// attachment/sampled use. FBs ride the LOAD twin (copy raster) and
+	// the dilate RP (H+V fullscreen).
+	copy_ = make_owned(layer_format, half_extent,
+	                     vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
+	                             vk::ImageUsageFlagBits::eTransferDst,
+	                     nullptr);
+	copy_tmp_ = make_owned(layer_format, half_extent,
+	                         vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+	                         nullptr);
+	{
+		vk::ImageView copy_view = *copy_.view_array;
+		vk::FramebufferCreateInfo copy_load_fb_info{
+		        .renderPass = *geom_load_rp,
+		        .attachmentCount = 1,
+		        .pAttachments = &copy_view,
+		        .width = half_extent.width,
+		        .height = half_extent.height,
+		        .layers = 1,
+		};
+		copy_load_fb = vk::raii::Framebuffer(*device, copy_load_fb_info);
+		vk::FramebufferCreateInfo copy_dilate_fb_info{
+		        .renderPass = *dilate_rp,
+		        .attachmentCount = 1,
+		        .pAttachments = &copy_view,
+		        .width = half_extent.width,
+		        .height = half_extent.height,
+		        .layers = 1,
+		};
+		copy_dilate_fb = vk::raii::Framebuffer(*device, copy_dilate_fb_info);
+		vk::ImageView tmp_view = *copy_tmp_.view_array;
+		vk::FramebufferCreateInfo tmp_dilate_fb_info{
+		        .renderPass = *dilate_rp,
+		        .attachmentCount = 1,
+		        .pAttachments = &tmp_view,
+		        .width = half_extent.width,
+		        .height = half_extent.height,
+		        .layers = 1,
+		};
+		copy_tmp_dilate_fb = vk::raii::Framebuffer(*device, tmp_dilate_fb_info);
+	}
 	layer_extent_ = new_extent;
 	half_extent_ = half_extent;
 	// Folded framebuffer, one per submit image (submit view varies):
@@ -676,6 +726,188 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	};
 	geom_pipeline = vk::raii::Pipeline(*device, *pipe_cache, geom_pipeline_info);
 
+	// LOAD twin of the geom RP (same R16F attachment, LOAD/STORE):
+	// loadOp is not part of render-pass compatibility, so geom_pipeline
+	// binds here too (feather cutout precedent). Multiview both eyes.
+	{
+		vk::AttachmentDescription load_attachment{
+		        .format = layer_format,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eLoad,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .initialLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentReference load_color_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::SubpassDescription load_subpass{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .colorAttachmentCount = 1,
+		        .pColorAttachments = &load_color_ref,
+		};
+		uint32_t load_view_mask = 0b11, load_corr_mask = 0b11;
+		vk::RenderPassMultiviewCreateInfo load_mv_info{
+		        .subpassCount = 1,
+		        .pViewMasks = &load_view_mask,
+		        .correlationMaskCount = 1,
+		        .pCorrelationMasks = &load_corr_mask,
+		};
+		vk::RenderPassCreateInfo load_rp_info{
+		        .pNext = &load_mv_info,
+		        .attachmentCount = 1,
+		        .pAttachments = &load_attachment,
+		        .subpassCount = 1,
+		        .pSubpasses = &load_subpass,
+		};
+		geom_load_rp = vk::raii::RenderPass(*device, load_rp_info);
+	}
+	// Back-wall pipe (CULL_FRONT, otherwise geom-identical): volume
+	// interiors resolve to the exit wall. Baked against geom_renderpass,
+	// bound under the compatible geom_load_rp above.
+	{
+		vk::PipelineRasterizationStateCreateInfo backwall_rasterization{
+		        .polygonMode = vk::PolygonMode::eFill,
+		        .cullMode = vk::CullModeFlagBits::eFront,
+		        .frontFace = vk::FrontFace::eCounterClockwise,
+		        .lineWidth = 1,
+		};
+		vk::GraphicsPipelineCreateInfo backwall_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = geom_stages,
+		        .pVertexInputState = &geom_vertex_input,
+		        .pInputAssemblyState = &input_assembly,
+		        .pViewportState = &viewport_state,
+		        .pRasterizationState = &backwall_rasterization,
+		        .pMultisampleState = &multisample,
+		        .pDepthStencilState = &depth_stencil,
+		        .pColorBlendState = &geom_blend,
+		        .pDynamicState = &dynamic,
+		        .layout = *geom_layout,
+		        .renderPass = *geom_renderpass,
+		};
+		backwall_pipeline = vk::raii::Pipeline(*device, *pipe_cache, backwall_pipeline_info);
+	}
+	// MIN-dilate fullscreen state (R16F): erode1d box-minimum taps
+	// (exact texel centers, NEAREST) widen known occluders over FAR.
+	// Standalone passes with barriers (not merged: H and V read
+	// different images in the same command buffer, so each pass binds
+	// its own ping-ponged set, merge precedent).
+	{
+		vk::AttachmentDescription dilate_attachment{
+		        .format = layer_format,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eDontCare,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentReference dilate_color_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::SubpassDescription dilate_subpass{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .colorAttachmentCount = 1,
+		        .pColorAttachments = &dilate_color_ref,
+		};
+		uint32_t dilate_view_mask = 0b11, dilate_corr_mask = 0b11;
+		vk::RenderPassMultiviewCreateInfo dilate_mv_info{
+		        .subpassCount = 1,
+		        .pViewMasks = &dilate_view_mask,
+		        .correlationMaskCount = 1,
+		        .pCorrelationMasks = &dilate_corr_mask,
+		};
+		vk::RenderPassCreateInfo dilate_rp_info{
+		        .pNext = &dilate_mv_info,
+		        .attachmentCount = 1,
+		        .pAttachments = &dilate_attachment,
+		        .subpassCount = 1,
+		        .pSubpasses = &dilate_subpass,
+		};
+		dilate_rp = vk::raii::RenderPass(*device, dilate_rp_info);
+		vk::DescriptorSetLayoutBinding dilate_binding{
+		        .binding = 0,
+		        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 1,
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		};
+		dilate_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
+		                                                              .bindingCount = 1,
+		                                                              .pBindings = &dilate_binding,
+		                                                      });
+		vk::DescriptorPoolSize dilate_pool_size{
+		        .type = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 4,
+		};
+		vk::DescriptorPoolCreateInfo dilate_pool_info{
+		        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+		        .maxSets = 4,
+		        .poolSizeCount = 1,
+		        .pPoolSizes = &dilate_pool_size,
+		};
+		dilate_pool = vk::raii::DescriptorPool(*device, dilate_pool_info);
+		for (int i = 0; i < 4; ++i)
+		{
+			vk::DescriptorSetAllocateInfo dilate_set_alloc{
+			        .descriptorPool = *dilate_pool,
+			        .descriptorSetCount = 1,
+			        .pSetLayouts = &*dilate_layout,
+			};
+			dilate_sets.emplace_back(std::move(device->allocateDescriptorSets(dilate_set_alloc)[0]));
+		}
+		struct dilate_push
+		{
+			float texel[2];
+			float dir[2];
+			float radius = 0;
+			float pad = 0;
+		};
+		static_assert(sizeof(dilate_push) == 24);
+		vk::PushConstantRange dilate_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        .offset = 0,
+		        .size = sizeof(dilate_push),
+		};
+		vk::PipelineLayoutCreateInfo dilate_layout_info{
+		        .setLayoutCount = 1,
+		        .pSetLayouts = &*dilate_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &dilate_push_range,
+		};
+		dilate_pipeline_layout = vk::raii::PipelineLayout(*device, dilate_layout_info);
+		auto dilate_vert = load_shader(*device, "blur.vert");
+		auto dilate_frag = load_shader(*device, "erode1d_mv.frag");
+		vk::PipelineShaderStageCreateInfo dilate_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **dilate_vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **dilate_frag,
+		                .pName = "main",
+		        },
+		};
+		vk::GraphicsPipelineCreateInfo dilate_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = dilate_stages,
+		        .pVertexInputState = &vertex_input,
+		        .pInputAssemblyState = &input_assembly,
+		        .pViewportState = &viewport_state,
+		        .pRasterizationState = &rasterization,
+		        .pMultisampleState = &multisample,
+		        .pDepthStencilState = &depth_stencil,
+		        .pColorBlendState = &blend,
+		        .pDynamicState = &dynamic,
+		        .layout = *dilate_pipeline_layout,
+		        .renderPass = *dilate_rp,
+		};
+		dilate_pipeline = vk::raii::Pipeline(*device, *pipe_cache, dilate_pipeline_info);
+	}
+
 	// Standalone verdict renderpass (single attachment, multiview):
 	// the verdict runs ahead of the fold in its own RP (it renders at
 	// a different size — opt #U half res). CLEAR-to-1 (opt #A box) +
@@ -1090,6 +1322,220 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	                    barrier);
 	if (pool)
 		cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, **pool, qafter);
+}
+
+bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<const geom_draw> occluders,
+                                         std::span<const geom_draw> volumes, int dilate_texels)
+{
+	if (not *copy_.image or not *copy_tmp_.image)
+		return false;
+	flush_uploads(cmd);
+
+	auto img_barrier = [&](vk::Image img, vk::ImageLayout old_layout, vk::ImageLayout new_layout,
+	                       vk::AccessFlags src_access, vk::AccessFlags dst_access,
+	                       vk::PipelineStageFlags src_stage, vk::PipelineStageFlags dst_stage) {
+		cmd.pipelineBarrier(src_stage, dst_stage, {}, {}, {},
+		                    vk::ImageMemoryBarrier{
+		                            .srcAccessMask = src_access,
+		                            .dstAccessMask = dst_access,
+		                            .oldLayout = old_layout,
+		                            .newLayout = new_layout,
+		                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                            .image = img,
+		                            .subresourceRange = {
+		                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                                    .levelCount = 1,
+		                                    .layerCount = 2,
+		                            },
+		                    });
+	};
+	// Clone the shared layer: both images fully overwritten here, so
+	// UNDEFINED discards (no first-use tracking, no tile-load cost).
+	img_barrier(*layer_.image, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageLayout::eTransferSrcOptimal,
+	            vk::AccessFlagBits::eShaderRead, vk::AccessFlagBits::eTransferRead,
+	            vk::PipelineStageFlagBits::eFragmentShader, vk::PipelineStageFlagBits::eTransfer);
+	img_barrier(*copy_.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eTransferDstOptimal, {}, vk::AccessFlagBits::eTransferWrite,
+	            vk::PipelineStageFlagBits::eTopOfPipe, vk::PipelineStageFlagBits::eTransfer);
+	vk::ImageCopy copy_region{
+	        .srcSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 2},
+	        .dstSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 2},
+	        .extent = {half_extent_.width, half_extent_.height, 1},
+	};
+	cmd.copyImage(*layer_.image, vk::ImageLayout::eTransferSrcOptimal, *copy_.image,
+	              vk::ImageLayout::eTransferDstOptimal, copy_region);
+	// The verdict samples the shared layer later in the same command
+	// buffer: restore its SHADER_READ layout now; the copy moves to
+	// the LOAD raster below.
+	img_barrier(*layer_.image, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+	            vk::AccessFlagBits::eTransferRead, vk::AccessFlagBits::eShaderRead,
+	            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eFragmentShader);
+	img_barrier(*copy_.image, vk::ImageLayout::eTransferDstOptimal, vk::ImageLayout::eColorAttachmentOptimal,
+	            vk::AccessFlagBits::eTransferWrite, vk::AccessFlagBits::eColorAttachmentWrite,
+	            vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eColorAttachmentOutput);
+
+	auto draw_list = [&](std::span<const geom_draw> draws, const std::map<std::string, mesh_buffers> & meshes,
+	                     vk::Pipeline pipe) {
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipe);
+		for (const auto & d: draws)
+		{
+			auto mit = meshes.find(d.mesh);
+			if (mit == meshes.end() or mit->second.index_count == 0)
+				continue;
+			cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+			cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+			cmd.pushConstants<geom_push>(*geom_layout, vk::ShaderStageFlagBits::eVertex, 0,
+			                             geom_push{.mvp = {{d.mvp[0], d.mvp[1]}}});
+			cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+		}
+	};
+	// Occluders (hidden, all placed) onto the clone: LOAD preserves the
+	// windows, MIN keeps the nearer of window/occluder per pixel.
+	if (not occluders.empty())
+	{
+		vk::RenderPassBeginInfo occl_begin{
+		        .renderPass = *geom_load_rp,
+		        .framebuffer = *copy_load_fb,
+		        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+		        .clearValueCount = 0,
+		        .pClearValues = nullptr,
+		};
+		cmd.beginRenderPass(occl_begin, vk::SubpassContents::eInline);
+		cmd.setViewport(0, vk::Viewport{
+		                        .x = 0,
+		                        .y = 0,
+		                        .width = (float)half_extent_.width,
+		                        .height = (float)half_extent_.height,
+		                        .minDepth = 0,
+		                        .maxDepth = 1,
+		                });
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+		draw_list(occluders, occluder_meshes, *geom_pipeline);
+		cmd.endRenderPass();
+		img_barrier(*copy_.image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+		            vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eShaderRead,
+		            vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader);
+	}
+	if (occluders.empty())
+	{
+		img_barrier(*copy_.image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+		            vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eShaderRead,
+		            vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader);
+	}
+	// MIN-dilate the known occluders (H then V): nearer bleeds over
+	// FAR, widening the exclusion by dilate_texels. The volume back
+	// wall below stays exact (rastered after).
+	int radius = std::clamp(dilate_texels, 0, 8);
+	if (radius > 0)
+	{
+		struct dilate_push
+		{
+			float texel[2];
+			float dir[2];
+			float radius = 0;
+			float pad = 0;
+		};
+		static_assert(sizeof(dilate_push) == 24);
+		auto dilate_pass = [&](bool horizontal) {
+			vk::DescriptorSet set = *dilate_sets[(dilate_parity ? 2 : 0) + (horizontal ? 0 : 1)];
+			vk::ImageView src_view = horizontal ? *copy_.view_array : *copy_tmp_.view_array;
+			vk::DescriptorImageInfo src_info{
+			        .sampler = *sampler_nearest,
+			        .imageView = src_view,
+			        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+			};
+			std::array<vk::WriteDescriptorSet, 1> dil_writes = {{
+			        {
+			                .dstSet = set,
+			                .dstBinding = 0,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+			                .pImageInfo = &src_info,
+			        },
+			}};
+			device->updateDescriptorSets(dil_writes, {});
+			vk::Framebuffer fb = horizontal ? *copy_tmp_dilate_fb : *copy_dilate_fb;
+			vk::RenderPassBeginInfo dil_begin{
+			        .renderPass = *dilate_rp,
+			        .framebuffer = fb,
+			        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+			        .clearValueCount = 0,
+			        .pClearValues = nullptr,
+			};
+			cmd.beginRenderPass(dil_begin, vk::SubpassContents::eInline);
+			cmd.setViewport(0, vk::Viewport{
+			                        .x = 0,
+			                        .y = 0,
+			                        .width = (float)half_extent_.width,
+			                        .height = (float)half_extent_.height,
+			                        .minDepth = 0,
+			                        .maxDepth = 1,
+			                });
+			cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *dilate_pipeline);
+			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *dilate_pipeline_layout, 0, set, {});
+			dilate_push pc{
+			        .texel = {(float)half_extent_.width ? 1.f / (float)half_extent_.width : 0.f,
+			                  (float)half_extent_.height ? 1.f / (float)half_extent_.height : 0.f},
+			        .dir = {horizontal ? 1.f : 0.f, horizontal ? 0.f : 1.f},
+			        .radius = (float)radius,
+			};
+			cmd.pushConstants<dilate_push>(*dilate_pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, pc);
+			cmd.draw(3, 1, 0, 0);
+			cmd.endRenderPass();
+		};
+		dilate_parity = !dilate_parity;
+		img_barrier(*copy_tmp_.image, vk::ImageLayout::eUndefined, vk::ImageLayout::eColorAttachmentOptimal, {},
+		            vk::AccessFlagBits::eColorAttachmentWrite, vk::PipelineStageFlagBits::eTopOfPipe,
+		            vk::PipelineStageFlagBits::eColorAttachmentOutput);
+		dilate_pass(true);
+		img_barrier(*copy_tmp_.image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+		            vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eShaderRead,
+		            vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader);
+		img_barrier(*copy_.image, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageLayout::eColorAttachmentOptimal,
+		            vk::AccessFlagBits::eShaderRead, vk::AccessFlagBits::eColorAttachmentWrite,
+		            vk::PipelineStageFlagBits::eFragmentShader, vk::PipelineStageFlagBits::eColorAttachmentOutput);
+		dilate_pass(false);
+		img_barrier(*copy_.image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+		            vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eShaderRead,
+		            vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader);
+	}
+	// Volume back walls (CULL_FRONT exit wall): LOAD preserves the
+	// dilated occluders, MIN keeps nearer of occluder/back-wall.
+	if (not volumes.empty())
+	{
+		img_barrier(*copy_.image, vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageLayout::eColorAttachmentOptimal,
+		            vk::AccessFlagBits::eShaderRead, vk::AccessFlagBits::eColorAttachmentWrite,
+		            vk::PipelineStageFlagBits::eFragmentShader, vk::PipelineStageFlagBits::eColorAttachmentOutput);
+		vk::RenderPassBeginInfo vol_begin{
+		        .renderPass = *geom_load_rp,
+		        .framebuffer = *copy_load_fb,
+		        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+		        .clearValueCount = 0,
+		        .pClearValues = nullptr,
+		};
+		cmd.beginRenderPass(vol_begin, vk::SubpassContents::eInline);
+		cmd.setViewport(0, vk::Viewport{
+		                        .x = 0,
+		                        .y = 0,
+		                        .width = (float)half_extent_.width,
+		                        .height = (float)half_extent_.height,
+		                        .minDepth = 0,
+		                        .maxDepth = 1,
+		                });
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+		draw_list(volumes, volume_meshes, *backwall_pipeline);
+		cmd.endRenderPass();
+	}
+	// Copy ends sampled: barrier only when the last writer left it as
+	// an attachment (volume raster, or the untouched clone when both
+	// lists were empty and no dilate ran). Otherwise it already ends
+	// SHADER_READ (occluder raster or dilate V).
+	if (not volumes.empty() or (occluders.empty() and radius == 0))
+		img_barrier(*copy_.image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
+		            vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eShaderRead,
+		            vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader);
+	return true;
 }
 
 void union_merge_renderer::create_verdict_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler)
@@ -1575,7 +2021,8 @@ std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> union_merge_renderer::make_b
 
 void union_merge_renderer::flush_uploads(vk::raii::CommandBuffer & cmd)
 {
-	for (auto & [key, mesh]: layer_meshes)
+	auto flush_map = [&](std::map<std::string, mesh_buffers> & meshes) {
+	for (auto & [key, mesh]: meshes)
 	{
 		(void)key;
 		if (not mesh.pending_upload)
@@ -1621,19 +2068,16 @@ void union_merge_renderer::flush_uploads(vk::raii::CommandBuffer & cmd)
 		                    barriers,
 		                    {});
 	}
+	};
+	flush_map(layer_meshes);
+	flush_map(occluder_meshes);
+	flush_map(volume_meshes);
 }
 
-void union_merge_renderer::set_layer_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
+void union_merge_renderer::set_mesh_in(std::map<std::string, mesh_buffers> & meshes, const std::string & key,
+                                       const passthrough_mesh::triangle_soup & soup)
 {
-	if (soup.indices.empty() or soup.vertices.empty())
-	{
-		remove_layer_mesh(key);
-		return;
-	}
-	// Rare path (map change): make sure no in-flight frame still reads
-	// the old buffers before replacing them.
-	device->waitIdle();
-	mesh_buffers & mesh = layer_meshes[key];
+	mesh_buffers & mesh = meshes[key];
 	vk::DeviceSize vertex_bytes = soup.vertices.size() * sizeof(XrVector3f);
 	vk::DeviceSize index_bytes = soup.indices.size() * sizeof(uint32_t);
 	vk::DeviceSize total = vertex_bytes + index_bytes;
@@ -1670,6 +2114,19 @@ void union_merge_renderer::set_layer_mesh(const std::string & key, const passthr
 	mesh.aabb_max = hi;
 }
 
+void union_merge_renderer::set_layer_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
+{
+	if (soup.indices.empty() or soup.vertices.empty())
+	{
+		remove_layer_mesh(key);
+		return;
+	}
+	// Rare path (map change): make sure no in-flight frame still reads
+	// the old buffers before replacing them.
+	device->waitIdle();
+	set_mesh_in(layer_meshes, key, soup);
+}
+
 void union_merge_renderer::remove_layer_mesh(const std::string & key)
 {
 	auto it = layer_meshes.find(key);
@@ -1684,6 +2141,62 @@ std::optional<std::pair<glm::vec3, glm::vec3>> union_merge_renderer::layer_mesh_
 {
 	auto it = layer_meshes.find(key);
 	if (it == layer_meshes.end())
+		return std::nullopt;
+	return std::make_pair(it->second.aabb_min, it->second.aabb_max);
+}
+
+void union_merge_renderer::set_occluder_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
+{
+	if (soup.indices.empty() or soup.vertices.empty())
+	{
+		remove_occluder_mesh(key);
+		return;
+	}
+	device->waitIdle();
+	set_mesh_in(occluder_meshes, key, soup);
+}
+
+void union_merge_renderer::remove_occluder_mesh(const std::string & key)
+{
+	auto it = occluder_meshes.find(key);
+	if (it == occluder_meshes.end())
+		return;
+	device->waitIdle();
+	occluder_meshes.erase(it);
+}
+
+std::optional<std::pair<glm::vec3, glm::vec3>> union_merge_renderer::occluder_mesh_bounds(const std::string & key) const
+{
+	auto it = occluder_meshes.find(key);
+	if (it == occluder_meshes.end())
+		return std::nullopt;
+	return std::make_pair(it->second.aabb_min, it->second.aabb_max);
+}
+
+void union_merge_renderer::set_volume_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
+{
+	if (soup.indices.empty() or soup.vertices.empty())
+	{
+		remove_volume_mesh(key);
+		return;
+	}
+	device->waitIdle();
+	set_mesh_in(volume_meshes, key, soup);
+}
+
+void union_merge_renderer::remove_volume_mesh(const std::string & key)
+{
+	auto it = volume_meshes.find(key);
+	if (it == volume_meshes.end())
+		return;
+	device->waitIdle();
+	volume_meshes.erase(it);
+}
+
+std::optional<std::pair<glm::vec3, glm::vec3>> union_merge_renderer::volume_mesh_bounds(const std::string & key) const
+{
+	auto it = volume_meshes.find(key);
+	if (it == volume_meshes.end())
 		return std::nullopt;
 	return std::make_pair(it->second.aabb_min, it->second.aabb_max);
 }

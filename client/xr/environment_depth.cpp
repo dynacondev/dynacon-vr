@@ -241,7 +241,7 @@ void xr::environment_depth::set_hand_removal(bool enabled)
 		return; // provider torn down (swapchain recreate): retry next frame
 	XrEnvironmentDepthHandRemovalSetInfoMETA info{
 	        .type = XR_TYPE_ENVIRONMENT_DEPTH_HAND_REMOVAL_SET_INFO_META,
-	        .enabled = enabled ? XR_TRUE : XR_FALSE,
+	        .enabled = enabled ? (XrBool32)XR_TRUE : (XrBool32)XR_FALSE,
 	};
 	if (XrResult res = xrSetEnvironmentDepthHandRemovalMETA(provider, &info); res != XR_SUCCESS)
 	{

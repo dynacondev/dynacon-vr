@@ -214,6 +214,19 @@ public:
 	void record_base(vk::raii::CommandBuffer & cmd, std::span<const geom_draw> draws,
 	                 const vk::raii::QueryPool * pool = nullptr, uint32_t qafter = 0);
 
+	// Sensor-compare copy (3d-depth-passthrough): clone the shared layer,
+	// MIN-raster every placed hidden occluder (all placed, no proximity
+	// gate — occlusion is physical), MIN-dilate the copy by dilate_texels
+	// (known-occluder widening only; the volume back wall below stays
+	// exact), then MIN-raster every depth-volume back wall (CULL_FRONT
+	// pipe). Single test downstream: sensor < copy + bias. Recorded
+	// once per frame after record_base and before the feather loop (same
+	// command buffer; barriers inside order every stage). Ends
+	// SHADER_READ for the feather compare tap. No-op (false) when the
+	// copy target was never built.
+	bool record_copy(vk::raii::CommandBuffer & cmd, std::span<const geom_draw> occluders,
+	                 std::span<const geom_draw> volumes, int dilate_texels);
+
 	// (Re)upload one window soup under its key. Synchronous (device
 	// idle on replace); call when idle, e.g. on map change, not per
 	// frame. Empty soup erases the entry.
@@ -222,6 +235,15 @@ public:
 	// Model-space AABB for the scene-side frustum skip (nullopt =
 	// unknown key: keep the draw). Computed once at upload.
 	std::optional<std::pair<glm::vec3, glm::vec3>> layer_mesh_bounds(const std::string & key) const;
+	// Copy-occluder (hidden, all placed) and volume (depth back wall)
+	// mesh stores: same synchronous upload discipline as the layer store
+	// above, separate namespaces (keys need not be distinct across stores).
+	void set_occluder_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
+	void remove_occluder_mesh(const std::string & key);
+	std::optional<std::pair<glm::vec3, glm::vec3>> occluder_mesh_bounds(const std::string & key) const;
+	void set_volume_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup);
+	void remove_volume_mesh(const std::string & key);
+	std::optional<std::pair<glm::vec3, glm::vec3>> volume_mesh_bounds(const std::string & key) const;
 
 	xr::swapchain & swapchain()
 	{
@@ -257,6 +279,12 @@ public:
 			return *verdict_.view_array;
 		return {};
 	}
+	vk::ImageView copy_view_array() const
+	{
+		if (*copy_.view_array != vk::ImageView{})
+			return *copy_.view_array;
+		return {};
+	}
 	// Half-res working size (the layer raster + verdict target live
 	// here; viz upsamples by sampling).
 	vk::Extent2D debug_layer_extent() const
@@ -270,6 +298,10 @@ private:
 	                                                                vk::MemoryPropertyFlags properties);
 	void flush_uploads(vk::raii::CommandBuffer & cmd);
 	void init_pipelines(vk::Format format);
+	struct mesh_buffers;
+	// Shared synchronous upload into one of the mesh stores above.
+	void set_mesh_in(std::map<std::string, mesh_buffers> & meshes, const std::string & key,
+	                 const passthrough_mesh::triangle_soup & soup);
 
 	vk::raii::Device * device = nullptr;
 	vk::raii::PhysicalDevice * physical_device = nullptr;
@@ -421,6 +453,36 @@ private:
 	// Expanded index-map scratch (capacity persists after the first
 	// verdict frame): avoids a ~2*(W+H) uint32 heap alloc per frame.
 	std::vector<uint32_t> verdict_map_scratch;
+	// Sensor-compare copy (3d-depth-passthrough, R16F half res): clone
+	// of the shared layer plus hidden occluders, MIN-dilated, plus
+	// volume back walls. Pass FBs ride the LOAD twin of the geom RP
+	// (raster) and the dilate RP (fullscreen H+V). Rebuilt in ensure()
+	// alongside layer_/verdict_ (same waitIdle).
+	layer_target copy_;
+	layer_target copy_tmp_;
+	vk::raii::Framebuffer copy_load_fb{nullptr};     // copy under geom_load_rp
+	vk::raii::Framebuffer copy_dilate_fb{nullptr};   // copy under dilate_rp (V target)
+	vk::raii::Framebuffer copy_tmp_dilate_fb{nullptr}; // tmp under dilate_rp (H target)
+	// LOAD twin of geom_renderpass (same R16F attachment, LOAD/STORE):
+	// loadOp is not part of render-pass compatibility, so geom_pipeline
+	// binds here too (feather cutout precedent).
+	vk::raii::RenderPass geom_load_rp{nullptr};
+	// Back-wall pipe (CULL_FRONT, otherwise geom-identical): volume
+	// interiors resolve to the exit wall. Baked against geom_renderpass,
+	// bound under the compatible geom_load_rp.
+	vk::raii::Pipeline backwall_pipeline{nullptr};
+	// MIN-dilate fullscreen state (R16F, erode1d_mv.frag + blur.vert,
+	// 24B push shared with the feather erode layout shape). Two sets
+	// ping-ponged by call parity (async mask CB may still read the
+	// other, merge precedent).
+	vk::raii::RenderPass dilate_rp{nullptr};
+	vk::raii::DescriptorSetLayout dilate_layout{nullptr};
+	vk::raii::DescriptorPool dilate_pool{nullptr};
+	std::vector<vk::raii::DescriptorSet> dilate_sets;
+	bool dilate_parity = false;
+	vk::raii::PipelineLayout dilate_pipeline_layout{nullptr};
+	vk::raii::Pipeline dilate_pipeline{nullptr};
+	// Dilate taps land on exact texel centers: reuses sampler_nearest.
 	vk::raii::DescriptorSetLayout apply_descriptor_layout{nullptr};
 	vk::raii::DescriptorPool apply_descriptor_pool{nullptr};
 	std::vector<vk::raii::DescriptorSet> apply_descriptor_sets;
@@ -456,4 +518,8 @@ private:
 		glm::vec3 aabb_min{0}, aabb_max{0};
 	};
 	std::map<std::string, mesh_buffers> layer_meshes;
+	// Copy-occluder (hidden, all placed) and volume (depth back wall)
+	// mesh stores: same upload discipline as layer_meshes above.
+	std::map<std::string, mesh_buffers> occluder_meshes;
+	std::map<std::string, mesh_buffers> volume_meshes;
 };
