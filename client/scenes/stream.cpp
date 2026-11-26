@@ -1788,6 +1788,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							frozen_capture_pose = capture_pose;
 							frozen_have_capture_pose = have_capture_pose;
 							frozen_depth_valid = true;
+							// Rewind history: buffer the capture pose per
+							// new sensor frame (strictly increasing
+							// capture_time; v1 runtimes report 0, skip
+							// those). Frozen frames never reach here (they
+							// take the early frozen branch above), and
+							// backward jumps (provider restart) clear and
+							// reseed.
+							if (have_capture_pose and shared_depth.capture_time != 0)
+							{
+								auto push_rewind = [&]()
+								{
+									rewind_sample s;
+									s.t = shared_depth.capture_time;
+									s.pose = capture_pose;
+									s.have_pose = true;
+									rewind_history.push_back(s);
+									while (rewind_history.size() > 25)
+										rewind_history.pop_front();
+								};
+								if (rewind_history.empty() or shared_depth.capture_time > rewind_history.back().t)
+									push_rewind();
+								else if (shared_depth.capture_time < rewind_history.back().t)
+								{
+									rewind_history.clear();
+									push_rewind();
+								}
+							}
 							// Phase-0 forensics: temporal model of the depth
 							// frame vs the predicted display frame (throttled
 							// 2s). Sizes the capture->display correction the
@@ -1865,6 +1892,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// swapchain_index belongs to the stopped session and
 			// must never be submitted as if fresh on re-enter.
 			frozen_depth_valid = false;
+			// Same for the rewind window: post-gap timestamps keep
+			// increasing, so without this the first windows would
+			// span dead time and dilute velocity until refilled.
+			rewind_history.clear();
 		}
 
 		// Fresh frame accumulators for the Statistics plots (filled by
@@ -3652,12 +3683,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// both sensor modes (the sensor frustum is projected
 				// through it, i.e. the headset<->sensor rotational
 				// extrinsic is assumed identity); TO is always the
-				// predicted display pose. Fallback (no capture timestamp
-				// / locate failed) is the acquire-time depth pose, the
-				// same fallback the baseline submit uses.
+				// predicted display pose. With a nonzero rewind gain the
+				// FROM pose is first rewound along the recent
+				// sensor-window velocity (see block below). Fallback (no
+				// capture timestamp / locate failed) is the acquire-time
+				// depth pose, the same fallback the baseline submit uses.
 				depth_overlay_renderer::splat_warp_params splat_params{};
 				bool have_splat = false;
 				int splat_sens_w = 0, splat_sens_h = 0;
+				std::string rewind_note;
+				double rewind_vmax = 0.0;
+				int rewind_span = 0;
 				if (debug_custom_splat and
 				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor) and
 				    have_depth_frame and env_depth)
@@ -3678,6 +3714,58 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							have_splat = false;
 							break;
 						}
+						glm::vec3 pc(from.position.x, from.position.y, from.position.z);
+						glm::vec3 pd(to.position.x, to.position.y, to.position.z);
+						// Smoothing-lag rewind: the depth values describe
+						// the world as seen from an older head pose, so
+						// shift the content pose back along the recent
+						// sensor-window velocity by the slider's extra
+						// milliseconds and warp from the effective pose
+						// with the unchanged math below. Translation
+						// rewind is per-axis (plain vector); rotation
+						// rewinds about the averaged angular-velocity axis
+						// (single axis-angle, never per-Euler-axis).
+						if (debug_rewind_gain_ms > 0.f and have_capture_pose and
+						    shared_depth.capture_time != 0 and rewind_history.size() >= 2)
+						{
+							int span = std::clamp(debug_rewind_samples, 1, 24);
+							size_t n = rewind_history.size() - 1;
+							size_t m = n > (size_t)span ? n - (size_t)span : 0;
+							const rewind_sample & newest = rewind_history[n];
+							const rewind_sample & oldest = rewind_history[m];
+							double dt_win = (double)(newest.t - oldest.t) * 1e-9;
+							if (dt_win > 1e-9 and newest.have_pose and oldest.have_pose)
+							{
+								if (eye == 0)
+									rewind_span = (int)(n - m);
+								double extra_s = (double)debug_rewind_gain_ms * 1e-3;
+								glm::vec3 p_new(newest.pose[eye].position.x, newest.pose[eye].position.y, newest.pose[eye].position.z);
+								glm::vec3 p_old(oldest.pose[eye].position.x, oldest.pose[eye].position.y, oldest.pose[eye].position.z);
+								glm::vec3 vel = (p_new - p_old) / (float)dt_win;
+								rewind_vmax = std::max(rewind_vmax, (double)glm::length(vel));
+								// MINUS: stale content lags reality, so the
+								// effective pose lies further back along +vel
+								// (same for -extra_ang below). Flipping this
+								// sign would double the swim, not cancel it.
+								pc = pc - vel * (float)extra_s;
+								glm::quat q_new(newest.pose[eye].orientation.w, newest.pose[eye].orientation.x,
+								                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
+								glm::quat q_old(oldest.pose[eye].orientation.w, oldest.pose[eye].orientation.x,
+								                oldest.pose[eye].orientation.y, oldest.pose[eye].orientation.z);
+								glm::quat dq = glm::normalize(q_new * glm::inverse(glm::normalize(q_old)));
+								if (dq.w < 0.f)
+									dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
+								float cos_half = std::clamp(dq.w, -1.f, 1.f);
+								float ang = 2.f * acosf(cos_half);
+								float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
+								if (ang > 1e-6f and sin_half > 1e-6f)
+								{
+									glm::vec3 axis = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half);
+									float extra_ang = ang * (float)(extra_s / dt_win);
+									qc = glm::normalize(glm::angleAxis(-extra_ang, axis) * qc);
+								}
+							}
+						}
 						glm::mat3 r = glm::mat3(glm::inverse(qc) * qd);
 						for (int row = 0; row < 3; ++row)
 						{
@@ -3686,8 +3774,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							splat_params.rot_rows[eye][row][2] = r[2][row];
 							splat_params.rot_rows[eye][row][3] = 0;
 						}
-						glm::vec3 pc(from.position.x, from.position.y, from.position.z);
-						glm::vec3 pd(to.position.x, to.position.y, to.position.z);
 						glm::vec3 t = glm::inverse(qd) * (pc - pd);
 						splat_params.trans[eye][0] = t.x;
 						splat_params.trans[eye][1] = t.y;
@@ -3709,6 +3795,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						splat_params.near_z = shared_depth.near_z;
 						splat_params.far_z = shared_depth.far_z;
 						splat_params.opacity = debug_depth_opacity;
+						if (debug_rewind_gain_ms > 0.f and rewind_span > 0)
+							rewind_note = fmt::format(" rewind +{:.0f}ms N{} vmax{:.2f}m/s",
+							                          (double)debug_rewind_gain_ms, rewind_span, rewind_vmax);
 					}
 				}
 				switch (debug_viz)
@@ -3733,10 +3822,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// Capture age forensics: which timebase this frame
 						// rode (v1 runtimes report no timestamp: gated).
 						if (shared_depth.capture_time != 0)
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms",
+							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms{}",
 							                           env_depth->depth_width(), env_depth->depth_height(),
 							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
-							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6);
+							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6,
+							                           rewind_note);
 						else
 							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
 							                           env_depth->depth_width(), env_depth->depth_height(),
@@ -3829,10 +3919,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								                                    env_depth->depth_view(shared_depth.swapchain_index), params);
 							viz_content_recorded = true;
 							auto le = merge_renderer->debug_layer_extent();
-							depth_status = fmt::format("raster vs sensor live {}x{} sensor {}x{} near {:.2f}m far {:.2f}m",
+							depth_status = fmt::format("raster vs sensor live {}x{} sensor {}x{} near {:.2f}m far {:.2f}m{}",
 							                           le.width, le.height,
 							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
+							                           rewind_note);
 						}
 						else
 						{
