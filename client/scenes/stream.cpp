@@ -1728,11 +1728,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (got_depth)
 						{
 							have_depth_frame = true;
-							// Sensor-viz submit pose: headset at the depth
-							// image's capture time. No depth-sensor query at a
-							// past time exists (or is needed): the single
-							// timestamp is the one riding the image we render.
-							if (debug_viz == debug_viz_mode::sensor)
+							// Sensor-viz submit pose + custom-warp FROM pose:
+							// headset at the depth image's capture time. No
+							// depth-sensor query at a past time exists (or is
+							// needed): the single timestamp is the one riding
+							// the image we render. Raster-vs-sensor reuses
+							// the same locate as its warp FROM (no submit
+							// use there).
+							if (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor)
 							{
 								const char * fallback_reason = nullptr;
 								if (shared_depth.capture_time == 0)
@@ -1767,7 +1770,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									if (last_had_pose or now - last_pose_log > 5'000'000'000LL)
 									{
 										last_pose_log = now;
-										spdlog::warn("Sensor viz: capture-pose unavailable ({}), submitting predicted depth pose (swims under head motion)", fallback_reason);
+										spdlog::warn("Depth viz: capture-pose unavailable ({}), submitting predicted depth pose (swims under head motion)", fallback_reason);
 									}
 									last_had_pose = false;
 								}
@@ -1775,7 +1778,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								{
 									last_had_pose = true;
 									last_pose_log = now;
-									spdlog::info("Sensor viz: capture-pose submit restored");
+									spdlog::info("Depth viz: capture-pose submit restored");
 								}
 							}
 							// Rolling buffer of depth 1: refreshed on
@@ -3557,6 +3560,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// already-acquired frames. Sensor provider cost is bound to its
 		// mode: the shared acquire site above stops it below.
 		int depth_image = -1;
+		bool used_custom_3dof = false;
+		bool viz_content_recorded = false;
 		if (debug_viz == debug_viz_mode::none)
 			depth_status.clear();
 		else
@@ -3583,6 +3588,60 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				std::array<vk::Extent2D, 2> depth_ext;
 				for (uint32_t view = 0; view < view_count; ++view)
 					depth_ext[view] = {((uint32_t)extents[view].width + 1) / 2, ((uint32_t)extents[view].height + 1) / 2};
+				// Custom 3DOF warp params: R_eye = Qc^-1 * Qd per eye
+				// (capture -> predicted display, translation ignored:
+				// rotation-only, the runtime timewarp copy). FROM is the
+				// headset pose at capture in both sensor modes (the
+				// sensor frustum is projected through it, i.e. the
+				// headset<->sensor rotational extrinsic is assumed
+				// identity); TO is always the predicted display pose.
+				// Fallback (no capture timestamp / locate failed) is the
+				// acquire-time depth pose, the same fallback the baseline
+				// submit uses.
+				depth_overlay_renderer::sensor_warp_params warp_params{};
+				bool have_warp = false;
+				if (debug_custom_3dof and
+				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor) and
+				    have_depth_frame and env_depth)
+				{
+					have_warp = true;
+					for (uint32_t eye = 0; eye < view_count; ++eye)
+					{
+						const XrPosef & from = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
+						const XrPosef & to = mask_pose[eye];
+						glm::quat qc(from.orientation.w, from.orientation.x, from.orientation.y, from.orientation.z);
+						glm::quat qd(to.orientation.w, to.orientation.x, to.orientation.y, to.orientation.z);
+						if (glm::dot(qc, qc) < 1e-12f or glm::dot(qd, qd) < 1e-12f)
+						{
+							have_warp = false;
+							break;
+						}
+						glm::mat3 r = glm::mat3(glm::inverse(qc) * qd);
+						for (int row = 0; row < 3; ++row)
+						{
+							warp_params.rot_rows[eye][row][0] = r[0][row];
+							warp_params.rot_rows[eye][row][1] = r[1][row];
+							warp_params.rot_rows[eye][row][2] = r[2][row];
+							warp_params.rot_rows[eye][row][3] = 0;
+						}
+						const XrFovf & sf = shared_depth.fov[eye];
+						warp_params.sens_tan[eye][0] = tanf(sf.angleLeft);
+						warp_params.sens_tan[eye][1] = tanf(sf.angleRight);
+						warp_params.sens_tan[eye][2] = tanf(sf.angleUp);
+						warp_params.sens_tan[eye][3] = tanf(sf.angleDown);
+						const XrFovf & df = mask_fov[eye];
+						warp_params.disp_tan[eye][0] = tanf(df.angleLeft);
+						warp_params.disp_tan[eye][1] = tanf(df.angleRight);
+						warp_params.disp_tan[eye][2] = tanf(df.angleUp);
+						warp_params.disp_tan[eye][3] = tanf(df.angleDown);
+					}
+					if (have_warp)
+					{
+						warp_params.near_z = shared_depth.near_z;
+						warp_params.far_z = shared_depth.far_z;
+						warp_params.opacity = debug_depth_opacity;
+					}
+				}
 				switch (debug_viz)
 				{
 					case debug_viz_mode::none:
@@ -3591,8 +3650,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						params.near_z = shared_depth.near_z;
 						params.far_z = shared_depth.far_z;
-						depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
-						                      env_depth->depth_view(shared_depth.swapchain_index), params);
+						if (have_warp)
+						{
+							depth_overlay->record_sensor_warp(command_buffer, (size_t)depth_image, depth_ext,
+							                                  env_depth->depth_view(shared_depth.swapchain_index), warp_params);
+							used_custom_3dof = true;
+						}
+						else
+							depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
+							                      env_depth->depth_view(shared_depth.swapchain_index), params);
+						viz_content_recorded = true;
 						// Capture age forensics: which timebase this frame
 						// rode (v1 runtimes report no timestamp: gated).
 						if (shared_depth.capture_time != 0)
@@ -3674,9 +3741,22 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						params.far_z = shared_depth.far_z;
 						if (merge_renderer and merge_this_frame and env_depth)
 						{
-							depth_overlay->record_raster_sensor(command_buffer, (size_t)depth_image, depth_ext,
-							                                    merge_renderer->layer_image(), merge_renderer->layer_view_array(),
-							                                    env_depth->depth_view(shared_depth.swapchain_index), params);
+							if (have_warp)
+							{
+								// Custom path: layer tapped directly (no
+								// pose involved), sensor warped
+								// capture->predicted; viz submitted at
+								// the predicted pose below.
+								depth_overlay->record_raster_sensor_warp(command_buffer, (size_t)depth_image, depth_ext,
+								                                        merge_renderer->layer_image(), merge_renderer->layer_view_array(),
+								                                        env_depth->depth_view(shared_depth.swapchain_index), warp_params);
+								used_custom_3dof = true;
+							}
+							else
+								depth_overlay->record_raster_sensor(command_buffer, (size_t)depth_image, depth_ext,
+								                                    merge_renderer->layer_image(), merge_renderer->layer_view_array(),
+								                                    env_depth->depth_view(shared_depth.swapchain_index), params);
+							viz_content_recorded = true;
 							auto le = merge_renderer->debug_layer_extent();
 							depth_status = fmt::format("raster vs sensor live {}x{} sensor {}x{} near {:.2f}m far {:.2f}m",
 							                           le.width, le.height,
@@ -3728,6 +3808,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// head moves — the reprojection inspection signal.
 				if (depth_frozen and (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
 					depth_status += " [PAUSED]";
+				// A/B tag: which warp produced this frame's content (only
+				// when content was recorded: waiting/busy frames stay clean).
+				if (viz_content_recorded and
+				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
+					depth_status += used_custom_3dof ? " [custom3dof]" : " [runtime]";
 			}
 			else if (depth_frozen and (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
 				depth_status = "overlay swapchain busy, skipped frame [PAUSED]";
@@ -4079,13 +4164,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// capture_time (capture_pose above) with the sensor frustum, so
 		// the rotation-only warp corrects capture->display head motion.
 		// Predicted depth pose is the logged fallback (swims).
+		// Custom 3DOF warp frames are already at the predicted display
+		// pose (warped in-shader), so they submit there and the runtime
+		// warp is ~identity.
 		// Submitting live would present stale pixels as fresh
 		// (swim/misalign under head motion).
 		if (depth_image >= 0 and depth_overlay)
 		{
 			const XrPosef * viz_pose = sync_pose.data();
 			const XrFovf * viz_fov = sync_fov.data();
-			if (debug_viz == debug_viz_mode::sensor)
+			if (used_custom_3dof)
+			{
+				viz_pose = mask_pose.data();
+				viz_fov = mask_fov.data();
+			}
+			else if (debug_viz == debug_viz_mode::sensor)
 			{
 				viz_pose = have_capture_pose ? capture_pose.data() : shared_depth.pose;
 				viz_fov = shared_depth.fov;

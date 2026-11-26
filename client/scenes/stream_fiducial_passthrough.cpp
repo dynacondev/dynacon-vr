@@ -1265,6 +1265,8 @@ void scenes::stream::gui_passthrough()
 		else
 			spdlog::info("Depth sensor {}", debug_pause_sensor ? "paused (frozen frame)" : "resumed (live)");
 	}
+	if (ImGui::Checkbox(_S("Custom 3DOF warp (vs runtime)"), &debug_custom_3dof))
+		spdlog::info("Depth viz warp {}", debug_custom_3dof ? "custom 3DOF" : "runtime");
 	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 	if (not depth_status.empty() and debug_viz != debug_viz_mode::none)

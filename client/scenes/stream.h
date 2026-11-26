@@ -891,6 +891,12 @@ private:
 	std::array<XrPosef, view_count> frozen_capture_pose{};
 	bool frozen_have_capture_pose = false;
 	bool frozen_depth_valid = false;
+	// Custom 3DOF rotation-only warp of the sensor depth into the
+	// predicted display view (CPU copy of the runtime timewarp): sensor
+	// and raster-vs-sensor modes resample capture->predicted in-shader
+	// and submit at the predicted pose. Off = direct tap + runtime warp
+	// (today's behavior) for A/B.
+	bool debug_custom_3dof = true;
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe

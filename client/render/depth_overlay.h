@@ -167,6 +167,40 @@ public:
 	                      vk::Image layer_image, vk::ImageView layer_view,
 	                      const frame_params & params);
 
+	// Custom 3DOF rotation-only warp params (std140): per-eye rotation
+	// rows (R = Qc^-1 * Qd) plus sensor/display frustum tangents.
+	// 176 bytes, 16-aligned.
+	struct sensor_warp_params
+	{
+		float rot_rows[2][3][4]; // [eye][row]: xyz = rotation row, w unused
+		float sens_tan[2][4];    // [eye]: sensor frustum tangents L, R, U, D
+		float disp_tan[2][4];    // [eye]: display (target) frustum tangents
+		float near_z = 0.1f;
+		float far_z = 10.f;
+		float opacity = 0.3f;
+		float pad = 0;
+	};
+
+	// Sensor viz through the custom 3DOF warp (sensor_3dof_warp.frag):
+	// same false color as record(), resampled capture->predicted.
+	// Shares the sensor set layout/pipeline layout/pool/set (layer
+	// precedent: only the fragment module differs); binding 1 rides
+	// the warp UBO below. Own pipeline object.
+	void record_sensor_warp(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                        const std::array<vk::Extent2D, 2> & extents,
+	                        vk::ImageView depth_view,
+	                        const sensor_warp_params & params);
+
+	// Raster-vs-sensor with the warped sensor tap
+	// (raster_sensor_3dof_warp.frag): layer tapped directly by output
+	// UV (no pose involved), sensor reprojected capture->predicted.
+	// Shares the raster-sensor layout/pool/set (same 3-binding shape);
+	// binding 2 rides the warp UBO below. Own pipeline object.
+	void record_raster_sensor_warp(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                               const std::array<vk::Extent2D, 2> & extents,
+	                               vk::Image layer_image, vk::ImageView layer_view,
+	                               vk::ImageView sensor_view,
+	                               const sensor_warp_params & params);
 	// VR-depth viz (decoder SBS, single image, GENERAL): green->red
 	// over 0..2.046m, far past 1020 black. Null view records opaque
 	// black. YCbCr views ride the immutable-sampler path (verdict
@@ -196,6 +230,7 @@ private:
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr}; // sensor viz (D16 false-color)
 	vk::raii::Pipeline layer_pipeline{nullptr}; // composited R16F viz
+	vk::raii::Pipeline sensor_warp_pipeline{nullptr}; // custom 3DOF sensor warp
 	vk::raii::Pipeline verdict_pipeline{nullptr}; // VR-vs-passthrough viz
 	vk::raii::DescriptorSetLayout set_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
@@ -217,6 +252,12 @@ private:
 	vk::raii::DescriptorSet raster_sensor_set{nullptr};
 	vk::raii::PipelineLayout raster_sensor_pipeline_layout{nullptr};
 	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
+	vk::raii::Pipeline raster_sensor_warp_pipeline{nullptr}; // custom 3DOF sensor tap
+	// Custom-warp UBO (sensor_warp_params, 176 B): separate allocation
+	// so the 16 B frame_params buffer above stays untouched. Written
+	// per warp record + flushed (non-coherent pattern, see upload).
+	buffer_allocation warp_ubo;
+	void upload_warp_params(const sensor_warp_params & params);
 	// VR+raster state (decoder SBS sampler2D + R16F layer + UBO): own
 	// layout + pool + set + pipeline. Converted views bake the paired
 	// handle's generation sampler as immutable (VUID-02738, verdict
