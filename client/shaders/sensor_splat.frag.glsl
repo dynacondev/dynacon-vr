@@ -21,12 +21,16 @@
 // Splat pass-through fragment: stores the splatted planar display depth
 // (meters) into the transient R16F image. No sampling, no UBO — the
 // depth test already resolved visibility. Blending off (replace).
+// Killed triangles (flat flag from the TL provoking vertex) discard.
 
 layout(location = 0) in float v_depth;
+layout(location = 1) flat in int v_kill;
 
 layout(location = 0) out float out_depth;
 
 void main()
 {
+	if (v_kill != 0)
+		discard;
 	out_depth = v_depth;
 }

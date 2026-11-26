@@ -669,10 +669,10 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 	}
 
 	// Splat pass-1 state: vertex-stage image + UBO layout, own pool/set,
-	// pipeline layout (vertex push block), pipeline (POINT_LIST, depth
-	// test LESS + write, no blending) and renderpass (R16F color +
-	// D16 depth). Teardown in dependency order (sets reference pool +
-	// set layout, pipeline references pipeline layout).
+	// pipeline layout (vertex push block), pipeline (TRIANGLE_LIST
+	// indexed mesh, depth test LESS + write, no blending) and renderpass
+	// (R16F color + D16 depth). Teardown in dependency order (sets
+	// reference pool + set layout, pipeline references pipeline layout).
 	splat_set.clear();
 	splat_pipeline.clear();
 	splat_pipeline_layout.clear();
@@ -787,7 +787,7 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		};
 		vk::PipelineVertexInputStateCreateInfo splat_vertex_input{};
 		vk::PipelineInputAssemblyStateCreateInfo splat_input_assembly{
-		        .topology = vk::PrimitiveTopology::ePointList,
+		        .topology = vk::PrimitiveTopology::eTriangleList,
 		};
 		vk::PipelineDepthStencilStateCreateInfo splat_depth{
 		        .depthTestEnable = VK_TRUE,
@@ -1319,7 +1319,11 @@ void depth_overlay_renderer::splat_pass1(vk::raii::CommandBuffer & cmd,
 	std::array<vk::ClearValue, 2> clears{};
 	clears[0].color.float32 = std::array<float, 4>{65504.f, 0.f, 0.f, 0.f};
 	clears[1].depthStencil = vk::ClearDepthStencilValue{1.0f, 0};
-	uint32_t point_count = (uint32_t)sens_w * (uint32_t)sens_h;
+	ensure_splat_index(sens_w, sens_h);
+	bool indexed = (bool)splat_index and sens_w >= 2 and sens_h >= 2;
+	uint32_t index_count = indexed ? (uint32_t)(sens_w - 1) * (uint32_t)(sens_h - 1) * 6u : 0;
+	if (indexed)
+		cmd.bindIndexBuffer(vk::Buffer(splat_index), 0, vk::IndexType::eUint32);
 	for (uint32_t eye = 0; eye < 2; ++eye)
 	{
 		auto & tgt = splat_targets[eye];
@@ -1342,9 +1346,63 @@ void depth_overlay_renderer::splat_pass1(vk::raii::CommandBuffer & cmd,
 		        .pClearValues = clears.data(),
 		};
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
-		cmd.draw(point_count, 1, 0, 0);
+		if (indexed)
+			cmd.drawIndexed(index_count, 1, 0, 0, 0);
 		cmd.endRenderPass();
 	}
+}
+
+void depth_overlay_renderer::ensure_splat_index(int sens_w, int sens_h)
+{
+	if (sens_w == splat_idx_w and sens_h == splat_idx_h and (bool)splat_index)
+		return;
+	// waitIdle'd here: sensor-size changes are rare (provider restart),
+	// and the rebuild must retire in-flight reads of the old index.
+	// Host-visible fill + flush, no staging (UBO pattern above).
+	device->waitIdle();
+	splat_index = buffer_allocation{};
+	splat_idx_w = sens_w;
+	splat_idx_h = sens_h;
+	if (sens_w < 2 or sens_h < 2)
+		return;
+	uint32_t quads_w = (uint32_t)sens_w - 1;
+	uint32_t quads_h = (uint32_t)sens_h - 1;
+	vk::DeviceSize index_count = vk::DeviceSize(quads_w) * vk::DeviceSize(quads_h) * 6;
+	splat_index = buffer_allocation(
+	        *device,
+	        vk::BufferCreateInfo{
+	                .size = index_count * sizeof(uint32_t),
+	                .usage = vk::BufferUsageFlagBits::eIndexBuffer,
+	        },
+	        VmaAllocationCreateInfo{
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	        },
+	        "depth splat index");
+	auto * out = static_cast<uint32_t *>(splat_index.map());
+	size_t m = 0;
+	for (int32_t y = 0; y < sens_h - 1; ++y)
+	{
+		for (int32_t x = 0; x < sens_w - 1; ++x)
+		{
+			// TL-first in both triangles: the TL corner is the
+			// provoking vertex whose flat kill flag the fragment
+			// reads. Order is load-bearing, keep it.
+			uint32_t a = (uint32_t)y * (uint32_t)sens_w + (uint32_t)x;
+			uint32_t b = a + 1;
+			uint32_t c = a + (uint32_t)sens_w;
+			uint32_t d = c + 1;
+			out[m++] = a;
+			out[m++] = b;
+			out[m++] = d;
+			out[m++] = a;
+			out[m++] = c;
+			out[m++] = d;
+		}
+	}
+	splat_index.unmap();
+	vmaFlushAllocation(vk_allocator::instance(), splat_index, 0, index_count * sizeof(uint32_t));
+	spdlog::info("Depth splat index: {}x{} ({} tris)", sens_w, sens_h, quads_w * quads_h * 2);
 }
 
 void depth_overlay_renderer::record_sensor_splat(vk::raii::CommandBuffer & cmd, size_t image_index,

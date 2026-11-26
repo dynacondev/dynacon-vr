@@ -23,10 +23,9 @@
 // depth layer. Green = agree, red ramp = |layer - sensor| over 0..2m.
 // No-data on either side (layer FAR >= 65000, splat clear 65504) reads
 // opaque black. This viz validates gross geometry, not sub-texel edge
-// agreement: fixed-size splats fatten foreground silhouettes by ~1.5 px,
-// painting systematic red halos on agreeing edges (same caveat class as
-// the direct-tap "contours show registration red"). Standard 4-byte eye
-// push, like all viz fragment shaders.
+// agreement: culled edge quads leave narrow honest FAR seams (the old
+// point-splat fattening halos are gone). Standard 4-byte eye push,
+// like all viz fragment shaders.
 
 layout(location = 0) in vec2 v_uv;
 

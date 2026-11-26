@@ -18,17 +18,21 @@
 
 #version 450
 
-// Forward splat vertex shader: one point per sensor texel, unprojected
-// with the planar convention, rigid-transformed capture->display and
-// projected with a finite display frustum. Hardware depth test resolves
-// visibility (nearest wins, order-independent); true disocclusions get
-// no splat and read as FAR clear. texelFetch with integer bounds keeps
-// the Y-flip exact and sidesteps vertex-stage sampler questions.
-// No-data and behind-camera points collapse to a clipped position.
+// Forward splat vertex shader: indexed triangle mesh over the sensor
+// texel grid (vertices at texel centers, static index buffer with two
+// triangles per quad, TL listed first in both). Each vertex unprojects
+// its own texel with the planar convention, rigid-transforms
+// capture->display and projects with a finite display frustum. Quads
+// straddling a depth step are killed (flat kill flag from the TL corner,
+// which is the provoking vertex for both triangles) so disocclusions
+// read as honest FAR holes instead of rubber-sheet stretches. Kept
+// quads interpolate smoothly (shared vertices compute bit-identical
+// positions, so no T-cracks) and the hardware depth test resolves
+// overlaps nearest-wins. texelFetch with integer bounds keeps the Y-flip
+// exact and sidesteps vertex-stage sampler questions.
 //
-// Plain scalar math only (no mat3/ternary on this driver path). The 12B
-// push block below rides the splat pipeline layout's vertex range; the
-// pass-2 fragment shaders declare the standard 4-byte eye push.
+// The push block below rides the splat pipeline layout's vertex range.
+// Plain scalar math only (no mat3/ternary on this driver path).
 
 layout(set = 0, binding = 0) uniform sampler2DArray depth_tex;
 
@@ -39,7 +43,7 @@ layout(set = 0, binding = 1) uniform splat_params
 	vec4 disp_tan[2]; // per eye display (target) frustum tangents: L, R, U, D
 	vec2 near_far;
 	float opacity;
-	float pad;
+	float cull_ratio; // max/min depth ratio over a quad before it is killed
 	vec4 trans[2]; // per eye: capture->display translation in display-eye space
 } u;
 
@@ -51,6 +55,7 @@ layout(push_constant) uniform pc
 } push;
 
 layout(location = 0) out float v_depth;
+layout(location = 1) flat out int v_kill;
 
 float linearize_depth(float d_norm, float n, float f)
 {
@@ -62,61 +67,85 @@ float linearize_depth(float d_norm, float n, float f)
 	return (n * f) / max(f - d_norm * (f - n), 1e-6);
 }
 
+// Capture->display rotation rows: transpose of the stored rows.
+vec3 c2d_mul(int e, vec3 Xc)
+{
+	vec3 r;
+	r.x = dot(vec3(u.rot_rows[e * 3 + 0].x, u.rot_rows[e * 3 + 1].x, u.rot_rows[e * 3 + 2].x), Xc);
+	r.y = dot(vec3(u.rot_rows[e * 3 + 0].y, u.rot_rows[e * 3 + 1].y, u.rot_rows[e * 3 + 2].y), Xc);
+	r.z = dot(vec3(u.rot_rows[e * 3 + 0].z, u.rot_rows[e * 3 + 1].z, u.rot_rows[e * 3 + 2].z), Xc);
+	return r;
+}
+
 void main()
 {
 	int e = push.eye;
 	int tx = gl_VertexIndex % push.sens_w;
 	int ty = gl_VertexIndex / push.sens_w;
-
-	// Integer Y-flip: framebuffer top row (ty = 0) is texture row H-1
-	// (same convention as the depth_viz.frag 1-v tap).
-	float d_norm = texelFetch(depth_tex, ivec3(tx, push.sens_h - 1 - ty, e), 0).r;
-	if (d_norm >= 0.9999)
-	{
-		gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-		v_depth = 0.0;
-		gl_PointSize = 1.0;
-		return;
-	}
-
-	// Texel centers in capture-tangent space.
-	float su = (float(tx) + 0.5) / float(push.sens_w);
-	float sv = (float(ty) + 0.5) / float(push.sens_h);
+	int tx1 = min(tx + 1, push.sens_w - 1);
+	int ty1 = min(ty + 1, push.sens_h - 1);
 	vec4 st = u.sens_tan[e];
-	float xs = mix(st.x, st.y, su);
-	float ys = mix(st.z, st.w, sv);
-
-	float z = linearize_depth(d_norm, u.near_far.x, u.near_far.y);
-	vec3 Xc = vec3(xs, ys, -1.0) * z;
-
-	// Capture->display: transpose of the stored rows, plus translation.
-	vec3 Xd;
-	Xd.x = dot(vec3(u.rot_rows[e * 3 + 0].x, u.rot_rows[e * 3 + 1].x, u.rot_rows[e * 3 + 2].x), Xc) + u.trans[e].x;
-	Xd.y = dot(vec3(u.rot_rows[e * 3 + 0].y, u.rot_rows[e * 3 + 1].y, u.rot_rows[e * 3 + 2].y), Xc) + u.trans[e].y;
-	Xd.z = dot(vec3(u.rot_rows[e * 3 + 0].z, u.rot_rows[e * 3 + 1].z, u.rot_rows[e * 3 + 2].z), Xc) + u.trans[e].z;
-	if (Xd.z >= -1e-6)
-	{
-		gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-		v_depth = 0.0;
-		gl_PointSize = 1.0;
-		return;
-	}
-
-	// Finite display projection. Framebuffer top (sv = 0) is NDC y = -1,
-	// matching the fullscreen-triangle convention (v_uv.y = 0 -> y = -1).
-	vec4 dt = u.disp_tan[e];
-	float xd = Xd.x / (-Xd.z);
-	float yd = Xd.y / (-Xd.z);
-	float du = (xd - dt.x) / (dt.y - dt.x);
-	float dv = (dt.z - yd) / (dt.z - dt.w);
-	float d = -Xd.z;
 	float n = u.near_far.x;
-	float f = 50.0;
-	gl_Position = vec4((2.0 * du - 1.0) * d, (2.0 * dv - 1.0) * d, f * (d - n) / (f - n), d);
+	float f = u.near_far.y;
+
+	// Quad depths (TL = own texel). Integer Y-flip: framebuffer top row
+	// (ty = 0) is texture row H-1 (same convention as depth_viz.frag).
+	float d00 = texelFetch(depth_tex, ivec3(tx, push.sens_h - 1 - ty, e), 0).r;
+	float d10 = texelFetch(depth_tex, ivec3(tx1, push.sens_h - 1 - ty, e), 0).r;
+	float d01 = texelFetch(depth_tex, ivec3(tx, push.sens_h - 1 - ty1, e), 0).r;
+	float d11 = texelFetch(depth_tex, ivec3(tx1, push.sens_h - 1 - ty1, e), 0).r;
+
+	// Kill test: no-data anywhere in the quad, a depth step across it,
+	// or any corner projecting behind the display eye. Positions always
+	// stay valid; the fragment stage discards killed triangles.
+	bool dead = (d00 >= 0.9999) || (d10 >= 0.9999) || (d01 >= 0.9999) || (d11 >= 0.9999);
+	float zmin = 1e30;
+	float zmax = 0.0;
+	vec3 Xd[4];
+	if (!dead)
+	{
+		float ds[4] = float[4](d00, d10, d01, d11);
+		float xs[4];
+		float ys[4];
+		xs[0] = st.x + (st.y - st.x) * (float(tx) + 0.5) / float(push.sens_w);
+		ys[0] = st.z + (st.w - st.z) * (float(ty) + 0.5) / float(push.sens_h);
+		xs[1] = st.x + (st.y - st.x) * (float(tx1) + 0.5) / float(push.sens_w);
+		ys[1] = ys[0];
+		xs[2] = xs[0];
+		ys[2] = st.z + (st.w - st.z) * (float(ty1) + 0.5) / float(push.sens_h);
+		xs[3] = xs[1];
+		ys[3] = ys[2];
+		for (int k = 0; k < 4; ++k)
+		{
+			// Far-clamped so sky pixels can't produce NaN steps or blow
+			// up the cull ratio.
+			float z = min(linearize_depth(ds[k], n, f), 20.0);
+			zmin = min(zmin, z);
+			zmax = max(zmax, z);
+			Xd[k] = c2d_mul(e, vec3(xs[k], ys[k], -1.0) * z) + u.trans[e].xyz;
+			if (Xd[k].z >= -1e-6)
+				dead = true;
+		}
+		if (!dead && zmax / max(zmin, 1e-6) > u.cull_ratio)
+			dead = true;
+	}
+	if (dead)
+		v_kill = 1;
+	else
+		v_kill = 0;
+
+	// Own corner reprojected (kept triangles interpolate these; killed
+	// triangles are discarded in the fragment shader).
+	float xs = st.x + (st.y - st.x) * (float(tx) + 0.5) / float(push.sens_w);
+	float ys = st.z + (st.w - st.z) * (float(ty) + 0.5) / float(push.sens_h);
+	float z = min(linearize_depth(d00, n, f), 20.0);
+	vec3 Xd0 = c2d_mul(e, vec3(xs, ys, -1.0) * z) + u.trans[e].xyz;
+	float d = max(-Xd0.z, 1e-6);
+	vec4 dt = u.disp_tan[e];
+	float du = (Xd0.x / (-Xd0.z) - dt.x) / (dt.y - dt.x);
+	float dv = (dt.z - Xd0.y / (-Xd0.z)) / (dt.z - dt.w);
+	float near = u.near_far.x;
+	float far = 50.0;
+	gl_Position = vec4((2.0 * du - 1.0) * d, (2.0 * dv - 1.0) * d, far * (d - near) / (far - near), d);
 	v_depth = d;
-	// Fixed footprint: covers ~3x sensor->display magnification pinholes.
-	// Residual pinholes at higher magnification and ~1.5-px foreground
-	// fattening at silhouettes are inherent; Adreno 740 supports far
-	// larger points, worst case on a limited device is graceful pinholes.
-	gl_PointSize = 3.0;
 }

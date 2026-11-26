@@ -179,7 +179,7 @@ public:
 		float near_z = 0.1f;
 		float far_z = 10.f;
 		float opacity = 0.3f;
-		float pad = 0;
+		float cull_ratio = 1.5f; // max/min quad depth ratio before kill
 		float trans[2][4]; // [eye]: xyz = qd^-1 * (pc - pd); w unused
 	};
 
@@ -268,9 +268,10 @@ private:
 	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
 	vk::raii::Pipeline splat_compare_pipeline{nullptr}; // splat pass-2 raster compare
 	// Splat pass-1 state (own layout: vertex-stage image + UBO; own pool,
-	// set, pipeline layout with the vertex push block, pipeline; own
-	// renderpass with color + depth). Declaration order matters: layout
-	// outlives sets (reverse destruction).
+	// set, pipeline layout with the vertex push block, pipeline
+	// (TRIANGLE_LIST indexed mesh, depth test LESS + write, no blend);
+	// own renderpass with color + depth). Declaration order matters:
+	// layout outlives sets (reverse destruction).
 	vk::raii::DescriptorSetLayout splat_layout{nullptr};
 	vk::raii::DescriptorPool splat_pool{nullptr};
 	vk::raii::DescriptorSet splat_set{nullptr};
@@ -296,9 +297,17 @@ private:
 	// splat record + flushed (non-coherent pattern, see upload).
 	buffer_allocation splat_ubo;
 	void upload_splat_params(const splat_warp_params & params);
-	// Pass 1 shared by both splat records: splat the sensor depth into
-	// the transient R16F image (depth-tested). Leaves the temp ready
-	// for a same-CB barrier to SHADER_READ_ONLY.
+	// Pass 1 shared by both splat records: splat the sensor mesh into
+	// the transient R16F image (edge-culled, depth-tested). Leaves the
+	// temp ready for a same-CB barrier to SHADER_READ_ONLY.
+	// Index buffer over the sensor texel grid (two TL-first triangles
+	// per quad; TL-first order is load-bearing for the flat kill flag,
+	// whose provoking vertex is always the first). Res-keyed (sensor
+	// dims arrive per frame); rebuilt waitIdle'd on change.
+	buffer_allocation splat_index;
+	int32_t splat_idx_w = 0;
+	int32_t splat_idx_h = 0;
+	void ensure_splat_index(int sens_w, int sens_h);
 	void splat_pass1(vk::raii::CommandBuffer & cmd,
 	                 vk::ImageView depth_view,
 	                 int sens_w, int sens_h);
