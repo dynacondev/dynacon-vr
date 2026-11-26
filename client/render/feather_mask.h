@@ -365,11 +365,15 @@ private:
 	// the binary working alpha ahead of the erode/blur chain (the blend
 	// unit does the OR — no work tap, which would be a feedback loop;
 	// R8 MIN-blend precedent from the reversed raster proves the blend
-	// path). R8 LOAD RP for the intermediates plus a pipe under the
-	// RGBA8 cutout LOAD twin for tier-0 submits. Full footprint every
-	// record (both bindings, Adreno partial-write rule); ping-ponged
-	// sets (async mask CB may still read the other, merge precedent);
-	// 4B bias push. Tier >= 2 skips with a warn (documented).
+	// path). R8 LOAD RP for the intermediates (tier-1 A, tiered seed —
+	// the reveal blurs with the rest of the chain) plus a pipe under the
+	// RGBA8 cutout LOAD twin for tier-0 submits (hard edge kept). Full
+	// footprint every record (both bindings, Adreno partial-write
+	// rule); ping-ponged sets (async mask CB may still read the other,
+	// merge precedent); 4B bias push. Runs in every tier (seed
+	// resolution on tiered: quarter for tier 2, eighth for tier 8).
+	// Reversed cuts raster as usual first; the reveal MAXes over them
+	// (physical visibility wins, hidden-wins-reversed precedent).
 	vk::raii::RenderPass reveal_r8_rp{nullptr};
 	vk::raii::DescriptorSetLayout reveal_layout{nullptr};
 	vk::raii::DescriptorPool reveal_pool{nullptr};

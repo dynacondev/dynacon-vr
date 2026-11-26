@@ -2233,7 +2233,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// become no-ops once pre-warmed).
 				for (auto & [oid, ost]: passthrough_objects)
 				{
-					if (ost.def.type != "3d-passthrough")
+					// Depth volumes claim + prewarm their feather like
+					// windows (renderer/swapchain/intermediates ready
+					// before first reveal); their soups live in the merge
+					// renderer, never in the feather mesh store.
+					if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-depth-passthrough")
 						continue;
 					float pf = ost.def.feather_px;
 					prewarmed_keys.emplace(pf);
@@ -2257,7 +2261,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				for (auto & [oid, ost]: passthrough_objects)
 				{
-					if (ost.def.type != "3d-passthrough" or not ost.soup_ready or not ost.fused.placed)
+					// Depth volumes join live (their feather group records
+					// the reveal) but upload no feather mesh: volume soups
+					// live in the merge renderer (copy path).
+					if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-depth-passthrough")
+						continue;
+					if (not ost.soup_ready or not ost.fused.placed)
 						continue;
 					float f = ost.def.feather_px;
 					live.insert(f);
@@ -2267,6 +2276,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
 					}
+					if (ost.def.type != "3d-passthrough")
+						continue;
 					auto mh = g.mesh_hashes.find(oid);
 					if (mh == g.mesh_hashes.end() or mh->second != ost.soup_hash)
 					{
@@ -2394,7 +2405,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				copy_occluder_draws.clear();
 				copy_volume_draws.clear();
 				copy_max_dilate = 0;
-				copy_max_bias = 0;
 				copy_max_bias = 0;
 				{
 					float lm_x = 2.f / (float)mw;
