@@ -1091,9 +1091,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		// the distance query); only the veil submit uses them.
 		bool is_boundary = def.type == "3d-boundary" or def.type == "3d-boundary-reversed";
 		bool is_hidden = def.type == "3d-passthrough-hidden";
-		if (def.type == "3d-depth-passthrough")
-			continue;
-		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_hidden)
+		bool is_depth = def.type == "3d-depth-passthrough";
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_hidden and not is_depth)
 		{
 			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
 			continue;
@@ -1630,7 +1629,7 @@ void scenes::stream::gui_fiducial_status()
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
 		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed" and
 		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed" and
-		    ost.def.type != "3d-passthrough-hidden")
+		    ost.def.type != "3d-passthrough-hidden" and ost.def.type != "3d-depth-passthrough")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
@@ -1663,8 +1662,9 @@ void scenes::stream::gui_fiducial_status()
 			continue;
 		}
 		std::string hidden_tag = (ost.def.type == "3d-passthrough-hidden") ? _S(" (hidden)") : "";
+		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
 		ImGui::Text("%s %.40s%s%s%s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", "", hidden_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", "", (hidden_tag + depth_tag).c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}
 	if (fiducial_trackers.empty())
 	{

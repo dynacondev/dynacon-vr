@@ -434,7 +434,10 @@ Each `passthrough` entry has:
   skipped with a warning. `"3d-passthrough-reversed"` reverse-cuts
   the model from every mask layer instead (game video shows through
   the silhouette, depth-tested against the windows covering each
-  pixel). `"3d-depth-passthrough"` is reserved (currently inert, skipped silently). `"3d-boundary"` shows
+  pixel). `"3d-depth-passthrough"` reveals the flat feed where the
+  runtime depth map resolves inside the model volume (single
+  `sensor < copy + bias` test against the merged copy of windows,
+  hidden and the volume back wall, feathered like a normal window). `"3d-boundary"` shows
   game video only *inside* the model volume and passthrough outside
   it — a Quest-guardian-style zone with adjustable size, shape and
   fade. `"3d-boundary-reversed"` inverts it (passthrough inside, game
@@ -470,7 +473,7 @@ Each `passthrough` entry has:
 - `scale`: uniform object scale, number or single-element array
   (default `1`, applied last)
 - `feather-px`: passthrough window feather width in screen pixels
-  (default `24`; `0` disables feathering). Mask stacks group by this
+  (default `24`, `12` for `3d-depth-passthrough`; `0` disables feathering). Mask stacks group by this
   value so each object feathers independently; applied live. Depth
   volumes reuse their feather value and feather through the same
   erode/blur chain. Not accepted for `3d-passthrough-reversed`,
@@ -479,6 +482,13 @@ Each `passthrough` entry has:
   layer and inherit each layer's feathering, while zones fade by
   distance instead (see `transition-distance`) and hidden cutouts are
   hard-edged (composited through the shared merged layer).
+- `dilate-px`: sensor-copy dilate radius in half-res texels
+  (`3d-depth-passthrough` only, default `2`, clamped to `0..8`). MIN-expands
+  known occluders (windows + hidden) so the single sensor compare tolerates
+  ±texel sensor noise; the volume back wall stays exact (rastered after).
+- `depth-bias-m`: sensor-compare depth bias in meters
+  (`3d-depth-passthrough` only, default `0`). Added to the merged copy
+  (windows + hidden + volume back wall) before the `sensor < copy + bias` test.
 - `transition-distance`: boundary fade width in meters
   (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
   scene cross-fades over ± this distance around the zone surface
