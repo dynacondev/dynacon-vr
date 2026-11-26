@@ -45,7 +45,6 @@
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <array>
-#include <deque>
 #include <cstddef>
 #include <filesystem>
 #include <map>
@@ -898,26 +897,22 @@ private:
 	// by the sensor / raster-vs-sensor viz. Off = direct tap + runtime
 	// warp (today's behavior) for A/B.
 	bool debug_custom_splat = true;
-	// Over-reprojection for sensor smoothing lag: the depth values'
-	// effective content time lags capture_time by the sensor pipeline's
-	// temporal smoothing, so the nominal capture->display warp
-	// under-corrects under head motion. Each new sensor frame (strictly
-	// increasing capture_time) buffers its capture pose below; the warp
-	// rewinds the content pose back along the recent sensor-window
-	// velocity by the slider's extra milliseconds, then runs the
-	// unchanged warp math from the effective pose. Gain 0 (also
-	// v1/no-pose/short-history/degenerate-dt) = nominal warp exactly.
-	// No deadband/clamp/LPF by design while testing: the window averaging is the smoother; if
-	// rest-swim shows on device, a deadband is the known fallback.
-	float debug_rewind_gain_ms = 0.f; // extra lag compensated, ms (negative = forward)
-	int debug_rewind_samples = 2;     // sensor-frame span back, 1..24 (N intervals over N+1 samples)
-	struct rewind_sample
-	{
-		XrTime t = 0;
-		std::array<XrPosef, view_count> pose{};
-		bool have_pose = false;
-	};
-	std::deque<rewind_sample> rewind_history{}; // oldest front; cap 25 = max span 24 + 1
+	// Per-texel flow correction for sensor smoothing lag: the depth
+	// values' effective content time lags the labelled capture_time, so
+	// under head motion every texel is displaced along its own image
+	// velocity (optical flow: translation flow ~ v/Z per texel depth,
+	// rotation flow uniform over the image, zero along the rotation
+	// axis). The warp shifts each texel forward along its display-eye
+	// flow by the slider's extra milliseconds (negative = backward).
+	// Uses instantaneous (frame-period) head velocity, never a
+	// long-window average (which collapses under oscillation, when
+	// displacement nets to zero at peak velocity). Gain 0 = nominal.
+	float debug_flow_ms = 0.f;
+	// Previous predicted display pose for the instantaneous-velocity
+	// finite difference (frame-period baseline).
+	XrTime flow_prev_t = 0;
+	std::array<XrPosef, view_count> flow_prev_pose{};
+	bool have_flow_prev = false;
 	// Sensor extrinsic test (debug): translational offset of the depth
 	// sensor from the headset origin in cm, applied in the content
 	// frame. Axes: [0]=right, [1]=up, [2]=back (OpenXR is -z forward,

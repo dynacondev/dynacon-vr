@@ -1788,33 +1788,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							frozen_capture_pose = capture_pose;
 							frozen_have_capture_pose = have_capture_pose;
 							frozen_depth_valid = true;
-							// Rewind history: buffer the capture pose per
-							// new sensor frame (strictly increasing
-							// capture_time; v1 runtimes report 0, skip
-							// those). Frozen frames never reach here (they
-							// take the early frozen branch above), and
-							// backward jumps (provider restart) clear and
-							// reseed.
-							if (have_capture_pose and shared_depth.capture_time != 0)
-							{
-								auto push_rewind = [&]()
-								{
-									rewind_sample s;
-									s.t = shared_depth.capture_time;
-									s.pose = capture_pose;
-									s.have_pose = true;
-									rewind_history.push_back(s);
-									while (rewind_history.size() > 25)
-										rewind_history.pop_front();
-								};
-								if (rewind_history.empty() or shared_depth.capture_time > rewind_history.back().t)
-									push_rewind();
-								else if (shared_depth.capture_time < rewind_history.back().t)
-								{
-									rewind_history.clear();
-									push_rewind();
-								}
-							}
 							// Phase-0 forensics: temporal model of the depth
 							// frame vs the predicted display frame (throttled
 							// 2s). Sizes the capture->display correction the
@@ -1892,10 +1865,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			// swapchain_index belongs to the stopped session and
 			// must never be submitted as if fresh on re-enter.
 			frozen_depth_valid = false;
-			// Same for the rewind window: post-gap timestamps keep
-			// increasing, so without this the first windows would
-			// span dead time and dilute velocity until refilled.
-			rewind_history.clear();
 		}
 
 		// Fresh frame accumulators for the Statistics plots (filled by
@@ -3683,17 +3652,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// both sensor modes (the sensor frustum is projected
 				// through it, i.e. the headset<->sensor rotational
 				// extrinsic is assumed identity); TO is always the
-				// predicted display pose. With a nonzero rewind gain the
-				// FROM pose is first rewound along the recent
-				// sensor-window velocity (see block below). Fallback (no
-				// capture timestamp / locate failed) is the acquire-time
+				// predicted display pose. Per-texel flow correction (see
+				// block below) shifts content along its display-eye
+				// velocity; extrinsic sliders offset the content frame.
+				// Fallback (no capture timestamp / locate failed) is the
 				// depth pose, the same fallback the baseline submit uses.
 				depth_overlay_renderer::splat_warp_params splat_params{};
 				bool have_splat = false;
 				int splat_sens_w = 0, splat_sens_h = 0;
 				std::string warp_note;
-				double rewind_vmax = 0.0;
-				int rewind_span = 0;
+				double flow_vmax = 0.0;
 				if (debug_custom_splat and
 				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor) and
 				    have_depth_frame and env_depth)
@@ -3703,6 +3671,45 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					splat_sens_h = (int)env_depth->depth_height();
 					if (splat_sens_w <= 0 or splat_sens_h <= 0)
 						have_splat = false;
+					// Flow source: instantaneous head velocity from the
+					// frame-period finite difference of the predicted
+					// display poses, as world-frame displacements over
+					// the slider interval (velocity * extra ms). A
+					// long-window average would collapse under
+					// oscillation, when displacement nets to zero at
+					// peak velocity; this baseline does not. Zero
+					// slider = zero displacement (exact).
+					double flow_extra_s = (double)debug_flow_ms * 1e-3;
+					double dt_flow = (double)(frame_state.predictedDisplayTime - flow_prev_t) * 1e-9;
+					bool have_flow = have_flow_prev and dt_flow > 1e-6 and dt_flow < 0.5; // 0.5s: hitch/gap guard
+					std::array<glm::vec3, view_count> flow_vel_w{};
+					std::array<glm::vec3, view_count> flow_om_w{};
+					if (have_flow and flow_extra_s != 0.0)
+					{
+						for (uint32_t eye = 0; eye < view_count; ++eye)
+						{
+							glm::vec3 p_now(mask_pose[eye].position.x, mask_pose[eye].position.y, mask_pose[eye].position.z);
+							glm::vec3 p_prev(flow_prev_pose[eye].position.x, flow_prev_pose[eye].position.y, flow_prev_pose[eye].position.z);
+							glm::vec3 vel = (p_now - p_prev) / (float)dt_flow;
+							flow_vmax = std::max(flow_vmax, (double)glm::length(vel));
+							flow_vel_w[eye] = vel * (float)flow_extra_s;
+							glm::quat q_now(mask_pose[eye].orientation.w, mask_pose[eye].orientation.x,
+							                mask_pose[eye].orientation.y, mask_pose[eye].orientation.z);
+							glm::quat q_prev(flow_prev_pose[eye].orientation.w, flow_prev_pose[eye].orientation.x,
+							                flow_prev_pose[eye].orientation.y, flow_prev_pose[eye].orientation.z);
+							glm::quat dq = glm::normalize(q_now * glm::inverse(glm::normalize(q_prev)));
+							if (dq.w < 0.f)
+								dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
+							float cos_half = std::clamp(dq.w, -1.f, 1.f);
+							float ang = 2.f * acosf(cos_half);
+							float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
+							if (ang > 1e-6f and sin_half > 1e-6f)
+								flow_om_w[eye] = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang * (float)(flow_extra_s / dt_flow));
+						}
+					}
+					flow_prev_t = frame_state.predictedDisplayTime;
+					flow_prev_pose = mask_pose;
+					have_flow_prev = true;
 					for (uint32_t eye = 0; eye < view_count; ++eye)
 					{
 						const XrPosef & from = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
@@ -3716,58 +3723,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						glm::vec3 pc(from.position.x, from.position.y, from.position.z);
 						glm::vec3 pd(to.position.x, to.position.y, to.position.z);
-						// Smoothing-lag rewind: the depth values describe
-						// the world as seen from an older head pose, so
-						// shift the content pose back along the recent
-						// sensor-window velocity by the slider's extra
-						// milliseconds (negative = forward) and warp from
-						// the effective pose with the unchanged math
-						// below. Translation rewind is per-axis (plain
-						// vector); rotation rewinds about the averaged
-						// angular-velocity axis (single axis-angle,
-						// never per-Euler-axis).
-						if (debug_rewind_gain_ms != 0.f and have_capture_pose and
-						    shared_depth.capture_time != 0 and rewind_history.size() >= 2)
-						{
-							int span = std::clamp(debug_rewind_samples, 1, 24);
-							size_t n = rewind_history.size() - 1;
-							size_t m = n > (size_t)span ? n - (size_t)span : 0;
-							const rewind_sample & newest = rewind_history[n];
-							const rewind_sample & oldest = rewind_history[m];
-							double dt_win = (double)(newest.t - oldest.t) * 1e-9;
-							if (dt_win > 1e-9 and newest.have_pose and oldest.have_pose)
-							{
-								if (eye == 0)
-									rewind_span = (int)(n - m);
-								double extra_s = (double)debug_rewind_gain_ms * 1e-3;
-								glm::vec3 p_new(newest.pose[eye].position.x, newest.pose[eye].position.y, newest.pose[eye].position.z);
-								glm::vec3 p_old(oldest.pose[eye].position.x, oldest.pose[eye].position.y, oldest.pose[eye].position.z);
-								glm::vec3 vel = (p_new - p_old) / (float)dt_win;
-								rewind_vmax = std::max(rewind_vmax, (double)glm::length(vel));
-								// Sign: positive ms rewinds (content assumed
-								// older than its label: effective pose back
-								// along +vel, same for -extra_ang below);
-								// negative ms pushes forward. The device
-								// null decides which is true.
-								pc = pc - vel * (float)extra_s;
-								glm::quat q_new(newest.pose[eye].orientation.w, newest.pose[eye].orientation.x,
-								                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
-								glm::quat q_old(oldest.pose[eye].orientation.w, oldest.pose[eye].orientation.x,
-								                oldest.pose[eye].orientation.y, oldest.pose[eye].orientation.z);
-								glm::quat dq = glm::normalize(q_new * glm::inverse(glm::normalize(q_old)));
-								if (dq.w < 0.f)
-									dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
-								float cos_half = std::clamp(dq.w, -1.f, 1.f);
-								float ang = 2.f * acosf(cos_half);
-								float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
-								if (ang > 1e-6f and sin_half > 1e-6f)
-								{
-									glm::vec3 axis = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half);
-									float extra_ang = ang * (float)(extra_s / dt_win);
-									qc = glm::normalize(glm::angleAxis(-extra_ang, axis) * qc);
-								}
-							}
-						}
+						// Per-texel flow is computed once above (frame-period
+						// finite difference) and filled into the UBO per
+						// eye; the vertex shader shifts each texel along
+						// its own display-eye flow. No long-window
+						// average: displacement nets to zero at peak
+						// velocity under oscillation.
 						// Sensor extrinsic test: translate the content
 						// frame by the slider offset (cm -> m), rotated
 						// into world by the content orientation. Identity
@@ -3803,6 +3764,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						glm::vec3 t = glm::inverse(qd) * (pc - pd);
 						if (std::fabs(debug_warp_gain - 1.f) > 1e-6f)
 							t = t * debug_warp_gain;
+						// Flow displacement into display-eye frame (the
+						// vertex shader shifts each texel along its own).
+						// Zero slider = zero vectors (exact identity).
+						glm::vec3 Dlin_eye = glm::inverse(qd) * flow_vel_w[eye];
+						glm::vec3 Dang_eye = glm::inverse(qd) * flow_om_w[eye];
+						splat_params.flow_lin[eye][0] = Dlin_eye.x;
+						splat_params.flow_lin[eye][1] = Dlin_eye.y;
+						splat_params.flow_lin[eye][2] = Dlin_eye.z;
+						splat_params.flow_lin[eye][3] = 0;
+						splat_params.flow_ang[eye][0] = Dang_eye.x;
+						splat_params.flow_ang[eye][1] = Dang_eye.y;
+						splat_params.flow_ang[eye][2] = Dang_eye.z;
+						splat_params.flow_ang[eye][3] = 0;
 						splat_params.trans[eye][0] = t.x;
 						splat_params.trans[eye][1] = t.y;
 						splat_params.trans[eye][2] = t.z;
@@ -3824,9 +3798,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						splat_params.far_z = shared_depth.far_z;
 						splat_params.opacity = debug_depth_opacity;
 						splat_params.depth_scale = debug_depth_scale;
-						if (debug_rewind_gain_ms != 0.f and rewind_span > 0)
-							warp_note = fmt::format(" rewind {:+.0f}ms N{} vmax{:.2f}m/s",
-							                          (double)debug_rewind_gain_ms, rewind_span, rewind_vmax);
+						if (debug_flow_ms != 0.f and have_flow)
+							warp_note = fmt::format(" flow {:+.0f}ms vmax{:.2f}m/s",
+							                        (double)debug_flow_ms, flow_vmax);
 						glm::vec3 r_ext_note(debug_extrinsic_cm[0], debug_extrinsic_cm[1], debug_extrinsic_cm[2]);
 						if (glm::dot(r_ext_note, r_ext_note) > 0.f)
 							warp_note += fmt::format(" ext({:+.1f},{:+.1f},{:+.1f})cm",
