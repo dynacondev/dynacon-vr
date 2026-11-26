@@ -1284,6 +1284,9 @@ void scenes::stream::gui_passthrough()
 	float depth_scale = debug_depth_scale;
 	if (ImGui::SliderFloat(_S("Depth scale"), &depth_scale, 0.8f, 1.2f, "%.3f"))
 		debug_depth_scale = std::clamp(depth_scale, 0.8f, 1.2f);
+	float warp_gain = debug_warp_gain;
+	if (ImGui::SliderFloat(_S("Warp gain"), &warp_gain, 0.5f, 1.5f, "%.3f"))
+		debug_warp_gain = std::clamp(warp_gain, 0.5f, 1.5f);
 	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 	ImGui::EndDisabled();

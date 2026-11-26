@@ -927,6 +927,10 @@ private:
 	float debug_extrinsic_cm[3] = {0.f, 0.f, 0.f};
 	// Multiplicative depth bias test (debug): 1 = sensor depths as-is.
 	float debug_depth_scale = 1.f;
+	// Warp gain test (debug): scales the capture->display delta itself
+	// (rotation angle and translation together); each texel's screen
+	// shift then scales with its nominal reprojection. 1 = nominal.
+	float debug_warp_gain = 1.f;
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe

@@ -3775,7 +3775,24 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						glm::vec3 r_ext(debug_extrinsic_cm[0], debug_extrinsic_cm[1], debug_extrinsic_cm[2]);
 						if (glm::dot(r_ext, r_ext) > 0.f)
 							pc = pc + qc * (r_ext * 0.01f);
-						glm::mat3 r = glm::mat3(glm::inverse(qc) * qd);
+						// Warp gain test: scale the capture->display delta
+						// itself (rotation angle about its own axis, plus
+						// translation), so every texel's reprojection
+						// scales with how far it moves. 1 = nominal.
+						glm::quat qdlt = glm::inverse(qc) * qd;
+						if (std::fabs(debug_warp_gain - 1.f) > 1e-6f)
+						{
+							glm::quat qn = glm::normalize(qdlt);
+							if (qn.w < 0.f)
+								qn = glm::quat(-qn.w, -qn.x, -qn.y, -qn.z);
+							float cos_half = std::clamp(qn.w, -1.f, 1.f);
+							float ang = 2.f * acosf(cos_half);
+							float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
+							if (ang > 1e-6f and sin_half > 1e-6f)
+								qdlt = glm::angleAxis(ang * debug_warp_gain,
+								                      glm::normalize(glm::vec3(qn.x, qn.y, qn.z) / sin_half));
+						}
+						glm::mat3 r = glm::mat3(qdlt);
 						for (int row = 0; row < 3; ++row)
 						{
 							splat_params.rot_rows[eye][row][0] = r[0][row];
@@ -3784,6 +3801,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							splat_params.rot_rows[eye][row][3] = 0;
 						}
 						glm::vec3 t = glm::inverse(qd) * (pc - pd);
+						if (std::fabs(debug_warp_gain - 1.f) > 1e-6f)
+							t = t * debug_warp_gain;
 						splat_params.trans[eye][0] = t.x;
 						splat_params.trans[eye][1] = t.y;
 						splat_params.trans[eye][2] = t.z;
@@ -3814,6 +3833,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							                           (double)debug_extrinsic_cm[0], (double)debug_extrinsic_cm[1], (double)debug_extrinsic_cm[2]);
 						if (std::fabs(debug_depth_scale - 1.f) > 1e-6f)
 							warp_note += fmt::format(" dsx{:.3f}", (double)debug_depth_scale);
+						if (std::fabs(debug_warp_gain - 1.f) > 1e-6f)
+							warp_note += fmt::format(" wg{:.3f}", (double)debug_warp_gain);
 					}
 				}
 				switch (debug_viz)
