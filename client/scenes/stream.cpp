@@ -3709,7 +3709,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						splat_params.near_z = shared_depth.near_z;
 						splat_params.far_z = shared_depth.far_z;
 						splat_params.opacity = debug_depth_opacity;
-						splat_params.cull_ratio = 1.5f; // max/min depth ratio before background stretch
+						splat_params.cull_ratio = 1.5f; // max/min quad depth ratio before background stretch
 					}
 				}
 				switch (debug_viz)
