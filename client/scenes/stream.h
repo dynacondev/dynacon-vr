@@ -909,7 +909,7 @@ private:
 	// v1/no-pose/short-history/degenerate-dt) = nominal warp exactly.
 	// No deadband/clamp/LPF by design while testing: the window averaging is the smoother; if
 	// rest-swim shows on device, a deadband is the known fallback.
-	float debug_rewind_gain_ms = 0.f; // extra lag compensated, ms
+	float debug_rewind_gain_ms = 0.f; // extra lag compensated, ms (negative = forward)
 	int debug_rewind_samples = 2;     // sensor-frame span back, 1..24 (N intervals over N+1 samples)
 	struct rewind_sample
 	{

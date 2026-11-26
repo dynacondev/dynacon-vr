@@ -1269,8 +1269,8 @@ void scenes::stream::gui_passthrough()
 		spdlog::info("Depth viz warp {}", debug_custom_splat ? "custom splat" : "runtime");
 	float rewind_ms = debug_rewind_gain_ms;
 	ImGui::BeginDisabled(not debug_custom_splat); // rewind only drives the custom splat warp
-	if (ImGui::SliderFloat(_S("Smoothing-lag rewind"), &rewind_ms, 0, 100, "%.0f ms"))
-		debug_rewind_gain_ms = std::clamp(rewind_ms, 0.f, 100.f);
+	if (ImGui::SliderFloat(_S("Smoothing-lag rewind"), &rewind_ms, -100, 100, "%+.0f ms"))
+		debug_rewind_gain_ms = std::clamp(rewind_ms, -100.f, 100.f);
 	int rewind_n = debug_rewind_samples;
 	if (ImGui::SliderInt(_S("Rewind sample span"), &rewind_n, 1, 24))
 		debug_rewind_samples = std::clamp(rewind_n, 1, 24);

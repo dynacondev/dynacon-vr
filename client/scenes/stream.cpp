@@ -3720,12 +3720,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// the world as seen from an older head pose, so
 						// shift the content pose back along the recent
 						// sensor-window velocity by the slider's extra
-						// milliseconds and warp from the effective pose
-						// with the unchanged math below. Translation
-						// rewind is per-axis (plain vector); rotation
-						// rewinds about the averaged angular-velocity axis
-						// (single axis-angle, never per-Euler-axis).
-						if (debug_rewind_gain_ms > 0.f and have_capture_pose and
+						// milliseconds (negative = forward) and warp from
+						// the effective pose with the unchanged math
+						// below. Translation rewind is per-axis (plain
+						// vector); rotation rewinds about the averaged
+						// angular-velocity axis (single axis-angle,
+						// never per-Euler-axis).
+						if (debug_rewind_gain_ms != 0.f and have_capture_pose and
 						    shared_depth.capture_time != 0 and rewind_history.size() >= 2)
 						{
 							int span = std::clamp(debug_rewind_samples, 1, 24);
@@ -3743,10 +3744,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								glm::vec3 p_old(oldest.pose[eye].position.x, oldest.pose[eye].position.y, oldest.pose[eye].position.z);
 								glm::vec3 vel = (p_new - p_old) / (float)dt_win;
 								rewind_vmax = std::max(rewind_vmax, (double)glm::length(vel));
-								// MINUS: stale content lags reality, so the
-								// effective pose lies further back along +vel
-								// (same for -extra_ang below). Flipping this
-								// sign would double the swim, not cancel it.
+								// Sign: positive ms rewinds (content assumed
+								// older than its label: effective pose back
+								// along +vel, same for -extra_ang below);
+								// negative ms pushes forward. The device
+								// null decides which is true.
 								pc = pc - vel * (float)extra_s;
 								glm::quat q_new(newest.pose[eye].orientation.w, newest.pose[eye].orientation.x,
 								                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
@@ -3795,8 +3797,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						splat_params.near_z = shared_depth.near_z;
 						splat_params.far_z = shared_depth.far_z;
 						splat_params.opacity = debug_depth_opacity;
-						if (debug_rewind_gain_ms > 0.f and rewind_span > 0)
-							rewind_note = fmt::format(" rewind +{:.0f}ms N{} vmax{:.2f}m/s",
+						if (debug_rewind_gain_ms != 0.f and rewind_span > 0)
+							rewind_note = fmt::format(" rewind {:+.0f}ms N{} vmax{:.2f}m/s",
 							                          (double)debug_rewind_gain_ms, rewind_span, rewind_vmax);
 					}
 				}
