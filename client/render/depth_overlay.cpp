@@ -755,6 +755,141 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		};
 		splat_pipeline = vk::raii::Pipeline(*device, nullptr, splat_pipeline_info);
 	}
+	// Tracked-hand draws (3d-depth-passthrough): LOAD twin of the splat
+	// RP so the sensor splat survives (loadOp is not part of
+	// compatibility, so the per-eye transient framebuffers are shared);
+	// position-only vertex input, push-only layout (96B VERT, inside
+	// the Vulkan minimum), same frag as the sensor splat.
+	{
+		vk::AttachmentDescription hand_color{
+		        .format = vk::Format::eR16Sfloat,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eLoad,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .initialLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentDescription hand_depth_att{
+		        .format = vk::Format::eD16Unorm,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eLoad,
+		        .storeOp = vk::AttachmentStoreOp::eDontCare,
+		        .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+		        .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+		        .initialLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		        .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		};
+		vk::AttachmentDescription hand_atts[2] = {hand_color, hand_depth_att};
+		vk::AttachmentReference hand_color_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentReference hand_depth_ref{
+		        .attachment = 1,
+		        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		};
+		vk::SubpassDescription hand_subpass{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .colorAttachmentCount = 1,
+		        .pColorAttachments = &hand_color_ref,
+		        .pDepthStencilAttachment = &hand_depth_ref,
+		};
+		vk::RenderPassCreateInfo hand_rp_info{
+		        .attachmentCount = 2,
+		        .pAttachments = hand_atts,
+		        .subpassCount = 1,
+		        .pSubpasses = &hand_subpass,
+		};
+		splat_load_rp = vk::raii::RenderPass(*device, hand_rp_info);
+	}
+	struct hand_pc
+	{
+		float view[16];
+		float tan[4];
+		float near_far[2];
+		int32_t eye = 0;
+		int32_t pad = 0;
+	};
+	static_assert(sizeof(hand_pc) == 96);
+	vk::PushConstantRange hand_push_range{
+	        .stageFlags = vk::ShaderStageFlagBits::eVertex,
+	        .offset = 0,
+	        .size = sizeof(hand_pc),
+	};
+	{
+		vk::PipelineLayoutCreateInfo hand_pl_info{
+		        .setLayoutCount = 0,
+		        .pSetLayouts = nullptr,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &hand_push_range,
+		};
+		hand_pipeline_layout = vk::raii::PipelineLayout(*device, hand_pl_info);
+	}
+	{
+		auto hand_vert = load_shader(*device, "depth_hand_mv.vert");
+		auto hand_frag = load_shader(*device, "sensor_splat.frag");
+		vk::PipelineShaderStageCreateInfo hand_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **hand_vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **hand_frag,
+		                .pName = "main",
+		        },
+		};
+		vk::VertexInputBindingDescription hand_binding{
+		        .binding = 0,
+		        .stride = sizeof(float) * 3,
+		        .inputRate = vk::VertexInputRate::eVertex,
+		};
+		vk::VertexInputAttributeDescription hand_attribute{
+		        .location = 0,
+		        .binding = 0,
+		        .format = vk::Format::eR32G32B32Sfloat,
+		        .offset = 0,
+		};
+		vk::PipelineVertexInputStateCreateInfo hand_vertex_input{
+		        .vertexBindingDescriptionCount = 1,
+		        .pVertexBindingDescriptions = &hand_binding,
+		        .vertexAttributeDescriptionCount = 1,
+		        .pVertexAttributeDescriptions = &hand_attribute,
+		};
+		vk::PipelineInputAssemblyStateCreateInfo hand_input_assembly{
+		        .topology = vk::PrimitiveTopology::eTriangleList,
+		};
+		vk::PipelineDepthStencilStateCreateInfo hand_depth{
+		        .depthTestEnable = VK_TRUE,
+		        .depthWriteEnable = VK_TRUE,
+		        .depthCompareOp = vk::CompareOp::eLess,
+		};
+		vk::PipelineColorBlendAttachmentState hand_blend_off{
+		        .blendEnable = VK_FALSE,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		};
+		vk::PipelineColorBlendStateCreateInfo hand_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &hand_blend_off,
+		};
+		vk::GraphicsPipelineCreateInfo hand_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = hand_stages,
+		        .pVertexInputState = &hand_vertex_input,
+		        .pInputAssemblyState = &hand_input_assembly,
+		        .pViewportState = &viewport_state,
+		        .pRasterizationState = &rasterization,
+		        .pMultisampleState = &multisample,
+		        .pDepthStencilState = &hand_depth,
+		        .pColorBlendState = &hand_blend,
+		        .pDynamicState = &dynamic,
+		        .layout = *hand_pipeline_layout,
+		        .renderPass = *splat_load_rp,
+		};
+		hand_pipeline = vk::raii::Pipeline(*device, nullptr, hand_pipeline_info);
+	}
 
 	// Converted YCbCr states bake this renderpass into their pipelines:
 	// rebuild them against the new one (plain views need nothing — the
@@ -1144,9 +1279,102 @@ void depth_overlay_renderer::splat_pass1_and_barrier(vk::raii::CommandBuffer & c
 void depth_overlay_renderer::fill_sync_heightfield(vk::raii::CommandBuffer & cmd,
                                                   vk::ImageView depth_view,
                                                   const splat_warp_params & params,
-                                                  int sens_w, int sens_h)
+                                                  int sens_w, int sens_h,
+                                                  const hand_splat * hands)
 {
-	splat_pass1_and_barrier(cmd, depth_view, params, sens_w, sens_h);
+	upload_splat_params(params);
+	splat_pass1(cmd, depth_view, sens_w, sens_h);
+	if (hands and hands->index_count > 0 and (vk::Buffer)hands->verts and (vk::Buffer)hands->indices)
+	{
+		// Sensor splat RP ends SHADER_READ: transition back for the
+		// hand LOAD passes, then hand the transient back SHADER_READ
+		// for the reveal/write-back taps below.
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
+		                    vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                    {},
+		                    {},
+		                    {},
+		                    vk::ImageMemoryBarrier{
+		                            .srcAccessMask = vk::AccessFlagBits::eShaderRead,
+		                            .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+		                            .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		                            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                            .image = vk::Image(splat_image),
+		                            .subresourceRange = {
+		                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                                    .levelCount = 1,
+		                                    .layerCount = 2,
+		                            },
+		                    });
+		struct hand_push
+		{
+			float view[16];
+			float tan[4];
+			float near_far[2];
+			int32_t eye = 0;
+			int32_t pad = 0;
+		};
+		static_assert(sizeof(hand_push) == 96);
+		for (uint32_t eye = 0; eye < 2; ++eye)
+		{
+			auto & tgt = splat_targets[eye];
+			hand_push pc{};
+			std::memcpy(pc.view, hands->view[eye], sizeof(pc.view));
+			std::memcpy(pc.tan, hands->tan[eye], sizeof(pc.tan));
+			pc.near_far[0] = hands->near_far[0];
+			pc.near_far[1] = hands->near_far[1];
+			pc.eye = (int32_t)eye;
+			vk::RenderPassBeginInfo begin_info{
+			        .renderPass = *splat_load_rp,
+			        .framebuffer = *tgt.framebuffer,
+			        .renderArea = {.offset = {0, 0}, .extent = splat_extent_},
+			        .clearValueCount = 0,
+			        .pClearValues = nullptr,
+			};
+			cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *hand_pipeline);
+			cmd.bindVertexBuffers(0, hands->verts, (vk::DeviceSize)0);
+			cmd.bindIndexBuffer(hands->indices, 0, vk::IndexType::eUint16);
+			cmd.setViewport(0, vk::Viewport{
+			                        .x = 0,
+			                        .y = 0,
+			                        .width = (float)splat_extent_.width,
+			                        .height = (float)splat_extent_.height,
+			                        .minDepth = 0,
+			                        .maxDepth = 1,
+			                });
+			cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = splat_extent_});
+			cmd.pushConstants<hand_push>(*hand_pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0, pc);
+			cmd.drawIndexed(hands->index_count, 1, 0, 0, 0);
+			cmd.endRenderPass();
+		}
+		// Hand passes end COLOR_ATTACHMENT: hand back SHADER_READ for
+		// the reveal/write-back taps (same access transition the
+		// splat-read barrier below encodes for the no-hands path).
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                    vk::PipelineStageFlagBits::eFragmentShader,
+		                    {},
+		                    {},
+		                    {},
+		                    vk::ImageMemoryBarrier{
+		                            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+		                            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+		                            .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		                            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                            .image = vk::Image(splat_image),
+		                            .subresourceRange = {
+		                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                                    .levelCount = 1,
+		                                    .layerCount = 2,
+		                            },
+		                    });
+		return;
+	}
+	splat_read_barrier(cmd, vk::Image(splat_image));
 }
 
 vk::ImageView depth_overlay_renderer::heightfield_view() const

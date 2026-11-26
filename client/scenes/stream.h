@@ -41,6 +41,7 @@
 #include "xr/board_solver.h"
 #include "xr/environment_depth.h"
 #include "xr/fiducial_filter.h"
+#include "xr/hand_tracker.h"
 #include "xr/boundary.h"
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
@@ -501,7 +502,7 @@ private:
 	// sampled by accumulate_metrics into global_metrics.
 	double fid_detect_ms = 0, fid_solve_ms = 0, fid_place_ms = 0;
 	int fid_votes = 0, fid_tags = 0;
-	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
+	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0, mask_depth_ms = 0;
 	int mask_draws = 0;
 	// Union-merge split timings (milliseconds, CPU record cost):
 	// common-layer base, merge record, finish (verdict + apply).
@@ -745,6 +746,9 @@ private:
 	std::map<std::string, std::string> copy_occluder_hashes;
 	std::map<std::string, std::string> copy_volume_hashes;
 	int copy_max_dilate = 0;
+	// Max depth_bias_m over the placed volumes (global guard shared by
+	// the feather reveal and the write-back twin).
+	float copy_max_bias = 0;
 	// One-shot log when the VR verdict first engages (virt paired).
 	bool vr_occlusion_logged = false;
 	// Passthrough-tab toggle: VR depth testing on/off. Off skips both
@@ -785,6 +789,28 @@ private:
 	// Capacity survives clear(). Render thread only.
 	std::vector<std::array<glm::mat4, 2>> proximity_spheres;
 	std::vector<std::array<glm::mat4, 2>> proximity_cylinders;
+	// Tracked-hand soup for the sensor heightfield (3d-depth-passthrough):
+	// CPU-skinned FB hand meshes (lobby quality) in world space at the
+	// video-frame time, rastered into the sync-eye splat transient right
+	// after the sensor splat (same LESS test). Static topology per mesh
+	// fetch (indices rebuilt on fetch only); positions re-skinned every
+	// frame into a host-visible vertex buffer (cutout_verts idiom).
+	// Render thread only.
+	struct hand_soup_topology
+	{
+		std::vector<XrVector3f> bind_positions;
+		std::vector<XrVector4sFB> blend_indices;
+		std::vector<XrVector4f> blend_weights;
+		std::vector<int16_t> indices;
+		std::vector<glm::mat4> inv_bind; // inverse(bind pose), static per fetch
+		bool ready = false;
+	};
+	std::array<hand_soup_topology, view_count> hand_soup_topo; // 0 = left, 1 = right
+	buffer_allocation hand_soup_verts;   // host-visible vec3 positions (both hands)
+	buffer_allocation hand_soup_indices; // host-visible uint16 (both hands, static)
+	uint32_t hand_soup_index_count = 0;
+	uint32_t hand_soup_vert_cap = 0; // allocated vertex capacity (verts)
+	bool hand_soup_valid = false;    // at least one hand skinned this frame
 	// The proximity palms borrow the GUI hand trackers (shared handles,
 	// per-frame positions — never culled): set from hidden_known at
 	// frame top so the GUI pair survives its interactability reset

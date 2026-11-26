@@ -2016,7 +2016,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// accumulate_metrics). fence_wait_ms is measured at frame top
 		// above, so it is not reset here; gui_ms/submit_ms are
 		// measured after this point and reset for freshness.
-		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = 0;
+		mask_raster_ms = mask_erode_ms = mask_blur_ms = mask_gizmo_ms = mask_depth_ms = 0;
 		mask_draws = 0;
 		gui_ms = submit_ms = 0;
 		cutouts_punched = false;
@@ -2394,6 +2394,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				copy_occluder_draws.clear();
 				copy_volume_draws.clear();
 				copy_max_dilate = 0;
+				copy_max_bias = 0;
+				copy_max_bias = 0;
 				{
 					float lm_x = 2.f / (float)mw;
 					float lm_y = 2.f / (float)mh;
@@ -2470,6 +2472,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							copy_volume_draws.push_back({oid, mvp});
 							int d = (int)ost.def.dilate_px;
 							copy_max_dilate = std::max(copy_max_dilate, std::min(std::max(d, 0), 8));
+							copy_max_bias = std::max(copy_max_bias, ost.def.depth_bias_m);
 						}
 					}
 				}
@@ -2489,6 +2492,190 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						merge_renderer->record_copy(rec_cmd, copy_occluder_draws, copy_volume_draws, copy_max_dilate);
 					um_base_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t0).count();
 				}
+				// Sensor heightfield for the depth reveal (sync-eye grid,
+				// hands in): splat the sensor capture with the sync warp,
+				// then the CPU-skinned hand soup, into the overlay
+				// transient both feather reveals and the write-back sample
+				// below. Same command buffer (barriers inside order the
+				// readers). The reveal only runs for groups that record
+				// below; the heightfield is skipped entirely without
+				// placed depth volumes.
+				bool depth_heightfield_filled = false;
+				depth_overlay_renderer::hand_splat depth_hand_soup{};
+				hand_soup_valid = false;
+				bool depth_path_active = vr_depth_test and depth_volume_active and have_depth_frame and env_depth and (bool)merge_renderer;
+				if (depth_path_active)
+				{
+					if (not depth_overlay)
+						depth_overlay = std::make_unique<depth_overlay_renderer>(device);
+					depth_overlay->ensure(instance, session, swapchain.format(),
+					                      (swapchain.width() + 1) / 2, (swapchain.height() + 1) / 2);
+					// Sync warp (capture -> video eye, the server timebase
+					// the copy lives in): the viz custom-splat targets the
+					// predicted display eye instead — never reuse its
+					// params here. FROM falls back to the acquire-time
+					// depth pose when the capture locate failed (same
+					// fallback the viz uses).
+					std::array<XrPosef, view_count> sync_from{};
+					std::array<XrFovf, view_count> sync_sens_fov{};
+					for (uint32_t eye = 0; eye < view_count; ++eye)
+					{
+						sync_from[eye] = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
+						sync_sens_fov[eye] = shared_depth.fov[eye];
+					}
+					depth_overlay_renderer::splat_warp_params sync_params{};
+					int sync_sens_w = (int)env_depth->depth_width();
+					int sync_sens_h = (int)env_depth->depth_height();
+					bool have_sync_splat = sync_sens_w > 0 and sync_sens_h > 0 and
+					        build_splat_warp(sync_from, sync_pose, sync_sens_fov, sync_fov,
+					                         shared_depth.near_z, shared_depth.far_z, debug_depth_opacity, sync_params);
+					if (have_sync_splat)
+					{
+						// Tracked-hand soup (lobby-quality FB meshes,
+						// CPU-skinned at the video-frame time): the sensor
+						// removal below erases hands from the map, this
+						// puts them back sharper than the sensor resolves.
+						// Untracked side (controllers, out of view) stays
+						// raw sensor: removal is armed only with a valid
+						// soup, so nothing is ever erased without a
+						// replacement (fail-closed).
+						if (system.hand_tracking_supported())
+						{
+							if (not left_hand)
+								left_hand = session.create_hand_tracker(XR_HAND_LEFT_EXT);
+							if (not right_hand)
+								right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
+						}
+						std::vector<glm::vec3> soup_pos;
+						std::vector<uint16_t> soup_idx;
+						soup_pos.reserve(4096);
+						soup_idx.reserve(12288);
+						auto skin_hand = [&](int side, XrHandEXT xr_hand, std::optional<xr::hand_tracker> & tracker) {
+							if (not tracker)
+								return;
+							const xr::hand_tracker::mesh_data * mesh = tracker->mesh();
+							if (not mesh or mesh->vertex_positions.empty() or mesh->indices.empty())
+								return;
+							auto located = tracker->locate(application::space(xr::spaces::world), sync_display_time);
+							if (not located)
+								return;
+							const auto & wrist = located->joints[XR_HAND_JOINT_WRIST_EXT].first;
+							if (not(wrist.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+								return;
+							auto & topo = hand_soup_topo[(size_t)side];
+							if (not topo.ready)
+							{
+								topo.bind_positions = mesh->vertex_positions;
+								topo.blend_indices = mesh->vertex_blend_indices;
+								topo.blend_weights = mesh->vertex_blend_weights;
+								topo.indices = mesh->indices;
+								topo.inv_bind.resize(mesh->joint_bind_poses.size());
+								for (size_t j = 0; j < mesh->joint_bind_poses.size(); ++j)
+								{
+									const auto & bp = mesh->joint_bind_poses[j];
+									glm::mat4 bind = glm::translate(glm::mat4(1), glm::vec3(bp.position.x, bp.position.y, bp.position.z)) *
+									                 glm::mat4_cast(glm::quat(bp.orientation.w, bp.orientation.x, bp.orientation.y, bp.orientation.z));
+									topo.inv_bind[j] = glm::inverse(bind);
+								}
+								topo.ready = true;
+							}
+							if (topo.inv_bind.size() != located->joints.size())
+								return;
+							std::array<glm::mat4, XR_HAND_JOINT_COUNT_EXT> skin{};
+							for (size_t j = 0; j < located->joints.size(); ++j)
+							{
+								const auto & jp = located->joints[j].first.pose;
+								glm::mat4 jw = glm::translate(glm::mat4(1), glm::vec3(jp.position.x, jp.position.y, jp.position.z)) *
+								               glm::mat4_cast(glm::quat(jp.orientation.w, jp.orientation.x, jp.orientation.y, jp.orientation.z));
+								skin[j] = jw * topo.inv_bind[j];
+							}
+							uint32_t base = (uint32_t)soup_pos.size();
+							for (size_t v = 0; v < topo.bind_positions.size(); ++v)
+							{
+								const auto & bp = topo.bind_positions[v];
+								const auto & bi = topo.blend_indices[v];
+								const auto & bw = topo.blend_weights[v];
+								glm::vec4 p(bp.x, bp.y, bp.z, 1);
+								glm::vec4 sp = skin[(size_t)std::clamp<int>(bi.x, 0, (int)skin.size() - 1)] * p * bw.x +
+								               skin[(size_t)std::clamp<int>(bi.y, 0, (int)skin.size() - 1)] * p * bw.y +
+								               skin[(size_t)std::clamp<int>(bi.z, 0, (int)skin.size() - 1)] * p * bw.z +
+								               skin[(size_t)std::clamp<int>(bi.w, 0, (int)skin.size() - 1)] * p * bw.w;
+								soup_pos.emplace_back(sp.x, sp.y, sp.z);
+							}
+							for (int16_t ix: topo.indices)
+								soup_idx.push_back((uint16_t)(base + ix));
+						};
+						skin_hand(0, XR_HAND_LEFT_EXT, left_hand);
+						skin_hand(1, XR_HAND_RIGHT_EXT, right_hand);
+						const depth_overlay_renderer::hand_splat * hands = nullptr;
+						if (not soup_pos.empty() and not soup_idx.empty() and soup_idx.size() % 3 == 0)
+						{
+							vk::DeviceSize vb = (vk::DeviceSize)soup_pos.size() * sizeof(glm::vec3);
+							if (not hand_soup_verts or hand_soup_vert_cap < (uint32_t)soup_pos.size())
+							{
+								hand_soup_verts = buffer_allocation{
+								        device,
+								        vk::BufferCreateInfo{
+								                .size = vb,
+								                .usage = vk::BufferUsageFlagBits::eVertexBuffer,
+								        },
+								        VmaAllocationCreateInfo{
+								                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+								                .usage = VMA_MEMORY_USAGE_AUTO,
+								        },
+								        "depth hand soup verts",
+								};
+								hand_soup_vert_cap = (uint32_t)soup_pos.size();
+							}
+							std::memcpy(hand_soup_verts.map(), soup_pos.data(), (size_t)vb);
+							hand_soup_verts.unmap();
+							if (hand_soup_index_count != (uint32_t)soup_idx.size())
+							{
+								hand_soup_indices = buffer_allocation{
+								        device,
+								        vk::BufferCreateInfo{
+								                .size = (vk::DeviceSize)soup_idx.size() * sizeof(uint16_t),
+								                .usage = vk::BufferUsageFlagBits::eIndexBuffer,
+								        },
+								        VmaAllocationCreateInfo{
+								                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+								                .usage = VMA_MEMORY_USAGE_AUTO,
+								        },
+								        "depth hand soup indices",
+								};
+								hand_soup_index_count = (uint32_t)soup_idx.size();
+							}
+							std::memcpy(hand_soup_indices.map(), soup_idx.data(), soup_idx.size() * sizeof(uint16_t));
+							hand_soup_indices.unmap();
+							for (uint32_t eye = 0; eye < view_count; ++eye)
+							{
+								glm::mat4 view = scene::view_matrix(sync_pose[eye]);
+								std::memcpy(depth_hand_soup.view[eye], &view, sizeof(view));
+								depth_hand_soup.tan[eye][0] = tanf(sync_fov[eye].angleLeft);
+								depth_hand_soup.tan[eye][1] = tanf(sync_fov[eye].angleRight);
+								depth_hand_soup.tan[eye][2] = tanf(sync_fov[eye].angleUp);
+								depth_hand_soup.tan[eye][3] = tanf(sync_fov[eye].angleDown);
+							}
+							depth_hand_soup.near_far[0] = shared_depth.near_z;
+							depth_hand_soup.near_far[1] = shared_depth.far_z;
+							depth_hand_soup.verts = vk::Buffer(hand_soup_verts);
+							depth_hand_soup.indices = vk::Buffer(hand_soup_indices);
+							depth_hand_soup.index_count = (uint32_t)soup_idx.size();
+							hand_soup_valid = true;
+							hands = &depth_hand_soup;
+						}
+						depth_overlay->fill_sync_heightfield(rec_cmd, env_depth->depth_view(shared_depth.swapchain_index),
+						                                    sync_params, sync_sens_w, sync_sens_h, hands);
+						depth_heightfield_filled = true;
+						// Removal is armed only with a valid replacement
+						// soup (fail-closed): raw sensor hands otherwise.
+						env_depth->set_hand_removal(hand_soup_valid);
+					}
+					else if (env_depth)
+						env_depth->set_hand_removal(false);
+				}
+				else if (env_depth)
+					env_depth->set_hand_removal(false);
 				// Debug-only cutout group (no objects): lets the marker
 				// window punch with a fiducials-only config. Claimed
 				// whenever cutouts exist but no group does (real groups
@@ -2572,6 +2759,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					last_box_log = instance.now();
 					log_boxes = true;
 				}
+				// Set when any group records a depth reveal below; the
+				// shared-layer write-back runs once after the loop.
+				bool depth_reveal_fired = false;
 				for (auto f: live_groups)
 				{
 					auto & g = mask_groups[f];
@@ -2675,9 +2865,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					// Reversed-only draws rasterize to a provable no-op, so a
 					// group with no positive draws is skipped exactly like an
-					// empty one.
+					// empty one — unless a depth volume claims this feather:
+					// volume-only groups still record (reveal-only).
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					if (draws.empty() or not any_positive)
+					// Depth reveal for this feather: any placed volume
+					// carrying this feather-px. Runs on top of windows
+					// too (same group), not just volume-only groups.
+					bool has_depth_here = false;
+					if (depth_heightfield_filled)
+					{
+						for (auto & [oid, ost]: passthrough_objects)
+						{
+							(void)oid;
+							if (ost.def.type == "3d-depth-passthrough" and ost.soup_ready and ost.fused.placed and
+							    ost.def.feather_px == f)
+							{
+								has_depth_here = true;
+								break;
+							}
+						}
+					}
+					if ((draws.empty() or not any_positive) and not has_depth_here)
 					{
 						g.active = false;
 						// Mesh-pipeline edge forensics: draws present ->
@@ -2723,10 +2931,26 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					g.active = true;
 					g.extent = {(int32_t)gw, (int32_t)gh};
 					feather_mask_renderer::mask_stage_cpu mstats{};
+					// Depth reveal params (borrowed heightfield + copy
+					// views, same-frame use only): sensor<copy+bias ORed
+					// into the working alpha ahead of the blur chain.
+					// Bias is the global max (uniform guard, documented).
+					feather_mask_renderer::depth_reveal reveal_params{};
+					const feather_mask_renderer::depth_reveal * reveal = nullptr;
+					if (has_depth_here)
+					{
+						reveal_params.sensor_view = depth_overlay->heightfield_view();
+						reveal_params.copy_view = merge_renderer->copy_view_array();
+						reveal_params.bias = copy_max_bias;
+						if (reveal_params.sensor_view and reveal_params.copy_view)
+							reveal = &reveal_params;
+					}
 					try
 					{
 						g.renderer->record(rec_cmd, g.swapchain.image(mask_index), {(uint32_t)mw, (uint32_t)mh}, draws,
-						                   true, f, cutouts, server_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh});
+						                   true, f, cutouts, server_mvp, &mstats, {(uint32_t)gw, (uint32_t)gh}, reveal);
+						if (reveal)
+							depth_reveal_fired = true;
 					}
 					catch (std::exception & e)
 					{
@@ -2740,13 +2964,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_raster_ms += mstats.raster_ms + mstats.punch_ms;
 					mask_erode_ms += mstats.erode_ms;
 					mask_blur_ms += mstats.blur_ms;
+					mask_depth_ms += mstats.depth_ms;
 					mask_draws += (int)mstats.draws;
 					// Box-coverage diagnostics for the scissor cull (see
 					// flag above; tier-0 has no scissored passes to report).
 					if (log_boxes and mstats.tier > 0)
 					{
-						spdlog::info("MaskBox: feather {}px box {:.0f}% tier {} draws {}",
-						             f, mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws);
+						spdlog::info("MaskBox: feather {}px box {:.0f}% tier {} draws {} depth {:.2f}ms",
+						             f, mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws, mstats.depth_ms);
 					}
 					if (not mask_split_written)
 					{
@@ -3183,6 +3408,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 				};
 				record_hidden_mask();
+				// Sensor write-back (3d-depth-passthrough): sensor depths
+				// that passed any group's reveal re-enter the shared layer
+				// so the verdict below occludes VR against them like real
+				// geometry. Once per frame (idempotent MIN), ahead of the
+				// verdict; skipped when no group revealed this frame.
+				if (depth_reveal_fired and vr_depth_test and depth_overlay and merge_renderer)
+				{
+					auto wsensor = depth_overlay->heightfield_view();
+					auto wcopy = merge_renderer->copy_view_array();
+					if (wsensor and wcopy)
+						merge_renderer->record_depth_writeback(rec_cmd, wsensor, wcopy, copy_max_bias);
+				}
 				// Merge: MAX-combine every active contributor
 				// (hidden first, then feather groups in map order, then
 				// debug) into ONE full-res image, submitted once with

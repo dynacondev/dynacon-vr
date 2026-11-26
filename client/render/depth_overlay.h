@@ -230,10 +230,26 @@ public:
 	// heightfield_view()/heightfield_sampler() in the feather reveal
 	// and the shared-layer write-back. Requires ensure() first (the
 	// transient lives there); no swapchain acquire needed.
+	// Tracked-hand soup splatted into the same transient (3d-depth-passthrough):
+	// CPU-skinned FB hand meshes (lobby quality) in world space at the
+	// video-frame time, drawn with the same depth test + mapping as the
+	// sensor splat so hands and sensor share one nearest-wins resolve.
+	// Plain floats (no glm dependency): view is column-major 4x4
+	// (world->sync-eye), tan is L,R,U,D, near_far meters.
+	struct hand_splat
+	{
+		vk::Buffer verts = nullptr;   // vec3 positions, world space
+		vk::Buffer indices = nullptr; // uint16 triangle list
+		uint32_t index_count = 0;
+		float view[2][16]{};
+		float tan[2][4]{};
+		float near_far[2]{0.1f, 10.f};
+	};
 	void fill_sync_heightfield(vk::raii::CommandBuffer & cmd,
 	                           vk::ImageView depth_view,
 	                           const splat_warp_params & params,
-	                           int sens_w, int sens_h);
+	                           int sens_w, int sens_h,
+	                           const hand_splat * hands = nullptr);
 	vk::ImageView heightfield_view() const;
 	vk::Sampler heightfield_sampler() const;
 
@@ -317,6 +333,14 @@ private:
 	vk::raii::PipelineLayout splat_pipeline_layout{nullptr};
 	vk::raii::Pipeline splat_pipeline{nullptr};
 	vk::raii::RenderPass splat_renderpass{nullptr};
+	// Tracked-hand draws into the same transient (3d-depth-passthrough):
+	// LOAD twin of the splat RP (same attachments, loadOp not in
+	// compatibility) so the sensor splat survives; position-only vertex
+	// input, push-only layout (96B VERT, inside the Vulkan minimum), same
+	// frag as the sensor splat (flat background depth + discard).
+	vk::raii::RenderPass splat_load_rp{nullptr};
+	vk::raii::PipelineLayout hand_pipeline_layout{nullptr};
+	vk::raii::Pipeline hand_pipeline{nullptr};
 	// Splat transient targets: owned R16F planar-depth image + D16 depth
 	// image (VMA, 2 layers each) at quarter-screen-linear (half the
 	// overlay per axis): still supersampled vs the ~320-class sensor
