@@ -3691,7 +3691,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				depth_overlay_renderer::splat_warp_params splat_params{};
 				bool have_splat = false;
 				int splat_sens_w = 0, splat_sens_h = 0;
-				std::string rewind_note;
+				std::string warp_note;
 				double rewind_vmax = 0.0;
 				int rewind_span = 0;
 				if (debug_custom_splat and
@@ -3768,6 +3768,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								}
 							}
 						}
+						// Sensor extrinsic test: translate the content
+						// frame by the slider offset (cm -> m), rotated
+						// into world by the content orientation. Identity
+						// rotation extrinsic (translation-only test).
+						glm::vec3 r_ext(debug_extrinsic_cm[0], debug_extrinsic_cm[1], debug_extrinsic_cm[2]);
+						if (glm::dot(r_ext, r_ext) > 0.f)
+							pc = pc + qc * (r_ext * 0.01f);
 						glm::mat3 r = glm::mat3(glm::inverse(qc) * qd);
 						for (int row = 0; row < 3; ++row)
 						{
@@ -3797,9 +3804,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						splat_params.near_z = shared_depth.near_z;
 						splat_params.far_z = shared_depth.far_z;
 						splat_params.opacity = debug_depth_opacity;
+						splat_params.depth_scale = debug_depth_scale;
 						if (debug_rewind_gain_ms != 0.f and rewind_span > 0)
-							rewind_note = fmt::format(" rewind {:+.0f}ms N{} vmax{:.2f}m/s",
+							warp_note = fmt::format(" rewind {:+.0f}ms N{} vmax{:.2f}m/s",
 							                          (double)debug_rewind_gain_ms, rewind_span, rewind_vmax);
+						glm::vec3 r_ext_note(debug_extrinsic_cm[0], debug_extrinsic_cm[1], debug_extrinsic_cm[2]);
+						if (glm::dot(r_ext_note, r_ext_note) > 0.f)
+							warp_note += fmt::format(" ext({:+.1f},{:+.1f},{:+.1f})cm",
+							                           (double)debug_extrinsic_cm[0], (double)debug_extrinsic_cm[1], (double)debug_extrinsic_cm[2]);
+						if (std::fabs(debug_depth_scale - 1.f) > 1e-6f)
+							warp_note += fmt::format(" dsx{:.3f}", (double)debug_depth_scale);
 					}
 				}
 				switch (debug_viz)
@@ -3828,11 +3842,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							                           env_depth->depth_width(), env_depth->depth_height(),
 							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
 							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6,
-							                           rewind_note);
+							                           warp_note);
 						else
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
+							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m{}",
 							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
+							                           warp_note);
 						break;
 					}
 					case debug_viz_mode::vr_depth:
@@ -3925,7 +3940,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							                           le.width, le.height,
 							                           env_depth->depth_width(), env_depth->depth_height(),
 							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
-							                           rewind_note);
+							                           warp_note);
 						}
 						else
 						{

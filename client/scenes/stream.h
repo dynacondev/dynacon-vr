@@ -918,6 +918,15 @@ private:
 		bool have_pose = false;
 	};
 	std::deque<rewind_sample> rewind_history{}; // oldest front; cap 25 = max span 24 + 1
+	// Sensor extrinsic test (debug): translational offset of the depth
+	// sensor from the headset origin in cm, applied in the content
+	// frame. Axes: [0]=right, [1]=up, [2]=back (OpenXR is -z forward,
+	// so a sensor mounted ahead of the headset is dialled as -Z).
+	// Rotation extrinsic stays identity until translation alone
+	// is ruled in or out.
+	float debug_extrinsic_cm[3] = {0.f, 0.f, 0.f};
+	// Multiplicative depth bias test (debug): 1 = sensor depths as-is.
+	float debug_depth_scale = 1.f;
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe

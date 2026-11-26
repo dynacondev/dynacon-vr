@@ -48,6 +48,7 @@ layout(set = 0, binding = 1) uniform splat_params
 	vec2 near_far;
 	float opacity;
 	vec4 trans[2]; // per eye: capture->display translation in display-eye space
+	float depth_scale; // multiplicative depth bias (debug)
 } u;
 
 layout(push_constant) uniform pc
@@ -124,7 +125,7 @@ void main()
 		// Far-clamped so sky pixels can't produce NaN steps.
 		if (ds[k] < 0.9999)
 		{
-			float z = min(linearize_depth(ds[k], n, f), 20.0);
+			float z = min(linearize_depth(ds[k], n, f) * u.depth_scale, 20.0);
 			vec3 Xd = c2d_mul(e, vec3(xs[k], ys[k], -1.0) * z) + u.trans[e].xyz;
 			if (Xd.z < -1e-6)
 				zbmax = max(zbmax, -Xd.z);
@@ -137,7 +138,7 @@ void main()
 	// overlaps nearest-wins. The own depth is the offset-0 tap above.
 	float ox = st.x + (st.y - st.x) * (float(tx) + 0.5) / float(push.sens_w);
 	float oy = st.z + (st.w - st.z) * (float(ty) + 0.5) / float(push.sens_h);
-	float z = min(linearize_depth(ds[0], n, f), 20.0);
+	float z = min(linearize_depth(ds[0], n, f) * u.depth_scale, 20.0);
 	vec3 Xd0 = c2d_mul(e, vec3(ox, oy, -1.0) * z) + u.trans[e].xyz;
 	float d = max(-Xd0.z, 1e-6);
 	vec4 dt = u.disp_tan[e];

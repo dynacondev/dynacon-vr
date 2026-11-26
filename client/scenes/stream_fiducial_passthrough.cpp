@@ -1274,6 +1274,16 @@ void scenes::stream::gui_passthrough()
 	int rewind_n = debug_rewind_samples;
 	if (ImGui::SliderInt(_S("Rewind sample span"), &rewind_n, 1, 24))
 		debug_rewind_samples = std::clamp(rewind_n, 1, 24);
+	if (ImGui::SliderFloat3(_S("Sensor extrinsic offset (cm, X right / Y up / Z back+)"), debug_extrinsic_cm, -10, 10, "%+.1f cm"))
+	{
+		for (int i = 0; i < 3; ++i)
+			debug_extrinsic_cm[i] = std::clamp(debug_extrinsic_cm[i], -10.f, 10.f);
+		spdlog::info("Depth sensor extrinsic {:+.1f} {:+.1f} {:+.1f} cm",
+		             (double)debug_extrinsic_cm[0], (double)debug_extrinsic_cm[1], (double)debug_extrinsic_cm[2]);
+	}
+	float depth_scale = debug_depth_scale;
+	if (ImGui::SliderFloat(_S("Depth scale"), &depth_scale, 0.8f, 1.2f, "%.3f"))
+		debug_depth_scale = std::clamp(depth_scale, 0.8f, 1.2f);
 	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 	ImGui::EndDisabled();
