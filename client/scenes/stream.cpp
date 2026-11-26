@@ -1697,7 +1697,20 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// Falls back to the acquire-time (predicted) depth pose, loudly.
 		std::array<XrPosef, view_count> capture_pose{};
 		bool have_capture_pose = false;
-		bool want_depth = debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor;
+		bool want_sensor_viz = debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor;
+		// Depth volumes need the sensor independent of the viz: placed +
+		// mesh-ready + fused pose (placements are fresh: update ran above).
+		bool depth_volume_active = false;
+		for (auto & [oid, ost]: passthrough_objects)
+		{
+			(void)oid;
+			if (ost.def.type == "3d-depth-passthrough" and ost.soup_ready and ost.fused.placed)
+			{
+				depth_volume_active = true;
+				break;
+			}
+		}
+		bool want_depth = want_sensor_viz or depth_volume_active;
 		if (want_depth)
 		{
 			if (not env_depth_probed)
@@ -1805,10 +1818,15 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// Rolling buffer of depth 1: refreshed on
 							// every successful acquire while a sensor viz
 							// mode is active (this block only runs then).
-							frozen_depth = shared_depth;
-							frozen_capture_pose = capture_pose;
-							frozen_have_capture_pose = have_capture_pose;
-							frozen_depth_valid = true;
+							// Depth-only frames (volume active, viz off)
+							// skip it: the frozen pose rides the viz submit
+							// and must not be poisoned with an empty locate.
+							if (want_sensor_viz)
+							{
+								frozen_depth = shared_depth;
+								frozen_capture_pose = capture_pose;
+								frozen_have_capture_pose = have_capture_pose;
+								frozen_depth_valid = true;
 							// Flow velocity history: buffer the capture pose
 							// per new sensor frame (strictly increasing
 							// capture_time; v1 runtimes report 0, skip
@@ -1837,12 +1855,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									flow_samp_history.push_back(s);
 								}
 							}
+							} // want_sensor_viz (frozen + flow)
 						}
-						else if (debug_pause_sensor and not frozen_depth_valid)
+						else if (want_sensor_viz and debug_pause_sensor and not frozen_depth_valid)
 						{
 							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for depth data (pause armed, no frozen frame yet)"; }
 						}
-						else
+						else if (want_sensor_viz)
 						{
 							if (status_rebuild_due(frame_state.predictedDisplayTime)) { depth_status = "waiting for depth data"; }
 						}
