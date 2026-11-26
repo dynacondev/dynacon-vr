@@ -36,7 +36,8 @@ struct push
 } // namespace
 
 static_assert(sizeof(depth_overlay_renderer::frame_params) == 16);
-static_assert(sizeof(depth_overlay_renderer::sensor_warp_params) == 256);
+static_assert(sizeof(depth_overlay_renderer::splat_warp_params) == 208);
+static_assert(sizeof(depth_overlay_renderer::splat_push) == 12);
 
 depth_overlay_renderer::depth_overlay_renderer(vk::raii::Device & device) : device(&device) {}
 
@@ -81,6 +82,108 @@ void depth_overlay_renderer::ensure(xr::instance & inst, xr::session & sess, vk:
 			targets.back()[eye].framebuffer = vk::raii::Framebuffer(*device, fb_info);
 		}
 	}
+	ensure_splat_targets();
+}
+
+void depth_overlay_renderer::ensure_splat_targets()
+{
+	// waitIdle'd by the caller (ensure: only runs on rebuild): retiring
+	// FBs/views/images is safe. Rebuilt unconditionally here (cheap,
+	// rare) so the FBs always reference the current splat renderpass,
+	// even on a format change with unchanged size. Tear down in
+	// dependency order (FBs reference views, views reference images).
+	for (auto & tgt : splat_targets)
+	{
+		tgt.framebuffer.clear();
+		tgt.view.clear();
+		tgt.depth_view.clear();
+	}
+	splat_view_array.clear();
+	splat_depth_image = image_allocation{};
+	splat_image = image_allocation{};
+	splat_extent_ = extent_;
+
+	splat_image = image_allocation(
+	        *device,
+	        vk::ImageCreateInfo{
+	                .imageType = vk::ImageType::e2D,
+	                .format = vk::Format::eR16Sfloat,
+	                .extent = {extent_.width, extent_.height, 1},
+	                .mipLevels = 1,
+	                .arrayLayers = 2,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .tiling = vk::ImageTiling::eOptimal,
+	                .usage = vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	        },
+	        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
+	        "depth splat transient");
+	splat_depth_image = image_allocation(
+	        *device,
+	        vk::ImageCreateInfo{
+	                .imageType = vk::ImageType::e2D,
+	                .format = vk::Format::eD16Unorm,
+	                .extent = {extent_.width, extent_.height, 1},
+	                .mipLevels = 1,
+	                .arrayLayers = 2,
+	                .samples = vk::SampleCountFlagBits::e1,
+	                .tiling = vk::ImageTiling::eOptimal,
+	                .usage = vk::ImageUsageFlagBits::eDepthStencilAttachment,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	                .initialLayout = vk::ImageLayout::eUndefined,
+	        },
+	        VmaAllocationCreateInfo{.usage = VMA_MEMORY_USAGE_AUTO},
+	        "depth splat depth");
+	splat_view_array = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
+	                                                               .image = vk::Image(splat_image),
+	                                                               .viewType = vk::ImageViewType::e2DArray,
+	                                                               .format = vk::Format::eR16Sfloat,
+	                                                               .subresourceRange = {
+	                                                                       .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                                                                       .baseMipLevel = 0,
+	                                                                       .levelCount = 1,
+	                                                                       .baseArrayLayer = 0,
+	                                                                       .layerCount = 2,
+	                                                               },
+	                                                       });
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		splat_targets[eye].view = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
+		                                                                       .image = vk::Image(splat_image),
+		                                                                       .viewType = vk::ImageViewType::e2DArray,
+		                                                                       .format = vk::Format::eR16Sfloat,
+		                                                                       .subresourceRange = {
+		                                                                               .aspectMask = vk::ImageAspectFlagBits::eColor,
+		                                                                               .baseMipLevel = 0,
+		                                                                               .levelCount = 1,
+		                                                                               .baseArrayLayer = eye,
+		                                                                               .layerCount = 1,
+		                                                                       },
+		                                                               });
+		splat_targets[eye].depth_view = vk::raii::ImageView(*device, vk::ImageViewCreateInfo{
+		                                                                             .image = vk::Image(splat_depth_image),
+		                                                                             .viewType = vk::ImageViewType::e2DArray,
+		                                                                             .format = vk::Format::eD16Unorm,
+		                                                                             .subresourceRange = {
+		                                                                                     .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		                                                                                     .baseMipLevel = 0,
+		                                                                                     .levelCount = 1,
+		                                                                                     .baseArrayLayer = eye,
+		                                                                                     .layerCount = 1,
+		                                                                             },
+		                                                                     });
+		vk::ImageView fb_atts[2] = {*splat_targets[eye].view, *splat_targets[eye].depth_view};
+		splat_targets[eye].framebuffer = vk::raii::Framebuffer(*device, vk::FramebufferCreateInfo{
+		                                                                                .renderPass = *splat_renderpass,
+		                                                                                .attachmentCount = 2,
+		                                                                                .pAttachments = fb_atts,
+		                                                                                .width = extent_.width,
+		                                                                                .height = extent_.height,
+		                                                                                .layers = 1,
+		                                                                        });
+	}
+	spdlog::info("Depth splat targets: {}x{}", extent_.width, extent_.height);
 }
 
 int depth_overlay_renderer::acquire()
@@ -187,7 +290,7 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 	// (union_merge ensure() precedent).
 	descriptor_set.clear();
 	pipeline.clear();
-	sensor_warp_pipeline.clear();
+	splat_colorize_pipeline.clear();
 	set_layout = vk::raii::DescriptorSetLayout(*device, set_layout_info);
 	vk::DescriptorPoolSize pool_sizes[2] = {
 	        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 8},
@@ -241,21 +344,21 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		        "depth overlay");
 	}
 
-	// Separate warp-params buffer (256 B): the 16 B frame_params buffer above
+	// Separate splat-params buffer (208 B): the 16 B frame_params buffer above
 	// stays untouched for the existing paths.
-	if (not warp_ubo or warp_ubo.info().size < sizeof(sensor_warp_params))
+	if (not splat_ubo or splat_ubo.info().size < sizeof(splat_warp_params))
 	{
-		warp_ubo = buffer_allocation(
+		splat_ubo = buffer_allocation(
 		        *device,
 		        vk::BufferCreateInfo{
-		                .size = sizeof(sensor_warp_params),
+		                .size = sizeof(splat_warp_params),
 		                .usage = vk::BufferUsageFlagBits::eUniformBuffer,
 		        },
 		        VmaAllocationCreateInfo{
 		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
 		                .usage = VMA_MEMORY_USAGE_AUTO,
 		        },
-		        "depth overlay warp");
+		        "depth overlay splat");
 	}
 
 	vk::PushConstantRange push_range{
@@ -347,7 +450,7 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		return vk::raii::Pipeline(*device, nullptr, plain_info);
 	};
 	layer_pipeline = make_plain_pipeline("layer_depth_viz.frag");
-	sensor_warp_pipeline = make_plain_pipeline("sensor_3dof_warp.frag");
+	splat_colorize_pipeline = make_plain_pipeline("splat_colorize.frag");
 
 	// Verdict viz samples two array images (verdict + layer for the
 	// no-window mask) plus the UBO: own layout/pool/set, same push +
@@ -442,11 +545,11 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 
 	// Raster-vs-sensor viz: same two-image + UBO shape as the verdict
 	// viz (verdict pattern above), own objects so both modes stay bound
-	// independently. The custom-3DOF twin pipeline below shares this
+	// independently. The splat-compare twin pipeline below shares this
 	// layout, so it retires here too (layout outlives all pipelines).
 	raster_sensor_set.clear();
 	raster_sensor_pipeline.clear();
-	raster_sensor_warp_pipeline.clear();
+	splat_compare_pipeline.clear();
 	raster_sensor_pipeline_layout.clear();
 	{
 		vk::DescriptorSetLayoutBinding rs_bindings[3] = {
@@ -532,12 +635,12 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		raster_sensor_pipeline = vk::raii::Pipeline(*device, nullptr, rs_pipeline_info);
 	}
 	{
-		// Custom 3DOF raster-vs-sensor twin: same 3-binding layout as
-		// the raster-sensor path above (a pipeline bakes its set
-		// layout), only the fragment module differs. Retired with the
-		// layout in the block above.
-		auto warp_frag = load_shader(*device, "raster_sensor_3dof_warp.frag");
-		vk::PipelineShaderStageCreateInfo warp_stages[2] = {
+		// Splat-compare twin: same 3-binding layout as the raster-sensor
+		// path above (a pipeline bakes its set layout), only the
+		// fragment module differs. Retired with the layout in the block
+		// above.
+		auto cmp_frag = load_shader(*device, "splat_compare.frag");
+		vk::PipelineShaderStageCreateInfo cmp_stages[2] = {
 		        {
 		                .stage = vk::ShaderStageFlagBits::eVertex,
 		                .module = **vert,
@@ -545,13 +648,13 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		        },
 		        {
 		                .stage = vk::ShaderStageFlagBits::eFragment,
-		                .module = **warp_frag,
+		                .module = **cmp_frag,
 		                .pName = "main",
 		        },
 		};
-		vk::GraphicsPipelineCreateInfo warp_pipeline_info{
+		vk::GraphicsPipelineCreateInfo cmp_pipeline_info{
 		        .stageCount = 2,
-		        .pStages = warp_stages,
+		        .pStages = cmp_stages,
 		        .pVertexInputState = &vertex_input,
 		        .pInputAssemblyState = &input_assembly,
 		        .pViewportState = &viewport_state,
@@ -562,7 +665,159 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		        .layout = *raster_sensor_pipeline_layout,
 		        .renderPass = *renderpass,
 		};
-		raster_sensor_warp_pipeline = vk::raii::Pipeline(*device, nullptr, warp_pipeline_info);
+		splat_compare_pipeline = vk::raii::Pipeline(*device, nullptr, cmp_pipeline_info);
+	}
+
+	// Splat pass-1 state: vertex-stage image + UBO layout, own pool/set,
+	// pipeline layout (vertex push block), pipeline (POINT_LIST, depth
+	// test LESS + write, no blending) and renderpass (R16F color +
+	// D16 depth). Teardown in dependency order (sets reference pool +
+	// set layout, pipeline references pipeline layout).
+	splat_set.clear();
+	splat_pipeline.clear();
+	splat_pipeline_layout.clear();
+	splat_layout.clear();
+	{
+		vk::DescriptorSetLayoutBinding splat_bindings[2] = {
+		        {
+		                .binding = 0,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eVertex,
+		        },
+		        {
+		                .binding = 1,
+		                .descriptorType = vk::DescriptorType::eUniformBuffer,
+		                .descriptorCount = 1,
+		                .stageFlags = vk::ShaderStageFlagBits::eVertex,
+		        },
+		};
+		vk::DescriptorSetLayoutCreateInfo splat_layout_info{
+		        .bindingCount = 2,
+		        .pBindings = splat_bindings,
+		};
+		splat_layout = vk::raii::DescriptorSetLayout(*device, splat_layout_info);
+		vk::DescriptorPoolSize splat_pool_sizes[2] = {
+		        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1},
+		        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1},
+		};
+		vk::DescriptorPoolCreateInfo splat_pool_info{
+		        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+		        .maxSets = 1,
+		        .poolSizeCount = 2,
+		        .pPoolSizes = splat_pool_sizes,
+		};
+		splat_pool = vk::raii::DescriptorPool(*device, splat_pool_info);
+		vk::DescriptorSetAllocateInfo splat_alloc{
+		        .descriptorPool = *splat_pool,
+		        .descriptorSetCount = 1,
+		        .pSetLayouts = &*splat_layout,
+		};
+		auto splat_sets = vk::raii::DescriptorSets(*device, splat_alloc);
+		splat_set = std::move(splat_sets.front());
+	}
+	vk::PushConstantRange splat_push_range{
+	        .stageFlags = vk::ShaderStageFlagBits::eVertex,
+	        .offset = 0,
+	        .size = sizeof(splat_push),
+	};
+	{
+		vk::PipelineLayoutCreateInfo splat_pl_info{
+		        .setLayoutCount = 1,
+		        .pSetLayouts = &*splat_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &splat_push_range,
+		};
+		splat_pipeline_layout = vk::raii::PipelineLayout(*device, splat_pl_info);
+	}
+	{
+		vk::AttachmentDescription splat_color{
+		        .format = vk::Format::eR16Sfloat,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eClear,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		        .finalLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		};
+		vk::AttachmentDescription splat_depth_att{
+		        .format = vk::Format::eD16Unorm,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eClear,
+		        .storeOp = vk::AttachmentStoreOp::eDontCare,
+		        .initialLayout = vk::ImageLayout::eUndefined,
+		        .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		};
+		vk::AttachmentDescription splat_atts[2] = {splat_color, splat_depth_att};
+		vk::AttachmentReference splat_color_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentReference splat_depth_ref{
+		        .attachment = 1,
+		        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		};
+		vk::SubpassDescription splat_subpass{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .colorAttachmentCount = 1,
+		        .pColorAttachments = &splat_color_ref,
+		        .pDepthStencilAttachment = &splat_depth_ref,
+		};
+		vk::RenderPassCreateInfo splat_rp_info{
+		        .attachmentCount = 2,
+		        .pAttachments = splat_atts,
+		        .subpassCount = 1,
+		        .pSubpasses = &splat_subpass,
+		};
+		splat_renderpass = vk::raii::RenderPass(*device, splat_rp_info);
+	}
+	{
+		auto splat_vert = load_shader(*device, "sensor_splat.vert");
+		auto splat_frag = load_shader(*device, "sensor_splat.frag");
+		vk::PipelineShaderStageCreateInfo splat_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **splat_vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **splat_frag,
+		                .pName = "main",
+		        },
+		};
+		vk::PipelineVertexInputStateCreateInfo splat_vertex_input{};
+		vk::PipelineInputAssemblyStateCreateInfo splat_input_assembly{
+		        .topology = vk::PrimitiveTopology::ePointList,
+		};
+		vk::PipelineDepthStencilStateCreateInfo splat_depth{
+		        .depthTestEnable = VK_TRUE,
+		        .depthWriteEnable = VK_TRUE,
+		        .depthCompareOp = vk::CompareOp::eLess,
+		};
+		vk::PipelineColorBlendAttachmentState splat_blend_off{
+		        .blendEnable = VK_FALSE,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		};
+		vk::PipelineColorBlendStateCreateInfo splat_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &splat_blend_off,
+		};
+		vk::GraphicsPipelineCreateInfo splat_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = splat_stages,
+		        .pVertexInputState = &splat_vertex_input,
+		        .pInputAssemblyState = &splat_input_assembly,
+		        .pViewportState = &viewport_state,
+		        .pRasterizationState = &rasterization,
+		        .pMultisampleState = &multisample,
+		        .pDepthStencilState = &splat_depth,
+		        .pColorBlendState = &splat_blend,
+		        .pDynamicState = &dynamic,
+		        .layout = *splat_pipeline_layout,
+		        .renderPass = *splat_renderpass,
+		};
+		splat_pipeline = vk::raii::Pipeline(*device, nullptr, splat_pipeline_info);
 	}
 
 	// VR-depth viz initial plain state (converted views rebuild the
@@ -1012,24 +1267,18 @@ void depth_overlay_renderer::upload_viz_params(const frame_params & params)
 	vmaFlushAllocation(vk_allocator::instance(), ubo, 0, sizeof(params));
 }
 
-void depth_overlay_renderer::upload_warp_params(const sensor_warp_params & params)
+void depth_overlay_renderer::upload_splat_params(const splat_warp_params & params)
 {
-	std::memcpy(warp_ubo.map(), &params, sizeof(params));
-	warp_ubo.unmap();
+	std::memcpy(splat_ubo.map(), &params, sizeof(params));
+	splat_ubo.unmap();
 	// Non-coherent host-visible memory: flush, same as above.
-	vmaFlushAllocation(vk_allocator::instance(), warp_ubo, 0, sizeof(params));
+	vmaFlushAllocation(vk_allocator::instance(), splat_ubo, 0, sizeof(params));
 }
 
-void depth_overlay_renderer::record_sensor_warp(vk::raii::CommandBuffer & cmd, size_t image_index,
-                                                const std::array<vk::Extent2D, 2> & extents,
-                                                vk::ImageView depth_view,
-                                                const sensor_warp_params & params)
+void depth_overlay_renderer::splat_pass1(vk::raii::CommandBuffer & cmd,
+                                         vk::ImageView depth_view,
+                                         int sens_w, int sens_h)
 {
-	if (image_index >= targets.size())
-		return;
-
-	upload_warp_params(params);
-
 	vk::DescriptorImageInfo image_info{
 	        .sampler = *sampler,
 	        .imageView = depth_view,
@@ -1038,12 +1287,118 @@ void depth_overlay_renderer::record_sensor_warp(vk::raii::CommandBuffer & cmd, s
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	vk::DescriptorBufferInfo buffer_info{
-	        .buffer = vk::Buffer(warp_ubo),
+	        .buffer = vk::Buffer(splat_ubo),
 	        .offset = 0,
-	        .range = sizeof(sensor_warp_params),
+	        .range = sizeof(splat_warp_params),
 	};
-	// Full footprint every record (Adreno partial-write rule): both
-	// bindings of the shared sensor layout.
+	// Full footprint every record (Adreno partial-write rule).
+	std::array<vk::WriteDescriptorSet, 2> writes = {{
+	        {
+	                .dstSet = *splat_set,
+	                .dstBinding = 0,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .pImageInfo = &image_info,
+	        },
+	        {
+	                .dstSet = *splat_set,
+	                .dstBinding = 1,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eUniformBuffer,
+	                .pBufferInfo = &buffer_info,
+	        },
+	}};
+	device->updateDescriptorSets(writes, nullptr);
+
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *splat_pipeline);
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *splat_pipeline_layout, 0, *splat_set, {});
+
+	// Clear color is FAR (65504 saturates the pass-2 ramp to red) with
+	// clear depth at far (1.0): uncovered pixels keep both and read as
+	// honest FAR holes. Depth test LESS keeps the nearest splat.
+	std::array<vk::ClearValue, 2> clears{};
+	clears[0].color.float32 = std::array<float, 4>{65504.f, 0.f, 0.f, 0.f};
+	clears[1].depthStencil = vk::ClearDepthStencilValue{1.0f, 0};
+	uint32_t point_count = (uint32_t)sens_w * (uint32_t)sens_h;
+	for (uint32_t eye = 0; eye < 2; ++eye)
+	{
+		auto & tgt = splat_targets[eye];
+		cmd.pushConstants<splat_push>(*splat_pipeline_layout, vk::ShaderStageFlagBits::eVertex, 0,
+		                              splat_push{(int32_t)eye, (int32_t)sens_w, (int32_t)sens_h});
+		cmd.setViewport(0, vk::Viewport{
+		                        .x = 0,
+		                        .y = 0,
+		                        .width = (float)splat_extent_.width,
+		                        .height = (float)splat_extent_.height,
+		                        .minDepth = 0,
+		                        .maxDepth = 1,
+		                });
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = splat_extent_});
+		vk::RenderPassBeginInfo begin_info{
+		        .renderPass = *splat_renderpass,
+		        .framebuffer = *tgt.framebuffer,
+		        .renderArea = {.offset = {0, 0}, .extent = splat_extent_},
+		        .clearValueCount = (uint32_t)clears.size(),
+		        .pClearValues = clears.data(),
+		};
+		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
+		cmd.draw(point_count, 1, 0, 0);
+		cmd.endRenderPass();
+	}
+}
+
+void depth_overlay_renderer::record_sensor_splat(vk::raii::CommandBuffer & cmd, size_t image_index,
+                                                 const std::array<vk::Extent2D, 2> & extents,
+                                                 vk::ImageView depth_view,
+                                                 const splat_warp_params & params,
+                                                 int sens_w, int sens_h)
+{
+	if (image_index >= targets.size() or sens_w <= 0 or sens_h <= 0)
+		return;
+
+	upload_splat_params(params);
+	splat_pass1(cmd, depth_view, sens_w, sens_h);
+
+	// Order the transient R16F write before the pass-2 tap (same
+	// command buffer; layout rides SHADER_READ_ONLY on both sides,
+	// viz_read_barrier pattern).
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	                    vk::PipelineStageFlagBits::eFragmentShader,
+	                    {},
+	                    {},
+	                    {},
+	                    vk::ImageMemoryBarrier{
+	                            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+	                            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	                            .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                            .image = vk::Image(splat_image),
+	                            .subresourceRange = {
+	                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                                    .levelCount = 1,
+	                                    .layerCount = 2,
+	                            },
+	                    });
+
+	// Pass 2: false-color the splatted depth (reuses the sensor set
+	// layout/pipeline layout/pool/set; only the frag module differs).
+	frame_params fp;
+	fp.near_z = params.near_z;
+	fp.far_z = params.far_z;
+	fp.opacity = params.opacity;
+	upload_viz_params(fp);
+	vk::DescriptorImageInfo image_info{
+	        .sampler = *sampler,
+	        .imageView = *splat_view_array,
+	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	};
+	vk::DescriptorBufferInfo buffer_info{
+	        .buffer = vk::Buffer(ubo),
+	        .offset = 0,
+	        .range = sizeof(frame_params),
+	};
 	std::array<vk::WriteDescriptorSet, 2> writes = {{
 	        {
 	                .dstSet = *descriptor_set,
@@ -1062,7 +1417,7 @@ void depth_overlay_renderer::record_sensor_warp(vk::raii::CommandBuffer & cmd, s
 	}};
 	device->updateDescriptorSets(writes, nullptr);
 
-	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *sensor_warp_pipeline);
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *splat_colorize_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, *descriptor_set, {});
 
 	// Fresh CLEAR images every frame: no barrier, no layout history.
@@ -1373,19 +1728,44 @@ void depth_overlay_renderer::record_raster_sensor(vk::raii::CommandBuffer & cmd,
 	}
 }
 
-void depth_overlay_renderer::record_raster_sensor_warp(vk::raii::CommandBuffer & cmd, size_t image_index,
-                                                       const std::array<vk::Extent2D, 2> & extents,
-                                                       vk::Image layer_image, vk::ImageView layer_view,
-                                                       vk::ImageView sensor_view,
-                                                       const sensor_warp_params & params)
+void depth_overlay_renderer::record_raster_splat(vk::raii::CommandBuffer & cmd, size_t image_index,
+                                                  const std::array<vk::Extent2D, 2> & extents,
+                                                  vk::Image layer_image, vk::ImageView layer_view,
+                                                  vk::ImageView sensor_view,
+                                                  const splat_warp_params & params,
+                                                  int sens_w, int sens_h)
 {
-	if (image_index >= targets.size())
+	if (image_index >= targets.size() or sens_w <= 0 or sens_h <= 0)
 		return;
 
-	upload_warp_params(params);
+	upload_splat_params(params);
+	splat_pass1(cmd, sensor_view, sens_w, sens_h);
+
+	// Order the transient R16F write plus the layer write before the
+	// pass-2 compare (same command buffer).
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	                    vk::PipelineStageFlagBits::eFragmentShader,
+	                    {},
+	                    {},
+	                    {},
+	                    vk::ImageMemoryBarrier{
+	                            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+	                            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	                            .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                            .image = vk::Image(splat_image),
+	                            .subresourceRange = {
+	                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                                    .levelCount = 1,
+	                                    .layerCount = 2,
+	                            },
+	                    });
 	{
-		// Layer rides the cross-CB read barrier; the sensor view rides
-		// no barrier (runtime hands it ready to sample).
+		// Pack valid images front for the cross-CB read barrier. The
+		// sensor view rides no barrier (the runtime hands the acquired
+		// image ready to sample, same as the sensor path).
 		vk::Image packed[1];
 		size_t m = 0;
 		if ((bool)layer_view and layer_image != vk::Image{})
@@ -1394,22 +1774,27 @@ void depth_overlay_renderer::record_raster_sensor_warp(vk::raii::CommandBuffer &
 	}
 
 	bool have_data = (bool)layer_view and layer_image != vk::Image{} and (bool)sensor_view;
+	frame_params fp;
+	fp.near_z = params.near_z;
+	fp.far_z = params.far_z;
+	fp.opacity = params.opacity;
 	if (have_data)
 	{
+		upload_viz_params(fp);
 		vk::DescriptorImageInfo layer_info{
 		        .sampler = *sampler,
 		        .imageView = layer_view,
 		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		};
-		vk::DescriptorImageInfo sensor_info{
+		vk::DescriptorImageInfo splat_info{
 		        .sampler = *sampler,
-		        .imageView = sensor_view,
+		        .imageView = *splat_view_array,
 		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 		};
 		vk::DescriptorBufferInfo buffer_info{
-		        .buffer = vk::Buffer(warp_ubo),
+		        .buffer = vk::Buffer(ubo),
 		        .offset = 0,
-		        .range = sizeof(sensor_warp_params),
+		        .range = sizeof(frame_params),
 		};
 		// Full footprint every record (Adreno partial-write rule).
 		std::array<vk::WriteDescriptorSet, 3> writes = {{
@@ -1425,7 +1810,7 @@ void depth_overlay_renderer::record_raster_sensor_warp(vk::raii::CommandBuffer &
 		                .dstBinding = 1,
 		                .descriptorCount = 1,
 		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
-		                .pImageInfo = &sensor_info,
+		                .pImageInfo = &splat_info,
 		        },
 		        {
 		                .dstSet = *raster_sensor_set,
@@ -1436,7 +1821,7 @@ void depth_overlay_renderer::record_raster_sensor_warp(vk::raii::CommandBuffer &
 		        },
 		}};
 		device->updateDescriptorSets(writes, nullptr);
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *raster_sensor_warp_pipeline);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *splat_compare_pipeline);
 		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *raster_sensor_pipeline_layout, 0, *raster_sensor_set, {});
 	}
 
@@ -1456,7 +1841,7 @@ void depth_overlay_renderer::record_raster_sensor_warp(vk::raii::CommandBuffer &
 		vk::ClearValue clear{};
 		clear.color.float32.fill(0);
 		if (not have_data)
-			clear = black_clear(params.opacity);
+			clear = black_clear(fp.opacity);
 		vk::RenderPassBeginInfo begin_info{
 		        .renderPass = *renderpass,
 		        .framebuffer = *tgt.framebuffer,

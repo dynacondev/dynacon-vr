@@ -1791,7 +1791,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// Phase-0 forensics: temporal model of the depth
 							// frame vs the predicted display frame (throttled
 							// 2s). Sizes the capture->display correction the
-							// 6DOF warp must span and cross-checks whether
+							// custom splat warp must span and cross-checks whether
 							// the returned depth pose rides predicted time.
 							// Note the depth-vs-mask delta below folds the
 							// static headset<->sensor extrinsic (depth pose
@@ -3618,7 +3618,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// already-acquired frames. Sensor provider cost is bound to its
 		// mode: the shared acquire site above stops it below.
 		int depth_image = -1;
-		bool used_custom_3dof = false;
+		bool used_custom_splat = false;
 		bool viz_content_recorded = false;
 		if (debug_viz == debug_viz_mode::none)
 			depth_status.clear();
@@ -3646,23 +3646,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				std::array<vk::Extent2D, 2> depth_ext;
 				for (uint32_t view = 0; view < view_count; ++view)
 					depth_ext[view] = {((uint32_t)extents[view].width + 1) / 2, ((uint32_t)extents[view].height + 1) / 2};
-				// Custom warp params: R_eye = Qc^-1 * Qd per eye plus
-				// t = Qd^-1 * (pc - pd) (capture -> predicted display,
-				// the runtime timewarp copy with translation). FROM is the
-				// headset pose at capture in both sensor modes (the
-				// sensor frustum is projected through it, i.e. the
-				// headset<->sensor rotational extrinsic is assumed
-				// identity); TO is always the predicted display pose.
-				// Fallback (no capture timestamp / locate failed) is the
-				// acquire-time depth pose, the same fallback the baseline
-				// submit uses.
-				depth_overlay_renderer::sensor_warp_params warp_params{};
-				bool have_warp = false;
-				if (debug_custom_3dof and
+				// Splat warp params: R_eye = Qc^-1 * Qd plus t = Qd^-1 * (pc - pd)
+				// per eye (capture -> predicted display, the runtime
+				// timewarp copy). FROM is the headset pose at capture in
+				// both sensor modes (the sensor frustum is projected
+				// through it, i.e. the headset<->sensor rotational
+				// extrinsic is assumed identity); TO is always the
+				// predicted display pose. Fallback (no capture timestamp
+				// / locate failed) is the acquire-time depth pose, the
+				// same fallback the baseline submit uses.
+				depth_overlay_renderer::splat_warp_params splat_params{};
+				bool have_splat = false;
+				int splat_sens_w = 0, splat_sens_h = 0;
+				if (debug_custom_splat and
 				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor) and
 				    have_depth_frame and env_depth)
 				{
-					have_warp = true;
+					have_splat = true;
+					splat_sens_w = (int)env_depth->depth_width();
+					splat_sens_h = (int)env_depth->depth_height();
+					if (splat_sens_w <= 0 or splat_sens_h <= 0)
+						have_splat = false;
 					for (uint32_t eye = 0; eye < view_count; ++eye)
 					{
 						const XrPosef & from = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
@@ -3671,74 +3675,40 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						glm::quat qd(to.orientation.w, to.orientation.x, to.orientation.y, to.orientation.z);
 						if (glm::dot(qc, qc) < 1e-12f or glm::dot(qd, qd) < 1e-12f)
 						{
-							have_warp = false;
+							have_splat = false;
 							break;
 						}
 						glm::mat3 r = glm::mat3(glm::inverse(qc) * qd);
 						for (int row = 0; row < 3; ++row)
 						{
-							warp_params.rot_rows[eye][row][0] = r[0][row];
-							warp_params.rot_rows[eye][row][1] = r[1][row];
-							warp_params.rot_rows[eye][row][2] = r[2][row];
-							warp_params.rot_rows[eye][row][3] = 0;
+							splat_params.rot_rows[eye][row][0] = r[0][row];
+							splat_params.rot_rows[eye][row][1] = r[1][row];
+							splat_params.rot_rows[eye][row][2] = r[2][row];
+							splat_params.rot_rows[eye][row][3] = 0;
 						}
+						glm::vec3 pc(from.position.x, from.position.y, from.position.z);
+						glm::vec3 pd(to.position.x, to.position.y, to.position.z);
+						glm::vec3 t = glm::inverse(qd) * (pc - pd);
+						splat_params.trans[eye][0] = t.x;
+						splat_params.trans[eye][1] = t.y;
+						splat_params.trans[eye][2] = t.z;
+						splat_params.trans[eye][3] = 0;
 						const XrFovf & sf = shared_depth.fov[eye];
-						warp_params.sens_tan[eye][0] = tanf(sf.angleLeft);
-						warp_params.sens_tan[eye][1] = tanf(sf.angleRight);
-						warp_params.sens_tan[eye][2] = tanf(sf.angleUp);
-						warp_params.sens_tan[eye][3] = tanf(sf.angleDown);
+						splat_params.sens_tan[eye][0] = tanf(sf.angleLeft);
+						splat_params.sens_tan[eye][1] = tanf(sf.angleRight);
+						splat_params.sens_tan[eye][2] = tanf(sf.angleUp);
+						splat_params.sens_tan[eye][3] = tanf(sf.angleDown);
 						const XrFovf & df = mask_fov[eye];
-						warp_params.disp_tan[eye][0] = tanf(df.angleLeft);
-						warp_params.disp_tan[eye][1] = tanf(df.angleRight);
-						warp_params.disp_tan[eye][2] = tanf(df.angleUp);
-						warp_params.disp_tan[eye][3] = tanf(df.angleDown);
+						splat_params.disp_tan[eye][0] = tanf(df.angleLeft);
+						splat_params.disp_tan[eye][1] = tanf(df.angleRight);
+						splat_params.disp_tan[eye][2] = tanf(df.angleUp);
+						splat_params.disp_tan[eye][3] = tanf(df.angleDown);
 					}
-					if (have_warp)
+					if (have_splat)
 					{
-						warp_params.near_z = shared_depth.near_z;
-						warp_params.far_z = shared_depth.far_z;
-						warp_params.opacity = debug_depth_opacity;
-						// 6DOF translation: qd^-1 * (pc - pd) per eye,
-						// capture->display in display-eye space (matches
-						// the c2d transpose in-shader).
-						uint32_t sens_w = env_depth ? env_depth->depth_width() : 0;
-						uint32_t sens_h = env_depth ? env_depth->depth_height() : 0;
-						for (uint32_t eye = 0; eye < view_count; ++eye)
-						{
-							const XrPosef & from = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
-							const XrPosef & to = mask_pose[eye];
-							glm::quat qc(from.orientation.w, from.orientation.x, from.orientation.y, from.orientation.z);
-							glm::quat qd(to.orientation.w, to.orientation.x, to.orientation.y, to.orientation.z);
-							glm::vec3 pc(from.position.x, from.position.y, from.position.z);
-							glm::vec3 pd(to.position.x, to.position.y, to.position.z);
-							glm::vec3 t = glm::inverse(qd) * (pc - pd);
-							warp_params.trans[eye][0] = t.x;
-							warp_params.trans[eye][1] = t.y;
-							warp_params.trans[eye][2] = t.z;
-							warp_params.trans[eye][3] = 0;
-							// Refine step cap: 8 sensor texels in tangent
-							// units; display texel pitch from the (halved)
-							// record extents, for the accept gate.
-							float sens_pitch = 0;
-							if (sens_w > 0 and sens_h > 0)
-							{
-								float spx = (warp_params.sens_tan[eye][1] - warp_params.sens_tan[eye][0]) / (float)sens_w;
-								float spy = (warp_params.sens_tan[eye][3] - warp_params.sens_tan[eye][2]) / (float)sens_h;
-								sens_pitch = std::max(spx, spy);
-							}
-							float dpx = (warp_params.disp_tan[eye][1] - warp_params.disp_tan[eye][0]) /
-							          std::max((float)depth_ext[eye].width, 1.0f);
-							float dpy = (warp_params.disp_tan[eye][3] - warp_params.disp_tan[eye][2]) /
-							          std::max((float)depth_ext[eye].height, 1.0f);
-							warp_params.misc[eye][0] = 8.0f * sens_pitch; // step cap AND min-seed diameter (shader halves it)
-							warp_params.misc[eye][1] = std::max(dpx, dpy);
-							warp_params.misc[eye][2] = 0;
-							warp_params.misc[eye][3] = 0;
-						}
-						warp_params.tune[0] = 1.5f; // accept gate, display texels
-						warp_params.tune[1] = 0;    // reserved (silhouette ratio retired)
-						warp_params.tune[2] = debug_6dof ? 2.0f : 0.0f;
-						warp_params.tune[3] = 0;
+						splat_params.near_z = shared_depth.near_z;
+						splat_params.far_z = shared_depth.far_z;
+						splat_params.opacity = debug_depth_opacity;
 					}
 				}
 				switch (debug_viz)
@@ -3749,11 +3719,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						params.near_z = shared_depth.near_z;
 						params.far_z = shared_depth.far_z;
-						if (have_warp)
+						if (have_splat)
 						{
-							depth_overlay->record_sensor_warp(command_buffer, (size_t)depth_image, depth_ext,
-							                                  env_depth->depth_view(shared_depth.swapchain_index), warp_params);
-							used_custom_3dof = true;
+							depth_overlay->record_sensor_splat(command_buffer, (size_t)depth_image, depth_ext,
+							                                   env_depth->depth_view(shared_depth.swapchain_index), splat_params,
+							                                   splat_sens_w, splat_sens_h);
+							used_custom_splat = true;
 						}
 						else
 							depth_overlay->record(command_buffer, (size_t)depth_image, depth_ext,
@@ -3840,16 +3811,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						params.far_z = shared_depth.far_z;
 						if (merge_renderer and merge_this_frame and env_depth)
 						{
-							if (have_warp)
+							if (have_splat)
 							{
 								// Custom path: layer tapped directly (no
-								// pose involved), sensor warped
-								// capture->predicted; viz submitted at
-								// the predicted pose below.
-								depth_overlay->record_raster_sensor_warp(command_buffer, (size_t)depth_image, depth_ext,
-								                                        merge_renderer->layer_image(), merge_renderer->layer_view_array(),
-								                                        env_depth->depth_view(shared_depth.swapchain_index), warp_params);
-								used_custom_3dof = true;
+								// pose involved), sensor via the splat
+								// transient; viz submitted at the predicted
+								// pose below.
+								depth_overlay->record_raster_splat(command_buffer, (size_t)depth_image, depth_ext,
+								                                   merge_renderer->layer_image(), merge_renderer->layer_view_array(),
+								                                   env_depth->depth_view(shared_depth.swapchain_index), splat_params,
+								                                   splat_sens_w, splat_sens_h);
+								used_custom_splat = true;
 							}
 							else
 								depth_overlay->record_raster_sensor(command_buffer, (size_t)depth_image, depth_ext,
@@ -3912,8 +3884,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if (viz_content_recorded and
 				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor))
 				{
-					if (used_custom_3dof)
-						depth_status += debug_6dof ? " [custom6dof]" : " [custom3dof]";
+					if (used_custom_splat)
+						depth_status += " [splat]";
 					else
 						depth_status += " [runtime]";
 				}
@@ -4268,8 +4240,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		// capture_time (capture_pose above) with the sensor frustum, so
 		// the rotation-only warp corrects capture->display head motion.
 		// Predicted depth pose is the logged fallback (swims).
-		// Custom 3DOF warp frames are already at the predicted display
-		// pose (warped in-shader), so they submit there and the runtime
+		// Custom splat frames are already at the predicted display
+		// pose (splatted in-shader), so they submit there and the runtime
 		// warp is ~identity.
 		// Submitting live would present stale pixels as fresh
 		// (swim/misalign under head motion).
@@ -4277,7 +4249,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 		{
 			const XrPosef * viz_pose = sync_pose.data();
 			const XrFovf * viz_fov = sync_fov.data();
-			if (used_custom_3dof)
+			if (used_custom_splat)
 			{
 				viz_pose = mask_pose.data();
 				viz_fov = mask_fov.data();

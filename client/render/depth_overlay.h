@@ -167,13 +167,11 @@ public:
 	                      vk::Image layer_image, vk::ImageView layer_view,
 	                      const frame_params & params);
 
-	// Custom 3DOF/6DOF rotation (+translation) warp params (std140):
-	// per-eye rotation rows (R = Qc^-1 * Qd) plus frustum tangents.
-	// 6DOF adds the display-eye origin in capture-eye space (trans)
-	// plus per-eye step/pitch scales (misc) and global tuning (tune:
-	// accept-gate texels, reserved, refinement enable, reserved).
-	// 256 bytes, 16-aligned.
-	struct sensor_warp_params
+	// Forward-splat warp params (std140): per-eye rotation rows
+	// (R = Qc^-1 * Qd), sensor/display frustum tangents, near/far and
+	// the capture->display translation in display-eye space. Read by the
+	// splat vertex shader. 208 bytes, 16-aligned.
+	struct splat_warp_params
 	{
 		float rot_rows[2][3][4]; // [eye][row]: xyz = rotation row, w unused
 		float sens_tan[2][4];    // [eye]: sensor frustum tangents L, R, U, D
@@ -182,34 +180,41 @@ public:
 		float far_z = 10.f;
 		float opacity = 0.3f;
 		float pad = 0;
-		float trans[2][4]; // [eye]: xyz = capture->display translation in display-eye
-		                   // space, qd^-1 * (pc - pd); w unused
-		float misc[2][4];  // [eye]: x = refine step cap (capture-tangent units),
-		                   // y = display texel pitch (tangent units), z/w reserved
-		float tune[4]; // x = accept gate (display texels), y = reserved,
-		               // z = refinement enable (0 = 3DOF seed, 2 = iterate), w reserved
+		float trans[2][4]; // [eye]: xyz = qd^-1 * (pc - pd); w unused
 	};
 
-	// Sensor viz through the custom 3DOF warp (sensor_3dof_warp.frag):
-	// same false color as record(), resampled capture->predicted.
-	// Shares the sensor set layout/pipeline layout/pool/set (layer
-	// precedent: only the fragment module differs); binding 1 rides
-	// the warp UBO below. Own pipeline object.
-	void record_sensor_warp(vk::raii::CommandBuffer & cmd, size_t image_index,
-	                        const std::array<vk::Extent2D, 2> & extents,
-	                        vk::ImageView depth_view,
-	                        const sensor_warp_params & params);
+	// Push block for the splat vertex shader (eye + sensor dims for the
+	// gl_VertexIndex -> texel mapping). The pass-2 fragment shaders use
+	// the standard 4-byte eye push like all viz frags. 12 bytes.
+	struct splat_push
+	{
+		int32_t eye = 0;
+		int32_t sens_w = 0;
+		int32_t sens_h = 0;
+	};
 
-	// Raster-vs-sensor with the warped sensor tap
-	// (raster_sensor_3dof_warp.frag): layer tapped directly by output
-	// UV (no pose involved), sensor reprojected capture->predicted.
-	// Shares the raster-sensor layout/pool/set (same 3-binding shape);
-	// binding 2 rides the warp UBO below. Own pipeline object.
-	void record_raster_sensor_warp(vk::raii::CommandBuffer & cmd, size_t image_index,
-	                               const std::array<vk::Extent2D, 2> & extents,
-	                               vk::Image layer_image, vk::ImageView layer_view,
-	                               vk::ImageView sensor_view,
-	                               const sensor_warp_params & params);
+	// Sensor viz through the forward splat (sensor_splat.vert +
+	// sensor_splat.frag -> splat_colorize.frag): each sensor texel
+	// splats into the predicted view with hardware depth test, then the
+	// transient depth image is false-colored. Pass 2 reuses the sensor
+	// set layout/pipeline layout/pool/set (same 2-binding shape).
+	void record_sensor_splat(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                         const std::array<vk::Extent2D, 2> & extents,
+	                         vk::ImageView depth_view,
+	                         const splat_warp_params & params,
+	                         int sens_w, int sens_h);
+
+	// Raster-vs-sensor with the splatted sensor tap
+	// (sensor_splat.* -> splat_compare.frag): layer tapped directly by
+	// output UV (no pose involved), sensor via the transient splat
+	// image. Pass 2 reuses the raster-sensor layout/pool/set (same
+	// 3-binding shape).
+	void record_raster_splat(vk::raii::CommandBuffer & cmd, size_t image_index,
+	                         const std::array<vk::Extent2D, 2> & extents,
+	                         vk::Image layer_image, vk::ImageView layer_view,
+	                         vk::ImageView sensor_view,
+	                         const splat_warp_params & params,
+	                         int sens_w, int sens_h);
 	// VR-depth viz (decoder SBS, single image, GENERAL): green->red
 	// over 0..2.046m, far past 1020 black. Null view records opaque
 	// black. YCbCr views ride the immutable-sampler path (verdict
@@ -239,7 +244,7 @@ private:
 	vk::raii::RenderPass renderpass{nullptr};
 	vk::raii::Pipeline pipeline{nullptr}; // sensor viz (D16 false-color)
 	vk::raii::Pipeline layer_pipeline{nullptr}; // composited R16F viz
-	vk::raii::Pipeline sensor_warp_pipeline{nullptr}; // custom 3DOF sensor warp
+	vk::raii::Pipeline splat_colorize_pipeline{nullptr}; // splat pass-2 sensor ramp
 	vk::raii::Pipeline verdict_pipeline{nullptr}; // VR-vs-passthrough viz
 	vk::raii::DescriptorSetLayout set_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
@@ -261,12 +266,43 @@ private:
 	vk::raii::DescriptorSet raster_sensor_set{nullptr};
 	vk::raii::PipelineLayout raster_sensor_pipeline_layout{nullptr};
 	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
-	vk::raii::Pipeline raster_sensor_warp_pipeline{nullptr}; // custom 3DOF sensor tap
-	// Custom-warp UBO (sensor_warp_params, 256 B): separate allocation
-	// so the 16 B frame_params buffer above stays untouched. Written
-	// per warp record + flushed (non-coherent pattern, see upload).
-	buffer_allocation warp_ubo;
-	void upload_warp_params(const sensor_warp_params & params);
+	vk::raii::Pipeline splat_compare_pipeline{nullptr}; // splat pass-2 raster compare
+	// Splat pass-1 state (own layout: vertex-stage image + UBO; own pool,
+	// set, pipeline layout with the vertex push block, pipeline; own
+	// renderpass with color + depth). Declaration order matters: layout
+	// outlives sets (reverse destruction).
+	vk::raii::DescriptorSetLayout splat_layout{nullptr};
+	vk::raii::DescriptorPool splat_pool{nullptr};
+	vk::raii::DescriptorSet splat_set{nullptr};
+	vk::raii::PipelineLayout splat_pipeline_layout{nullptr};
+	vk::raii::Pipeline splat_pipeline{nullptr};
+	vk::raii::RenderPass splat_renderpass{nullptr};
+	// Splat transient targets: owned R16F planar-depth image + D16 depth
+	// image (VMA, 2 layers each), rebuilt in ensure() with the overlay
+	// size.
+	image_allocation splat_image;
+	image_allocation splat_depth_image;
+	vk::raii::ImageView splat_view_array{nullptr}; // 2-layer R16F sampled view (pass 2)
+	struct splat_target
+	{
+		vk::raii::ImageView view{nullptr};      // 1-layer R16F view (pass-1 FB)
+		vk::raii::ImageView depth_view{nullptr}; // 1-layer D16 view (pass-1 FB)
+		vk::raii::Framebuffer framebuffer{nullptr};
+	};
+	std::array<splat_target, 2> splat_targets;
+	vk::Extent2D splat_extent_{0, 0};
+	// Splat warp UBO (splat_warp_params, 208 B): separate allocation so
+	// the 16 B frame_params buffer above stays untouched. Written per
+	// splat record + flushed (non-coherent pattern, see upload).
+	buffer_allocation splat_ubo;
+	void upload_splat_params(const splat_warp_params & params);
+	// Pass 1 shared by both splat records: splat the sensor depth into
+	// the transient R16F image (depth-tested). Leaves the temp ready
+	// for a same-CB barrier to SHADER_READ_ONLY.
+	void splat_pass1(vk::raii::CommandBuffer & cmd,
+	                 vk::ImageView depth_view,
+	                 int sens_w, int sens_h);
+	void ensure_splat_targets();
 	// VR+raster state (decoder SBS sampler2D + R16F layer + UBO): own
 	// layout + pool + set + pipeline. Converted views bake the paired
 	// handle's generation sampler as immutable (VUID-02738, verdict
