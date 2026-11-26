@@ -1274,6 +1274,9 @@ void scenes::stream::gui_passthrough()
 	int flow_n = debug_flow_n;
 	if (ImGui::SliderInt(_S("Flow sample span"), &flow_n, 0, 3))
 		debug_flow_n = std::clamp(flow_n, 0, 3);
+	float flow_l = debug_flow_lookup_ms;
+	if (ImGui::SliderFloat(_S("Flow lookup trim"), &flow_l, -100, 100, "%+.0f ms"))
+		debug_flow_lookup_ms = std::clamp(flow_l, -100.f, 100.f);
 	if (ImGui::SliderFloat3(_S("Sensor extrinsic offset (cm, X right / Y up / Z back+)"), debug_extrinsic_cm, -10, 10, "%+.1f cm"))
 	{
 		for (int i = 0; i < 3; ++i)

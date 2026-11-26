@@ -911,10 +911,12 @@ private:
 	// nominal.
 	float debug_flow_ms = 0.f;
 	int debug_flow_n = 1; // sensor-sample span back, 0..3
+	float debug_flow_lookup_ms = 0.f; // continuous trim on the velocity lookup time (+ = newer)
 	// Capture-pose history for the flow velocity (debug): one entry per
-	// new sensor frame; the selected sample's velocity comes from the
-	// finite difference with its predecessor. Cap 8 (N max 3 needs at
-	// most N+2 samples).
+	// new sensor frame; the N-selected pair (plus ms trim with
+	// interpolation between adjacent pairs and hitch fallback) supplies
+	// the finite-difference velocity. Cap 8 (N max 3 needs at most N+2
+	// samples plus trim headroom).
 	struct flow_sample
 	{
 		XrTime t = 0;

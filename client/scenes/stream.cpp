@@ -3709,41 +3709,125 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					double flow_extra_s = (double)debug_flow_ms * 1e-3;
 					int flow_n = 0;
 					double flow_ts_ms = 0.0;
+					double flow_lt_ms = 0.0;
 					bool have_flow_samp = false;
 					std::array<glm::vec3, view_count> flow_vel_w{};
 					std::array<glm::vec3, view_count> flow_om_w{};
 					if (debug_flow_ms != 0.f and flow_samp_history.size() >= 2)
 					{
-						int want = std::clamp(debug_flow_n, 0, 3);
 						size_t n = flow_samp_history.size() - 1;
-						size_t k = n - std::min((size_t)want, n - 1);
-						flow_n = (int)(n - k);
-						const flow_sample & newest = flow_samp_history[k];
-						const flow_sample & oldest = flow_samp_history[k - 1];
-						double dt_samp = (double)(newest.t - oldest.t) * 1e-9;
-						if (dt_samp > 1e-9 and dt_samp < 0.5) // 0.5s: hitch/gap guard
+						// Per-pair finite-difference velocities (world frame).
+						auto pair_dt = [&](size_t kk) -> double
 						{
-							have_flow_samp = true;
-							flow_ts_ms = dt_samp * 1e3;
-							for (uint32_t eye = 0; eye < view_count; ++eye)
+							if (kk < 1 or kk > n)
+								return 0.0;
+							const flow_sample & a = flow_samp_history[kk - 1];
+							const flow_sample & b = flow_samp_history[kk];
+							return (double)(b.t - a.t) * 1e-9;
+						};
+						auto pair_vel = [&](size_t kk, uint32_t eye, glm::vec3 &vel, glm::vec3 &om) -> bool
+						{
+							if (kk < 1 or kk > n)
+								return false;
+							double dt = pair_dt(kk);
+							if (!(dt > 1e-9) or !(dt < 0.5)) // 0.5s: hitch/gap guard
+								return false;
+							const flow_sample & a = flow_samp_history[kk - 1];
+							const flow_sample & b = flow_samp_history[kk];
+							glm::vec3 p_new(b.pose[eye].position.x, b.pose[eye].position.y, b.pose[eye].position.z);
+							glm::vec3 p_old(a.pose[eye].position.x, a.pose[eye].position.y, a.pose[eye].position.z);
+							vel = (p_new - p_old) / (float)dt;
+							glm::quat q_new(b.pose[eye].orientation.w, b.pose[eye].orientation.x,
+							                b.pose[eye].orientation.y, b.pose[eye].orientation.z);
+							glm::quat q_old(a.pose[eye].orientation.w, a.pose[eye].orientation.x,
+							                a.pose[eye].orientation.y, a.pose[eye].orientation.z);
+							glm::quat dq = glm::normalize(q_new * glm::inverse(glm::normalize(q_old)));
+							if (dq.w < 0.f)
+								dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
+							float cos_half = std::clamp(dq.w, -1.f, 1.f);
+							float ang = 2.f * acosf(cos_half);
+							float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
+							om = glm::vec3(0.f);
+							if (ang > 1e-6f and sin_half > 1e-6f)
+								om = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang / (float)dt);
+							return true;
+						};
+						auto pair_tmid = [&](size_t kk) -> double
+						{
+							if (kk < 1 or kk > n)
+								return 0.0;
+							const flow_sample & a = flow_samp_history[kk - 1];
+							const flow_sample & b = flow_samp_history[kk];
+							return ((double)a.t + (double)b.t) * 0.5e-9;
+						};
+						// N selects the pair; the ms trim slides the lookup
+						// continuously around it (+ = newer velocity).
+						int want = std::clamp(debug_flow_n, 0, 3);
+						size_t k0 = n - std::min((size_t)want, n - 1);
+						flow_n = (int)(n - k0);
+						double t_target = pair_tmid(k0) + (double)debug_flow_lookup_ms * 1e-3;
+						t_target = std::clamp(t_target, pair_tmid(1), pair_tmid(n));
+						size_t j = 1;
+						while (j < n and pair_tmid(j + 1) < t_target)
+							++j;
+						double blend = 0.0;
+						size_t j2 = j;
+						auto pair_ok = [&](size_t kk) -> bool
+						{
+							if (kk < 1 or kk > n)
+								return false;
+							double dt = pair_dt(kk);
+							return (dt > 1e-9) and (dt < 0.5);
+						};
+						flow_ts_ms = (pair_ok(j) ? pair_dt(j) : pair_dt(j2)) * 1e3;
+						flow_lt_ms = (t_target - pair_tmid(k0)) * 1e3; // effective trim vs N pair
+						if (j < n)
+						{
+							double tj = pair_tmid(j);
+							double tj1 = pair_tmid(j + 1);
+							if (tj1 > tj)
 							{
-								glm::vec3 p_new(newest.pose[eye].position.x, newest.pose[eye].position.y, newest.pose[eye].position.z);
-								glm::vec3 p_old(oldest.pose[eye].position.x, oldest.pose[eye].position.y, oldest.pose[eye].position.z);
-								glm::vec3 vel = (p_new - p_old) / (float)dt_samp;
+								blend = std::clamp((t_target - tj) / (tj1 - tj), 0.0, 1.0);
+								j2 = j + 1;
+							}
+						}
+						for (uint32_t eye = 0; eye < view_count; ++eye)
+						{
+							glm::vec3 v0(0.f), w0(0.f), v1(0.f), w1(0.f);
+							bool ok0 = pair_vel(j, eye, v0, w0);
+							bool ok1 = (j2 == j) ? ok0 : pair_vel(j2, eye, v1, w1);
+							glm::vec3 vb(0.f), wb(0.f), vc(0.f), wc(0.f);
+							float b = 0.f;
+							bool use = false;
+							if (ok0 and ok1 and j2 != j)
+							{
+								vb = v0;
+								wb = w0;
+								vc = v1;
+								wc = w1;
+								b = (float)blend;
+								use = true;
+							}
+							else if (ok0) // j2==j, or neighbor pair straddles a hitch: use pair j alone
+							{
+								vb = v0;
+								wb = w0;
+								use = true;
+							}
+							else if (j2 != j and ok1) // pair j straddles a hitch: use pair j2 alone
+							{
+								vb = v1;
+								wb = w1;
+								use = true;
+							}
+							if (use)
+							{
+								have_flow_samp = true;
+								glm::vec3 vel = vb + (vc - vb) * b;
+								glm::vec3 om = wb + (wc - wb) * b;
 								flow_vmax = std::max(flow_vmax, (double)glm::length(vel));
 								flow_vel_w[eye] = vel * (float)flow_extra_s;
-								glm::quat q_new(newest.pose[eye].orientation.w, newest.pose[eye].orientation.x,
-								                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
-								glm::quat q_old(oldest.pose[eye].orientation.w, oldest.pose[eye].orientation.x,
-								                oldest.pose[eye].orientation.y, oldest.pose[eye].orientation.z);
-								glm::quat dq = glm::normalize(q_new * glm::inverse(glm::normalize(q_old)));
-								if (dq.w < 0.f)
-									dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
-								float cos_half = std::clamp(dq.w, -1.f, 1.f);
-								float ang = 2.f * acosf(cos_half);
-								float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
-								if (ang > 1e-6f and sin_half > 1e-6f)
-									flow_om_w[eye] = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang * (float)(flow_extra_s / dt_samp));
+								flow_om_w[eye] = om * (float)flow_extra_s;
 							}
 						}
 					}
@@ -3834,8 +3918,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						splat_params.opacity = debug_depth_opacity;
 						splat_params.depth_scale = debug_depth_scale;
 						if (debug_flow_ms != 0.f and have_flow_samp)
-							warp_note = fmt::format(" flow {:+.0f}ms N{} Ts{:.0f}ms vmax{:.2f}m/s",
-							                        (double)debug_flow_ms, flow_n, flow_ts_ms, flow_vmax);
+							warp_note = fmt::format(" flow {:+.0f}ms N{} Ts{:.0f}ms Lt{:+.0f}ms vmax{:.2f}m/s",
+							                        (double)debug_flow_ms, flow_n, flow_ts_ms,
+							                        flow_lt_ms, flow_vmax);
 						glm::vec3 r_ext_note(debug_extrinsic_cm[0], debug_extrinsic_cm[1], debug_extrinsic_cm[2]);
 						if (glm::dot(r_ext_note, r_ext_note) > 0.f)
 							warp_note += fmt::format(" ext({:+.1f},{:+.1f},{:+.1f})cm",
