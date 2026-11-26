@@ -18,6 +18,10 @@
 
 #version 450
 
+#extension GL_GOOGLE_include_directive : require
+
+#include "depth_viz_common.glsl.inc"
+
 // Verdict debug view: samples the binary R8 verdict (1 = passthrough
 // reveal, 0 = VR wins) and paints green / red. Geometry-free pixels
 // (layer FAR >= 65000: no-window frames, reversed-only cuts, hidden,
@@ -37,16 +41,12 @@ layout(location = 0) out vec4 out_color;
 layout(set = 0, binding = 0) uniform sampler2DArray verdict_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray layer_tex;
 
-layout(set = 0, binding = 2) uniform params
-{
-	vec2 near_far;
-	float opacity;
-	float pad;
-} u;
-
 layout(push_constant) uniform pc
 {
 	int eye;
+	float near_z;
+	float far_z;
+	float opacity;
 } push;
 
 void main()
@@ -59,5 +59,5 @@ void main()
 	vec3 col = mix(vec3(0.9, 0.15, 0.1), vec3(0.1, 0.9, 0.2), v);
 	col = mix(col, vec3(0.0), empty);
 
-	out_color = vec4(col, u.opacity);
+	out_color = vec4(col, push.opacity);
 }

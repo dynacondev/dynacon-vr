@@ -18,6 +18,10 @@
 
 #version 450
 
+#extension GL_GOOGLE_include_directive : require
+
+#include "depth_viz_common.glsl.inc"
+
 // Raster-vs-sensor validation view: compares the owned R16F common depth
 // layer (linear meters, 2-layer array, half merge res) against the
 // runtime D16 environment depth (linearized in-shader with the UBO
@@ -47,27 +51,13 @@ layout(set = 0, binding = 0) uniform sampler2DArray layer_tex;
 
 layout(set = 0, binding = 1) uniform sampler2DArray sensor_tex;
 
-layout(set = 0, binding = 2) uniform params
-{
-	vec2 near_far;
-	float opacity;
-	float pad;
-} u;
-
 layout(push_constant) uniform pc
 {
 	int eye;
+	float near_z;
+	float far_z;
+	float opacity;
 } push;
-
-float linearize_depth(float d_norm, float n, float f)
-{
-	if (!(f > n) || f > 1e9)
-	{
-		// Infinite far plane. D=0 -> near, D=1 -> far.
-		return n / max(1.0 - d_norm, 1e-6);
-	}
-	return (n * f) / max(f - d_norm * (f - n), 1e-6);
-}
 
 void main()
 {
@@ -79,12 +69,12 @@ void main()
 	float no_return = step(0.9999, ds);
 	float noval = max(absent, no_return);
 
-	float d = linearize_depth(ds, u.near_far.x, u.near_far.y);
+	float d = viz_linearize_depth(ds, push.near_z, push.far_z);
 	float lc = min(l, 10.0);
 	float dc = min(d, 10.0);
 	float t = clamp(abs(lc - dc) * 0.5, 0.0, 1.0);
-	vec3 col = mix(vec3(0.1, 0.9, 0.2), vec3(0.9, 0.15, 0.1), t);
+	vec3 col = viz_ramp(t);
 	col = mix(col, vec3(0.0), noval);
 
-	out_color = vec4(col, u.opacity);
+	out_color = vec4(col, push.opacity);
 }

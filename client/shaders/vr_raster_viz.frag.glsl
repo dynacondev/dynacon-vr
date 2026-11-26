@@ -18,6 +18,10 @@
 
 #version 450
 
+#extension GL_GOOGLE_include_directive : require
+
+#include "depth_viz_common.glsl.inc"
+
 // VR-depth viz with the composited raster pasted on top: samples the
 // decoded SBS virtual-depth frame (single image, both eyes side by
 // side) with the frame handle's own generation sampler and maps 0..2.046m green->red
@@ -43,16 +47,12 @@ layout(set = 0, binding = 0) uniform sampler2D virt_tex;
 
 layout(set = 0, binding = 1) uniform sampler2DArray layer_tex;
 
-layout(set = 0, binding = 2) uniform params
-{
-	vec2 near_far;
-	float opacity;
-	float pad;
-} u;
-
 layout(push_constant) uniform pc
 {
 	int eye;
+	float near_z;
+	float far_z;
+	float opacity;
 } push;
 
 void main()
@@ -63,14 +63,14 @@ void main()
 
 	float vempty = step(1020.5 / 1023.0, vd);
 	float v = clamp(vd * 2.046, 0.0, 2.046);
-	vec3 col = mix(vec3(0.1, 0.9, 0.2), vec3(0.9, 0.15, 0.1), v / 2.046);
+	vec3 col = viz_ramp(v / 2.046);
 	col = mix(col, vec3(0.0), vempty);
 
 	float l = texture(layer_tex, vec3(v_uv, e)).r;
 	float present = 1.0 - step(65000.0, l);
 	float d = clamp(l, 0.0, 2.046);
-	vec3 lcol = mix(vec3(0.1, 0.9, 0.2), vec3(0.9, 0.15, 0.1), d / 2.046);
+	vec3 lcol = viz_ramp(d / 2.046);
 	col = mix(col, lcol, present);
 
-	out_color = vec4(col, u.opacity);
+	out_color = vec4(col, push.opacity);
 }

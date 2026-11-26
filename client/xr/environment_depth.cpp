@@ -287,12 +287,3 @@ vk::ImageView xr::environment_depth::depth_view(uint32_t swapchain_index) const
 	(void)swapchain_index;
 	return nullptr;
 }
-
-uint32_t xr::environment_depth::depth_image_count() const
-{
-#ifdef XR_META_ENVIRONMENT_DEPTH_EXTENSION_NAME
-	return (uint32_t)depth_images.size();
-#else
-	return 0;
-#endif
-}

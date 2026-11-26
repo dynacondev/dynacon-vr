@@ -1793,84 +1793,27 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// capture_time; v1 runtimes report 0, skip
 							// those). Frozen frames never reach here (early
 							// frozen branch above); backward jumps (provider
-							// restart) clear and reseed. Cap 8 (only the newest
-							// pair is ever read).
+							// restart) clear and reseed. Cap 2: only the
+							// newest pair is ever read.
 							if (have_capture_pose and shared_depth.capture_time != 0)
 							{
-								auto push_flow = [&]()
+								if (flow_samp_history.empty() or shared_depth.capture_time > flow_samp_history.back().t)
 								{
 									flow_sample s;
 									s.t = shared_depth.capture_time;
 									s.pose = capture_pose;
 									flow_samp_history.push_back(s);
-									while (flow_samp_history.size() > 8)
+									while (flow_samp_history.size() > 2)
 										flow_samp_history.pop_front();
-								};
-								if (flow_samp_history.empty() or shared_depth.capture_time > flow_samp_history.back().t)
-									push_flow();
+								}
 								else if (shared_depth.capture_time < flow_samp_history.back().t)
 								{
 									// Provider restart: drop stale history, reseed.
 									flow_samp_history.clear();
-									push_flow();
-								}
-							}
-							// Phase-0 forensics: temporal model of the depth
-							// frame vs the predicted display frame (throttled
-							// 2s). Sizes the capture->display correction the
-							// custom splat warp must span and cross-checks whether
-							// the returned depth pose rides predicted time.
-							// Note the depth-vs-mask delta below folds the
-							// static headset<->sensor extrinsic (depth pose
-							// vs HMD pose); the capture-vs-mask line is the
-							// actual warp span.
-							{
-								static XrTime last_forensics_log = 0;
-								constexpr float kRadToDeg = 57.29578f;
-								XrTime forensics_now = instance.now();
-								if (forensics_now - last_forensics_log > 2'000'000'000LL)
-								{
-									last_forensics_log = forensics_now;
-									auto pose_delta = [](const XrPosef & a, const XrPosef & b, float & ang_deg, float & trans_m) {
-										float dot = std::fabs(a.orientation.w * b.orientation.w +
-										                      a.orientation.x * b.orientation.x +
-										                      a.orientation.y * b.orientation.y +
-										                      a.orientation.z * b.orientation.z);
-										ang_deg = 2.0f * std::acos(std::clamp(dot, 0.0f, 1.0f)) * kRadToDeg;
-										float dx = a.position.x - b.position.x;
-										float dy = a.position.y - b.position.y;
-										float dz = a.position.z - b.position.z;
-										trans_m = std::sqrt(dx * dx + dy * dy + dz * dz);
-									};
-									float depth_ang[view_count]{};
-									float depth_tr[view_count]{};
-									for (uint32_t eye = 0; eye < view_count; ++eye)
-										pose_delta(shared_depth.pose[eye], mask_pose[eye], depth_ang[eye], depth_tr[eye]);
-									if (shared_depth.capture_time != 0)
-									{
-										double age_ms = (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6;
-										spdlog::info("Depth forensics: age {:.1f}ms near {:.2f}m far {:.2f}m idx {} L depth-rot {:.2f}deg depth-trans {:.1f}mm R depth-rot {:.2f}deg depth-trans {:.1f}mm",
-										             age_ms, (double)shared_depth.near_z, (double)shared_depth.far_z,
-										             shared_depth.swapchain_index,
-										             (double)depth_ang[0], (double)(depth_tr[0] * 1000.f),
-										             (double)depth_ang[1], (double)(depth_tr[1] * 1000.f));
-									}
-									else
-										spdlog::info("Depth forensics: age n/a (no capture timestamp) near {:.2f}m far {:.2f}m idx {} L depth-rot {:.2f}deg depth-trans {:.1f}mm R depth-rot {:.2f}deg depth-trans {:.1f}mm",
-										             (double)shared_depth.near_z, (double)shared_depth.far_z,
-										             shared_depth.swapchain_index,
-										             (double)depth_ang[0], (double)(depth_tr[0] * 1000.f),
-										             (double)depth_ang[1], (double)(depth_tr[1] * 1000.f));
-									if (have_capture_pose)
-									{
-										float cap_ang[view_count]{};
-										float cap_tr[view_count]{};
-										for (uint32_t eye = 0; eye < view_count; ++eye)
-											pose_delta(capture_pose[eye], mask_pose[eye], cap_ang[eye], cap_tr[eye]);
-										spdlog::info("Depth forensics capture->display: L rot {:.2f}deg trans {:.1f}mm R rot {:.2f}deg trans {:.1f}mm",
-										             (double)cap_ang[0], (double)(cap_tr[0] * 1000.f),
-										             (double)cap_ang[1], (double)(cap_tr[1] * 1000.f));
-									}
+									flow_sample s;
+									s.t = shared_depth.capture_time;
+									s.pose = capture_pose;
+									flow_samp_history.push_back(s);
 								}
 							}
 						}
@@ -3665,7 +3608,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			}
 			else if ((depth_image = depth_overlay->acquire()) >= 0)
 			{
-				depth_overlay_renderer::frame_params params;
+				depth_overlay_renderer::viz_params params;
 				params.opacity = debug_depth_opacity;
 				// near_z/far_z ride along at defaults: only the sensor
 				// and raster-vs-sensor shaders read them (the isolation
@@ -3760,11 +3703,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							splat_params.rot_rows[eye][row][2] = r[2][row];
 							splat_params.rot_rows[eye][row][3] = 0;
 						}
-						glm::vec3 t = glm::inverse(qd) * (pc - pd);
-						// Flow displacement into display-eye frame (the
-						// vertex shader shifts each texel along its own).
-						glm::vec3 Dlin_eye = glm::inverse(qd) * flow_vel_w[eye];
-						glm::vec3 Dang_eye = glm::inverse(qd) * flow_om_w[eye];
+						// Translation + flow into the display-eye frame (the
+						// vertex shader shifts each texel along its own):
+						// one inverse per eye.
+						glm::quat qd_inv = glm::inverse(qd);
+						glm::vec3 t = qd_inv * (pc - pd);
+						glm::vec3 Dlin_eye = qd_inv * flow_vel_w[eye];
+						glm::vec3 Dang_eye = qd_inv * flow_om_w[eye];
 						splat_params.flow_lin[eye][0] = Dlin_eye.x;
 						splat_params.flow_lin[eye][1] = Dlin_eye.y;
 						splat_params.flow_lin[eye][2] = Dlin_eye.z;
@@ -3978,6 +3923,35 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				depth_status = "overlay swapchain busy, skipped frame [PAUSED]";
 			else
 				depth_status = "overlay swapchain busy, skipped frame";
+			// Human readout throttle: the strings above rebuild at frame
+			// rate (a fmt::format heap churn per frame); publish at most
+			// every 250ms, immediately on mode change. The frozen-age
+			// readout still advances, in quarter-second steps.
+			{
+				static std::string published;
+				static XrTime last_publish = 0;
+				static debug_viz_mode last_published_mode = debug_viz_mode::none;
+				if (debug_viz != last_published_mode)
+				{
+					// Mode change always republishes (even when the
+					// string is unchanged, so the gate below can't go
+					// stale and fire early on the next change).
+					last_published_mode = debug_viz;
+					if (depth_status != published)
+					{
+						published = depth_status;
+						last_publish = frame_state.predictedDisplayTime;
+					}
+				}
+				else if (depth_status != published and
+				         (frame_state.predictedDisplayTime < last_publish or
+				          frame_state.predictedDisplayTime - last_publish > 250'000'000LL))
+				{
+					published = depth_status;
+					last_publish = frame_state.predictedDisplayTime;
+				}
+				depth_status = published;
+			}
 		}
 
 		command_buffer.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, *query_pool, 1);

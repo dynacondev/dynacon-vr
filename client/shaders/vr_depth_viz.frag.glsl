@@ -18,6 +18,10 @@
 
 #version 450
 
+#extension GL_GOOGLE_include_directive : require
+
+#include "depth_viz_common.glsl.inc"
+
 // VR-depth debug false-color: samples the decoded SBS virtual-depth
 // frame (single image, both eyes side by side) with the frame handle's
 // own generation sampler and maps 0..2.046m green->red. Same decode convention as the
@@ -39,16 +43,12 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D virt_tex;
 
-layout(set = 0, binding = 1) uniform params
-{
-	vec2 near_far;
-	float opacity;
-	float pad;
-} u;
-
 layout(push_constant) uniform pc
 {
 	int eye;
+	float near_z;
+	float far_z;
+	float opacity;
 } push;
 
 void main()
@@ -60,8 +60,8 @@ void main()
 	float empty = step(1020.5 / 1023.0, vd);
 	float d = clamp(vd * 2.046, 0.0, 2.046);
 	float t = d / 2.046;
-	vec3 col = mix(vec3(0.1, 0.9, 0.2), vec3(0.9, 0.15, 0.1), t);
+	vec3 col = viz_ramp(t);
 	col = mix(col, vec3(0.0), empty);
 
-	out_color = vec4(col, u.opacity);
+	out_color = vec4(col, push.opacity);
 }

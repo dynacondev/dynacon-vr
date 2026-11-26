@@ -18,6 +18,10 @@
 
 #version 450
 
+#extension GL_GOOGLE_include_directive : require
+
+#include "depth_viz_common.glsl.inc"
+
 // Forward splat vertex shader: indexed triangle mesh over the sensor
 // texel grid (vertices at texel centers, two triangles per quad with TL
 // listed first in both). Each vertex unprojects its own texel with the
@@ -63,16 +67,6 @@ layout(push_constant) uniform pc
 } push;
 
 layout(location = 0) flat out float v_bg;
-
-float linearize_depth(float d_norm, float n, float f)
-{
-	if (!(f > n) || f > 1e9)
-	{
-		// Infinite far plane. D=0 -> near, D=1 -> far.
-		return n / max(1.0 - d_norm, 1e-6);
-	}
-	return (n * f) / max(f - d_norm * (f - n), 1e-6);
-}
 
 // Capture->display rotation rows: transpose of the stored rows.
 vec3 c2d_mul(int e, vec3 Xc)
@@ -129,7 +123,7 @@ void main()
 		// Far-clamped so sky pixels can't produce NaN steps.
 		if (ds[k] < 0.9999)
 		{
-			float z = min(linearize_depth(ds[k], n, f), 20.0);
+			float z = min(viz_linearize_depth(ds[k], n, f), 20.0);
 			vec3 Xd = c2d_mul(e, vec3(xs[k], ys[k], -1.0) * z) + u.trans[e].xyz;
 			// Per-texel flow correction: shift content forward along
 			// its own display-eye velocity (translation flow ~ v/Z per
@@ -149,7 +143,7 @@ void main()
 	// overlaps nearest-wins. The own depth is the offset-0 tap above.
 	float ox = st.x + (st.y - st.x) * (float(tx) + 0.5) / float(push.sens_w);
 	float oy = st.z + (st.w - st.z) * (float(ty) + 0.5) / float(push.sens_h);
-	float z = min(linearize_depth(ds[0], n, f), 20.0);
+	float z = min(viz_linearize_depth(ds[0], n, f), 20.0);
 	vec3 Xd0 = c2d_mul(e, vec3(ox, oy, -1.0) * z) + u.trans[e].xyz;
 	Xd0 = Xd0 - (u.flow_lin[e].xyz + cross(u.flow_ang[e].xyz, Xd0));
 	float d = max(-Xd0.z, 1e-6);

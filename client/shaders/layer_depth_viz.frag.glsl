@@ -18,6 +18,10 @@
 
 #version 450
 
+#extension GL_GOOGLE_include_directive : require
+
+#include "depth_viz_common.glsl.inc"
+
 // Composited-layer debug false-color: samples the owned R16F common
 // depth layer (linear meters, 2-layer array, half merge res) and maps
 // 0..2.046m green->red to match the VR-depth viz, so the two are
@@ -37,16 +41,12 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2DArray layer_tex;
 
-layout(set = 0, binding = 1) uniform params
-{
-	vec2 near_far;
-	float opacity;
-	float pad;
-} u;
-
 layout(push_constant) uniform pc
 {
 	int eye;
+	float near_z;
+	float far_z;
+	float opacity;
 } push;
 
 void main()
@@ -56,8 +56,8 @@ void main()
 	float empty = step(65000.0, l);
 	float d = clamp(l, 0.0, 2.046);
 	float t = d / 2.046;
-	vec3 col = mix(vec3(0.1, 0.9, 0.2), vec3(0.9, 0.15, 0.1), t);
+	vec3 col = viz_ramp(t);
 	col = mix(col, vec3(0.0), empty);
 
-	out_color = vec4(col, u.opacity);
+	out_color = vec4(col, push.opacity);
 }

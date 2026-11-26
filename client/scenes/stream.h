@@ -909,7 +909,7 @@ private:
 		XrTime t = 0;
 		std::array<XrPosef, view_count> pose{};
 	};
-	std::deque<flow_sample> flow_samp_history{}; // oldest front; cap 8
+	std::deque<flow_sample> flow_samp_history{}; // oldest front; cap 2 (newest pair only)
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe

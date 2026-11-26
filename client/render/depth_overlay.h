@@ -93,14 +93,29 @@ debug_viz_mode_name(debug_viz_mode m)
 class depth_overlay_renderer
 {
 public:
-	// Trimmed UBO mirror of depth_viz.frag params (std140): near/far
-	// planes in meters plus the global opacity. 16 bytes, no pads.
-	struct frame_params
+	// Pass-2 colorize params: near/far planes plus the global opacity.
+	// Ride the fragment push block (16 B with the eye, viz_push below),
+	// not a UBO: only the splat pass-1 keeps a UBO (272 B vertex block).
+	// Only the sensor, raster-vs-sensor and splat-colorize shaders read
+	// near/far (the isolation ramps are hardcoded 0..2.046m in-shader); every pass-2
+	// shader declares the identical push block so the shared set layouts
+	// stay valid for all pass-2 pipelines.
+	struct viz_params
 	{
 		float near_z = 0.1f;
 		float far_z = 10.f;
 		float opacity = 0.3f;
-		float pad = 0;
+	};
+
+	// Fragment push block shared by every pass-2 viz shader (16 B).
+	// Byte-identical declaration required in all of them (multiview
+	// lesson: never pair mismatched push blocks across a shared layout).
+	struct viz_push
+	{
+		int32_t eye = 0;
+		float near_z = 0.1f;
+		float far_z = 10.f;
+		float opacity = 0.3f;
 	};
 
 	explicit depth_overlay_renderer(vk::raii::Device & device);
@@ -123,7 +138,7 @@ public:
 	void record(vk::raii::CommandBuffer & cmd, size_t image_index,
 	            const std::array<vk::Extent2D, 2> & extents,
 	            vk::ImageView depth_view,
-	            const frame_params & params);
+	            const viz_params & params);
 
 	// Composited-layer viz (R16F linear meters, 2-layer array, half
 	// merge res): green->red over 0..2.046m to match VR depth, FAR
@@ -131,7 +146,7 @@ public:
 	void record_layer(vk::raii::CommandBuffer & cmd, size_t image_index,
 	                  const std::array<vk::Extent2D, 2> & extents,
 	                  vk::Image layer_image, vk::ImageView layer_view,
-	                  const frame_params & params);
+	                  const viz_params & params);
 
 	// Verdict viz (R8 binary + R16F layer for the no-window mask):
 	// red = VR wins, green = passthrough, layer FAR black. Null views
@@ -140,7 +155,7 @@ public:
 	                    const std::array<vk::Extent2D, 2> & extents,
 	                    vk::Image verdict_image, vk::ImageView verdict_view,
 	                    vk::Image layer_image, vk::ImageView layer_view,
-	                    const frame_params & params);
+	                    const viz_params & params);
 
 	// Raster-vs-sensor validation viz (R16F layer + runtime D16 sensor
 	// for the same eye UV): green = agree, red ramp = |layer - sensor|
@@ -152,7 +167,7 @@ public:
 	                          const std::array<vk::Extent2D, 2> & extents,
 	                          vk::Image layer_image, vk::ImageView layer_view,
 	                          vk::ImageView sensor_view,
-	                          const frame_params & params);
+	                          const viz_params & params);
 
 	// VR-depth viz with the raster ramp pasted on top wherever a window
 	// is present (shared 0..2.046m ramp, far past 1020 black, no-window
@@ -165,7 +180,7 @@ public:
 	                      vk::ImageView virt_view, vk::Sampler virt_sampler,
 	                      const wivrn::decoder::ycbcr_definition & ycbcr,
 	                      vk::Image layer_image, vk::ImageView layer_view,
-	                      const frame_params & params);
+	                      const viz_params & params);
 
 	// Forward-splat warp params (std140): per-eye rotation rows
 	// (R = Qc^-1 * Qd), sensor/display frustum tangents, near/far,
@@ -180,7 +195,7 @@ public:
 		float near_z = 0.1f;
 		float far_z = 10.f;
 		float opacity = 0.3f;
-		float pad = 0; // explicit std140 pad: keeps trans 16-aligned (frame_params precedent)
+		float pad = 0; // explicit std140 pad: keeps trans 16-aligned
 		float trans[2][4]; // [eye]: xyz = qd^-1 * (pc - pd); w unused
 		float flow_lin[2][4]; // [eye]: translational flow displacement, display-eye frame
 		float flow_ang[2][4]; // [eye]: angular flow displacement (axis*angle), display-eye frame
@@ -199,8 +214,8 @@ public:
 	// Sensor viz through the forward splat (sensor_splat.vert +
 	// sensor_splat.frag -> splat_colorize.frag): each sensor texel
 	// splats into the predicted view with hardware depth test, then the
-	// transient depth image is false-colored. Pass 2 reuses the sensor
-	// set layout/pipeline layout/pool/set (same 2-binding shape).
+	// transient depth image is false-colored. Pass 2 reuses the base
+	// 1-image set (splat transient sampled in place of the sensor view).
 	void record_sensor_splat(vk::raii::CommandBuffer & cmd, size_t image_index,
 	                         const std::array<vk::Extent2D, 2> & extents,
 	                         vk::ImageView depth_view,
@@ -210,8 +225,8 @@ public:
 	// Raster-vs-sensor with the splatted sensor tap
 	// (sensor_splat.* -> splat_compare.frag): layer tapped directly by
 	// output UV (no pose involved), sensor via the transient splat
-	// image. Pass 2 reuses the raster-sensor layout/pool/set (same
-	// 3-binding shape).
+	// image. Pass 2 reuses the shared two-image set (splat transient in
+	// place of the direct sensor view).
 	void record_raster_splat(vk::raii::CommandBuffer & cmd, size_t image_index,
 	                         const std::array<vk::Extent2D, 2> & extents,
 	                         vk::Image layer_image, vk::ImageView layer_view,
@@ -227,7 +242,7 @@ public:
 	                 const std::array<vk::Extent2D, 2> & extents,
 	                 vk::ImageView virt_view, vk::Sampler virt_sampler,
 	                 const wivrn::decoder::ycbcr_definition & ycbcr,
-	                 const frame_params & params);
+	                 const viz_params & params);
 
 	// Release the acquired image (after submit, before endFrame).
 	void release();
@@ -239,7 +254,18 @@ public:
 
 private:
 	void init_pipelines(vk::Format format);
-	void upload_viz_params(const frame_params & params);
+	// Shared fullscreen-triangle draw for every pass-2 viz record: binds
+	// (when have_data), pushes the 16 B viz_push per eye, sets viewport
+	// + scissor, and draws into both eye layers (transparent clear, or
+	// opaque black at opacity when have_data is false and no draw).
+	void draw_viz_eyes(vk::raii::CommandBuffer & cmd, vk::PipelineLayout layout, vk::Pipeline pipeline,
+	                   vk::DescriptorSet set, const std::array<vk::Extent2D, 2> & extents, size_t image_index,
+	                   float near_z, float far_z, float opacity, bool have_data);
+	// Fullscreen-triangle pass-2 pipeline against an explicit layout
+	// (base 1-image, two-image, or converted immutable): shared vertex
+	// input/assembly/viewport/raster/multisample/blend/dynamic state,
+	// only the fragment module differs.
+	vk::raii::Pipeline make_pass2_pipeline(const char * frag_name, vk::PipelineLayout layout);
 
 	vk::raii::Device * device = nullptr;
 
@@ -248,28 +274,23 @@ private:
 	vk::raii::Pipeline pipeline{nullptr}; // sensor viz (D16 false-color)
 	vk::raii::Pipeline layer_pipeline{nullptr}; // composited R16F viz
 	vk::raii::Pipeline splat_colorize_pipeline{nullptr}; // splat pass-2 sensor ramp
-	vk::raii::Pipeline verdict_pipeline{nullptr}; // VR-vs-passthrough viz
-	vk::raii::DescriptorSetLayout set_layout{nullptr};
+	vk::raii::Pipeline virt_plain_pipeline{nullptr}; // VR-depth viz, plain (unconverted) views
+	vk::raii::DescriptorSetLayout set_layout{nullptr}; // 1-image shape, shared by all above
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	vk::raii::DescriptorSet descriptor_set{nullptr};
 	vk::raii::Sampler sampler{nullptr};
-	buffer_allocation ubo;
-	// Verdict-viz state (verdict R8 + layer R16F + UBO): own layout
-	// (two image bindings), pool and set; shares pipeline_layout push
-	// shape (eye) and renderpass/targets above.
-	vk::raii::DescriptorSetLayout verdict_viz_layout{nullptr};
-	vk::raii::DescriptorPool verdict_viz_pool{nullptr};
-	vk::raii::DescriptorSet verdict_viz_set{nullptr};
-	vk::raii::PipelineLayout verdict_viz_pipeline_layout{nullptr};
-	// Raster-vs-sensor state (layer R16F + sensor D16 + UBO): own layout
-	// (two image bindings), pool, set, layout and pipeline; shares the
-	// eye-push shape and renderpass/targets above (verdict-viz pattern).
-	vk::raii::DescriptorSetLayout raster_sensor_layout{nullptr};
-	vk::raii::DescriptorPool raster_sensor_pool{nullptr};
-	vk::raii::DescriptorSet raster_sensor_set{nullptr};
-	vk::raii::PipelineLayout raster_sensor_pipeline_layout{nullptr};
-	vk::raii::Pipeline raster_sensor_pipeline{nullptr};
+	// Two-image state (verdict R8 + layer, layer + sensor, layer + splat,
+	// virt + layer): one layout/pool/set/pipeline-layout shared by the
+	// verdict, raster-sensor, splat-compare and plain vr_raster pipelines
+	// below (same 2-image shape, one mode recorded per frame).
+	vk::raii::DescriptorSetLayout twoimg_layout{nullptr};
+	vk::raii::DescriptorPool twoimg_pool{nullptr};
+	vk::raii::DescriptorSet twoimg_set{nullptr};
+	vk::raii::PipelineLayout twoimg_pipeline_layout{nullptr};
+	vk::raii::Pipeline verdict_pipeline{nullptr}; // VR-vs-passthrough viz
+	vk::raii::Pipeline raster_sensor_pipeline{nullptr}; // direct raster-vs-sensor viz
 	vk::raii::Pipeline splat_compare_pipeline{nullptr}; // splat pass-2 raster compare
+	vk::raii::Pipeline vr_raster_plain_pipeline{nullptr}; // VR+raster viz, plain views
 	// Splat pass-1 state (own layout: vertex-stage image + UBO; own pool,
 	// set, pipeline layout with the vertex push block, pipeline
 	// (TRIANGLE_LIST indexed mesh, depth test LESS + write, no blend);
@@ -282,8 +303,10 @@ private:
 	vk::raii::Pipeline splat_pipeline{nullptr};
 	vk::raii::RenderPass splat_renderpass{nullptr};
 	// Splat transient targets: owned R16F planar-depth image + D16 depth
-	// image (VMA, 2 layers each), rebuilt in ensure() with the overlay
-	// size.
+	// image (VMA, 2 layers each) at quarter-screen-linear (half the
+	// overlay per axis): still supersampled vs the ~320-class sensor
+	// grid for sub-texel reprojection, at a quarter of the overlay
+	// fill. Rebuilt in ensure() with the overlay size.
 	image_allocation splat_image;
 	image_allocation splat_depth_image;
 	vk::raii::ImageView splat_view_array{nullptr}; // 2-layer R16F sampled view (pass 2)
@@ -295,8 +318,8 @@ private:
 	};
 	std::array<splat_target, 2> splat_targets;
 	vk::Extent2D splat_extent_{0, 0};
-	// Splat warp UBO (splat_warp_params, 272 B): separate allocation so
-	// the 16 B frame_params buffer above stays untouched. Written per
+	// Splat warp UBO (splat_warp_params, 272 B): the only viz UBO (the
+	// pass-2 colorize params ride the fragment push block). Written per
 	// splat record + flushed (non-coherent pattern, see upload).
 	buffer_allocation splat_ubo;
 	void upload_splat_params(const splat_warp_params & params);
@@ -317,14 +340,16 @@ private:
 	                 vk::ImageView depth_view,
 	                 int sens_w, int sens_h);
 	void ensure_splat_targets();
-	// VR+raster state (decoder SBS sampler2D + R16F layer + UBO): own
-	// layout + pool + set + pipeline. Converted views bake the paired
-	// handle's generation sampler as immutable (VUID-02738, verdict
-	// pattern); plain views keep the mutable layout. waitIdle'd
-	// rebuild, rare. Declaration order matters: layout outlives sets
-	// (reverse destruction). Non-owning alias: refreshed on every
-	// rebuild before any bind; a generation change rebuilds before the
-	// next bind (handle comparison in ensure_vr_raster_layout).
+	// VR+raster converted state (decoder SBS sampler2D immutable + R16F
+	// layer + plain sampling): built on demand for converted views only.
+	// Plain views use vr_raster_plain_pipeline on the shared two-image
+	// layout (no per-definition objects). The converted layout bakes the
+	// paired handle's generation sampler as immutable (VUID-02738,
+	// verdict pattern). waitIdle'd rebuild, rare. Declaration order
+	// matters: layout outlives sets (reverse destruction). Non-owning
+	// alias: refreshed on every rebuild before any bind; a generation
+	// change rebuilds before the next bind (handle comparison in
+	// ensure_vr_raster_layout).
 	vk::Sampler vr_raster_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition vr_raster_ycbcr_built{};
 	void create_vr_raster_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);
@@ -334,14 +359,16 @@ private:
 	vk::raii::DescriptorSet vr_raster_set{nullptr};
 	vk::raii::PipelineLayout vr_raster_pipeline_layout{nullptr};
 	vk::raii::Pipeline vr_raster_pipeline{nullptr};
-	// VR-depth viz state (decoder SBS sampler2D + UBO): own layout +
-	// pool + set + pipeline. Converted views bake the paired handle's
-	// generation sampler as immutable (VUID-02738, verdict pattern);
-	// plain views keep the mutable layout. waitIdle'd rebuild, rare.
-	// Declaration order matters: layout outlives sets (reverse
-	// destruction). Non-owning alias: refreshed on every rebuild before
-	// any bind; a generation change rebuilds before the next bind
-	// (handle comparison in ensure_virt_layout).
+	// VR-depth converted state (decoder SBS sampler2D immutable): built
+	// on demand for converted views only. Plain views use
+	// virt_plain_pipeline on the shared 1-image layout (no
+	// per-definition objects). The converted layout bakes the paired
+	// handle's generation sampler as immutable (VUID-02738, verdict
+	// pattern). waitIdle'd rebuild, rare. Declaration order matters:
+	// layout outlives sets (reverse destruction). Non-owning alias:
+	// refreshed on every rebuild before any bind; a generation change
+	// rebuilds before the next bind (handle comparison in
+	// ensure_virt_layout).
 	vk::Sampler virt_immutable_src{nullptr};
 	wivrn::decoder::ycbcr_definition virt_ycbcr_built{};
 	void create_virt_state(const wivrn::decoder::ycbcr_definition & def, vk::Sampler generation_sampler);

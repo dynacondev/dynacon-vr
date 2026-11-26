@@ -98,7 +98,6 @@ public:
 	// array, D16). Valid while the provider lives.
 	vk::ImageView depth_view(uint32_t swapchain_index) const;
 
-	uint32_t depth_image_count() const;
 	uint32_t depth_width() const
 	{
 		return depth_w;
