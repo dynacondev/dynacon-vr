@@ -634,15 +634,19 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		};
 		splat_layout = vk::raii::DescriptorSetLayout(*device, splat_layout_info);
 		vk::DescriptorPoolSize splat_pool_sizes[2] = {
-		        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 1},
-		        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 1},
+		        {.type = vk::DescriptorType::eCombinedImageSampler, .descriptorCount = 3},
+		        {.type = vk::DescriptorType::eUniformBuffer, .descriptorCount = 3},
 		};
 		vk::DescriptorPoolCreateInfo splat_pool_info{
 		        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
-		        .maxSets = 1,
+		        .maxSets = 3,
 		        .poolSizeCount = 2,
 		        .pPoolSizes = splat_pool_sizes,
 		};
+		// (Re)allocated below; clear first so no set outlives its pool
+		// across the waitIdle'd rebuild (union_merge ensure() precedent).
+		splat_set.clear();
+		splat_fill_sets.clear();
 		splat_pool = vk::raii::DescriptorPool(*device, splat_pool_info);
 		vk::DescriptorSetAllocateInfo splat_alloc{
 		        .descriptorPool = *splat_pool,
@@ -651,6 +655,17 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		};
 		auto splat_sets = vk::raii::DescriptorSets(*device, splat_alloc);
 		splat_set = std::move(splat_sets.front());
+		// Fill-dedicated ping-pong pair (A1: the mask-phase heightfield
+		// fill and the viz splat share the transient across command
+		// buffers on async frames — host writes to one set/UBO while
+		// the GPU reads the other would corrupt the warp. Merge
+		// descriptor precedent: alternate per call.)
+		splat_fill_sets.clear();
+		for (int i = 0; i < 2; ++i)
+		{
+			auto fill_sets = vk::raii::DescriptorSets(*device, splat_alloc);
+			splat_fill_sets.emplace_back(std::move(fill_sets.front()));
+		}
 	}
 	vk::PushConstantRange splat_push_range{
 	        .stageFlags = vk::ShaderStageFlagBits::eVertex,
@@ -1125,18 +1140,20 @@ void depth_overlay_renderer::ensure_vr_raster_layout(const wivrn::decoder::ycbcr
 }
 
 
-void depth_overlay_renderer::upload_splat_params(const splat_warp_params & params)
+void depth_overlay_renderer::upload_splat_params(buffer_allocation & ubo, const splat_warp_params & params)
 {
-	std::memcpy(splat_ubo.map(), &params, sizeof(params));
-	splat_ubo.unmap();
+	std::memcpy(ubo.map(), &params, sizeof(params));
+	ubo.unmap();
 	// Non-coherent host-visible memory: the GPU reads stale values
 	// forever without an explicit flush (vmaUnmapMemory does not flush).
-	vmaFlushAllocation(vk_allocator::instance(), splat_ubo, 0, sizeof(params));
+	vmaFlushAllocation(vk_allocator::instance(), ubo, 0, sizeof(params));
 }
 
 void depth_overlay_renderer::splat_pass1(vk::raii::CommandBuffer & cmd,
                                          vk::ImageView depth_view,
-                                         int sens_w, int sens_h)
+                                         int sens_w, int sens_h,
+                                         vk::DescriptorSet set,
+                                         buffer_allocation & ubo)
 {
 	vk::DescriptorImageInfo image_info{
 	        .sampler = *sampler,
@@ -1146,21 +1163,21 @@ void depth_overlay_renderer::splat_pass1(vk::raii::CommandBuffer & cmd,
 	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	};
 	vk::DescriptorBufferInfo buffer_info{
-	        .buffer = vk::Buffer(splat_ubo),
+	        .buffer = vk::Buffer(ubo),
 	        .offset = 0,
 	        .range = sizeof(splat_warp_params),
 	};
 	// Full footprint every record (Adreno partial-write rule).
 	std::array<vk::WriteDescriptorSet, 2> writes = {{
 	        {
-	                .dstSet = *splat_set,
+	                .dstSet = set,
 	                .dstBinding = 0,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
 	                .pImageInfo = &image_info,
 	        },
 	        {
-	                .dstSet = *splat_set,
+	                .dstSet = set,
 	                .dstBinding = 1,
 	                .descriptorCount = 1,
 	                .descriptorType = vk::DescriptorType::eUniformBuffer,
@@ -1170,7 +1187,7 @@ void depth_overlay_renderer::splat_pass1(vk::raii::CommandBuffer & cmd,
 	device->updateDescriptorSets(writes, nullptr);
 
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *splat_pipeline);
-	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *splat_pipeline_layout, 0, *splat_set, {});
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *splat_pipeline_layout, 0, set, {});
 
 	// Clear color is FAR (65504 saturates the pass-2 ramp to red) with
 	// clear depth at far (1.0): uncovered pixels keep both and read as
@@ -1271,8 +1288,8 @@ void depth_overlay_renderer::splat_pass1_and_barrier(vk::raii::CommandBuffer & c
                                                          const splat_warp_params & params,
                                                          int sens_w, int sens_h)
 {
-	upload_splat_params(params);
-	splat_pass1(cmd, sensor_view, sens_w, sens_h);
+	upload_splat_params(splat_ubo, params);
+	splat_pass1(cmd, sensor_view, sens_w, sens_h, *splat_set, splat_ubo);
 	splat_read_barrier(cmd, vk::Image(splat_image));
 }
 
@@ -1282,8 +1299,28 @@ void depth_overlay_renderer::fill_sync_heightfield(vk::raii::CommandBuffer & cmd
                                                   int sens_w, int sens_h,
                                                   const hand_splat * hands)
 {
-	upload_splat_params(params);
-	splat_pass1(cmd, depth_view, sens_w, sens_h);
+	// Fill-dedicated ping-pong slot (A1): the mask-phase fill and the
+	// viz splat share the transient across command buffers on async
+	// frames — host writes to one set/UBO while the GPU reads the other
+	// would corrupt the warp. Merge descriptor precedent.
+	splat_fill_parity = !splat_fill_parity;
+	auto & fill_ubo = splat_fill_ubo[splat_fill_parity ? 1 : 0];
+	if (not fill_ubo or fill_ubo.info().size < sizeof(splat_warp_params))
+	{
+		fill_ubo = buffer_allocation(
+		        *device,
+		        vk::BufferCreateInfo{
+		                .size = sizeof(splat_warp_params),
+		                .usage = vk::BufferUsageFlagBits::eUniformBuffer,
+		        },
+		        VmaAllocationCreateInfo{
+		                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "depth fill splat params");
+	}
+	upload_splat_params(fill_ubo, params);
+	splat_pass1(cmd, depth_view, sens_w, sens_h, *splat_fill_sets[splat_fill_parity ? 1 : 0], fill_ubo);
 	if (hands and hands->index_count > 0 and (vk::Buffer)hands->verts and (vk::Buffer)hands->indices)
 	{
 		// Sensor splat RP ends SHADER_READ: transition back for the
@@ -1380,11 +1417,6 @@ void depth_overlay_renderer::fill_sync_heightfield(vk::raii::CommandBuffer & cmd
 vk::ImageView depth_overlay_renderer::heightfield_view() const
 {
 	return *splat_view_array;
-}
-
-vk::Sampler depth_overlay_renderer::heightfield_sampler() const
-{
-	return *sampler;
 }
 
 void depth_overlay_renderer::record_sensor_splat(vk::raii::CommandBuffer & cmd, size_t image_index,

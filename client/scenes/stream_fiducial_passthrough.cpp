@@ -1099,8 +1099,8 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		}
 		auto & ost = passthrough_objects[def.id];
 		ost.def = def;
-		if ((is_boundary or is_hidden) and def.model_hash.empty())
-			ost.status = "no model configured (boundary/hidden needs model-path)";
+		if ((is_boundary or is_hidden or is_depth) and def.model_hash.empty())
+			ost.status = "no model configured (this type needs model-path)";
 		// Model geometry upload (shared across this object's instances).
 		if (not def.model_hash.empty())
 		{

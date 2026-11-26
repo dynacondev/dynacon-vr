@@ -811,6 +811,10 @@ private:
 	uint32_t hand_soup_index_count = 0;
 	uint32_t hand_soup_vert_cap = 0; // allocated vertex capacity (verts)
 	bool hand_soup_valid = false;    // at least one hand skinned this frame
+	// Persistent skinning scratch (no per-frame heap churn,
+	// verdict_map_scratch precedent).
+	std::vector<glm::vec3> hand_soup_pos_scratch;
+	std::vector<uint16_t> hand_soup_idx_scratch;
 	// The proximity palms borrow the GUI hand trackers (shared handles,
 	// per-frame positions — never culled): set from hidden_known at
 	// frame top so the GUI pair survives its interactability reset

@@ -2480,7 +2480,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							if (bounds and not box_visible(bounds->first, bounds->second, mvp))
 								continue;
 							copy_volume_draws.push_back({oid, mvp});
-							int d = (int)ost.def.dilate_px;
+							// Config values are floats; round (don't
+							// truncate: 2.9 dilate means 3) then clamp.
+							int d = (int)lroundf(ost.def.dilate_px);
 							copy_max_dilate = std::max(copy_max_dilate, std::min(std::max(d, 0), 8));
 							copy_max_bias = std::max(copy_max_bias, ost.def.depth_bias_m);
 						}
@@ -2491,14 +2493,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// sample these, so they lead the mask phase in the same
 				// command buffer (barriers inside order the later readers).
 				// Skipped with the depth test off (nothing samples them;
-				// the merge applies merged directly). um_base_ms covers
-				// base + copy (the copy only runs with depth volumes).
+				// the merge applies merged directly). The copy only runs
+				// with a visible volume (fully-culled volumes reveal
+				// nothing; B2). um_base_ms covers base + copy.
+				bool depth_volumes_visible = not copy_volume_draws.empty();
 				um_base_ms = 0;
 				if (vr_depth_test)
 				{
 					auto um_t0 = std::chrono::steady_clock::now();
 					merge_renderer->record_base(rec_cmd, layer_draws, &rec_pool, qmerge + 2);
-					if (depth_volume_active)
+					if (depth_volume_active and depth_volumes_visible)
 						merge_renderer->record_copy(rec_cmd, copy_occluder_draws, copy_volume_draws, copy_max_dilate);
 					um_base_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - um_t0).count();
 				}
@@ -2513,7 +2517,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				bool depth_heightfield_filled = false;
 				depth_overlay_renderer::hand_splat depth_hand_soup{};
 				hand_soup_valid = false;
-				bool depth_path_active = vr_depth_test and depth_volume_active and have_depth_frame and env_depth and (bool)merge_renderer;
+				bool depth_path_active = vr_depth_test and depth_volume_active and depth_volumes_visible and have_depth_frame and env_depth and (bool)merge_renderer;
 				if (depth_path_active)
 				{
 					if (not depth_overlay)
@@ -2543,12 +2547,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						// Tracked-hand soup (lobby-quality FB meshes,
 						// CPU-skinned at the video-frame time): the sensor
-						// removal below erases hands from the map, this
-						// puts them back sharper than the sensor resolves.
-						// Untracked side (controllers, out of view) stays
-						// raw sensor: removal is armed only with a valid
-						// soup, so nothing is ever erased without a
-						// replacement (fail-closed).
+						// removal below erases BOTH hands from the map
+						// (runtime-global, no per-hand switch); this puts
+						// tracked hands back sharper than the sensor
+						// resolves. Armed only with a valid soup: with no
+						// tracked hand at all the raw sensor stays
+						// (fail-closed). Mixed (one tracked, one not —
+						// controllers, out of view): the untracked side is
+						// erased without a replacement and reads as FAR
+						// there (closed, but a hole).
+						// No flow correction on the soup (deliberate): flow
+						// models the sensor's ~20ms timestamp lag; hands
+						// are posed fresh at the video-frame time, so the
+						// same shift would move them off truth. Residual
+						// under fast hand motion (capture-vs-sync poses) is
+						// bounded by the frame gap and accepted.
 						if (system.hand_tracking_supported())
 						{
 							if (not left_hand)
@@ -2556,11 +2569,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							if (not right_hand)
 								right_hand = session.create_hand_tracker(XR_HAND_RIGHT_EXT);
 						}
-						std::vector<glm::vec3> soup_pos;
-						std::vector<uint16_t> soup_idx;
-						soup_pos.reserve(4096);
-						soup_idx.reserve(12288);
-						auto skin_hand = [&](int side, XrHandEXT xr_hand, std::optional<xr::hand_tracker> & tracker) {
+						// Persistent scratch (C1: no per-frame heap churn,
+						// verdict_map_scratch precedent).
+						hand_soup_pos_scratch.clear();
+						hand_soup_idx_scratch.clear();
+						auto & soup_pos = hand_soup_pos_scratch;
+						auto & soup_idx = hand_soup_idx_scratch;
+						auto skin_hand = [&](int side, std::optional<xr::hand_tracker> & tracker) {
 							if (not tracker)
 								return;
 							const xr::hand_tracker::mesh_data * mesh = tracker->mesh();
@@ -2572,6 +2587,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							const auto & wrist = located->joints[XR_HAND_JOINT_WRIST_EXT].first;
 							if (not(wrist.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
 								return;
+							// Invalid fingers fall back to the wrist pose
+							// (B3: never collapse vertices on stale/zero
+							// joints; the mesh degrades around the wrist
+							// instead of spiking).
 							auto & topo = hand_soup_topo[(size_t)side];
 							if (not topo.ready)
 							{
@@ -2594,12 +2613,18 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							std::array<glm::mat4, XR_HAND_JOINT_COUNT_EXT> skin{};
 							for (size_t j = 0; j < located->joints.size(); ++j)
 							{
-								const auto & jp = located->joints[j].first.pose;
+								const auto & jl = located->joints[j].first;
+								const auto & jp = (jl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)
+								        ? jl.pose
+								        : wrist.pose;
 								glm::mat4 jw = glm::translate(glm::mat4(1), glm::vec3(jp.position.x, jp.position.y, jp.position.z)) *
 								               glm::mat4_cast(glm::quat(jp.orientation.w, jp.orientation.x, jp.orientation.y, jp.orientation.z));
 								skin[j] = jw * topo.inv_bind[j];
 							}
 							uint32_t base = (uint32_t)soup_pos.size();
+							// FB meshes are ~3k verts both hands; hard-guard
+							// the uint16 index space (C5).
+							assert(base + topo.bind_positions.size() < 65536);
 							for (size_t v = 0; v < topo.bind_positions.size(); ++v)
 							{
 								const auto & bp = topo.bind_positions[v];
@@ -2615,14 +2640,21 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							for (int16_t ix: topo.indices)
 								soup_idx.push_back((uint16_t)(base + ix));
 						};
-						skin_hand(0, XR_HAND_LEFT_EXT, left_hand);
-						skin_hand(1, XR_HAND_RIGHT_EXT, right_hand);
+						skin_hand(0, left_hand);
+						skin_hand(1, right_hand);
 						const depth_overlay_renderer::hand_splat * hands = nullptr;
 						if (not soup_pos.empty() and not soup_idx.empty() and soup_idx.size() % 3 == 0)
 						{
 							vk::DeviceSize vb = (vk::DeviceSize)soup_pos.size() * sizeof(glm::vec3);
 							if (not hand_soup_verts or hand_soup_vert_cap < (uint32_t)soup_pos.size())
 							{
+								// Replacing a live buffer while a prior
+								// async mask CB may still read it faults the
+								// GPU: idle first (rare path — capacity only
+								// grows, mesh topology is static). Union_merge
+								// set_mesh precedent.
+								if (hand_soup_verts)
+									device.waitIdle();
 								hand_soup_verts = buffer_allocation{
 								        device,
 								        vk::BufferCreateInfo{
@@ -2639,8 +2671,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 							std::memcpy(hand_soup_verts.map(), soup_pos.data(), (size_t)vb);
 							hand_soup_verts.unmap();
+							// Non-coherent host-visible memory: flush, or
+							// the GPU reads stale verts forever (splat-UBO
+							// idiom; unmap alone does not flush).
+							vmaFlushAllocation(vk_allocator::instance(), hand_soup_verts, 0, vb);
 							if (hand_soup_index_count != (uint32_t)soup_idx.size())
 							{
+								// Same in-flight hazard as the verts above:
+								// idle before replacing a live index buffer.
+								if (hand_soup_indices)
+									device.waitIdle();
 								hand_soup_indices = buffer_allocation{
 								        device,
 								        vk::BufferCreateInfo{
@@ -2657,6 +2697,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							}
 							std::memcpy(hand_soup_indices.map(), soup_idx.data(), soup_idx.size() * sizeof(uint16_t));
 							hand_soup_indices.unmap();
+							vmaFlushAllocation(vk_allocator::instance(), hand_soup_indices, 0, soup_idx.size() * sizeof(uint16_t));
 							for (uint32_t eye = 0; eye < view_count; ++eye)
 							{
 								glm::mat4 view = scene::view_matrix(sync_pose[eye]);
@@ -2878,17 +2919,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					// empty one — unless a depth volume claims this feather:
 					// volume-only groups still record (reveal-only).
 					bool any_positive = std::ranges::any_of(draws, [](const feather_mask_renderer::instance_draw & d) { return !d.reverse; });
-					// Depth reveal for this feather: any placed volume
-					// carrying this feather-px. Runs on top of windows
-					// too (same group), not just volume-only groups.
+					// Depth reveal for this feather: any surviving (frustum-
+					// visible, B2) volume draw carrying this feather-px.
+					// Runs on top of windows too (same group), not just
+					// volume-only groups.
 					bool has_depth_here = false;
 					if (depth_heightfield_filled)
 					{
-						for (auto & [oid, ost]: passthrough_objects)
+						for (auto & vd: copy_volume_draws)
 						{
-							(void)oid;
-							if (ost.def.type == "3d-depth-passthrough" and ost.soup_ready and ost.fused.placed and
-							    ost.def.feather_px == f)
+							auto voit = passthrough_objects.find(vd.mesh);
+							if (voit != passthrough_objects.end() and voit->second.def.feather_px == f)
 							{
 								has_depth_here = true;
 								break;

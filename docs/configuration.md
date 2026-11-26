@@ -489,6 +489,7 @@ Each `passthrough` entry has:
 - `depth-bias-m`: sensor-compare depth bias in meters
   (`3d-depth-passthrough` only, default `0`). Added to the merged copy
   (windows + hidden + volume back wall) before the `sensor < copy + bias` test.
+  Negative values tighten the test (sensor must beat the copy by more).
 - `transition-distance`: boundary fade width in meters
   (`3d-boundary(-reversed)` only, default `0.3`, applied live). The
   scene cross-fades over ± this distance around the zone surface

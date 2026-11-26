@@ -227,9 +227,10 @@ public:
 	// with hardware depth test into the owned R16F transient), ordered
 	// for a same-CB tap. The caller rasters tracked-hand soup into the
 	// same transient next (same depth test), then samples it via
-	// heightfield_view()/heightfield_sampler() in the feather reveal
-	// and the shared-layer write-back. Requires ensure() first (the
-	// transient lives there); no swapchain acquire needed.
+	// heightfield_view() in the feather reveal and the shared-layer
+	// write-back (callers use their own NEAREST samplers — feather
+	// sampler_nearest, merge sampler_nearest). Requires ensure() first
+	// (the transient lives there); no swapchain acquire needed.
 	// Tracked-hand soup splatted into the same transient (3d-depth-passthrough):
 	// CPU-skinned FB hand meshes (lobby quality) in world space at the
 	// video-frame time, drawn with the same depth test + mapping as the
@@ -251,7 +252,6 @@ public:
 	                           int sens_w, int sens_h,
 	                           const hand_splat * hands = nullptr);
 	vk::ImageView heightfield_view() const;
-	vk::Sampler heightfield_sampler() const;
 
 	// Raster-vs-sensor with the splatted sensor tap
 	// (sensor_splat.* -> splat_compare.frag): layer tapped directly by
@@ -330,6 +330,13 @@ private:
 	vk::raii::DescriptorSetLayout splat_layout{nullptr};
 	vk::raii::DescriptorPool splat_pool{nullptr};
 	vk::raii::DescriptorSet splat_set{nullptr};
+	// Fill-dedicated ping-pong state (mask-phase heightfield vs viz
+	// splat across command buffers, async frames): alternating set/UBO
+	// per fill call so host writes never race in-flight GPU reads.
+	// Merge descriptor precedent.
+	std::vector<vk::raii::DescriptorSet> splat_fill_sets;
+	std::array<buffer_allocation, 2> splat_fill_ubo;
+	bool splat_fill_parity = false;
 	vk::raii::PipelineLayout splat_pipeline_layout{nullptr};
 	vk::raii::Pipeline splat_pipeline{nullptr};
 	vk::raii::RenderPass splat_renderpass{nullptr};
@@ -361,7 +368,7 @@ private:
 	// pass-2 colorize params ride the fragment push block). Written per
 	// splat record + flushed (non-coherent pattern, see upload).
 	buffer_allocation splat_ubo;
-	void upload_splat_params(const splat_warp_params & params);
+	void upload_splat_params(buffer_allocation & ubo, const splat_warp_params & params);
 	// Pass 1 shared by both splat records: splat the sensor mesh into
 	// the transient R16F image (flat-splat, depth-tested). Leaves the
 	// temp ready for a same-CB barrier to SHADER_READ_ONLY.
@@ -377,7 +384,9 @@ private:
 	void ensure_splat_index(int sens_w, int sens_h);
 	void splat_pass1(vk::raii::CommandBuffer & cmd,
 	                 vk::ImageView depth_view,
-	                 int sens_w, int sens_h);
+	                 int sens_w, int sens_h,
+	                 vk::DescriptorSet set,
+	                 buffer_allocation & ubo);
 	// Pass-1 shared by both splat records: upload warp params, splat
 	// the sensor mesh into the transient R16F image, then order the
 	// write before the same-CB pass-2 tap.
