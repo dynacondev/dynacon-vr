@@ -829,6 +829,184 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		cutout_load_renderpass = vk::raii::RenderPass(device, cut_rp_info);
 	}
+
+	// Depth reveal state (3d-depth-passthrough): single test
+	// MAX-blended over the binary working alpha ahead of the blur
+	// chain (the blend unit does the OR — no work tap, which would be
+	// a feedback loop; R8 MIN-blend precedent from the reversed raster
+	// proves the blend path). R8 LOAD RP for the intermediates plus a
+	// pipe under the RGBA8 cutout LOAD twin for tier-0 submits. Full
+	// footprint every record (both bindings, Adreno partial-write
+	// rule); ping-ponged sets (async mask CB may still read the other,
+	// merge precedent); 4B bias push.
+	{
+		uint32_t rev_view_mask = 0b11, rev_corr_mask = 0b11;
+		vk::RenderPassMultiviewCreateInfo rev_mv_info{
+		        .subpassCount = 1,
+		        .pViewMasks = &rev_view_mask,
+		        .correlationMaskCount = 1,
+		        .pCorrelationMasks = &rev_corr_mask,
+		};
+		vk::AttachmentDescription rev_r8_attachment{
+		        .format = blur_format,
+		        .samples = vk::SampleCountFlagBits::e1,
+		        .loadOp = vk::AttachmentLoadOp::eLoad,
+		        .storeOp = vk::AttachmentStoreOp::eStore,
+		        .initialLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		        .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentReference rev_r8_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::SubpassDescription rev_r8_subpass{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .colorAttachmentCount = 1,
+		        .pColorAttachments = &rev_r8_ref,
+		};
+		vk::RenderPassCreateInfo rev_r8_rp_info{
+		        .pNext = &rev_mv_info,
+		        .attachmentCount = 1,
+		        .pAttachments = &rev_r8_attachment,
+		        .subpassCount = 1,
+		        .pSubpasses = &rev_r8_subpass,
+		};
+		reveal_r8_rp = vk::raii::RenderPass(device, rev_r8_rp_info);
+
+		vk::DescriptorSetLayoutBinding rev_bindings[2];
+		for (uint32_t i = 0; i < 2; ++i)
+		{
+			rev_bindings[i] = vk::DescriptorSetLayoutBinding{
+			        .binding = i,
+			        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+			        .descriptorCount = 1,
+			        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+			};
+		}
+		reveal_layout = vk::raii::DescriptorSetLayout(device, vk::DescriptorSetLayoutCreateInfo{
+		                                                              .bindingCount = 2,
+		                                                              .pBindings = rev_bindings,
+		                                                      });
+		vk::DescriptorPoolSize rev_pool_size{
+		        .type = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 4,
+		};
+		vk::DescriptorPoolCreateInfo rev_pool_info{
+		        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+		        .maxSets = 2,
+		        .poolSizeCount = 1,
+		        .pPoolSizes = &rev_pool_size,
+		};
+		reveal_pool = vk::raii::DescriptorPool(device, rev_pool_info);
+		for (int i = 0; i < 2; ++i)
+		{
+			vk::DescriptorSetAllocateInfo rev_set_alloc{
+			        .descriptorPool = *reveal_pool,
+			        .descriptorSetCount = 1,
+			        .pSetLayouts = &*reveal_layout,
+			};
+			reveal_sets.emplace_back(std::move(device.allocateDescriptorSets(rev_set_alloc)[0]));
+		}
+		struct reveal_push
+		{
+			float bias = 0;
+		};
+		static_assert(sizeof(reveal_push) == 4);
+		vk::PushConstantRange rev_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        .offset = 0,
+		        .size = sizeof(reveal_push),
+		};
+		vk::PipelineLayoutCreateInfo rev_layout_info{
+		        .setLayoutCount = 1,
+		        .pSetLayouts = &*reveal_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &rev_push_range,
+		};
+		reveal_pipeline_layout = vk::raii::PipelineLayout(device, rev_layout_info);
+
+		vk::PipelineVertexInputStateCreateInfo rev_vertex_input{};
+		vk::PipelineInputAssemblyStateCreateInfo rev_input_assembly{
+		        .topology = vk::PrimitiveTopology::eTriangleList,
+		};
+		vk::PipelineViewportStateCreateInfo rev_viewport_state{
+		        .viewportCount = 1,
+		        .scissorCount = 1,
+		};
+		vk::PipelineRasterizationStateCreateInfo rev_rasterization{
+		        .polygonMode = vk::PolygonMode::eFill,
+		        .cullMode = vk::CullModeFlagBits::eNone,
+		        .frontFace = vk::FrontFace::eCounterClockwise,
+		        .lineWidth = 1,
+		};
+		vk::PipelineMultisampleStateCreateInfo rev_multisample{
+		        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+		};
+		vk::PipelineColorBlendAttachmentState rev_max_attachment{
+		        .blendEnable = VK_TRUE,
+		        .srcColorBlendFactor = vk::BlendFactor::eOne,
+		        .dstColorBlendFactor = vk::BlendFactor::eOne,
+		        .colorBlendOp = vk::BlendOp::eMax,
+		        .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+		        .dstAlphaBlendFactor = vk::BlendFactor::eOne,
+		        .alphaBlendOp = vk::BlendOp::eMax,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		};
+		vk::PipelineColorBlendStateCreateInfo rev_max_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &rev_max_attachment,
+		};
+		vk::DynamicState rev_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+		vk::PipelineDynamicStateCreateInfo rev_dynamic{
+		        .dynamicStateCount = 2,
+		        .pDynamicStates = rev_dynamics,
+		};
+		auto rev_vert = load_shader(device, "blur.vert");
+		auto rev_frag = load_shader(device, "depth_reveal_mv.frag");
+		vk::PipelineShaderStageCreateInfo rev_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **rev_vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **rev_frag,
+		                .pName = "main",
+		        },
+		};
+		vk::GraphicsPipelineCreateInfo rev_r8_pipe_info{
+		        .stageCount = 2,
+		        .pStages = rev_stages,
+		        .pVertexInputState = &rev_vertex_input,
+		        .pInputAssemblyState = &rev_input_assembly,
+		        .pViewportState = &rev_viewport_state,
+		        .pRasterizationState = &rev_rasterization,
+		        .pMultisampleState = &rev_multisample,
+		        .pColorBlendState = &rev_max_blend,
+		        .pDynamicState = &rev_dynamic,
+		        .layout = *reveal_pipeline_layout,
+		        .renderPass = *reveal_r8_rp,
+		};
+		reveal_r8_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), rev_r8_pipe_info);
+		// RGBA8 twin for tier-0 submits (same stages/layout, cutout
+		// LOAD twin — loadOp is not part of compatibility).
+		vk::GraphicsPipelineCreateInfo rev_rgba_pipe_info{
+		        .stageCount = 2,
+		        .pStages = rev_stages,
+		        .pVertexInputState = &rev_vertex_input,
+		        .pInputAssemblyState = &rev_input_assembly,
+		        .pViewportState = &rev_viewport_state,
+		        .pRasterizationState = &rev_rasterization,
+		        .pMultisampleState = &rev_multisample,
+		        .pColorBlendState = &rev_max_blend,
+		        .pDynamicState = &rev_dynamic,
+		        .layout = *reveal_pipeline_layout,
+		        .renderPass = *cutout_load_renderpass,
+		};
+		reveal_rgba_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), rev_rgba_pipe_info);
+	}
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -1614,6 +1792,10 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 	device.waitIdle();
 	targets_extent = extent;
 	targets_has_intermediates = with_intermediates;
+	// Working images are recreated below: drop the cached reveal
+	// framebuffer (creation-only rebuild on next reveal record).
+	reveal_fb.clear();
+	reveal_fb_src = VK_NULL_HANDLE;
 	if (not with_intermediates)
 	{
 		// Tier-0 direct raster never touches the blur/downsample
@@ -1941,10 +2123,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
                                    const std::vector<std::array<glm::vec3, 6>> & cutouts,
                                    const std::array<glm::mat4, 2> & cutout_mvp,
                                    mask_stage_cpu * cpu_stats,
-                                   vk::Extent2D out_extent)
+                                   vk::Extent2D out_extent,
+                                   const depth_reveal * reveal)
 {
 	auto t_total0 = std::chrono::steady_clock::now();
-	double ms_raster = 0, ms_erode = 0, ms_blur = 0, ms_punch = 0;
+	double ms_raster = 0, ms_erode = 0, ms_blur = 0, ms_punch = 0, ms_depth = 0;
 	float box_frac = 1;
 	size_t n_draws = 0;
 	int tier_out = -1;
@@ -1961,6 +2144,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cpu_stats->erode_ms = ms_erode;
 			cpu_stats->blur_ms = ms_blur;
 			cpu_stats->punch_ms = ms_punch;
+			cpu_stats->depth_ms = ms_depth;
 			cpu_stats->total_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_total0).count();
 			cpu_stats->tier = tier_out;
 			cpu_stats->draws = n_draws;
@@ -2052,6 +2236,96 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			        });
 		}
 		return *triple_fb;
+	};
+
+	// Depth-reveal pass (3d-depth-passthrough, null reveal = skip):
+	// single sensor<copy+bias test MAX-blended over the working image
+	// (LOAD framebuffer, fullscreen, no content-box scissor — volume
+	// reveals live outside the silhouette box) ahead of the blur chain.
+	// The blend unit does the OR (no work tap: sampling the bound
+	// attachment would be a feedback loop). Tier-0 reveals the submit
+	// image under its LOAD twin; tier-1/tiered reveal the R8 working
+	// target under reveal_r8_rp (framebuffer cached creation-only like
+	// triple_fb above).
+	struct reveal_push
+	{
+		float bias = 0;
+	};
+	auto reveal_fb_for = [&](vk::Image img, vk::ImageView view, vk::Extent2D e) -> vk::Framebuffer {
+		if (reveal_fb_src != img)
+		{
+			reveal_fb_src = img;
+			vk::ImageView att = view;
+			reveal_fb = vk::raii::Framebuffer(device,
+			        vk::FramebufferCreateInfo{
+			                .renderPass = *reveal_r8_rp,
+			                .attachmentCount = 1,
+			                .pAttachments = &att,
+			                .width = e.width,
+			                .height = e.height,
+			                .layers = 1,
+			        });
+		}
+		return *reveal_fb;
+	};
+	auto run_reveal = [&](vk::Image work_img, vk::Framebuffer work_fb, vk::RenderPass work_rp,
+	                      vk::Pipeline work_pipe, vk::Extent2D e) {
+		section_clock depth_clk(&ms_depth);
+		// WAW execution barrier (cutout-punch precedent): the raster
+		// wrote work_img as COLOR_ATTACHMENT; the LOAD pass below
+		// reads it back. Layout stays COLOR_ATTACHMENT on both sides.
+		transfer_barrier(work_img,
+		                 vk::ImageLayout::eColorAttachmentOptimal,
+		                 vk::ImageLayout::eColorAttachmentOptimal,
+		                 vk::AccessFlagBits::eColorAttachmentWrite,
+		                 vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eColorAttachmentRead,
+		                 vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
+		reveal_parity = !reveal_parity;
+		vk::DescriptorSet rset = *reveal_sets[reveal_parity ? 1 : 0];
+		vk::DescriptorImageInfo sensor_info{
+		        .sampler = *sampler_nearest,
+		        .imageView = reveal->sensor_view,
+		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		};
+		vk::DescriptorImageInfo copy_info{
+		        .sampler = *sampler_nearest,
+		        .imageView = reveal->copy_view,
+		        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+		};
+		// Full footprint every record (Adreno partial-write rule).
+		std::array<vk::WriteDescriptorSet, 2> rev_writes = {{
+		        {
+		                .dstSet = rset,
+		                .dstBinding = 0,
+		                .descriptorCount = 1,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .pImageInfo = &sensor_info,
+		        },
+		        {
+		                .dstSet = rset,
+		                .dstBinding = 1,
+		                .descriptorCount = 1,
+		                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+		                .pImageInfo = &copy_info,
+		        },
+		}};
+		device.updateDescriptorSets(rev_writes, {});
+		vk::RenderPassBeginInfo rev_begin{
+		        .renderPass = work_rp,
+		        .framebuffer = work_fb,
+		        .renderArea = {.offset = {0, 0}, .extent = e},
+		        .clearValueCount = 0,
+		        .pClearValues = nullptr,
+		};
+		cmd.beginRenderPass(rev_begin, vk::SubpassContents::eInline);
+		set_full_viewport(e);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, work_pipe);
+		cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *reveal_pipeline_layout, 0, rset, {});
+		cmd.pushConstants<reveal_push>(*reveal_pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
+		                               reveal_push{.bias = reveal->bias});
+		cmd.draw(3, 1, 0, 0);
+		cmd.endRenderPass();
 	};
 
 	auto it = targets.find(image);
@@ -2196,8 +2470,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 
 
 	// No silhouette draws (and no reversed cuts): clear-only, then the
-	// cutout punch below runs if armed.
-	if (not rasterize or not has_positive)
+	// cutout punch below runs if armed. A depth reveal still runs on
+	// the cleared image (volume-only groups have no silhouettes).
+	if ((not rasterize or not has_positive) and not reveal)
 	{
 		section_clock raster_clk(&ms_raster);
 		// Bypass: clear-only pass, transparent mask, full stack hot.
@@ -2219,7 +2494,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// No meshes: nothing to raster, but cutouts still punch (the
 		// debug-only group has no meshes by design). Tier branches below
 		// run over empty draws (clear passes), then the punch stamps.
-		if (meshes.empty() and cutouts.empty())
+		// A depth reveal still runs (volume-only groups).
+		if (meshes.empty() and cutouts.empty() and not reveal)
 		{
 			fill_stats();
 			return;
@@ -2366,6 +2642,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// image. Exact, one multiview raster pass, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
 			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed);
+			if (reveal)
+				run_reveal(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *reveal_rgba_pipeline, out_extent);
 		}
 		else if (tier == 1)
 		{
@@ -2387,6 +2665,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			section_clock raster_clk(&ms_raster);
 			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed);
 		}
+		if (reveal)
+			run_reveal(*target_a.image, reveal_fb_for(*target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *reveal_r8_pipeline, half_extent);
 		make_readable(*target_a.image);
 		// Merged triple (one renderpass, subpasses 0/1/2): erode H into
 		// B, erode V back into A, blur H into B — tile-resident, ordered
@@ -2494,6 +2774,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				section_clock raster_clk(&ms_raster);
 				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed);
 			}
+			if (reveal)
+				run_reveal(*down_targets[seed_level - 1].image,
+				           reveal_fb_for(*down_targets[seed_level - 1].image, *down_targets[seed_level - 1].view_array, de_seed),
+				           *reveal_r8_rp, *reveal_r8_pipeline, de_seed);
 			make_readable(*down_targets[seed_level - 1].image);
 			section_clock blur_clk(&ms_blur);
 			// Levels seed_level+1..N from the selected tier; sizes shared

@@ -163,6 +163,8 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	verdict_descriptor_sets.clear();
 	apply_descriptor_sets.clear();
 	dilate_sets.clear();
+	writeback_sets.clear();
+	layer_load_fb.clear();
 	copy_load_fb.clear();
 	copy_dilate_fb.clear();
 	copy_tmp_dilate_fb.clear();
@@ -308,6 +310,20 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        .layers = 1,
 		};
 		copy_tmp_dilate_fb = vk::raii::Framebuffer(*device, tmp_dilate_fb_info);
+	}
+	// Shared-layer LOAD framebuffer for the sensor write-back (MIN blend
+	// preserves the rastered windows): the write-back pass below re-begins
+	// it under geom_load_rp (loadOp is not part of compatibility).
+	{
+		vk::ImageView layer_view = *layer_.view_array;
+		layer_load_fb = vk::raii::Framebuffer(*device, vk::FramebufferCreateInfo{
+		                                                        .renderPass = *geom_load_rp,
+		                                                        .attachmentCount = 1,
+		                                                        .pAttachments = &layer_view,
+		                                                        .width = half_extent.width,
+		                                                        .height = half_extent.height,
+		                                                        .layers = 1,
+		                                                });
 	}
 	layer_extent_ = new_extent;
 	half_extent_ = half_extent;
@@ -906,6 +922,106 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 		        .renderPass = *dilate_rp,
 		};
 		dilate_pipeline = vk::raii::Pipeline(*device, *pipe_cache, dilate_pipeline_info);
+	}
+	// Sensor write-back fullscreen state (R16F, MIN blend under the
+	// LOAD twin so rastered windows survive): same single test as the
+	// feather reveal, 4B bias push. Ping-ponged sets (async mask CB may
+	// still read the other, merge precedent).
+	{
+		vk::DescriptorSetLayoutBinding wb_bindings[2];
+		for (uint32_t i = 0; i < 2; ++i)
+		{
+			wb_bindings[i] = vk::DescriptorSetLayoutBinding{
+			        .binding = i,
+			        .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+			        .descriptorCount = 1,
+			        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+			};
+		}
+		writeback_layout = vk::raii::DescriptorSetLayout(*device, vk::DescriptorSetLayoutCreateInfo{
+		                                                                 .bindingCount = 2,
+		                                                                 .pBindings = wb_bindings,
+		                                                         });
+		vk::DescriptorPoolSize wb_pool_size{
+		        .type = vk::DescriptorType::eCombinedImageSampler,
+		        .descriptorCount = 4,
+		};
+		vk::DescriptorPoolCreateInfo wb_pool_info{
+		        .flags = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet,
+		        .maxSets = 2,
+		        .poolSizeCount = 1,
+		        .pPoolSizes = &wb_pool_size,
+		};
+		writeback_pool = vk::raii::DescriptorPool(*device, wb_pool_info);
+		for (int i = 0; i < 2; ++i)
+		{
+			vk::DescriptorSetAllocateInfo wb_set_alloc{
+			        .descriptorPool = *writeback_pool,
+			        .descriptorSetCount = 1,
+			        .pSetLayouts = &*writeback_layout,
+			};
+			writeback_sets.emplace_back(std::move(device->allocateDescriptorSets(wb_set_alloc)[0]));
+		}
+		struct writeback_push
+		{
+			float bias = 0;
+		};
+		static_assert(sizeof(writeback_push) == 4);
+		vk::PushConstantRange wb_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eFragment,
+		        .offset = 0,
+		        .size = sizeof(writeback_push),
+		};
+		vk::PipelineLayoutCreateInfo wb_layout_info{
+		        .setLayoutCount = 1,
+		        .pSetLayouts = &*writeback_layout,
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &wb_push_range,
+		};
+		writeback_pipeline_layout = vk::raii::PipelineLayout(*device, wb_layout_info);
+		auto wb_vert = load_shader(*device, "blur.vert");
+		auto wb_frag = load_shader(*device, "depth_writeback_mv.frag");
+		vk::PipelineShaderStageCreateInfo wb_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **wb_vert,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **wb_frag,
+		                .pName = "main",
+		        },
+		};
+		vk::PipelineColorBlendAttachmentState wb_blend_attachment{
+		        .blendEnable = VK_TRUE,
+		        .srcColorBlendFactor = vk::BlendFactor::eOne,
+		        .dstColorBlendFactor = vk::BlendFactor::eOne,
+		        .colorBlendOp = vk::BlendOp::eMin,
+		        .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+		        .dstAlphaBlendFactor = vk::BlendFactor::eOne,
+		        .alphaBlendOp = vk::BlendOp::eMin,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR,
+		};
+		vk::PipelineColorBlendStateCreateInfo wb_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &wb_blend_attachment,
+		};
+		vk::GraphicsPipelineCreateInfo wb_pipeline_info{
+		        .stageCount = 2,
+		        .pStages = wb_stages,
+		        .pVertexInputState = &vertex_input,
+		        .pInputAssemblyState = &input_assembly,
+		        .pViewportState = &viewport_state,
+		        .pRasterizationState = &rasterization,
+		        .pMultisampleState = &multisample,
+		        .pDepthStencilState = &depth_stencil,
+		        .pColorBlendState = &wb_blend,
+		        .pDynamicState = &dynamic,
+		        .layout = *writeback_pipeline_layout,
+		        .renderPass = *geom_load_rp,
+		};
+		writeback_pipeline = vk::raii::Pipeline(*device, *pipe_cache, wb_pipeline_info);
 	}
 
 	// Standalone verdict renderpass (single attachment, multiview):
@@ -1535,6 +1651,118 @@ bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<
 		img_barrier(*copy_.image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
 		            vk::AccessFlagBits::eColorAttachmentWrite, vk::AccessFlagBits::eShaderRead,
 		            vk::PipelineStageFlagBits::eColorAttachmentOutput, vk::PipelineStageFlagBits::eFragmentShader);
+	return true;
+}
+
+bool union_merge_renderer::record_depth_writeback(vk::raii::CommandBuffer & cmd, vk::ImageView sensor_view,
+                                                   vk::ImageView copy_view, float bias)
+{
+	if (not *layer_.image or sensor_view == vk::ImageView{} or copy_view == vk::ImageView{})
+		return false;
+
+	// The shared layer ends SHADER_READ (record_base barrier; feather
+	// records never touch it): transition to the LOAD raster, run the
+	// test fullscreen (MIN keeps the nearer of sensor and window), and
+	// hand back SHADER_READ for the verdict tap below.
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eFragmentShader,
+	                    vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	                    {},
+	                    {},
+	                    {},
+	                    vk::ImageMemoryBarrier{
+	                            .srcAccessMask = vk::AccessFlagBits::eShaderRead,
+	                            .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+	                            .oldLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                            .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                            .image = *layer_.image,
+	                            .subresourceRange = {
+	                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                                    .levelCount = 1,
+	                                    .layerCount = 2,
+	                            },
+	                    });
+	writeback_parity = !writeback_parity;
+	vk::DescriptorSet wset = *writeback_sets[writeback_parity ? 1 : 0];
+	vk::DescriptorImageInfo sensor_info{
+	        .sampler = *sampler_nearest,
+	        .imageView = sensor_view,
+	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	};
+	vk::DescriptorImageInfo copy_info{
+	        .sampler = *sampler_nearest,
+	        .imageView = copy_view,
+	        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	};
+	// Full footprint every record (Adreno partial-write rule).
+	std::array<vk::WriteDescriptorSet, 2> wb_writes = {{
+	        {
+	                .dstSet = wset,
+	                .dstBinding = 0,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .pImageInfo = &sensor_info,
+	        },
+	        {
+	                .dstSet = wset,
+	                .dstBinding = 1,
+	                .descriptorCount = 1,
+	                .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+	                .pImageInfo = &copy_info,
+	        },
+	}};
+	device->updateDescriptorSets(wb_writes, {});
+	vk::RenderPassBeginInfo wb_begin{
+	        .renderPass = *geom_load_rp,
+	        .framebuffer = *layer_load_fb,
+	        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+	        .clearValueCount = 0,
+	        .pClearValues = nullptr,
+	};
+	cmd.beginRenderPass(wb_begin, vk::SubpassContents::eInline);
+	cmd.setViewport(0, vk::Viewport{
+	                        .x = 0,
+	                        .y = 0,
+	                        .width = (float)half_extent_.width,
+	                        .height = (float)half_extent_.height,
+	                        .minDepth = 0,
+	                        .maxDepth = 1,
+	                });
+	// Full-extent scissor, set explicitly: prior passes in this command
+	// buffer leave narrowed boxes behind (verdict content box, per-draw
+	// unions) — inheriting one would clip the write-back with no
+	// validation complaint.
+	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *writeback_pipeline);
+	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *writeback_pipeline_layout, 0, wset, {});
+	struct writeback_push
+	{
+		float bias = 0;
+	};
+	cmd.pushConstants<writeback_push>(*writeback_pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0,
+	                                  writeback_push{.bias = bias});
+	cmd.draw(3, 1, 0, 0);
+	cmd.endRenderPass();
+	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
+	                    vk::PipelineStageFlagBits::eFragmentShader,
+	                    {},
+	                    {},
+	                    {},
+	                    vk::ImageMemoryBarrier{
+	                            .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+	                            .dstAccessMask = vk::AccessFlagBits::eShaderRead,
+	                            .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+	                            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+	                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+	                            .image = *layer_.image,
+	                            .subresourceRange = {
+	                                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                                    .levelCount = 1,
+	                                    .layerCount = 2,
+	                            },
+	                    });
 	return true;
 }
 

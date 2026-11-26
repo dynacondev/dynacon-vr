@@ -927,6 +927,20 @@ private:
 	// chain through (first call per frame stamps, later calls ride).
 	// Render thread only.
 	bool status_rebuild_due(XrTime now);
+	// Splat warp params (capture->target rigid + frustum tangents +
+	// flow): shared by the viz custom-splat and the depth heightfield.
+	// FROM is the headset pose at capture (or the acquire-time depth
+	// pose fallback); TO is the target eye pose (predicted display for
+	// viz, sync/video eye for depth). near/far ride the depth frame;
+	// opacity rides the viz slider (depth callers pass their own).
+	// Returns false on degenerate quats (caller sits the splat out).
+	// Render thread only.
+	bool build_splat_warp(const std::array<XrPosef, view_count> & from_pose,
+	                      const std::array<XrPosef, view_count> & to_pose,
+	                      const std::array<XrFovf, view_count> & sens_fov,
+	                      const std::array<XrFovf, view_count> & disp_fov,
+	                      float near_z, float far_z, float opacity,
+	                      depth_overlay_renderer::splat_warp_params & out);
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe
 	// optimistic so the canvas exists when the probe lands; runtimes

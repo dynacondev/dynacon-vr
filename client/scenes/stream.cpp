@@ -954,6 +954,129 @@ bool scenes::stream::status_rebuild_due(XrTime now)
 	return true;
 }
 
+bool scenes::stream::build_splat_warp(const std::array<XrPosef, view_count> & from_pose,
+                                      const std::array<XrPosef, view_count> & to_pose,
+                                      const std::array<XrFovf, view_count> & sens_fov,
+                                      const std::array<XrFovf, view_count> & disp_fov,
+                                      float near_z, float far_z, float opacity,
+                                      depth_overlay_renderer::splat_warp_params & out)
+{
+	out = depth_overlay_renderer::splat_warp_params{};
+	// Locked-in flow correction (device-validated): shift each texel
+	// forward along head motion by a fixed 20ms of the latest
+	// sensor-sample finite-difference velocity. Always applied.
+	double flow_extra_s = kFlowExtraMs * 1e-3;
+	std::array<glm::vec3, view_count> flow_vel_w{};
+	std::array<glm::vec3, view_count> flow_om_w{};
+	if (flow_samp_history.size() >= 2)
+	{
+		size_t n = flow_samp_history.size() - 1;
+		const flow_sample & newest = flow_samp_history[n];
+		const flow_sample & oldest = flow_samp_history[n - 1];
+		double dt_samp = (double)(newest.t - oldest.t) * 1e-9;
+		if (dt_samp > 1e-9 and dt_samp < 0.5) // 0.5s: hitch/gap guard
+		{
+			for (uint32_t eye = 0; eye < view_count; ++eye)
+			{
+				glm::vec3 p_new(newest.pose[eye].position.x, newest.pose[eye].position.y, newest.pose[eye].position.z);
+				glm::vec3 p_old(oldest.pose[eye].position.x, oldest.pose[eye].position.y, oldest.pose[eye].position.z);
+				glm::vec3 vel = (p_new - p_old) / (float)dt_samp;
+				flow_vel_w[eye] = vel * (float)flow_extra_s;
+				glm::quat q_new(newest.pose[eye].orientation.w, newest.pose[eye].orientation.x,
+				                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
+				glm::quat q_old(oldest.pose[eye].orientation.w, oldest.pose[eye].orientation.x,
+				                oldest.pose[eye].orientation.y, oldest.pose[eye].orientation.z);
+				// Runtime quats are unit: one normalize of the
+				// delta suffices.
+				glm::quat dq = glm::normalize(q_new * glm::inverse(q_old));
+				if (dq.w < 0.f)
+					dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
+				float cos_half = std::clamp(dq.w, -1.f, 1.f);
+				float ang = 2.f * acosf(cos_half);
+				float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
+				if (ang > 1e-6f and sin_half > 1e-6f)
+					flow_om_w[eye] = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang * (float)(flow_extra_s / dt_samp));
+			}
+		}
+	}
+	// Frustum tangents are static per frustum (sensor: per
+	// provider; target: per eye fov), so cache the tanf results keyed
+	// on the fov values. Render thread only (function statics, viz
+	// precedent).
+	static std::array<XrFovf, view_count> last_sens_fov{};
+	static std::array<std::array<float, 4>, view_count> sens_tan_cache{};
+	static std::array<XrFovf, view_count> last_disp_fov{};
+	static std::array<std::array<float, 4>, view_count> disp_tan_cache{};
+	auto fov_changed = [](const XrFovf & a, const XrFovf & b) {
+		return a.angleLeft != b.angleLeft or a.angleRight != b.angleRight or
+		       a.angleUp != b.angleUp or a.angleDown != b.angleDown;
+	};
+	out.near_z = near_z;
+	out.far_z = far_z;
+	out.opacity = opacity;
+	for (uint32_t eye = 0; eye < view_count; ++eye)
+	{
+		const XrPosef & from = from_pose[eye];
+		const XrPosef & to = to_pose[eye];
+		glm::quat qc(from.orientation.w, from.orientation.x, from.orientation.y, from.orientation.z);
+		glm::quat qd(to.orientation.w, to.orientation.x, to.orientation.y, to.orientation.z);
+		if (glm::dot(qc, qc) < 1e-12f or glm::dot(qd, qd) < 1e-12f)
+			return false;
+		glm::vec3 pc(from.position.x, from.position.y, from.position.z);
+		glm::vec3 pd(to.position.x, to.position.y, to.position.z);
+		// Per-texel flow is computed once above (latest-pair
+		// finite difference, fixed -20ms) and filled into
+		// the UBO per eye below.
+		glm::mat3 r = glm::mat3(glm::inverse(qc) * qd);
+		for (int row = 0; row < 3; ++row)
+		{
+			out.rot_rows[eye][row][0] = r[0][row];
+			out.rot_rows[eye][row][1] = r[1][row];
+			out.rot_rows[eye][row][2] = r[2][row];
+			out.rot_rows[eye][row][3] = 0;
+		}
+		// Translation + flow into the target-eye frame (the
+		// vertex shader shifts each texel along its own):
+		// one inverse per eye.
+		glm::quat qd_inv = glm::inverse(qd);
+		glm::vec3 t = qd_inv * (pc - pd);
+		glm::vec3 Dlin_eye = qd_inv * flow_vel_w[eye];
+		glm::vec3 Dang_eye = qd_inv * flow_om_w[eye];
+		out.flow_lin[eye][0] = Dlin_eye.x;
+		out.flow_lin[eye][1] = Dlin_eye.y;
+		out.flow_lin[eye][2] = Dlin_eye.z;
+		out.flow_lin[eye][3] = 0;
+		out.flow_ang[eye][0] = Dang_eye.x;
+		out.flow_ang[eye][1] = Dang_eye.y;
+		out.flow_ang[eye][2] = Dang_eye.z;
+		out.flow_ang[eye][3] = 0;
+		out.trans[eye][0] = t.x;
+		out.trans[eye][1] = t.y;
+		out.trans[eye][2] = t.z;
+		out.trans[eye][3] = 0;
+		const XrFovf & sf = sens_fov[eye];
+		if (fov_changed(sf, last_sens_fov[eye]))
+		{
+			sens_tan_cache[eye] = {tanf(sf.angleLeft), tanf(sf.angleRight),
+			                       tanf(sf.angleUp), tanf(sf.angleDown)};
+			last_sens_fov[eye] = sf;
+		}
+		const XrFovf & df = disp_fov[eye];
+		if (fov_changed(df, last_disp_fov[eye]))
+		{
+			disp_tan_cache[eye] = {tanf(df.angleLeft), tanf(df.angleRight),
+			                       tanf(df.angleUp), tanf(df.angleDown)};
+			last_disp_fov[eye] = df;
+		}
+		for (int k = 0; k < 4; ++k)
+		{
+			out.sens_tan[eye][k] = sens_tan_cache[eye][k];
+			out.disp_tan[eye][k] = disp_tan_cache[eye][k];
+		}
+	}
+	return true;
+}
+
 void scenes::stream::update_stream_kiosk(XrTime predicted_display_time)
 {
 	const auto & config = application::get_config();
@@ -1762,14 +1885,13 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						if (got_depth)
 						{
 							have_depth_frame = true;
-							// Sensor-viz submit pose + custom-warp FROM pose:
-							// headset at the depth image's capture time. No
-							// depth-sensor query at a past time exists (or is
-							// needed): the single timestamp is the one riding
-							// the image we render. Raster-vs-sensor reuses
-							// the same locate as its warp FROM (no submit
-							// use there).
-							if (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor)
+							// Headset pose at the depth image's capture time:
+							// the viz submit re-anchors to it, and both the
+							// viz and depth warps use it as their FROM pose
+							// (single timestamp riding the image we render;
+							// no past-time sensor query exists or is needed).
+							// Raster-vs-sensor reuses the same locate as its
+							// warp FROM (no submit use there).
 							{
 								const char * fallback_reason = nullptr;
 								if (shared_depth.capture_time == 0)
@@ -1794,46 +1916,53 @@ void scenes::stream::render(const XrFrameState & frame_state)
 										fallback_reason = "capture locate threw";
 									}
 								}
-								// Fallback is adb-visible: change-triggered +
-								// heartbeat while active.
-								static bool last_had_pose = true;
-								static XrTime last_pose_log = 0;
-								XrTime now = instance.now();
-								if (fallback_reason)
+								// Fallback is adb-visible on the viz path
+								// (change-triggered + heartbeat while
+								// active); depth-only frames stay silent
+								// (the uncorrected warp below covers it).
+								if (want_sensor_viz)
 								{
-									if (last_had_pose or now - last_pose_log > 5'000'000'000LL)
+									static bool last_had_pose = true;
+									static XrTime last_pose_log = 0;
+									XrTime now = instance.now();
+									if (fallback_reason)
 									{
-										last_pose_log = now;
-										spdlog::warn("Depth viz: capture-pose unavailable ({}), submitting predicted depth pose (swims under head motion)", fallback_reason);
+										if (last_had_pose or now - last_pose_log > 5'000'000'000LL)
+										{
+											last_pose_log = now;
+											spdlog::warn("Depth viz: capture-pose unavailable ({}), submitting predicted depth pose (swims under head motion)", fallback_reason);
+										}
+										last_had_pose = false;
 									}
-									last_had_pose = false;
-								}
-								else if (not last_had_pose)
-								{
-									last_had_pose = true;
-									last_pose_log = now;
-									spdlog::info("Depth viz: capture-pose submit restored");
+									else if (not last_had_pose)
+									{
+										last_had_pose = true;
+										last_pose_log = now;
+										spdlog::info("Depth viz: capture-pose submit restored");
+									}
 								}
 							}
 							// Rolling buffer of depth 1: refreshed on
 							// every successful acquire while a sensor viz
-							// mode is active (this block only runs then).
-							// Depth-only frames (volume active, viz off)
-							// skip it: the frozen pose rides the viz submit
-							// and must not be poisoned with an empty locate.
+							// mode is active. Depth-only frames (volume
+							// active, viz off) skip it: the frozen pose
+							// rides the viz submit and must not be poisoned
+							// with an empty locate.
 							if (want_sensor_viz)
 							{
 								frozen_depth = shared_depth;
 								frozen_capture_pose = capture_pose;
 								frozen_have_capture_pose = have_capture_pose;
 								frozen_depth_valid = true;
+							}
 							// Flow velocity history: buffer the capture pose
 							// per new sensor frame (strictly increasing
 							// capture_time; v1 runtimes report 0, skip
 							// those). Frozen frames never reach here (early
 							// frozen branch above); backward jumps (provider
 							// restart) clear and reseed. Cap 2: only the
-							// newest pair is ever read.
+							// newest pair is ever read. Shared by the viz
+							// and depth warps (same capture poses).
 							if (have_capture_pose and shared_depth.capture_time != 0)
 							{
 								if (flow_samp_history.empty() or shared_depth.capture_time > flow_samp_history.back().t)
@@ -1855,7 +1984,6 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									flow_samp_history.push_back(s);
 								}
 							}
-							} // want_sensor_viz (frozen + flow)
 						}
 						else if (want_sensor_viz and debug_pause_sensor and not frozen_depth_valid)
 						{
@@ -3782,125 +3910,16 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					splat_sens_h = (int)env_depth->depth_height();
 					if (splat_sens_w <= 0 or splat_sens_h <= 0)
 						have_splat = false;
-					// Locked-in flow correction (device-validated): shift
-					// each texel forward along head motion by a fixed
-					// 20ms of the latest sensor-sample finite-difference
-					// velocity. Always applied.
-					double flow_extra_s = kFlowExtraMs * 1e-3;
-					std::array<glm::vec3, view_count> flow_vel_w{};
-					std::array<glm::vec3, view_count> flow_om_w{};
-					if (flow_samp_history.size() >= 2)
-					{
-						size_t n = flow_samp_history.size() - 1;
-						const flow_sample & newest = flow_samp_history[n];
-						const flow_sample & oldest = flow_samp_history[n - 1];
-						double dt_samp = (double)(newest.t - oldest.t) * 1e-9;
-						if (dt_samp > 1e-9 and dt_samp < 0.5) // 0.5s: hitch/gap guard
-						{
-							for (uint32_t eye = 0; eye < view_count; ++eye)
-							{
-								glm::vec3 p_new(newest.pose[eye].position.x, newest.pose[eye].position.y, newest.pose[eye].position.z);
-								glm::vec3 p_old(oldest.pose[eye].position.x, oldest.pose[eye].position.y, oldest.pose[eye].position.z);
-								glm::vec3 vel = (p_new - p_old) / (float)dt_samp;
-								flow_vel_w[eye] = vel * (float)flow_extra_s;
-								glm::quat q_new(newest.pose[eye].orientation.w, newest.pose[eye].orientation.x,
-								                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
-								glm::quat q_old(oldest.pose[eye].orientation.w, oldest.pose[eye].orientation.x,
-								                oldest.pose[eye].orientation.y, oldest.pose[eye].orientation.z);
-								// Runtime quats are unit: one normalize of the
-								// delta suffices.
-								glm::quat dq = glm::normalize(q_new * glm::inverse(q_old));
-								if (dq.w < 0.f)
-									dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
-								float cos_half = std::clamp(dq.w, -1.f, 1.f);
-								float ang = 2.f * acosf(cos_half);
-								float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
-								if (ang > 1e-6f and sin_half > 1e-6f)
-									flow_om_w[eye] = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang * (float)(flow_extra_s / dt_samp));
-							}
-						}
-					}
-					// Frustum tangents are static per frustum (sensor: per
-					// provider; display: per mask fov), so cache the
-					// tanf results keyed on the fov values. Render
-					// thread only (function statics, precedent below).
-					static std::array<XrFovf, view_count> last_sens_fov{};
-					static std::array<std::array<float, 4>, view_count> sens_tan_cache{};
-					static std::array<XrFovf, view_count> last_disp_fov{};
-					static std::array<std::array<float, 4>, view_count> disp_tan_cache{};
-					auto fov_changed = [](const XrFovf & a, const XrFovf & b) {
-						return a.angleLeft != b.angleLeft or a.angleRight != b.angleRight or
-						       a.angleUp != b.angleUp or a.angleDown != b.angleDown;
-					};
+					std::array<XrPosef, view_count> splat_from{};
+					std::array<XrFovf, view_count> splat_sens_fov{};
 					for (uint32_t eye = 0; eye < view_count; ++eye)
 					{
-						const XrPosef & from = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
-						const XrPosef & to = mask_pose[eye];
-						glm::quat qc(from.orientation.w, from.orientation.x, from.orientation.y, from.orientation.z);
-						glm::quat qd(to.orientation.w, to.orientation.x, to.orientation.y, to.orientation.z);
-						if (glm::dot(qc, qc) < 1e-12f or glm::dot(qd, qd) < 1e-12f)
-						{
-							have_splat = false;
-							break;
-						}
-						glm::vec3 pc(from.position.x, from.position.y, from.position.z);
-						glm::vec3 pd(to.position.x, to.position.y, to.position.z);
-						// Per-texel flow is computed once above (latest-pair
-						// finite difference, fixed -20ms) and filled into
-						// the UBO per eye below.
-						glm::mat3 r = glm::mat3(glm::inverse(qc) * qd);
-						for (int row = 0; row < 3; ++row)
-						{
-							splat_params.rot_rows[eye][row][0] = r[0][row];
-							splat_params.rot_rows[eye][row][1] = r[1][row];
-							splat_params.rot_rows[eye][row][2] = r[2][row];
-							splat_params.rot_rows[eye][row][3] = 0;
-						}
-						// Translation + flow into the display-eye frame (the
-						// vertex shader shifts each texel along its own):
-						// one inverse per eye.
-						glm::quat qd_inv = glm::inverse(qd);
-						glm::vec3 t = qd_inv * (pc - pd);
-						glm::vec3 Dlin_eye = qd_inv * flow_vel_w[eye];
-						glm::vec3 Dang_eye = qd_inv * flow_om_w[eye];
-						splat_params.flow_lin[eye][0] = Dlin_eye.x;
-						splat_params.flow_lin[eye][1] = Dlin_eye.y;
-						splat_params.flow_lin[eye][2] = Dlin_eye.z;
-						splat_params.flow_lin[eye][3] = 0;
-						splat_params.flow_ang[eye][0] = Dang_eye.x;
-						splat_params.flow_ang[eye][1] = Dang_eye.y;
-						splat_params.flow_ang[eye][2] = Dang_eye.z;
-						splat_params.flow_ang[eye][3] = 0;
-						splat_params.trans[eye][0] = t.x;
-						splat_params.trans[eye][1] = t.y;
-						splat_params.trans[eye][2] = t.z;
-						splat_params.trans[eye][3] = 0;
-						const XrFovf & sf = shared_depth.fov[eye];
-						if (fov_changed(sf, last_sens_fov[eye]))
-						{
-							sens_tan_cache[eye] = {tanf(sf.angleLeft), tanf(sf.angleRight),
-							                       tanf(sf.angleUp), tanf(sf.angleDown)};
-							last_sens_fov[eye] = sf;
-						}
-						const XrFovf & df = mask_fov[eye];
-						if (fov_changed(df, last_disp_fov[eye]))
-						{
-							disp_tan_cache[eye] = {tanf(df.angleLeft), tanf(df.angleRight),
-							                       tanf(df.angleUp), tanf(df.angleDown)};
-							last_disp_fov[eye] = df;
-						}
-						for (int k = 0; k < 4; ++k)
-						{
-							splat_params.sens_tan[eye][k] = sens_tan_cache[eye][k];
-							splat_params.disp_tan[eye][k] = disp_tan_cache[eye][k];
-						}
+						splat_from[eye] = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
+						splat_sens_fov[eye] = shared_depth.fov[eye];
 					}
-					if (have_splat)
-					{
-						splat_params.near_z = shared_depth.near_z;
-						splat_params.far_z = shared_depth.far_z;
-						splat_params.opacity = debug_depth_opacity;
-					}
+					if (not build_splat_warp(splat_from, mask_pose, splat_sens_fov, mask_fov,
+					                         shared_depth.near_z, shared_depth.far_z, debug_depth_opacity, splat_params))
+						have_splat = false;
 				}
 				switch (debug_viz)
 				{

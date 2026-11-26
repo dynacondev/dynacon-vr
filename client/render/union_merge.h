@@ -227,6 +227,17 @@ public:
 	bool record_copy(vk::raii::CommandBuffer & cmd, std::span<const geom_draw> occluders,
 	                 std::span<const geom_draw> volumes, int dilate_texels);
 
+	// Sensor write-back (3d-depth-passthrough): fullscreen pass into the
+	// shared layer (LOAD, MIN blend) writing the sensor depth where the
+	// reveal test passes and FAR elsewhere, so the verdict occludes VR
+	// against sensor-confirmed geometry. Same single test as the feather
+	// reveal (borrowed sensor/copy views, same-frame use only; bias).
+	// Recorded after the depth groups' feather records, before the
+	// verdict; ends SHADER_READ for the verdict tap. No-op (false) when
+	// targets were never built.
+	bool record_depth_writeback(vk::raii::CommandBuffer & cmd, vk::ImageView sensor_view,
+	                            vk::ImageView copy_view, float bias);
+
 	// (Re)upload one window soup under its key. Synchronous (device
 	// idle on replace); call when idle, e.g. on map change, not per
 	// frame. Empty soup erases the entry.
@@ -467,6 +478,19 @@ private:
 	// loadOp is not part of render-pass compatibility, so geom_pipeline
 	// binds here too (feather cutout precedent).
 	vk::raii::RenderPass geom_load_rp{nullptr};
+	// Shared-layer LOAD framebuffer for the sensor write-back (owned by
+	// the layer target, bound under geom_load_rp). Rebuilt in ensure().
+	vk::raii::Framebuffer layer_load_fb{nullptr};
+	// Sensor write-back fullscreen state (R16F, MIN blend, LOAD so the
+	// rastered windows survive): same test as the feather reveal, bias
+	// push shared with the dilate shape (4B). Ping-ponged sets (async
+	// mask CB may still read the other, merge precedent).
+	vk::raii::DescriptorSetLayout writeback_layout{nullptr};
+	vk::raii::DescriptorPool writeback_pool{nullptr};
+	std::vector<vk::raii::DescriptorSet> writeback_sets;
+	bool writeback_parity = false;
+	vk::raii::PipelineLayout writeback_pipeline_layout{nullptr};
+	vk::raii::Pipeline writeback_pipeline{nullptr};
 	// Back-wall pipe (CULL_FRONT, otherwise geom-identical): volume
 	// interiors resolve to the exit wall. Baked against geom_renderpass,
 	// bound under the compatible geom_load_rp.

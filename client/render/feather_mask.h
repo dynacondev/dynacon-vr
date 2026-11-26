@@ -149,6 +149,7 @@ public:
 		double erode_ms = 0;  // separable box-min erosion (H+V, any radius)
 		double blur_ms = 0;   // blur H+V (tier 1) or downsample+H+V (tiered)
 		double punch_ms = 0;  // marker-window cutout punch
+		double depth_ms = 0;  // sensor reveal MAX pass (3d-depth-passthrough, 0 when off)
 		double total_ms = 0;  // whole record() body, incl. target setup
 		int tier = -1;        // selected tier, -1 = bypass/clear-only/empty
 		size_t draws = 0;   // drawIndexed calls: silhouettes (one per MV
@@ -168,7 +169,25 @@ public:
 	// clears only.
 	// Cutouts are world-space quads (two triangles each) punched crisp
 	// through the finished mask at full alpha (mask 1 = reality), sharing
-	// one view-only MVP.
+	// one view-only MVP. Optional sensor reveal (depth_reveal above,
+	// null = off) ORs the sensor test into the binary working alpha
+	// before the blur chain.
+	// Sensor reveal for 3d-depth-passthrough (optional, null = off):
+	// resampled sensor heightfield + merged copy (borrowed views,
+	// same-frame use only — same discipline as submitted_view_array
+	// above) plus the config bias. When set, record() runs the reveal
+	// pass (single sensor<copy+bias test ORed into the binary working
+	// alpha) right after the silhouette raster and before the
+	// erode/blur chain, so the reveal feathers with the group. The
+	// write-back twin (sensor depths into the shared layer) is a
+	// union_merge pass the scene records after this returns.
+	struct depth_reveal
+	{
+		vk::ImageView sensor_view = nullptr; // R16F array, sync-eye grid, hands in
+		vk::ImageView copy_view = nullptr;   // R16F array, same grid
+		float bias = 0;
+	};
+
 	void record(vk::raii::CommandBuffer & cmd,
 	            vk::Image image,
 	            vk::Extent2D extent,
@@ -178,7 +197,8 @@ public:
 	            const std::vector<std::array<glm::vec3, 6>> & cutouts,
 	            const std::array<glm::mat4, 2> & cutout_mvp,
 	            mask_stage_cpu * cpu_stats,
-	            vk::Extent2D out_extent);
+	            vk::Extent2D out_extent,
+	            const depth_reveal * reveal = nullptr);
 
 	// Hidden proximity record (3d-passthrough-hidden): hard-edged
 	// near-field reveal, submit-merged into the single merged layer.
@@ -340,6 +360,28 @@ private:
 	// exploit hardware bilinear); downsample keeps it too (its ±0.5
 	// offsets would hit nearest tie-breaks).
 	vk::raii::Sampler sampler_nearest{nullptr};
+
+	// Depth reveal (3d-depth-passthrough): single test MAX-blended over
+	// the binary working alpha ahead of the erode/blur chain (the blend
+	// unit does the OR — no work tap, which would be a feedback loop;
+	// R8 MIN-blend precedent from the reversed raster proves the blend
+	// path). R8 LOAD RP for the intermediates plus a pipe under the
+	// RGBA8 cutout LOAD twin for tier-0 submits. Full footprint every
+	// record (both bindings, Adreno partial-write rule); ping-ponged
+	// sets (async mask CB may still read the other, merge precedent);
+	// 4B bias push. Tier >= 2 skips with a warn (documented).
+	vk::raii::RenderPass reveal_r8_rp{nullptr};
+	vk::raii::DescriptorSetLayout reveal_layout{nullptr};
+	vk::raii::DescriptorPool reveal_pool{nullptr};
+	std::vector<vk::raii::DescriptorSet> reveal_sets;
+	bool reveal_parity = false;
+	vk::raii::PipelineLayout reveal_pipeline_layout{nullptr};
+	vk::raii::Pipeline reveal_r8_pipeline{nullptr};   // MAX over R8 working target
+	vk::raii::Pipeline reveal_rgba_pipeline{nullptr}; // MAX over RGBA8 submit (tier-0)
+	// Cached LOAD framebuffer for the R8 working target under
+	// reveal_r8_rp (creation-only, keyed like triple_fb below).
+	vk::raii::Framebuffer reveal_fb{nullptr};
+	vk::Image reveal_fb_src = VK_NULL_HANDLE;
 
 	// Blur intermediates (full mask resolution, own images: full usage
 	// control, unlike swapchain images). Recreated when the extent changes.

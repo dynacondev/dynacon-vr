@@ -1141,6 +1141,24 @@ void depth_overlay_renderer::splat_pass1_and_barrier(vk::raii::CommandBuffer & c
 	splat_read_barrier(cmd, vk::Image(splat_image));
 }
 
+void depth_overlay_renderer::fill_sync_heightfield(vk::raii::CommandBuffer & cmd,
+                                                  vk::ImageView depth_view,
+                                                  const splat_warp_params & params,
+                                                  int sens_w, int sens_h)
+{
+	splat_pass1_and_barrier(cmd, depth_view, params, sens_w, sens_h);
+}
+
+vk::ImageView depth_overlay_renderer::heightfield_view() const
+{
+	return *splat_view_array;
+}
+
+vk::Sampler depth_overlay_renderer::heightfield_sampler() const
+{
+	return *sampler;
+}
+
 void depth_overlay_renderer::record_sensor_splat(vk::raii::CommandBuffer & cmd, size_t image_index,
                                                  const std::array<vk::Extent2D, 2> & extents,
                                                  vk::ImageView depth_view,

@@ -222,6 +222,21 @@ public:
 	                         const splat_warp_params & params,
 	                         int sens_w, int sens_h);
 
+	// Sync-eye heightfield fill for 3d-depth-passthrough (no viz
+	// overlay): splat pass 1 only (sensor mesh warped capture->sync
+	// with hardware depth test into the owned R16F transient), ordered
+	// for a same-CB tap. The caller rasters tracked-hand soup into the
+	// same transient next (same depth test), then samples it via
+	// heightfield_view()/heightfield_sampler() in the feather reveal
+	// and the shared-layer write-back. Requires ensure() first (the
+	// transient lives there); no swapchain acquire needed.
+	void fill_sync_heightfield(vk::raii::CommandBuffer & cmd,
+	                           vk::ImageView depth_view,
+	                           const splat_warp_params & params,
+	                           int sens_w, int sens_h);
+	vk::ImageView heightfield_view() const;
+	vk::Sampler heightfield_sampler() const;
+
 	// Raster-vs-sensor with the splatted sensor tap
 	// (sensor_splat.* -> splat_compare.frag): layer tapped directly by
 	// output UV (no pose involved), sensor via the transient splat
