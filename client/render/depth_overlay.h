@@ -179,7 +179,7 @@ public:
 		float near_z = 0.1f;
 		float far_z = 10.f;
 		float opacity = 0.3f;
-		float cull_ratio = 1.5f; // max/min quad depth ratio before kill
+		float cull_ratio = 1.5f; // max/min quad depth ratio before background stretch
 		float trans[2][4]; // [eye]: xyz = qd^-1 * (pc - pd); w unused
 	};
 
@@ -301,8 +301,8 @@ private:
 	// the transient R16F image (edge-culled, depth-tested). Leaves the
 	// temp ready for a same-CB barrier to SHADER_READ_ONLY.
 	// Index buffer over the sensor texel grid (two TL-first triangles
-	// per quad; TL-first order is load-bearing for the flat kill flag,
-	// whose provoking vertex is always the first). Res-keyed (sensor
+	// per quad; TL-first order is load-bearing for the flat verdict
+	// flag, whose provoking vertex is always the first). Res-keyed (sensor
 	// dims arrive per frame); rebuilt waitIdle'd on change.
 	buffer_allocation splat_index;
 	int32_t splat_idx_w = 0;

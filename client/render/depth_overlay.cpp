@@ -1386,7 +1386,7 @@ void depth_overlay_renderer::ensure_splat_index(int sens_w, int sens_h)
 		for (int32_t x = 0; x < sens_w - 1; ++x)
 		{
 			// TL-first in both triangles: the TL corner is the
-			// provoking vertex whose flat kill flag the fragment
+			// provoking vertex whose flat verdict flag the fragment
 			// reads. Order is load-bearing, keep it.
 			uint32_t a = (uint32_t)y * (uint32_t)sens_w + (uint32_t)x;
 			uint32_t b = a + 1;
