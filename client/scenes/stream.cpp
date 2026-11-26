@@ -1788,6 +1788,64 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							frozen_capture_pose = capture_pose;
 							frozen_have_capture_pose = have_capture_pose;
 							frozen_depth_valid = true;
+							// Phase-0 forensics: temporal model of the depth
+							// frame vs the predicted display frame (throttled
+							// 2s). Sizes the capture->display correction the
+							// 6DOF warp must span and cross-checks whether
+							// the returned depth pose rides predicted time.
+							// Note the depth-vs-mask delta below folds the
+							// static headset<->sensor extrinsic (depth pose
+							// vs HMD pose); the capture-vs-mask line is the
+							// actual warp span.
+							{
+								static XrTime last_forensics_log = 0;
+								constexpr float kRadToDeg = 57.29578f;
+								XrTime forensics_now = instance.now();
+								if (forensics_now - last_forensics_log > 2'000'000'000LL)
+								{
+									last_forensics_log = forensics_now;
+									auto pose_delta = [](const XrPosef & a, const XrPosef & b, float & ang_deg, float & trans_m) {
+										float dot = std::fabs(a.orientation.w * b.orientation.w +
+										                      a.orientation.x * b.orientation.x +
+										                      a.orientation.y * b.orientation.y +
+										                      a.orientation.z * b.orientation.z);
+										ang_deg = 2.0f * std::acos(std::clamp(dot, 0.0f, 1.0f)) * kRadToDeg;
+										float dx = a.position.x - b.position.x;
+										float dy = a.position.y - b.position.y;
+										float dz = a.position.z - b.position.z;
+										trans_m = std::sqrt(dx * dx + dy * dy + dz * dz);
+									};
+									float depth_ang[view_count]{};
+									float depth_tr[view_count]{};
+									for (uint32_t eye = 0; eye < view_count; ++eye)
+										pose_delta(shared_depth.pose[eye], mask_pose[eye], depth_ang[eye], depth_tr[eye]);
+									if (shared_depth.capture_time != 0)
+									{
+										double age_ms = (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6;
+										spdlog::info("Depth forensics: age {:.1f}ms near {:.2f}m far {:.2f}m idx {} L depth-rot {:.2f}deg depth-trans {:.1f}mm R depth-rot {:.2f}deg depth-trans {:.1f}mm",
+										             age_ms, (double)shared_depth.near_z, (double)shared_depth.far_z,
+										             shared_depth.swapchain_index,
+										             (double)depth_ang[0], (double)(depth_tr[0] * 1000.f),
+										             (double)depth_ang[1], (double)(depth_tr[1] * 1000.f));
+									}
+									else
+										spdlog::info("Depth forensics: age n/a (no capture timestamp) near {:.2f}m far {:.2f}m idx {} L depth-rot {:.2f}deg depth-trans {:.1f}mm R depth-rot {:.2f}deg depth-trans {:.1f}mm",
+										             (double)shared_depth.near_z, (double)shared_depth.far_z,
+										             shared_depth.swapchain_index,
+										             (double)depth_ang[0], (double)(depth_tr[0] * 1000.f),
+										             (double)depth_ang[1], (double)(depth_tr[1] * 1000.f));
+									if (have_capture_pose)
+									{
+										float cap_ang[view_count]{};
+										float cap_tr[view_count]{};
+										for (uint32_t eye = 0; eye < view_count; ++eye)
+											pose_delta(capture_pose[eye], mask_pose[eye], cap_ang[eye], cap_tr[eye]);
+										spdlog::info("Depth forensics capture->display: L rot {:.2f}deg trans {:.1f}mm R rot {:.2f}deg trans {:.1f}mm",
+										             (double)cap_ang[0], (double)(cap_tr[0] * 1000.f),
+										             (double)cap_ang[1], (double)(cap_tr[1] * 1000.f));
+									}
+								}
+							}
 						}
 						else if (debug_pause_sensor and not frozen_depth_valid)
 							depth_status = "waiting for depth data (pause armed, no frozen frame yet)";
