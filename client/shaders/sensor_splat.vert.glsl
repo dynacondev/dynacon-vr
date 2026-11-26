@@ -114,9 +114,13 @@ void main()
 	float f = 50.0;
 	gl_Position = vec4((2.0 * du - 1.0) * d, (2.0 * dv - 1.0) * d, f * (d - n) / (f - n), d);
 	v_depth = d;
-	// Fixed footprint: covers ~3x sensor->display magnification pinholes.
-	// Residual pinholes at higher magnification and ~1.5-px foreground
-	// fattening at silhouettes are inherent; Adreno 740 supports far
-	// larger points, worst case on a limited device is graceful pinholes.
-	gl_PointSize = 3.0;
+	// Depth-adaptive footprint: a texel's linear footprint scales ~zc/zd
+	// (area ~square; axial-depth proxy — exact for forward motion,
+	// approximate under rotation/obliquity), so the point covers the
+	// local magnification instead of a fixed size. Clamped: residual
+	// pinholes past 6px and up to ~3px foreground fattening at max grow
+	// are inherent. Adreno 740 supports far larger points; worst case on
+	// a limited device is graceful pinholes.
+	float grow = clamp(z / d, 0.25, 4.0);
+	gl_PointSize = clamp(3.0 * grow, 1.0, 6.0);
 }
