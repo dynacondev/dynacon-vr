@@ -51,12 +51,8 @@ layout(set = 0, binding = 1) uniform splat_params
 	vec2 near_far;
 	float opacity;
 	vec4 trans[2]; // per eye: capture->display translation in display-eye space
-	float depth_scale; // multiplicative depth bias (debug)
-	float pad_f0;
-	float pad_f1;
-	float pad_f2; // pad flow_lin to 16-alignment (std140)
-	vec4 flow_lin[2]; // per eye: translational flow displacement, display-eye frame (debug)
-	vec4 flow_ang[2]; // per eye: angular flow displacement (axis*angle), display-eye frame (debug)
+	vec4 flow_lin[2]; // per eye: translational flow displacement, display-eye frame
+	vec4 flow_ang[2]; // per eye: angular flow displacement (axis*angle), display-eye frame
 } u;
 
 layout(push_constant) uniform pc
@@ -133,12 +129,12 @@ void main()
 		// Far-clamped so sky pixels can't produce NaN steps.
 		if (ds[k] < 0.9999)
 		{
-			float z = min(linearize_depth(ds[k], n, f) * u.depth_scale, 20.0);
+			float z = min(linearize_depth(ds[k], n, f), 20.0);
 			vec3 Xd = c2d_mul(e, vec3(xs[k], ys[k], -1.0) * z) + u.trans[e].xyz;
 			// Per-texel flow correction: shift content forward along
 			// its own display-eye velocity (translation flow ~ v/Z per
 			// texel, rotation flow uniform over the image, zero along
-			// the rotation axis). Exact identity when the slider is 0.
+			// the rotation axis). Exact identity with a zero flow displacement.
 			// (UBO holds head displacement; the minus applies the
 			// content correction.)
 			Xd = Xd - (u.flow_lin[e].xyz + cross(u.flow_ang[e].xyz, Xd));
@@ -153,7 +149,7 @@ void main()
 	// overlaps nearest-wins. The own depth is the offset-0 tap above.
 	float ox = st.x + (st.y - st.x) * (float(tx) + 0.5) / float(push.sens_w);
 	float oy = st.z + (st.w - st.z) * (float(ty) + 0.5) / float(push.sens_h);
-	float z = min(linearize_depth(ds[0], n, f) * u.depth_scale, 20.0);
+	float z = min(linearize_depth(ds[0], n, f), 20.0);
 	vec3 Xd0 = c2d_mul(e, vec3(ox, oy, -1.0) * z) + u.trans[e].xyz;
 	Xd0 = Xd0 - (u.flow_lin[e].xyz + cross(u.flow_ang[e].xyz, Xd0));
 	float d = max(-Xd0.z, 1e-6);

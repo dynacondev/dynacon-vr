@@ -1793,8 +1793,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							// capture_time; v1 runtimes report 0, skip
 							// those). Frozen frames never reach here (early
 							// frozen branch above); backward jumps (provider
-							// restart) clear and reseed. Cap 8 (N max 3
-							// needs at most N+2 samples for the pair).
+							// restart) clear and reseed. Cap 8 (only the newest
+							// pair is ever read).
 							if (have_capture_pose and shared_depth.capture_time != 0)
 							{
 								auto push_flow = [&]()
@@ -3681,14 +3681,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// extrinsic is assumed identity); TO is always the
 				// predicted display pose. Per-texel flow correction (see
 				// block below) shifts content along its display-eye
-				// velocity; extrinsic sliders offset the content frame.
-				// Fallback (no capture timestamp / locate failed) is the
-				// depth pose, the same fallback the baseline submit uses.
+				// flow by a fixed -20ms. Fallback (no capture timestamp
+				// / locate failed) is the acquire-time depth pose, the
+				// same fallback the baseline submit uses.
 				depth_overlay_renderer::splat_warp_params splat_params{};
 				bool have_splat = false;
 				int splat_sens_w = 0, splat_sens_h = 0;
-				std::string warp_note;
-				double flow_vmax = 0.0;
 				if (debug_custom_splat and
 				    (debug_viz == debug_viz_mode::sensor or debug_viz == debug_viz_mode::raster_vs_sensor) and
 				    have_depth_frame and env_depth)
@@ -3698,136 +3696,43 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					splat_sens_h = (int)env_depth->depth_height();
 					if (splat_sens_w <= 0 or splat_sens_h <= 0)
 						have_splat = false;
-					// Flow source: instantaneous velocity of the N-back
-					// sensor sample (finite difference of consecutive
-					// capture poses), as world-frame displacements over
-					// the slider interval (velocity * extra ms). Selecting
-					// by sample age keeps the velocity contemporaneous
-					// with the content; a render-frame baseline would
-					// average across unrelated motion. Zero slider =
-					// zero displacement (exact).
-					double flow_extra_s = (double)debug_flow_ms * 1e-3;
-					int flow_n = 0;
-					double flow_ts_ms = 0.0;
-					double flow_lt_ms = 0.0;
-					bool have_flow_samp = false;
+					// Locked-in flow correction (device-validated): the depth
+					// content is ~20ms newer than its capture timestamp, so
+					// shift each texel forward along head motion by a fixed
+					// 20ms of the latest sensor-sample finite-difference
+					// velocity (negative extra time: the UBO displacements
+					// point backward along head motion; the shader
+					// subtracts them). Always applied.
+					constexpr double kFlowExtraMs = -20.0;
+					double flow_extra_s = kFlowExtraMs * 1e-3;
 					std::array<glm::vec3, view_count> flow_vel_w{};
 					std::array<glm::vec3, view_count> flow_om_w{};
-					if (debug_flow_ms != 0.f and flow_samp_history.size() >= 2)
+					if (flow_samp_history.size() >= 2)
 					{
 						size_t n = flow_samp_history.size() - 1;
-						// Per-pair finite-difference velocities (world frame).
-						auto pair_dt = [&](size_t kk) -> double
+						const flow_sample & newest = flow_samp_history[n];
+						const flow_sample & oldest = flow_samp_history[n - 1];
+						double dt_samp = (double)(newest.t - oldest.t) * 1e-9;
+						if (dt_samp > 1e-9 and dt_samp < 0.5) // 0.5s: hitch/gap guard
 						{
-							if (kk < 1 or kk > n)
-								return 0.0;
-							const flow_sample & a = flow_samp_history[kk - 1];
-							const flow_sample & b = flow_samp_history[kk];
-							return (double)(b.t - a.t) * 1e-9;
-						};
-						auto pair_vel = [&](size_t kk, uint32_t eye, glm::vec3 &vel, glm::vec3 &om) -> bool
-						{
-							if (kk < 1 or kk > n)
-								return false;
-							double dt = pair_dt(kk);
-							if (!(dt > 1e-9) or !(dt < 0.5)) // 0.5s: hitch/gap guard
-								return false;
-							const flow_sample & a = flow_samp_history[kk - 1];
-							const flow_sample & b = flow_samp_history[kk];
-							glm::vec3 p_new(b.pose[eye].position.x, b.pose[eye].position.y, b.pose[eye].position.z);
-							glm::vec3 p_old(a.pose[eye].position.x, a.pose[eye].position.y, a.pose[eye].position.z);
-							vel = (p_new - p_old) / (float)dt;
-							glm::quat q_new(b.pose[eye].orientation.w, b.pose[eye].orientation.x,
-							                b.pose[eye].orientation.y, b.pose[eye].orientation.z);
-							glm::quat q_old(a.pose[eye].orientation.w, a.pose[eye].orientation.x,
-							                a.pose[eye].orientation.y, a.pose[eye].orientation.z);
-							glm::quat dq = glm::normalize(q_new * glm::inverse(glm::normalize(q_old)));
-							if (dq.w < 0.f)
-								dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
-							float cos_half = std::clamp(dq.w, -1.f, 1.f);
-							float ang = 2.f * acosf(cos_half);
-							float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
-							om = glm::vec3(0.f);
-							if (ang > 1e-6f and sin_half > 1e-6f)
-								om = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang / (float)dt);
-							return true;
-						};
-						auto pair_tmid = [&](size_t kk) -> double
-						{
-							if (kk < 1 or kk > n)
-								return 0.0;
-							const flow_sample & a = flow_samp_history[kk - 1];
-							const flow_sample & b = flow_samp_history[kk];
-							return ((double)a.t + (double)b.t) * 0.5e-9;
-						};
-						// N selects the pair; the ms trim slides the lookup
-						// continuously around it (+ = newer velocity).
-						int want = std::clamp(debug_flow_n, 0, 3);
-						size_t k0 = n - std::min((size_t)want, n - 1);
-						flow_n = (int)(n - k0);
-						double t_target = pair_tmid(k0) + (double)debug_flow_lookup_ms * 1e-3;
-						t_target = std::clamp(t_target, pair_tmid(1), pair_tmid(n));
-						size_t j = 1;
-						while (j < n and pair_tmid(j + 1) < t_target)
-							++j;
-						double blend = 0.0;
-						size_t j2 = j;
-						auto pair_ok = [&](size_t kk) -> bool
-						{
-							if (kk < 1 or kk > n)
-								return false;
-							double dt = pair_dt(kk);
-							return (dt > 1e-9) and (dt < 0.5);
-						};
-						flow_ts_ms = (pair_ok(j) ? pair_dt(j) : pair_dt(j2)) * 1e3;
-						flow_lt_ms = (t_target - pair_tmid(k0)) * 1e3; // effective trim vs N pair
-						if (j < n)
-						{
-							double tj = pair_tmid(j);
-							double tj1 = pair_tmid(j + 1);
-							if (tj1 > tj)
+							for (uint32_t eye = 0; eye < view_count; ++eye)
 							{
-								blend = std::clamp((t_target - tj) / (tj1 - tj), 0.0, 1.0);
-								j2 = j + 1;
-							}
-						}
-						for (uint32_t eye = 0; eye < view_count; ++eye)
-						{
-							glm::vec3 v0(0.f), w0(0.f), v1(0.f), w1(0.f);
-							bool ok0 = pair_vel(j, eye, v0, w0);
-							bool ok1 = (j2 == j) ? ok0 : pair_vel(j2, eye, v1, w1);
-							glm::vec3 vb(0.f), wb(0.f), vc(0.f), wc(0.f);
-							float b = 0.f;
-							bool use = false;
-							if (ok0 and ok1 and j2 != j)
-							{
-								vb = v0;
-								wb = w0;
-								vc = v1;
-								wc = w1;
-								b = (float)blend;
-								use = true;
-							}
-							else if (ok0) // j2==j, or neighbor pair straddles a hitch: use pair j alone
-							{
-								vb = v0;
-								wb = w0;
-								use = true;
-							}
-							else if (j2 != j and ok1) // pair j straddles a hitch: use pair j2 alone
-							{
-								vb = v1;
-								wb = w1;
-								use = true;
-							}
-							if (use)
-							{
-								have_flow_samp = true;
-								glm::vec3 vel = vb + (vc - vb) * b;
-								glm::vec3 om = wb + (wc - wb) * b;
-								flow_vmax = std::max(flow_vmax, (double)glm::length(vel));
+								glm::vec3 p_new(newest.pose[eye].position.x, newest.pose[eye].position.y, newest.pose[eye].position.z);
+								glm::vec3 p_old(oldest.pose[eye].position.x, oldest.pose[eye].position.y, oldest.pose[eye].position.z);
+								glm::vec3 vel = (p_new - p_old) / (float)dt_samp;
 								flow_vel_w[eye] = vel * (float)flow_extra_s;
-								flow_om_w[eye] = om * (float)flow_extra_s;
+								glm::quat q_new(newest.pose[eye].orientation.w, newest.pose[eye].orientation.x,
+								                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
+								glm::quat q_old(oldest.pose[eye].orientation.w, oldest.pose[eye].orientation.x,
+								                oldest.pose[eye].orientation.y, oldest.pose[eye].orientation.z);
+								glm::quat dq = glm::normalize(q_new * glm::inverse(glm::normalize(q_old)));
+								if (dq.w < 0.f)
+									dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
+								float cos_half = std::clamp(dq.w, -1.f, 1.f);
+								float ang = 2.f * acosf(cos_half);
+								float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
+								if (ang > 1e-6f and sin_half > 1e-6f)
+									flow_om_w[eye] = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang * (float)(flow_extra_s / dt_samp));
 							}
 						}
 					}
@@ -3844,35 +3749,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						glm::vec3 pc(from.position.x, from.position.y, from.position.z);
 						glm::vec3 pd(to.position.x, to.position.y, to.position.z);
-						// Per-texel flow is computed once above (velocity of
-						// the N-back sensor sample) and filled into the
-						// UBO per eye below; the vertex shader shifts each
-						// texel along its own display-eye flow.
-						// Sensor extrinsic test: translate the content
-						// frame by the slider offset (cm -> m), rotated
-						// into world by the content orientation. Identity
-						// rotation extrinsic (translation-only test).
-						glm::vec3 r_ext(debug_extrinsic_cm[0], debug_extrinsic_cm[1], debug_extrinsic_cm[2]);
-						if (glm::dot(r_ext, r_ext) > 0.f)
-							pc = pc + qc * (r_ext * 0.01f);
-						// Warp gain test: scale the capture->display delta
-						// itself (rotation angle about its own axis, plus
-						// translation), so every texel's reprojection
-						// scales with how far it moves. 1 = nominal.
-						glm::quat qdlt = glm::inverse(qc) * qd;
-						if (std::fabs(debug_warp_gain - 1.f) > 1e-6f)
-						{
-							glm::quat qn = glm::normalize(qdlt);
-							if (qn.w < 0.f)
-								qn = glm::quat(-qn.w, -qn.x, -qn.y, -qn.z);
-							float cos_half = std::clamp(qn.w, -1.f, 1.f);
-							float ang = 2.f * acosf(cos_half);
-							float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
-							if (ang > 1e-6f and sin_half > 1e-6f)
-								qdlt = glm::angleAxis(ang * debug_warp_gain,
-								                      glm::normalize(glm::vec3(qn.x, qn.y, qn.z) / sin_half));
-						}
-						glm::mat3 r = glm::mat3(qdlt);
+						// Per-texel flow is computed once above (latest-pair
+						// finite difference, fixed -20ms) and filled into
+						// the UBO per eye below.
+						glm::mat3 r = glm::mat3(glm::inverse(qc) * qd);
 						for (int row = 0; row < 3; ++row)
 						{
 							splat_params.rot_rows[eye][row][0] = r[0][row];
@@ -3881,11 +3761,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							splat_params.rot_rows[eye][row][3] = 0;
 						}
 						glm::vec3 t = glm::inverse(qd) * (pc - pd);
-						if (std::fabs(debug_warp_gain - 1.f) > 1e-6f)
-							t = t * debug_warp_gain;
 						// Flow displacement into display-eye frame (the
 						// vertex shader shifts each texel along its own).
-						// Zero slider = zero vectors (exact identity).
 						glm::vec3 Dlin_eye = glm::inverse(qd) * flow_vel_w[eye];
 						glm::vec3 Dang_eye = glm::inverse(qd) * flow_om_w[eye];
 						splat_params.flow_lin[eye][0] = Dlin_eye.x;
@@ -3913,22 +3790,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					}
 					if (have_splat)
 					{
-						splat_params.near_z = shared_depth.near_z;
-						splat_params.far_z = shared_depth.far_z;
-						splat_params.opacity = debug_depth_opacity;
-						splat_params.depth_scale = debug_depth_scale;
-						if (debug_flow_ms != 0.f and have_flow_samp)
-							warp_note = fmt::format(" flow {:+.0f}ms N{} Ts{:.0f}ms Lt{:+.0f}ms vmax{:.2f}m/s",
-							                        (double)debug_flow_ms, flow_n, flow_ts_ms,
-							                        flow_lt_ms, flow_vmax);
-						glm::vec3 r_ext_note(debug_extrinsic_cm[0], debug_extrinsic_cm[1], debug_extrinsic_cm[2]);
-						if (glm::dot(r_ext_note, r_ext_note) > 0.f)
-							warp_note += fmt::format(" ext({:+.1f},{:+.1f},{:+.1f})cm",
-							                           (double)debug_extrinsic_cm[0], (double)debug_extrinsic_cm[1], (double)debug_extrinsic_cm[2]);
-						if (std::fabs(debug_depth_scale - 1.f) > 1e-6f)
-							warp_note += fmt::format(" dsx{:.3f}", (double)debug_depth_scale);
-						if (std::fabs(debug_warp_gain - 1.f) > 1e-6f)
-							warp_note += fmt::format(" wg{:.3f}", (double)debug_warp_gain);
+					splat_params.near_z = shared_depth.near_z;
+					splat_params.far_z = shared_depth.far_z;
+					splat_params.opacity = debug_depth_opacity;
 					}
 				}
 				switch (debug_viz)
@@ -3953,16 +3817,14 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						// Capture age forensics: which timebase this frame
 						// rode (v1 runtimes report no timestamp: gated).
 						if (shared_depth.capture_time != 0)
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms{}",
+							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m age {:.1f}ms",
 							                           env_depth->depth_width(), env_depth->depth_height(),
 							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
-							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6,
-							                           warp_note);
+							                           (double)(frame_state.predictedDisplayTime - shared_depth.capture_time) * 1e-6);
 						else
-							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m{}",
+							depth_status = fmt::format("live {}x{} near {:.2f}m far {:.2f}m",
 							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
-							                           warp_note);
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
 						break;
 					}
 					case debug_viz_mode::vr_depth:
@@ -4051,11 +3913,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 								                                    env_depth->depth_view(shared_depth.swapchain_index), params);
 							viz_content_recorded = true;
 							auto le = merge_renderer->debug_layer_extent();
-							depth_status = fmt::format("raster vs sensor live {}x{} sensor {}x{} near {:.2f}m far {:.2f}m{}",
+							depth_status = fmt::format("raster vs sensor live {}x{} sensor {}x{} near {:.2f}m far {:.2f}m",
 							                           le.width, le.height,
 							                           env_depth->depth_width(), env_depth->depth_height(),
-							                           (double)shared_depth.near_z, (double)shared_depth.far_z,
-							                           warp_note);
+							                           (double)shared_depth.near_z, (double)shared_depth.far_z);
 						}
 						else
 						{

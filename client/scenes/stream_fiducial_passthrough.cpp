@@ -1267,30 +1267,6 @@ void scenes::stream::gui_passthrough()
 	}
 	if (ImGui::Checkbox(_S("Custom warp (splat vs runtime)"), &debug_custom_splat))
 		spdlog::info("Depth viz warp {}", debug_custom_splat ? "custom splat" : "runtime");
-	float flow_ms = debug_flow_ms;
-	ImGui::BeginDisabled(not debug_custom_splat); // flow only drives the custom splat warp
-	if (ImGui::SliderFloat(_S("Flow correction"), &flow_ms, -100, 100, "%+.0f ms"))
-		debug_flow_ms = std::clamp(flow_ms, -100.f, 100.f);
-	int flow_n = debug_flow_n;
-	if (ImGui::SliderInt(_S("Flow sample span"), &flow_n, 0, 3))
-		debug_flow_n = std::clamp(flow_n, 0, 3);
-	float flow_l = debug_flow_lookup_ms;
-	if (ImGui::SliderFloat(_S("Flow lookup trim"), &flow_l, -100, 100, "%+.0f ms"))
-		debug_flow_lookup_ms = std::clamp(flow_l, -100.f, 100.f);
-	if (ImGui::SliderFloat3(_S("Sensor extrinsic offset (cm, X right / Y up / Z back+)"), debug_extrinsic_cm, -10, 10, "%+.1f cm"))
-	{
-		for (int i = 0; i < 3; ++i)
-			debug_extrinsic_cm[i] = std::clamp(debug_extrinsic_cm[i], -10.f, 10.f);
-		spdlog::info("Depth sensor extrinsic {:+.1f} {:+.1f} {:+.1f} cm",
-		             (double)debug_extrinsic_cm[0], (double)debug_extrinsic_cm[1], (double)debug_extrinsic_cm[2]);
-	}
-	float depth_scale = debug_depth_scale;
-	if (ImGui::SliderFloat(_S("Depth scale"), &depth_scale, 0.8f, 1.2f, "%.3f"))
-		debug_depth_scale = std::clamp(depth_scale, 0.8f, 1.2f);
-	float warp_gain = debug_warp_gain;
-	if (ImGui::SliderFloat(_S("Warp gain"), &warp_gain, 0.5f, 1.5f, "%.3f"))
-		debug_warp_gain = std::clamp(warp_gain, 0.5f, 1.5f);
-	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 	ImGui::EndDisabled();
 	if (not depth_status.empty() and debug_viz != debug_viz_mode::none)

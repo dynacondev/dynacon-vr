@@ -898,44 +898,18 @@ private:
 	// by the sensor / raster-vs-sensor viz. Off = direct tap + runtime
 	// warp (today's behavior) for A/B.
 	bool debug_custom_splat = true;
-	// Per-texel flow correction for sensor smoothing lag: the depth
-	// values' effective content time lags the labelled capture_time, so
-	// under head motion every texel is displaced along its own image
-	// velocity (optical flow: translation flow ~ v/Z per texel depth,
-	// rotation flow uniform over the image, zero along the rotation
-	// axis). The warp shifts each texel forward along its display-eye
-	// flow by the slider's extra milliseconds (negative = backward).
-	// The velocity is the instantaneous one associated with the sensor
-	// sample N captures back (N slider: 0 = current, 3 = three prior),
-	// so timing (N) and magnitude (ms) sweep independently. Gain 0 =
-	// nominal.
-	float debug_flow_ms = 0.f;
-	int debug_flow_n = 1; // sensor-sample span back, 0..3
-	float debug_flow_lookup_ms = 0.f; // continuous trim on the velocity lookup time (+ = newer)
-	// Capture-pose history for the flow velocity (debug): one entry per
-	// new sensor frame; the N-selected pair (plus ms trim with
-	// interpolation between adjacent pairs and hitch fallback) supplies
-	// the finite-difference velocity. Cap 8 (N max 3 needs at most N+2
-	// samples plus trim headroom).
+	// Per-texel flow correction (device-validated): the depth content
+	// is ~20ms newer than its capture timestamp, so the warp shifts each
+	// texel forward along its display-eye image velocity by a fixed 20ms
+	// of the latest sensor-sample finite-difference velocity.
+	// Translation flow ~ v/Z per texel depth, rotation flow uniform,
+	// zero along the rotation axis.
 	struct flow_sample
 	{
 		XrTime t = 0;
 		std::array<XrPosef, view_count> pose{};
 	};
-	std::deque<flow_sample> flow_samp_history{};
-	// Sensor extrinsic test (debug): translational offset of the depth
-	// sensor from the headset origin in cm, applied in the content
-	// frame. Axes: [0]=right, [1]=up, [2]=back (OpenXR is -z forward,
-	// so a sensor mounted ahead of the headset is dialled as -Z).
-	// Rotation extrinsic stays identity until translation alone
-	// is ruled in or out.
-	float debug_extrinsic_cm[3] = {0.f, 0.f, 0.f};
-	// Multiplicative depth bias test (debug): 1 = sensor depths as-is.
-	float debug_depth_scale = 1.f;
-	// Warp gain test (debug): scales the capture->display delta itself
-	// (rotation angle and translation together); each texel's screen
-	// shift then scales with its nominal reprojection. 1 = nominal.
-	float debug_warp_gain = 1.f;
+	std::deque<flow_sample> flow_samp_history{}; // oldest front; cap 8
 	std::string depth_status;         // UI status line, refreshed per frame
 	// Fullscreen flat passthrough under the viz (same lift as the
 	// boundary veil). True from the toggle frame for sensor (pre-probe

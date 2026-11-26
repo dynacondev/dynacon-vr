@@ -170,8 +170,8 @@ public:
 	// Forward-splat warp params (std140): per-eye rotation rows
 	// (R = Qc^-1 * Qd), sensor/display frustum tangents, near/far,
 	// the capture->display translation in display-eye space, and a
-	// depth-scale bias (debug), and per-texel flow displacements. Read by
-	// the splat vertex shader. 288 bytes.
+	// per-texel flow displacements. Read by
+	// the splat vertex shader. 272 bytes.
 	struct splat_warp_params
 	{
 		float rot_rows[2][3][4]; // [eye][row]: xyz = rotation row, w unused
@@ -182,10 +182,8 @@ public:
 		float opacity = 0.3f;
 		float pad = 0; // explicit std140 pad: keeps trans 16-aligned (frame_params precedent)
 		float trans[2][4]; // [eye]: xyz = qd^-1 * (pc - pd); w unused
-		float depth_scale = 1.f; // multiplicative depth bias (debug)
-		float pad2[3] = {0, 0, 0}; // pad flow to 16-alignment (trans pattern above)
-		float flow_lin[2][4]; // [eye]: translational flow displacement, display-eye frame (debug)
-		float flow_ang[2][4]; // [eye]: angular flow displacement (axis*angle), display-eye frame (debug)
+		float flow_lin[2][4]; // [eye]: translational flow displacement, display-eye frame
+		float flow_ang[2][4]; // [eye]: angular flow displacement (axis*angle), display-eye frame
 	};
 
 	// Push block for the splat vertex shader (eye + sensor dims for the
@@ -297,7 +295,7 @@ private:
 	};
 	std::array<splat_target, 2> splat_targets;
 	vk::Extent2D splat_extent_{0, 0};
-	// Splat warp UBO (splat_warp_params, 288 B): separate allocation so
+	// Splat warp UBO (splat_warp_params, 272 B): separate allocation so
 	// the 16 B frame_params buffer above stays untouched. Written per
 	// splat record + flushed (non-coherent pattern, see upload).
 	buffer_allocation splat_ubo;

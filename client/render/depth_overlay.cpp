@@ -36,7 +36,7 @@ struct push
 } // namespace
 
 static_assert(sizeof(depth_overlay_renderer::frame_params) == 16);
-static_assert(sizeof(depth_overlay_renderer::splat_warp_params) == 288);
+static_assert(sizeof(depth_overlay_renderer::splat_warp_params) == 272);
 static_assert(sizeof(depth_overlay_renderer::splat_push) == 12);
 
 depth_overlay_renderer::depth_overlay_renderer(vk::raii::Device & device) : device(&device) {}
@@ -344,7 +344,7 @@ void depth_overlay_renderer::init_pipelines(vk::Format format)
 		        "depth overlay");
 	}
 
-	// Separate splat-params buffer (288 B): the 16 B frame_params buffer above
+	// Separate splat-params buffer (272 B): the 16 B frame_params buffer above
 	// stays untouched for the existing paths.
 	if (not splat_ubo or splat_ubo.info().size < sizeof(splat_warp_params))
 	{
