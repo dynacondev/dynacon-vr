@@ -45,6 +45,7 @@
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <array>
+#include <deque>
 #include <cstddef>
 #include <filesystem>
 #include <map>
@@ -904,15 +905,22 @@ private:
 	// rotation flow uniform over the image, zero along the rotation
 	// axis). The warp shifts each texel forward along its display-eye
 	// flow by the slider's extra milliseconds (negative = backward).
-	// Uses instantaneous (frame-period) head velocity, never a
-	// long-window average (which collapses under oscillation, when
-	// displacement nets to zero at peak velocity). Gain 0 = nominal.
+	// The velocity is the instantaneous one associated with the sensor
+	// sample N captures back (N slider: 0 = current, 3 = three prior),
+	// so timing (N) and magnitude (ms) sweep independently. Gain 0 =
+	// nominal.
 	float debug_flow_ms = 0.f;
-	// Previous predicted display pose for the instantaneous-velocity
-	// finite difference (frame-period baseline).
-	XrTime flow_prev_t = 0;
-	std::array<XrPosef, view_count> flow_prev_pose{};
-	bool have_flow_prev = false;
+	int debug_flow_n = 1; // sensor-sample span back, 0..3
+	// Capture-pose history for the flow velocity (debug): one entry per
+	// new sensor frame; the selected sample's velocity comes from the
+	// finite difference with its predecessor. Cap 8 (N max 3 needs at
+	// most N+2 samples).
+	struct flow_sample
+	{
+		XrTime t = 0;
+		std::array<XrPosef, view_count> pose{};
+	};
+	std::deque<flow_sample> flow_samp_history{};
 	// Sensor extrinsic test (debug): translational offset of the depth
 	// sensor from the headset origin in cm, applied in the content
 	// frame. Axes: [0]=right, [1]=up, [2]=back (OpenXR is -z forward,

@@ -1788,6 +1788,33 @@ void scenes::stream::render(const XrFrameState & frame_state)
 							frozen_capture_pose = capture_pose;
 							frozen_have_capture_pose = have_capture_pose;
 							frozen_depth_valid = true;
+							// Flow velocity history: buffer the capture pose
+							// per new sensor frame (strictly increasing
+							// capture_time; v1 runtimes report 0, skip
+							// those). Frozen frames never reach here (early
+							// frozen branch above); backward jumps (provider
+							// restart) clear and reseed. Cap 8 (N max 3
+							// needs at most N+2 samples for the pair).
+							if (have_capture_pose and shared_depth.capture_time != 0)
+							{
+								auto push_flow = [&]()
+								{
+									flow_sample s;
+									s.t = shared_depth.capture_time;
+									s.pose = capture_pose;
+									flow_samp_history.push_back(s);
+									while (flow_samp_history.size() > 8)
+										flow_samp_history.pop_front();
+								};
+								if (flow_samp_history.empty() or shared_depth.capture_time > flow_samp_history.back().t)
+									push_flow();
+								else if (shared_depth.capture_time < flow_samp_history.back().t)
+								{
+									// Provider restart: drop stale history, reseed.
+									flow_samp_history.clear();
+									push_flow();
+								}
+							}
 							// Phase-0 forensics: temporal model of the depth
 							// frame vs the predicted display frame (throttled
 							// 2s). Sizes the capture->display correction the
@@ -3671,45 +3698,55 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					splat_sens_h = (int)env_depth->depth_height();
 					if (splat_sens_w <= 0 or splat_sens_h <= 0)
 						have_splat = false;
-					// Flow source: instantaneous head velocity from the
-					// frame-period finite difference of the predicted
-					// display poses, as world-frame displacements over
-					// the slider interval (velocity * extra ms). A
-					// long-window average would collapse under
-					// oscillation, when displacement nets to zero at
-					// peak velocity; this baseline does not. Zero
-					// slider = zero displacement (exact).
+					// Flow source: instantaneous velocity of the N-back
+					// sensor sample (finite difference of consecutive
+					// capture poses), as world-frame displacements over
+					// the slider interval (velocity * extra ms). Selecting
+					// by sample age keeps the velocity contemporaneous
+					// with the content; a render-frame baseline would
+					// average across unrelated motion. Zero slider =
+					// zero displacement (exact).
 					double flow_extra_s = (double)debug_flow_ms * 1e-3;
-					double dt_flow = (double)(frame_state.predictedDisplayTime - flow_prev_t) * 1e-9;
-					bool have_flow = have_flow_prev and dt_flow > 1e-6 and dt_flow < 0.5; // 0.5s: hitch/gap guard
+					int flow_n = 0;
+					double flow_ts_ms = 0.0;
+					bool have_flow_samp = false;
 					std::array<glm::vec3, view_count> flow_vel_w{};
 					std::array<glm::vec3, view_count> flow_om_w{};
-					if (have_flow and flow_extra_s != 0.0)
+					if (debug_flow_ms != 0.f and flow_samp_history.size() >= 2)
 					{
-						for (uint32_t eye = 0; eye < view_count; ++eye)
+						int want = std::clamp(debug_flow_n, 0, 3);
+						size_t n = flow_samp_history.size() - 1;
+						size_t k = n - std::min((size_t)want, n - 1);
+						flow_n = (int)(n - k);
+						const flow_sample & newest = flow_samp_history[k];
+						const flow_sample & oldest = flow_samp_history[k - 1];
+						double dt_samp = (double)(newest.t - oldest.t) * 1e-9;
+						if (dt_samp > 1e-9 and dt_samp < 0.5) // 0.5s: hitch/gap guard
 						{
-							glm::vec3 p_now(mask_pose[eye].position.x, mask_pose[eye].position.y, mask_pose[eye].position.z);
-							glm::vec3 p_prev(flow_prev_pose[eye].position.x, flow_prev_pose[eye].position.y, flow_prev_pose[eye].position.z);
-							glm::vec3 vel = (p_now - p_prev) / (float)dt_flow;
-							flow_vmax = std::max(flow_vmax, (double)glm::length(vel));
-							flow_vel_w[eye] = vel * (float)flow_extra_s;
-							glm::quat q_now(mask_pose[eye].orientation.w, mask_pose[eye].orientation.x,
-							                mask_pose[eye].orientation.y, mask_pose[eye].orientation.z);
-							glm::quat q_prev(flow_prev_pose[eye].orientation.w, flow_prev_pose[eye].orientation.x,
-							                flow_prev_pose[eye].orientation.y, flow_prev_pose[eye].orientation.z);
-							glm::quat dq = glm::normalize(q_now * glm::inverse(glm::normalize(q_prev)));
-							if (dq.w < 0.f)
-								dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
-							float cos_half = std::clamp(dq.w, -1.f, 1.f);
-							float ang = 2.f * acosf(cos_half);
-							float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
-							if (ang > 1e-6f and sin_half > 1e-6f)
-								flow_om_w[eye] = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang * (float)(flow_extra_s / dt_flow));
+							have_flow_samp = true;
+							flow_ts_ms = dt_samp * 1e3;
+							for (uint32_t eye = 0; eye < view_count; ++eye)
+							{
+								glm::vec3 p_new(newest.pose[eye].position.x, newest.pose[eye].position.y, newest.pose[eye].position.z);
+								glm::vec3 p_old(oldest.pose[eye].position.x, oldest.pose[eye].position.y, oldest.pose[eye].position.z);
+								glm::vec3 vel = (p_new - p_old) / (float)dt_samp;
+								flow_vmax = std::max(flow_vmax, (double)glm::length(vel));
+								flow_vel_w[eye] = vel * (float)flow_extra_s;
+								glm::quat q_new(newest.pose[eye].orientation.w, newest.pose[eye].orientation.x,
+								                newest.pose[eye].orientation.y, newest.pose[eye].orientation.z);
+								glm::quat q_old(oldest.pose[eye].orientation.w, oldest.pose[eye].orientation.x,
+								                oldest.pose[eye].orientation.y, oldest.pose[eye].orientation.z);
+								glm::quat dq = glm::normalize(q_new * glm::inverse(glm::normalize(q_old)));
+								if (dq.w < 0.f)
+									dq = glm::quat(-dq.w, -dq.x, -dq.y, -dq.z);
+								float cos_half = std::clamp(dq.w, -1.f, 1.f);
+								float ang = 2.f * acosf(cos_half);
+								float sin_half = sqrtf(std::max(0.f, 1.f - cos_half * cos_half));
+								if (ang > 1e-6f and sin_half > 1e-6f)
+									flow_om_w[eye] = glm::normalize(glm::vec3(dq.x, dq.y, dq.z) / sin_half) * (ang * (float)(flow_extra_s / dt_samp));
+							}
 						}
 					}
-					flow_prev_t = frame_state.predictedDisplayTime;
-					flow_prev_pose = mask_pose;
-					have_flow_prev = true;
 					for (uint32_t eye = 0; eye < view_count; ++eye)
 					{
 						const XrPosef & from = have_capture_pose ? capture_pose[eye] : shared_depth.pose[eye];
@@ -3723,12 +3760,10 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						}
 						glm::vec3 pc(from.position.x, from.position.y, from.position.z);
 						glm::vec3 pd(to.position.x, to.position.y, to.position.z);
-						// Per-texel flow is computed once above (frame-period
-						// finite difference) and filled into the UBO per
-						// eye; the vertex shader shifts each texel along
-						// its own display-eye flow. No long-window
-						// average: displacement nets to zero at peak
-						// velocity under oscillation.
+						// Per-texel flow is computed once above (velocity of
+						// the N-back sensor sample) and filled into the
+						// UBO per eye below; the vertex shader shifts each
+						// texel along its own display-eye flow.
 						// Sensor extrinsic test: translate the content
 						// frame by the slider offset (cm -> m), rotated
 						// into world by the content orientation. Identity
@@ -3798,9 +3833,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						splat_params.far_z = shared_depth.far_z;
 						splat_params.opacity = debug_depth_opacity;
 						splat_params.depth_scale = debug_depth_scale;
-						if (debug_flow_ms != 0.f and have_flow)
-							warp_note = fmt::format(" flow {:+.0f}ms vmax{:.2f}m/s",
-							                        (double)debug_flow_ms, flow_vmax);
+						if (debug_flow_ms != 0.f and have_flow_samp)
+							warp_note = fmt::format(" flow {:+.0f}ms N{} Ts{:.0f}ms vmax{:.2f}m/s",
+							                        (double)debug_flow_ms, flow_n, flow_ts_ms, flow_vmax);
 						glm::vec3 r_ext_note(debug_extrinsic_cm[0], debug_extrinsic_cm[1], debug_extrinsic_cm[2]);
 						if (glm::dot(r_ext_note, r_ext_note) > 0.f)
 							warp_note += fmt::format(" ext({:+.1f},{:+.1f},{:+.1f})cm",
