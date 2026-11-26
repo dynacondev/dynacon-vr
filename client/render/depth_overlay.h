@@ -183,10 +183,9 @@ public:
 		float trans[2][4]; // [eye]: xyz = qd^-1 * (pc - pd); w unused
 	};
 
-	// Push block for the splat vertex shader (eye + sensor texel dims;
-	// the shader derives the (sens_w+1)x(sens_h+1) corner grid itself).
-	// The pass-2 fragment shaders use the standard 4-byte eye push like
-	// all viz frags. 12 bytes.
+	// Push block for the splat vertex shader (eye + sensor dims for the
+	// gl_VertexIndex -> texel mapping). The pass-2 fragment shaders use
+	// the standard 4-byte eye push like all viz frags. 12 bytes.
 	struct splat_push
 	{
 		int32_t eye = 0;
@@ -301,14 +300,12 @@ private:
 	// Pass 1 shared by both splat records: splat the sensor mesh into
 	// the transient R16F image (flat-splat, depth-tested). Leaves the
 	// temp ready for a same-CB barrier to SHADER_READ_ONLY.
-	// Index buffer over the sensor texel corners ((sens_w+1)x(sens_h+1)
-	// vertices, sens_w*sens_h quads, two TL-first triangles per quad;
-	// TL-first order is load-bearing for the flat background depth, whose
-	// provoking vertex is always the first). Edge replication shares a
-	// border texel's depth with neighboring windows (a no-data corner is
-	// skipped, so quads survive on their remaining valid corners; only
-	// all-invalid windows discard). Res-keyed (sensor dims arrive per
-	// frame); rebuilt waitIdle'd on change.
+	// Index buffer over the sensor texel grid (two TL-first triangles
+	// per quad; TL-first order is load-bearing for the flat background
+	// depth, whose provoking vertex is always the first). A no-data
+	// corner is skipped, so quads survive on their remaining valid
+	// corners; only all-invalid windows discard. Res-keyed (sensor dims
+	// arrive per frame); rebuilt waitIdle'd on change.
 	buffer_allocation splat_index;
 	int32_t splat_idx_w = 0;
 	int32_t splat_idx_h = 0;

@@ -1321,7 +1321,7 @@ void depth_overlay_renderer::splat_pass1(vk::raii::CommandBuffer & cmd,
 	clears[1].depthStencil = vk::ClearDepthStencilValue{1.0f, 0};
 	ensure_splat_index(sens_w, sens_h);
 	bool indexed = (bool)splat_index and sens_w >= 2 and sens_h >= 2;
-	uint32_t index_count = indexed ? (uint32_t)sens_w * (uint32_t)sens_h * 6u : 0; // corner grid: sens_w*sens_h quads
+	uint32_t index_count = indexed ? (uint32_t)(sens_w - 1) * (uint32_t)(sens_h - 1) * 6u : 0;
 	if (indexed)
 		cmd.bindIndexBuffer(vk::Buffer(splat_index), 0, vk::IndexType::eUint32);
 	for (uint32_t eye = 0; eye < 2; ++eye)
@@ -1365,12 +1365,10 @@ void depth_overlay_renderer::ensure_splat_index(int sens_w, int sens_h)
 	splat_idx_h = sens_h;
 	if (sens_w < 2 or sens_h < 2)
 		return;
-	// Corner grid: (sens_w+1) x (sens_h+1) vertices at texel corners,
-	// sens_w*sens_h quads (one per texel square). Guard unchanged (M5):
-	// degenerate lines stay no-mesh exactly as before.
-	uint32_t quads_w = (uint32_t)sens_w;
-	uint32_t quads_h = (uint32_t)sens_h;
-	uint32_t stride_w = (uint32_t)sens_w + 1; // corner-grid row stride (load-bearing)
+	// Center grid: sens_w*sens_h vertices at texel centers,
+	// (sens_w-1)*(sens_h-1) quads. Degenerate lines stay no-mesh.
+	uint32_t quads_w = (uint32_t)sens_w - 1;
+	uint32_t quads_h = (uint32_t)sens_h - 1;
 	vk::DeviceSize index_count = vk::DeviceSize(quads_w) * vk::DeviceSize(quads_h) * 6;
 	splat_index = buffer_allocation(
 	        *device,
@@ -1385,16 +1383,16 @@ void depth_overlay_renderer::ensure_splat_index(int sens_w, int sens_h)
 	        "depth splat index");
 	auto * out = static_cast<uint32_t *>(splat_index.map());
 	size_t m = 0;
-	for (int32_t y = 0; y < sens_h; ++y)
+	for (int32_t y = 0; y < sens_h - 1; ++y)
 	{
-		for (int32_t x = 0; x < sens_w; ++x)
+		for (int32_t x = 0; x < sens_w - 1; ++x)
 		{
 			// TL-first in both triangles: the TL corner is the
 			// provoking vertex whose flat background depth the fragment
 			// reads. Order is load-bearing, keep it.
-			uint32_t a = (uint32_t)y * stride_w + (uint32_t)x;
+			uint32_t a = (uint32_t)y * (uint32_t)sens_w + (uint32_t)x;
 			uint32_t b = a + 1;
-			uint32_t c = a + stride_w;
+			uint32_t c = a + (uint32_t)sens_w;
 			uint32_t d = c + 1;
 			out[m++] = a;
 			out[m++] = b;
