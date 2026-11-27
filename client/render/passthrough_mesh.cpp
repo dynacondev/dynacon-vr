@@ -32,28 +32,11 @@
 #include <spdlog/spdlog.h>
 #include <unordered_set>
 
-namespace
-{
-struct error_category : std::error_category
-{
-	const char * name() const noexcept override
-	{
-		return "fastgltf";
-	}
+// File-scope bake helpers (needed both inside append_primitive's anonymous
+// namespace and by the global conforming pass in flatten_gltf below).
 
-	std::string message(int condition) const override
-	{
-		return std::string(fastgltf::getErrorMessage(static_cast<fastgltf::Error>(condition)));
-	}
-};
-static error_category fastgltf_error_category;
-
-// Epsilon weld (bake-time): collapse bitwise-identical baked positions
-// so duplicated verts from overlapping primitives share one index.
-// Kills exact-duplicate T-junctions and feeds the aspect-capped
-// splitter cleaner input with zero geometry change (near-dups from
-// distinct transforms differ by ulps — far below visibility — and are
-// deliberately left alone). Pre-placement model meters.
+// Bitwise position key: collapse bitwise-identical baked positions so
+// duplicated verts from overlapping primitives share one index.
 struct weld_key
 {
 	uint32_t x, y, z;
@@ -75,6 +58,27 @@ struct weld_hash
 
 // Sanity cap: refuse absurd meshes rather than handing them to the runtime
 constexpr size_t max_triangles = 4'000'000;
+
+// Conforming closure over [range_vert, ...)/[range_start, ...): force-split
+// tris at hanging vertices. Defined after the anonymous namespace (it is
+// called both per-primitive and globally from flatten_gltf).
+void conforming_closure_range(passthrough_mesh::triangle_soup & out, uint32_t range_vert, size_t range_start);
+
+namespace
+{
+struct error_category : std::error_category
+{
+	const char * name() const noexcept override
+	{
+		return "fastgltf";
+	}
+
+	std::string message(int condition) const override
+	{
+		return std::string(fastgltf::getErrorMessage(static_cast<fastgltf::Error>(condition)));
+	}
+};
+static error_category fastgltf_error_category;
 
 std::vector<uint32_t> read_indices(fastgltf::Asset & asset, const fastgltf::Accessor & accessor)
 {
@@ -230,8 +234,11 @@ void append_primitive(
 	// damage and the fully-in-front coordinate span. Threshold is
 	// pre-placement-scale: placements are ~uniform-1 (config default),
 	// larger scales re-open the hole proportionally. Midpoints are
-	// bitwise-identical across shared edges, so the output is watertight
-	// up to float rounding (no persistent T-junctions, no gaps); each
+	// bitwise-identical across shared edges, so the output has no
+	// positional gaps (up to float rounding); the conforming closure
+	// below additionally removes topological T-junctions (hanging
+	// vertices whose long-vs-halved edge specs disagree in the
+	// rasterizer's fixed-point equations: deficit pinholes). Each
 	// half keeps the parent orientation, so flip_winding composes
 	// unchanged.
 	constexpr float kMaxBakeEdge = 0.10f;
@@ -375,6 +382,7 @@ void append_primitive(
 		pending.push_back({e0, m, w});
 		pending.push_back({m, e1, w});
 	}
+	conforming_closure_range(out, base_vertex, index_start);
 }
 
 void append_node(
@@ -405,7 +413,86 @@ void append_node(
 	for (size_t child: node.children)
 		append_node(asset, child, world, out);
 }
+
 } // namespace
+
+// Conforming closure over [range_vert, ...)/[range_start, ...): force-split
+// tris at hanging vertices so both sides of every shared edge reference
+// identical endpoints. The rasterizer evaluates each side's edge equation
+// in fixed point; a long edge on one side vs two halves on the other can
+// disagree by snapping and drop the pixel on both sides (deficit pinhole,
+// which tier-1 erode widens into a hairline). Midpoints computed from
+// identical endpoints are bitwise-identical, so the lookup below never
+// creates vertices — it only reuses existing ones. Boundary/unconnected
+// matches are split too (exact tilings either way; only costs tris).
+// Runs per primitive inside append_primitive and once globally over the
+// whole soup in flatten_gltf (cross-primitive duplicates need the global
+// pass: weld/posmap are per-primitive).
+void conforming_closure_range(passthrough_mesh::triangle_soup & out, uint32_t range_vert, size_t range_start)
+{
+	auto same_pos = [&](uint32_t u, uint32_t v) {
+		const XrVector3f & a = out.vertices[u];
+		const XrVector3f & b = out.vertices[v];
+		return std::bit_cast<uint32_t>(a.x) == std::bit_cast<uint32_t>(b.x) &&
+		       std::bit_cast<uint32_t>(a.y) == std::bit_cast<uint32_t>(b.y) &&
+		       std::bit_cast<uint32_t>(a.z) == std::bit_cast<uint32_t>(b.z);
+	};
+	// Vertex set is fixed by closure (no pushes), so build once.
+	std::unordered_map<weld_key, uint32_t, weld_hash> posmap;
+	for (size_t v = range_vert; v < out.vertices.size(); ++v)
+	{
+		const XrVector3f & p = out.vertices[v];
+		posmap[{std::bit_cast<uint32_t>(p.x), std::bit_cast<uint32_t>(p.y), std::bit_cast<uint32_t>(p.z)}] =
+		        (uint32_t)v;
+	}
+	constexpr size_t kMaxClosureRounds = 64;
+	for (size_t round = 0; round < kMaxClosureRounds; ++round)
+	{
+		struct hanging
+		{
+			size_t pos;
+			uint32_t e0, e1, w, m;
+		};
+		std::vector<hanging> splits;
+		for (size_t p = range_start; p + 3 <= out.indices.size(); p += 3)
+		{
+			uint32_t t[3] = {out.indices[p], out.indices[p + 1], out.indices[p + 2]};
+			if (t[0] == t[1] || t[1] == t[2] || t[2] == t[0] || same_pos(t[0], t[1]) ||
+			    same_pos(t[1], t[2]) || same_pos(t[2], t[0]))
+				continue;
+			for (int k = 0; k < 3; ++k)
+			{
+				uint32_t a = t[k], b = t[(k + 1) % 3], c = t[(k + 2) % 3];
+				const XrVector3f & pa = out.vertices[a];
+				const XrVector3f & pb = out.vertices[b];
+				weld_key mk{std::bit_cast<uint32_t>((pa.x + pb.x) * 0.5f),
+				            std::bit_cast<uint32_t>((pa.y + pb.y) * 0.5f),
+				            std::bit_cast<uint32_t>((pa.z + pb.z) * 0.5f)};
+				auto it = posmap.find(mk);
+				if (it == posmap.end())
+					continue;
+				uint32_t m = it->second;
+				if (same_pos(m, a) || same_pos(m, b) || same_pos(m, c))
+					continue;
+				splits.push_back({p, a, b, c, m});
+				break; // one split per tri per round (two would rewrite the same slots)
+			}
+		}
+		if (splits.empty())
+			break;
+		if (round + 1 == kMaxClosureRounds)
+			spdlog::warn("passthrough_mesh: conforming closure cap hit, residual T-junctions remain");
+		for (auto & s : splits)
+		{
+			if (out.indices.size() + 3 > max_triangles * 3)
+				throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
+			out.indices[s.pos] = s.e0;
+			out.indices[s.pos + 1] = s.m;
+			out.indices[s.pos + 2] = s.w;
+			out.indices.insert(out.indices.end(), {s.m, s.e1, s.w});
+		}
+	}
+}
 
 passthrough_mesh::triangle_soup passthrough_mesh::flatten_gltf(const std::filesystem::path & path)
 {
@@ -471,6 +558,11 @@ passthrough_mesh::triangle_soup passthrough_mesh::flatten_gltf(const std::filesy
 
 	if (out.vertices.empty() or out.indices.empty())
 		throw std::runtime_error("passthrough_mesh: no triangles found in model");
+
+	// Global conforming pass: heals cross-primitive T-junctions (the
+	// per-primitive pass inside append_primitive only sees its own
+	// range). No new vertices; idempotent on conformed ranges.
+	conforming_closure_range(out, 0, 0);
 
 	spdlog::info("passthrough_mesh: {} -> {} vertices, {} triangles", path.string(), out.vertices.size(), out.indices.size() / 3);
 	return out;
