@@ -20,15 +20,18 @@
 
 #extension GL_EXT_multiview : require
 
-// AA-spike twin of mask_mv.vert: adds an explicit per-corner barycentric
+// AA twin of mask_mv.vert: adds an explicit per-corner barycentric
 // attribute (location 1). Meshes upload de-indexed (3 verts per triangle,
 // corners (1,0,0), (0,1,0), (0,0,1)) so shared verts need no splitting.
-// Push block byte-identical to mask_mv (132B): the shared VERT|FRAG range
-// trap applies — never widen this block.
+// Barycentric is noperspective (screen-linear): the fragment evaluates
+// coverage at screen-space subpixel offsets, for which
+// perspective-correct interpolation would be wrong. Push block
+// byte-identical to mask_mv (132B): the shared VERT|FRAG range trap
+// applies — never widen this block.
 layout(location = 0) in vec3 pos;
 layout(location = 1) in vec3 bary;
 
-layout(location = 0) out vec3 vBary;
+layout(location = 0) noperspective out vec3 vBary;
 
 layout(push_constant) uniform PushConstants
 {

@@ -1246,7 +1246,7 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	// legal; max() over duplicates is neutral). Ping-pong parity:
 	// the other set may still be read by a prior in-flight command
 	// buffer (inline fallback while the async CB flies).
-	// AA spike (Nov 2026): always LINEAR. The NEAREST 1:1 fast path is
+	// AA (Nov 2026): always LINEAR. The NEAREST 1:1 fast path is
 	// dropped so analytic-coverage grey edge pixels filter on upscale;
 	// flat interiors sample identically either way (all 4 taps agree).
 	// extent (the merge size) is currently implied by the views; kept for

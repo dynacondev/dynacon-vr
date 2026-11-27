@@ -18,25 +18,21 @@
 
 #version 450
 
-// AA-spike twin of mask_mv.frag: analytic edge coverage from the explicit
-// barycentric varying. coverage = min over smoothstep(0, fwidth, bary):
-// 1.0 interior, ~0.5 on the silhouette edge. REPLACE blend, no depth
-// (positives-only tier-0/tier-1 groups; reversed groups stay on the binary
-// mask_mv path). Push block byte-identical to mask_mv (132B). View-agnostic
-// (no gl_ViewIndex use), so no multiview extension is required here — the
+// AA twin of mask_mv.frag: analytic edge coverage from the explicit
+// barycentric varying, evaluated on a 2x2 ordered subpixel grid (+-0.25px)
+// and averaged. The ramp is edge-centered — smoothstep(-0.5*fw, +0.5*fw)
+// is point-symmetric, so watertight neighbours' complements sum to exactly
+// 1.0 at every tap (a one-sided 0..fw ramp would sum to ~0 at the edge
+// center instead). The rasterizer runs conservative-overestimate, so the
+// neighbour across a shared edge shades this pixel too; ADD (blend ONE,
+// ONE, saturated by the UNORM store) sums interior straddles to 1.0,
+// while a lone silhouette fragment keeps its smooth single-sided ramp —
+// continuous in subpixel phase, no quantization steps. No depth (order
+// independent, both-sides safe); reversed cuts stay binary MIN.
+// Push block byte-identical to mask_mv (132B). View-agnostic (no
+// gl_ViewIndex use), so no multiview extension is required here — the
 // vertex stage selects the eye.
-//
-// SPIKE NOTES (device run decides):
-// - Single-sample raster shades one side of a shared interior edge
-//   (tie-break), so watertight interiors may show a ~0.5 hairline where
-//   the binary path wrote 1.0.
-// - REPLACE with no depth is order-dependent on overlap: a grey foreground
-//   edge REPLACEs (dims) a background 1.0 interior where binary 1-over-1
-//   was invisible. Disjoint/exterior-dominated windows are unaffected.
-// - Tier-0 binary punches (marker cutouts, sensor reveal) stamp hard
-//   values over the grey ramp with no reconciling blur (tier-1 reconciles
-//   via its blur chain).
-layout(location = 0) in vec3 vBary;
+layout(location = 0) noperspective in vec3 vBary;
 
 layout(push_constant) uniform PushConstants
 {
@@ -47,11 +43,28 @@ pc;
 
 layout(location = 0) out vec4 out_color;
 
+float smoothcov(vec3 b, vec3 fw)
+{
+	// Edge-centered ramp: point-symmetric, so complements across a
+	// shared edge sum to exactly 1.0. Half-width 0.5*fw keeps the 1px
+	// ramp (silhouette reaches 1.0 half a pixel inside, 0 half a pixel
+	// outside — a soft outer toe, fail-safe).
+	vec3 a3 = smoothstep(-0.5 * fw, 0.5 * fw, b);
+	return min(min(a3.x, a3.y), a3.z);
+}
+
 void main()
 {
 	// eps keeps smoothstep defined when fwidth is 0 (degenerate UV).
 	vec3 fw = fwidth(vBary) + vec3(1e-4);
-	vec3 a3 = smoothstep(vec3(0.0), fw, vBary);
-	float cov = min(min(a3.x, a3.y), a3.z);
-	out_color = vec4(pc.opacity * cov);
+	// Screen-space barycentric gradients: one pixel of travel.
+	vec3 gx = dFdx(vBary);
+	vec3 gy = dFdy(vBary);
+	vec3 gp = gx + gy;
+	vec3 gm = gx - gy;
+	float cov = smoothcov(vBary - 0.25 * gp, fw)
+	          + smoothcov(vBary + 0.25 * gm, fw)
+	          + smoothcov(vBary - 0.25 * gm, fw)
+	          + smoothcov(vBary + 0.25 * gp, fw);
+	out_color = vec4(pc.opacity * cov * 0.25);
 }

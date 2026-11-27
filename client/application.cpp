@@ -900,6 +900,11 @@ void application::initialize_vulkan()
 	optional_device_extensions.emplace(VK_IMG_FILTER_CUBIC_EXTENSION_NAME);
 	optional_device_extensions.emplace(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
 	optional_device_extensions.emplace(VK_EXT_FRAGMENT_DENSITY_MAP_EXTENSION_NAME);
+	// Conservative rasterization (overestimate) for the feather-mask
+	// analytic AA pipes (explicit bary + ADD-saturate). Probed present
+	// on Quest 3 (Adreno 740); optional so runtimes without it still
+	// create a device (AA pipes require it — see feather_mask ctor).
+	optional_device_extensions.emplace(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME);
 
 #if WIVRN_USE_V4L2
 	// V4L2 decoders expose their output through DMA-buf

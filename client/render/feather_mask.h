@@ -171,7 +171,7 @@ public:
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP. Optional sensor reveal (depth_reveal above,
 	// null = off) ORs the sensor test into the working alpha (binary on
-	// the binary path, grey ramp under the AA spike when positives-only)
+	// the binary path, grey ramp under the AA when positives-only)
 	// before the blur chain.
 	// Sensor reveal for 3d-depth-passthrough (optional, null = off):
 	// resampled sensor heightfield + merged copy (borrowed views,
@@ -300,13 +300,18 @@ private:
 	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
-	// AA-spike pipes (explicit-bary mask_aa_mv.vert/frag, REPLACE, no
-	// depth): RGBA for tier-0 direct raster, R8 for tier-1 half-res
-	// raster. Positives-only groups; reversed groups stay binary.
-	// Same silhouette_mv_layout (push-only) as the binary pipes.
+	// AA pipes (explicit-bary mask_aa_mv.vert/frag, conservative
+	// overestimate, ADD-saturate, no depth): RGBA for tier-0 direct
+	// raster, R8 for tier-1 half-res raster. Positives-only groups;
+	// reversed groups stay binary. Overestimate emits the neighbour
+	// fragment at shared-edge pixels; 2x2 ordered-grid smooth coverage
+	// ADD-sums interior straddles to 1.0 (silhouette stays single-sided).
+	// Same silhouette_mv_layout (push-only) as the binary pipes. Null
+	// when the device lacks VK_EXT_conservative_rasterization (record
+	// falls back to binary).
 	vk::raii::Pipeline aa_pipeline_mv{nullptr};
 	vk::raii::Pipeline aa_raster_r8_pipeline_mv{nullptr};
-	// One-shot log state for the AA-spike reversed fallback in record().
+	// One-shot log state for the AA reversed fallback in record().
 	// Render-thread only (record() records; the async CB only executes).
 	bool aa_rev_logged_ = false;
 
@@ -373,7 +378,7 @@ private:
 
 	// Depth reveal (3d-depth-passthrough): single test MAX-blended over
 	// the working alpha (binary on the binary path, grey ramp under the
-	// AA spike when positives-only) ahead of the erode/blur chain (the blend
+	// AA when positives-only) ahead of the erode/blur chain (the blend
 	// unit does the OR — no work tap, which would be a feedback loop;
 	// R8 MIN-blend precedent from the reversed raster proves the blend
 	// path). R8 LOAD RP for the intermediates (tier-1 A, tiered seed —
@@ -470,7 +475,7 @@ private:
 			vk::DeviceSize index_bytes = 0;
 		};
 		std::optional<upload_sizes> pending_upload;
-		// AA-spike de-indexed upload (3 verts per triangle + per-corner
+		// AA de-indexed upload (3 verts per triangle + per-corner
 		// bary): expanded at set_mesh time from the same soup, drawn
 		// non-indexed. Dies with the entry on map-drop/erase (meshes
 		// survive reset_targets(), like the indexed buffers above).

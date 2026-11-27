@@ -64,7 +64,7 @@ struct silhouette_mv_push
 static_assert(sizeof(silhouette_mv_push) == 132);
 static_assert(sizeof(silhouette_mv_push) <= 256);
 
-// AA-spike vertex (mask_aa_mv.vert): position + explicit per-corner
+// AA vertex (mask_aa_mv.vert): position + explicit per-corner
 // barycentric. Uploaded de-indexed (3 verts/tri); stride shared with the
 // AA pipeline vertex input below.
 struct aa_vert
@@ -410,12 +410,60 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	raster_r8_depth_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, blend, &depth_write);
 	raster_r8_reverse_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, min_blend, &depth_test);
 
-	// AA-spike pipes (explicit-bary mask_aa_mv.vert/frag, REPLACE, no
-	// depth): same rasterization/multisample/blend/dynamic state and the
-	// same silhouette_mv_layout (push-only) as the binary pipes; only the
-	// vertex input (pos+bary) and shader modules differ. Tier-0 RGBA and
-	// tier-1 R8 variants; the shared pipeline_cache covers the compiles.
+	// AA pipes (explicit-bary mask_aa_mv.vert/frag, conservative
+	// overestimate, ADD-saturate, no depth): same dynamic state and the
+	// same silhouette_mv_layout (push-only) as the binary pipes; vertex
+	// input (pos+bary), rasterization (conservative) and blend (ADD)
+	// differ. Tier-0 RGBA and tier-1 R8 variants; the shared
+	// pipeline_cache covers the compiles.
+	//
+	// Coverage model: overestimate emits the neighbour fragment at
+	// shared-edge pixels too; each fragment evaluates smooth coverage
+	// on a 2x2 ordered subpixel grid and they ADD (watertight mesh =>
+	// complements sum to 1.0 interior, silhouette stays single-sided).
+	// ADD saturates via the UNORM store clamp (fail-safe over-reveal).
+	// Reversed cuts stay binary MIN. Requires
+	// VK_EXT_conservative_rasterization at device creation: without it
+	// the pipes stay null and record() falls back to binary raster.
+	bool has_cr = false;
+	for (const auto & e: physical_device.enumerateDeviceExtensionProperties())
 	{
+		if (std::strcmp(e.extensionName.data(), VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0)
+		{
+			has_cr = true;
+			break;
+		}
+	}
+	if (not has_cr)
+		spdlog::warn("feather AA disabled (no VK_EXT_conservative_rasterization): binary raster");
+	else
+	{
+		vk::PipelineColorBlendAttachmentState aa_add_attachment{
+		        .blendEnable = VK_TRUE,
+		        .srcColorBlendFactor = vk::BlendFactor::eOne,
+		        .dstColorBlendFactor = vk::BlendFactor::eOne,
+		        .colorBlendOp = vk::BlendOp::eAdd,
+		        .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+		        .dstAlphaBlendFactor = vk::BlendFactor::eOne,
+		        .alphaBlendOp = vk::BlendOp::eAdd,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		};
+		vk::PipelineColorBlendStateCreateInfo aa_add_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &aa_add_attachment,
+		};
+		// Conservative overestimate, zero extra: emit every touched
+		// pixel (extra=0 is a multiple of the 0.5 granularity, within
+		// the 0.5 maxExtra — probed on Quest 3). Base halo ~0.5px lands
+		// as a soft toe via the smooth coverage (fail-safe).
+		vk::PipelineRasterizationConservativeStateCreateInfoEXT cr_state{
+		        .flags = {},
+		        .conservativeRasterizationMode = vk::ConservativeRasterizationModeEXT::eOverestimate,
+		        .extraPrimitiveOverestimationSize = 0.0f,
+		};
+		vk::PipelineRasterizationStateCreateInfo aa_rasterization = rasterization;
+		aa_rasterization.pNext = &cr_state;
 		vk::VertexInputBindingDescription aa_binding{
 		        .binding = 0,
 		        .stride = sizeof(aa_vert),
@@ -462,10 +510,10 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 			        .pVertexInputState = &aa_vertex_input,
 			        .pInputAssemblyState = &input_assembly,
 			        .pViewportState = &viewport_state,
-			        .pRasterizationState = &rasterization,
+			        .pRasterizationState = &aa_rasterization,
 			        .pMultisampleState = &multisample,
 			        .pDepthStencilState = nullptr,
-			        .pColorBlendState = &blend,
+			        .pColorBlendState = &aa_add_blend,
 			        .pDynamicState = &dynamic,
 			        .layout = *silhouette_mv_layout,
 			        .renderPass = *rp,
@@ -474,7 +522,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		aa_pipeline_mv = make_aa_mv_variant(renderpass_mv);
 		aa_raster_r8_pipeline_mv = make_aa_mv_variant(raster_r8_renderpass_mv);
-		spdlog::info("feather AA pipes built (explicit bary, REPLACE, no depth)");
+		spdlog::info("feather AA pipes built (explicit bary, conservative overestimate, ADD, no depth)");
 	}
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
@@ -1147,7 +1195,7 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
-	// AA-spike de-indexed upload: 3 verts per triangle with per-corner
+	// AA de-indexed upload: 3 verts per triangle with per-corner
 	// bary ((1,0,0),(0,1,0),(0,0,1)), drawn non-indexed by the AA pipes.
 	// Same soup, same waitIdle cover above (map-change only).
 	{
@@ -2227,7 +2275,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 		                    barriers,
 		                    {});
 	}
-	// AA-spike de-indexed upload (vertex-only, same discipline).
+	// AA de-indexed upload (vertex-only, same discipline).
 	if (mesh.aa_pending_upload)
 	{
 		vk::DeviceSize aa_bytes = *mesh.aa_pending_upload;
@@ -2298,10 +2346,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// 0), so clear-only and let the cutout punch below run if armed. Depth
 	// engages exactly when a reversed draw exists; positive-only calls
 	// rasterize as usual.
-	// AA spike (Nov 2026): analytic coverage on positives-only tier-0
-	// and tier-1 raster. Reversed groups stay on the binary mask_mv path
-	// (cuts untested with grey coverage); tiered/hidden paths below are
-	// untouched. No depth companions: REPLACE, no depth, same as binary.
+	// AA (Nov 2026): conservative-overestimate analytic coverage on
+	// positives-only tier-0 and tier-1 raster (2x2 ordered subpixel grid
+	// averaged per fragment, ADD-saturated across neighbours: interior
+	// straddles sum to 1.0). Reversed groups stay on the binary mask_mv
+	// path (cuts untested with grey coverage); tiered/hidden paths below
+	// are untouched. No depth companions, order independent.
 	if (has_reversed)
 	{
 		if (not aa_rev_logged_)
@@ -2601,8 +2651,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		vk::Pipeline rev_pipe;
 		vk::RenderPass rp;
 		vk::RenderPass depth_rp;
-		// AA-spike pipe (mask_aa_mv, REPLACE, no depth) for the color-only
-		// FB above. Raw handle like the rest; null = binary only.
+		// AA pipe (mask_aa_mv, conservative overestimate, ADD, no depth)
+		// for the color-only FB above. Raw handle like the rest; null =
+		// binary only (e.g. extension missing).
 		vk::Pipeline aa_pipe;
 	};
 	// Multiview silhouette raster: one draw broadcasts to both layers via
@@ -2829,7 +2880,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// Hard edge: rasterize silhouettes straight into the swapchain
 			// image. Exact, one multiview raster pass, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
-			// AA spike: analytic coverage when positives-only.
+			// AA: conservative analytic coverage (ADD) when positives-only.
 			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv, *aa_pipeline_mv}, out_extent, has_reversed, !has_reversed);
 			if (reveal)
 				run_reveal(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *reveal_rgba_pipeline, out_extent);
@@ -2852,7 +2903,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		int erode = erode_radius(spread, 2.f);
 		{
 			section_clock raster_clk(&ms_raster);
-			// AA spike: analytic coverage when positives-only. Grey feeds
+			// AA: conservative analytic coverage (ADD) when positives-only. Grey feeds
 			// the blur chain linearly (like opacity fade); box-min erode
 			// is nonlinear, so the fringe may erode ~1 texel deeper than
 			// the binary contour — the device run compares contours.
