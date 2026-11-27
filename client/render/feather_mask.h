@@ -300,7 +300,7 @@ private:
 	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
-	// AA pipes (explicit-bary mask_aa_mv.vert/frag, conservative
+	// AA pipes (plane-coefficient mask_aa_mv.vert/frag, conservative
 	// overestimate, ADD-saturate, backface-culled, no depth): RGBA for
 	// tier-0 direct raster, R8 for tier-1 half-res raster.
 	// Positives-only groups; reversed groups stay binary. Overestimate

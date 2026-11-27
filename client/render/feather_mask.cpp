@@ -73,18 +73,18 @@ struct silhouette_mv_push
 static_assert(sizeof(silhouette_mv_push) == 140);
 static_assert(sizeof(silhouette_mv_push) <= 256);
 
-// AA vertex (mask_aa_mv.vert): position + explicit per-corner
-// barycentric + static object-space barycentric gradients (identical on
-// all 3 verts of a triangle). Uploaded de-indexed (3 verts/tri); stride
-// shared with the AA pipeline vertex input below.
+// AA vertex (mask_aa_mv.vert): position + triangle plane coefficients
+// (B_i(p) = g_i.p + c_i, identical on all 3 verts of a triangle).
+// Uploaded de-indexed (3 verts/tri); stride shared with the AA
+// pipeline vertex input below.
 struct aa_vert
 {
 	XrVector3f pos;
-	float bary[3];
+	float c[2];
 	XrVector3f grad1;
 	XrVector3f grad2;
 };
-static_assert(sizeof(aa_vert) == sizeof(XrVector3f) * 3 + 3 * sizeof(float));
+static_assert(sizeof(aa_vert) == sizeof(XrVector3f) * 3 + 2 * sizeof(float));
 
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
@@ -422,10 +422,10 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	raster_r8_depth_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, blend, &depth_write);
 	raster_r8_reverse_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, min_blend, &depth_test);
 
-	// AA pipes (explicit-bary mask_aa_mv.vert/frag, conservative
+	// AA pipes (plane-coefficient mask_aa_mv.vert/frag, conservative
 	// overestimate, ADD-saturate, no depth): same dynamic state and the
 	// same silhouette_mv_layout (push-only) as the binary pipes; vertex
-	// input (pos+bary+gradients), rasterization (conservative) and
+	// input (pos+c+gradients), rasterization (conservative) and
 	// blend (ADD) differ. Tier-0 RGBA and tier-1 R8 variants; the shared
 	// pipeline_cache covers the compiles.
 	//
@@ -501,8 +501,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        {
 		                .location = 1,
 		                .binding = 0,
-		                .format = vk::Format::eR32G32B32Sfloat,
-		                .offset = offsetof(aa_vert, bary),
+		                .format = vk::Format::eR32G32Sfloat,
+		                .offset = offsetof(aa_vert, c),
 		        },
 		        {
 		                .location = 2,
@@ -556,7 +556,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		aa_pipeline_mv = make_aa_mv_variant(renderpass_mv);
 		aa_raster_r8_pipeline_mv = make_aa_mv_variant(raster_r8_renderpass_mv);
-		spdlog::info("feather AA pipes built (explicit bary, conservative overestimate, ADD, backface-culled, no depth)");
+		spdlog::info("feather AA pipes built (plane-coefficient, conservative overestimate, ADD, backface-culled, no depth)");
 	}
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
@@ -1229,11 +1229,11 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
-	// AA de-indexed upload: 3 verts per triangle with per-corner
-	// bary ((1,0,0),(0,1,0),(0,0,1)) plus static object-space
-	// barycentric gradients (identical on all 3 verts of a triangle),
-	// drawn non-indexed by the AA pipes. Same soup, same waitIdle
-	// cover above (map-change only).
+	// AA de-indexed upload: 3 verts per triangle with triangle plane
+	// coefficients (c1, c2; B_i(p) = g_i.p + c_i, identical on all 3
+	// verts) plus static object-space gradients, drawn non-indexed by
+	// the AA pipes. Same soup, same waitIdle cover above (map-change
+	// only).
 	{
 		size_t tri_count = soup.indices.size() / 3;
 		std::vector<aa_vert> aa;
@@ -1246,27 +1246,31 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 				const XrVector3f & v = soup.vertices[soup.indices[t * 3 + k]];
 				p[k] = glm::vec3(v.x, v.y, v.z);
 			}
-			// Object-space gradients of the barycentric coords:
-			// b1 = g1.p + c1 etc. with g1 = (e2 x N)/|N|^2. Static
-			// (geometry only); the shader transforms them per fragment.
-			// Guarded against degenerates (bake never emits NaN/Inf).
+			// Object-space barycentric plane coefficients: B_i(p) = g_i.p
+			// + c_i with c_i = 1 - g_i.p_i. Static (geometry only); the
+			// shader evaluates them at the exact fragment point.
 			glm::vec3 e1 = p[1] - p[0], e2 = p[2] - p[0];
 			glm::vec3 N = glm::cross(e1, e2);
 			float d = glm::dot(N, N);
 			glm::vec3 g1(0.0f), g2(0.0f);
+			float c1 = -1.0f, c2 = -1.0f;
 			if (d >= 1e-18f)
 			{
 				g1 = glm::cross(e2, N) / d;
 				g2 = glm::cross(N, e1) / d;
+				c1 = 1.0f - glm::dot(g1, p[1]);
+				c2 = 1.0f - glm::dot(g2, p[2]);
 			}
+			// Degenerate guard values (g=0, c=-1): B=(-1,-1,3) drives the
+			// per-edge min to 0 coverage even if a zero-area triangle
+			// ever rasterizes (it normally emits no fragments at all).
 			for (int k = 0; k < 3; ++k)
 			{
 				aa_vert v{};
 				const XrVector3f & sp = soup.vertices[soup.indices[t * 3 + k]];
 				v.pos = sp;
-				v.bary[0] = (k == 0) ? 1.f : 0.f;
-				v.bary[1] = (k == 1) ? 1.f : 0.f;
-				v.bary[2] = (k == 2) ? 1.f : 0.f;
+				v.c[0] = c1;
+				v.c[1] = c2;
 				v.grad1 = {g1.x, g1.y, g1.z};
 				v.grad2 = {g2.x, g2.y, g2.z};
 				aa.push_back(v);
