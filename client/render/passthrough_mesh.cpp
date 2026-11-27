@@ -182,7 +182,7 @@ void append_primitive(
 	// up to float rounding (no persistent T-junctions, no gaps); each
 	// half keeps the parent orientation, so flip_winding composes
 	// unchanged.
-	constexpr float kMaxBakeEdge = 0.25f;
+	constexpr float kMaxBakeEdge = 0.10f;
 	constexpr float kMaxBakeEdge2 = kMaxBakeEdge * kMaxBakeEdge;
 	auto edge_len2 = [&](uint32_t u, uint32_t v) {
 		float dx = out.vertices[u].x - out.vertices[v].x;
