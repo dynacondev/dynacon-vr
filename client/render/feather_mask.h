@@ -508,7 +508,7 @@ private:
 	vk::raii::Pipeline hidden_sphere_pipe{nullptr};
 	vk::raii::Pipeline hidden_silhouette_pipe{nullptr};
 	// (silhouette_mv_layout above, built in the ctor, serves the hidden
-	// pipes too — identical 132B range, one layout for all MV mask pipes).
+	// pipes too — identical 140B range, one layout for all MV mask pipes).
 	buffer_allocation hidden_sphere_verts_;
 	uint32_t hidden_sphere_vert_count = 0;
 	// Body-column twin of the sphere verts: closed unit cylinder

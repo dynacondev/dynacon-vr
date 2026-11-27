@@ -53,26 +53,38 @@ struct blur_push
 };
 
 // Silhouette raster push block. Mirrors mask_mv.vert/frag.glsl: per-eye
-// mvp selected by gl_ViewIndex. 132B exceeds the 128-byte Vulkan minimum —
+// mvp selected by gl_ViewIndex. 140B exceeds the 128-byte Vulkan minimum —
 // Adreno 740 (Quest 3) provides 256B; the ctor and ensure_hidden throw
-// loudly below when the device reports less.
+// loudly below when the device reports less. Binary mask_mv shaders
+// declare the 132B prefix subset (legal: ranges may exceed the declared
+// block); only the AA shaders read inv_view.
 struct silhouette_mv_push
 {
 	std::array<glm::mat4, 2> mvp;
 	float opacity = 1;
+	// Reciprocal viewport scale (2/W, 2/H) for the AA analytic
+	// screen-space gradients. Set at the AA record site; zeros
+	// elsewhere (unread by the binary shaders). Two floats (not a
+	// vec2): vec2 is 8-aligned in std140 and would land at 136
+	// while C++ packs it at 132.
+	float inv_view_w = 0;
+	float inv_view_h = 0;
 };
-static_assert(sizeof(silhouette_mv_push) == 132);
+static_assert(sizeof(silhouette_mv_push) == 140);
 static_assert(sizeof(silhouette_mv_push) <= 256);
 
 // AA vertex (mask_aa_mv.vert): position + explicit per-corner
-// barycentric. Uploaded de-indexed (3 verts/tri); stride shared with the
-// AA pipeline vertex input below.
+// barycentric + static object-space barycentric gradients (identical on
+// all 3 verts of a triangle). Uploaded de-indexed (3 verts/tri); stride
+// shared with the AA pipeline vertex input below.
 struct aa_vert
 {
 	XrVector3f pos;
 	float bary[3];
+	XrVector3f grad1;
+	XrVector3f grad2;
 };
-static_assert(sizeof(aa_vert) == sizeof(XrVector3f) + 3 * sizeof(float));
+static_assert(sizeof(aa_vert) == sizeof(XrVector3f) * 3 + 3 * sizeof(float));
 
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
@@ -263,11 +275,11 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// Multiview raster path (one draw broadcasts to both eyes):
 	// CLEAR/STORE/OPTIMAL attachments plus viewMask=both. Uses
 	// mask_mv.vert/frag (plain gl_ViewIndex indexing, no mat3/ternary)
-	// with the 132B MVP-pair push (silhouette_mv_push shape); layout is
+	// with the 140B MVP-pair push (silhouette_mv_push shape); layout is
 	// dedicated here so the raster MV pipes never depend on the lazy
 	// hidden init.
 	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(silhouette_mv_push))
-		throw std::runtime_error("feather silhouette multiview needs 132B push constants");
+		throw std::runtime_error("feather silhouette multiview needs 140B push constants");
 	{
 		vk::PushConstantRange mv_push_range{
 		        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
@@ -413,8 +425,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// AA pipes (explicit-bary mask_aa_mv.vert/frag, conservative
 	// overestimate, ADD-saturate, no depth): same dynamic state and the
 	// same silhouette_mv_layout (push-only) as the binary pipes; vertex
-	// input (pos+bary), rasterization (conservative) and blend (ADD)
-	// differ. Tier-0 RGBA and tier-1 R8 variants; the shared
+	// input (pos+bary+gradients), rasterization (conservative) and
+	// blend (ADD) differ. Tier-0 RGBA and tier-1 R8 variants; the shared
 	// pipeline_cache covers the compiles.
 	//
 	// Coverage model: overestimate emits the neighbour fragment at
@@ -479,7 +491,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .stride = sizeof(aa_vert),
 		        .inputRate = vk::VertexInputRate::eVertex,
 		};
-		vk::VertexInputAttributeDescription aa_attributes[2] = {
+		vk::VertexInputAttributeDescription aa_attributes[4] = {
 		        {
 		                .location = 0,
 		                .binding = 0,
@@ -492,11 +504,23 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .format = vk::Format::eR32G32B32Sfloat,
 		                .offset = offsetof(aa_vert, bary),
 		        },
+		        {
+		                .location = 2,
+		                .binding = 0,
+		                .format = vk::Format::eR32G32B32Sfloat,
+		                .offset = offsetof(aa_vert, grad1),
+		        },
+		        {
+		                .location = 3,
+		                .binding = 0,
+		                .format = vk::Format::eR32G32B32Sfloat,
+		                .offset = offsetof(aa_vert, grad2),
+		        },
 		};
 		vk::PipelineVertexInputStateCreateInfo aa_vertex_input{
 		        .vertexBindingDescriptionCount = 1,
 		        .pVertexBindingDescriptions = &aa_binding,
-		        .vertexAttributeDescriptionCount = 2,
+		        .vertexAttributeDescriptionCount = 4,
 		        .pVertexAttributeDescriptions = aa_attributes,
 		};
 		auto aa_vert_mod = load_shader(device, "mask_aa_mv.vert");
@@ -1206,21 +1230,45 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
 	// AA de-indexed upload: 3 verts per triangle with per-corner
-	// bary ((1,0,0),(0,1,0),(0,0,1)), drawn non-indexed by the AA pipes.
-	// Same soup, same waitIdle cover above (map-change only).
+	// bary ((1,0,0),(0,1,0),(0,0,1)) plus static object-space
+	// barycentric gradients (identical on all 3 verts of a triangle),
+	// drawn non-indexed by the AA pipes. Same soup, same waitIdle
+	// cover above (map-change only).
 	{
 		size_t tri_count = soup.indices.size() / 3;
 		std::vector<aa_vert> aa;
 		aa.reserve(tri_count * 3);
 		for (size_t t = 0; t < tri_count; ++t)
 		{
+			glm::vec3 p[3];
+			for (int k = 0; k < 3; ++k)
+			{
+				const XrVector3f & v = soup.vertices[soup.indices[t * 3 + k]];
+				p[k] = glm::vec3(v.x, v.y, v.z);
+			}
+			// Object-space gradients of the barycentric coords:
+			// b1 = g1.p + c1 etc. with g1 = (e2 x N)/|N|^2. Static
+			// (geometry only); the shader transforms them per fragment.
+			// Guarded against degenerates (bake never emits NaN/Inf).
+			glm::vec3 e1 = p[1] - p[0], e2 = p[2] - p[0];
+			glm::vec3 N = glm::cross(e1, e2);
+			float d = glm::dot(N, N);
+			glm::vec3 g1(0.0f), g2(0.0f);
+			if (d >= 1e-18f)
+			{
+				g1 = glm::cross(e2, N) / d;
+				g2 = glm::cross(N, e1) / d;
+			}
 			for (int k = 0; k < 3; ++k)
 			{
 				aa_vert v{};
-				v.pos = soup.vertices[soup.indices[t * 3 + k]];
+				const XrVector3f & sp = soup.vertices[soup.indices[t * 3 + k]];
+				v.pos = sp;
 				v.bary[0] = (k == 0) ? 1.f : 0.f;
 				v.bary[1] = (k == 1) ? 1.f : 0.f;
 				v.bary[2] = (k == 2) ? 1.f : 0.f;
+				v.grad1 = {g1.x, g1.y, g1.z};
+				v.grad2 = {g2.x, g2.y, g2.z};
 				aa.push_back(v);
 			}
 		}
@@ -1410,12 +1458,12 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 
 	if (not hidden_ready)
 	{
-		// Multiview silhouette pushes (132B MVP pair) exceed the 128-byte
-		// Vulkan minimum: Adreno 740 (Quest 3) provides 256B. Throw loudly
+		// Multiview silhouette pushes (140B MVP pair + viewport scale)
+		// exceed the 128-byte Vulkan minimum: Adreno 740 (Quest 3) provides 256B. Throw loudly
 		// here — not silently on device — when unsupported (see the
 		// silhouette_mv_push note above the ctor).
 		if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(silhouette_mv_push))
-			throw std::runtime_error("hidden multiview needs 132B push constants");
+			throw std::runtime_error("hidden multiview needs 140B push constants");
 		hidden_ready = true;
 		// Unit-sphere verts (shared proximity-depth generator).
 		auto sphere = passthrough_mesh::unit_sphere_positions();
@@ -1532,7 +1580,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		                                                 });
 
 		// Multiview twins of the mask modules (mask_mv.vert/frag, 132B
-		// silhouette_mv_layout): same raster state as the tier-0 raster plus
+		// prefix of silhouette_mv_layout): same raster state as the tier-0 raster plus
 		// the proximity depth test.
 		auto hvert = load_shader(device, "mask_mv.vert");
 		auto hfrag = load_shader(device, "mask_mv.frag");
@@ -1610,7 +1658,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		        .depthWriteEnable = VK_TRUE,
 		        .depthCompareOp = vk::CompareOp::eLess,
 		};
-		// Reuse the ctor-built silhouette MV layout (identical 132B
+		// Reuse the ctor-built silhouette MV layout (identical 140B
 		// silhouette_mv_push range): one layout for all MV mask pipes.
 		hidden_sphere_pipe = vk::raii::Pipeline(device, *pipe_cache,
 		                                        vk::GraphicsPipelineCreateInfo{
@@ -2699,7 +2747,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					continue;
 				float v = d.reverse ? 1.f - d.opacity : d.opacity;
 				cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-				                                  silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = v});
+				                                  silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = v, .inv_view_w = 2.f / (float)e.width, .inv_view_h = 2.f / (float)e.height});
 				if (use_aa and mit->second.aa_vertex_count > 0)
 				{
 					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.aa_vertex_buffer, (vk::DeviceSize)0);

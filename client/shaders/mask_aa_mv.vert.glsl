@@ -20,29 +20,44 @@
 
 #extension GL_EXT_multiview : require
 
-// AA twin of mask_mv.vert: adds an explicit per-corner barycentric
-// attribute (location 1). Meshes upload de-indexed (3 verts per triangle,
-// corners (1,0,0), (0,1,0), (0,0,1)) so shared verts need no splitting.
-// Barycentric is noperspective (screen-linear): the fragment evaluates
-// coverage at screen-space subpixel offsets, for which
-// perspective-correct interpolation would be wrong. Push block
-// byte-identical to mask_mv (132B): the shared VERT|FRAG range trap
-// applies — never widen this block.
+// AA twin of mask_mv.vert: adds explicit per-corner barycentrics
+// (location 1) plus static object-space barycentric gradients
+// (locations 2-3, identical on all 3 verts of a triangle). Meshes upload
+// de-indexed (3 verts per triangle, corners (1,0,0), (0,1,0), (0,0,1))
+// so shared verts need no splitting. Barycentric is noperspective
+// (screen-linear): the fragment evaluates coverage at screen-space
+// subpixel offsets, for which perspective-correct interpolation would
+// be wrong. vProj carries (ndc.xy, 1/w): both are affine in screen
+// pixels, so noperspective interpolation is exact per fragment. Push
+// block declares the full 140B (binary mask_mv declares the 132B
+// prefix subset: ranges may exceed the declared block, shared-prefix
+// offsets agree).
 layout(location = 0) in vec3 pos;
 layout(location = 1) in vec3 bary;
+layout(location = 2) in vec3 grad1;
+layout(location = 3) in vec3 grad2;
 
 layout(location = 0) noperspective out vec3 vBary;
+layout(location = 1) noperspective out vec3 vProj;
+layout(location = 2) flat out vec3 vG1;
+layout(location = 3) flat out vec3 vG2;
 
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp[2];
 	// First-acquisition fade: global silhouette opacity, ramps 0 -> 1.
 	float opacity;
+	float inv_view_w;
+	float inv_view_h;
 }
 pc;
 
 void main()
 {
 	vBary = bary;
-	gl_Position = pc.mvp[gl_ViewIndex] * vec4(pos, 1.0);
+	vG1 = grad1;
+	vG2 = grad2;
+	vec4 clip = pc.mvp[gl_ViewIndex] * vec4(pos, 1.0);
+	gl_Position = clip;
+	vProj = vec3(clip.xy / clip.w, 1.0 / clip.w);
 }
