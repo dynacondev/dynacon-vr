@@ -2725,6 +2725,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// (positives-only: caller guarantees !use_depth when AA is on).
 	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth, bool use_aa = false) {
 		use_aa = use_aa and not use_depth and (site.aa_pipe != vk::Pipeline{});
+		use_aa = use_aa and not use_depth and (site.aa_pipe != vk::Pipeline{});
 		std::array<vk::ClearValue, 2> clears{};
 		clears[0].color.float32.fill(0);
 		clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
@@ -3078,7 +3079,13 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// below runs once per level for both eyes (multiview).
 			{
 				section_clock raster_clk(&ms_raster);
-				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed);
+				// TEMP DIAGNOSTIC pairs with the tier-0->2 force above:
+				// engage the AA pipe on the tiered seed raster (positives-only),
+				// otherwise the magnified quarter-res inspection shows binary.
+				// Seed-relative gradient units (default): the ramp spans a
+				// full seed texel so the nearest-magnified lens below shows
+				// the grey staircase directly.
+				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv, *aa_raster_r8_pipeline_mv}, de_seed, has_reversed, !has_reversed);
 			}
 			if (reveal)
 				run_reveal(*down_targets[seed_level - 1].image,

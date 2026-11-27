@@ -123,8 +123,11 @@ public:
 	static int tier_for_feather(float feather_px)
 	{
 		float f = feather_px;
+		// TEMP DIAGNOSTIC (revert after): force hard-edge tier-0 through
+		// the half-res tier-1 path to inspect AA up close (2x runtime
+		// magnification). Shared with the scene so sizing stays in agreement.
 		if (f <= 0)
-			return 0;
+			return 1;
 		if (f > 128.f)
 			f = 128.f;
 		if (f <= 16)
