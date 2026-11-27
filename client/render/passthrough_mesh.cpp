@@ -20,6 +20,7 @@
 
 #include "utils/mapped_file.h"
 #include <array>
+#include <bit>
 #include <cmath>
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
@@ -46,6 +47,31 @@ struct error_category : std::error_category
 	}
 };
 static error_category fastgltf_error_category;
+
+// Epsilon weld (bake-time): collapse bitwise-identical baked positions
+// so duplicated verts from overlapping primitives share one index.
+// Kills exact-duplicate T-junctions and feeds the aspect-capped
+// splitter cleaner input with zero geometry change (near-dups from
+// distinct transforms differ by ulps — far below visibility — and are
+// deliberately left alone). Pre-placement model meters.
+struct weld_key
+{
+	uint32_t x, y, z;
+	bool operator==(const weld_key & o) const
+	{
+		return x == o.x && y == o.y && z == o.z;
+	}
+};
+struct weld_hash
+{
+	size_t operator()(weld_key const & k) const noexcept
+	{
+		size_t h = std::hash<uint32_t>{}(k.x);
+		h ^= std::hash<uint32_t>{}(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		h ^= std::hash<uint32_t>{}(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		return h;
+	}
+};
 
 // Sanity cap: refuse absurd meshes rather than handing them to the runtime
 constexpr size_t max_triangles = 4'000'000;
@@ -126,12 +152,27 @@ void append_primitive(
 
 	const fastgltf::Accessor & position_accessor = asset.accessors.at(position_attr->accessorIndex);
 
-	// Bake node transform into positions
+	// Bake node transform into positions, epsilon-welded: near-coincident
+	// positions share one vertex (remap records the welded index per
+	// position in accessor order).
 	uint32_t base_vertex = out.vertices.size();
 	size_t index_start = out.indices.size();
+	std::vector<uint32_t> weld_remap;
+	weld_remap.reserve(position_accessor.count);
+	std::unordered_map<weld_key, uint32_t, weld_hash> welded;
 	fastgltf::iterateAccessor<glm::vec3>(asset, position_accessor, [&](glm::vec3 position) {
 		glm::vec3 world = glm::vec3(world_transform * glm::vec4(position, 1));
+		weld_key k{std::bit_cast<uint32_t>(world.x), std::bit_cast<uint32_t>(world.y), std::bit_cast<uint32_t>(world.z)};
+		auto it = welded.find(k);
+		if (it != welded.end())
+		{
+			weld_remap.push_back(it->second - base_vertex);
+			return;
+		}
+		uint32_t idx = (uint32_t)out.vertices.size();
 		out.vertices.push_back({world.x, world.y, world.z});
+		welded.emplace(k, idx);
+		weld_remap.push_back(idx - base_vertex);
 	});
 
 	std::vector<uint32_t> indices;
@@ -151,6 +192,17 @@ void append_primitive(
 		out.vertices.resize(base_vertex);
 		return;
 	}
+
+	// Indices address positions in accessor order: remap through the weld.
+	// Also rejects out-of-range values before any vertex dereference.
+	if (!indices.empty() && *std::max_element(indices.begin(), indices.end()) >= weld_remap.size())
+	{
+		spdlog::warn("passthrough_mesh: index out of range, skipping primitive");
+		out.vertices.resize(base_vertex);
+		return;
+	}
+	for (uint32_t & idx : indices)
+		idx = base_vertex + weld_remap[idx];
 
 	if (out.indices.size() + indices.size() > max_triangles * 3)
 		throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
@@ -190,13 +242,28 @@ void append_primitive(
 		float dz = out.vertices[u].z - out.vertices[v].z;
 		return dx * dx + dy * dy + dz * dz;
 	};
+	auto v3 = [&](uint32_t v) {
+		const XrVector3f & p = out.vertices[v];
+		return glm::vec3(p.x, p.y, p.z);
+	};
+	// Longest^2 / 2area (1.155 equilateral, huge for needles).
+	auto aspect_of = [](const glm::vec3 & a, const glm::vec3 & b, const glm::vec3 & c) {
+		glm::vec3 e1 = b - a, e2 = c - a, e3 = c - b;
+		float area2 = glm::length(glm::cross(e1, e2));
+		if (!(area2 > 0))
+			return std::numeric_limits<float>::max();
+		float m = std::max({glm::dot(e1, e1), glm::dot(e2, e2), glm::dot(e3, e3)});
+		return m / area2;
+	};
 	std::vector<std::array<uint32_t, 3>> pending;
 	pending.reserve(indices.size() / 3 + 1);
 	for (size_t i = 0; i < indices.size(); i += 3)
 	{
-		uint32_t a = indices[i] + base_vertex;
-		uint32_t b = indices[i + 1] + base_vertex;
-		uint32_t c = indices[i + 2] + base_vertex;
+		uint32_t a = indices[i];
+		uint32_t b = indices[i + 1];
+		uint32_t c = indices[i + 2];
+		if (a == b || b == c || c == a)
+			continue; // welded-degenerate: zero area, rasterizer-culls anyway
 		if (flip_winding)
 			pending.push_back({a, c, b});
 		else
@@ -219,26 +286,76 @@ void append_primitive(
 		}
 		if (out.indices.size() + (pending.size() + 2) * 3 > max_triangles * 3)
 			throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
-		// Split the longest edge at its midpoint. The halves tile the
-		// parent (bitwise-identical midpoint everywhere: watertight up
-		// to float rounding) with the parent orientation (verified per
-		// edge case).
-		uint32_t e0 = a, e1 = b;
-		if (e_ab >= e_bc && e_ab >= e_ca)
+		// Aspect-capped split: among splits that strictly shrink the max
+		// edge, pick the one minimizing the worst child aspect; tie-break
+		// longest edge. Blind longest-edge splitting preserves needles
+		// (children stay needles); the cap prefers splits that actually
+		// improve shape. The longest edge usually qualifies; tied-max/NaN
+		// fall back to the longest-edge halve below, so progress is
+		// guaranteed. The halves tile the parent (bitwise-identical
+		// scalar midpoint everywhere: watertight up to float rounding)
+		// with the parent orientation (cyclic order preserved).
+		float parent_max = std::max({e_ab, e_bc, e_ca});
+		uint32_t e0 = a, e1 = b, w = c;
 		{
-			e0 = a;
-			e1 = b;
+			float best_worst = std::numeric_limits<float>::max();
+			float best_len = -1.0f;
+			bool have = false;
+			uint32_t eu[3] = {a, b, c};
+			uint32_t ev[3] = {b, c, a};
+			uint32_t ew[3] = {c, a, b};
+			for (int k = 0; k < 3; ++k)
+			{
+				uint32_t u = eu[k], v = ev[k], ow = ew[k];
+				float len = edge_len2(u, v);
+				glm::vec3 pu = v3(u), pv = v3(v), pw = v3(ow);
+				glm::vec3 m = (pu + pv) * 0.5f;
+				auto d2 = [](const glm::vec3 & x, const glm::vec3 & y) {
+					glm::vec3 d = x - y;
+					return glm::dot(d, d);
+				};
+				float cmax = std::max({d2(pu, m), d2(m, pw), d2(pu, pw), d2(m, pv), d2(pv, pw)});
+				if (!(cmax < parent_max))
+					continue; // no progress: longest edge survives
+				float worst = std::max(aspect_of(pu, m, pw), aspect_of(m, pv, pw));
+				if (worst < best_worst || (worst == best_worst && len > best_len))
+				{
+					best_worst = worst;
+					best_len = len;
+					e0 = u;
+					e1 = v;
+					w = ow;
+					have = true;
+				}
+			}
+			if (!have)
+			{
+				// Degenerate-adjacent fallback (NaN-safe): halve the longest.
+				if (e_ab >= e_bc && e_ab >= e_ca)
+				{
+					e0 = a;
+					e1 = b;
+					w = c;
+				}
+				else if (e_bc >= e_ca)
+				{
+					e0 = b;
+					e1 = c;
+					w = a;
+				}
+				else
+				{
+					e0 = c;
+					e1 = a;
+					w = b;
+				}
+			}
 		}
-		else if (e_bc >= e_ca)
-		{
-			e0 = b;
-			e1 = c;
-		}
-		else
-		{
-			e0 = c;
-			e1 = a;
-		}
+		// Midpoint from the selected edge endpoints (identical float ops
+		// everywhere: shared edges stay bitwise-identical). The finite
+		// check doubles as the NaN guard: NaN comparisons select nothing
+		// above, the fallback halves the longest, and a NaN midpoint
+		// skips the primitive here instead of looping to the budget.
 		XrVector3f p0 = out.vertices[e0];
 		XrVector3f p1 = out.vertices[e1];
 		float mx = (p0.x + p1.x) * 0.5f;
@@ -253,21 +370,10 @@ void append_primitive(
 		}
 		out.vertices.push_back({mx, my, mz});
 		uint32_t m = (uint32_t)out.vertices.size() - 1;
-		if (e0 == a && e1 == b)
-		{
-			pending.push_back({a, m, c});
-			pending.push_back({m, b, c});
-		}
-		else if (e0 == b && e1 == c)
-		{
-			pending.push_back({a, b, m});
-			pending.push_back({a, m, c});
-		}
-		else
-		{
-			pending.push_back({a, b, m});
-			pending.push_back({m, b, c});
-		}
+		// Halves (e0,m,w)+(m,e1,w): cyclic reorderings of the verified
+		// per-edge cases, so orientation is preserved by construction.
+		pending.push_back({e0, m, w});
+		pending.push_back({m, e1, w});
 	}
 }
 
