@@ -58,7 +58,14 @@ float smoothcov(vec3 b, vec3 fw)
 void main()
 {
 	// eps keeps smoothstep defined when fwidth is 0 (degenerate UV).
-	vec3 fw = fwidth(vBary) + vec3(1e-4);
+	// Upper clamp at 1.0: on subpixel-dense tessellation adjacent quad
+	// pixels sit in different triangles, so dFdx measures inter-triangle
+	// jumps instead of the gradient and fw explodes — flattening the
+	// ramp into a near-constant ~0.5 that ADD saturates everywhere.
+	// Bary units are self-normalizing per triangle, so capping the ramp
+	// at 1 bary unit restores spatial selectivity (outside offsets read
+	// true 0) while leaving normal triangles bit-identical.
+	vec3 fw = min(fwidth(vBary) + vec3(1e-4), vec3(1.0));
 	// Screen-space barycentric gradients: one pixel of travel.
 	vec3 gx = dFdx(vBary);
 	vec3 gy = dFdy(vBary);
