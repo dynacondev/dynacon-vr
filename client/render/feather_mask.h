@@ -317,9 +317,6 @@ private:
 	// One-shot log state for the AA reversed fallback in record().
 	// Render-thread only (record() records; the async CB only executes).
 	bool aa_rev_logged_ = false;
-	// DIAGNOSTIC SPLIT 3 throttle (revert with the split).
-	// Render-thread only.
-	uint64_t diag_ticks_ = 0;
 
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
@@ -493,11 +490,6 @@ private:
 		vk::DeviceSize aa_staging_size = 0;
 		std::optional<vk::DeviceSize> aa_pending_upload;
 		glm::vec3 aabb_min{0}, aabb_max{0};
-		// DIAGNOSTIC SPLIT 3 (revert with the split): CPU copy for
-		// clip-space replay (guardband/straddle measurement). Filled
-		// in set_mesh, read by the throttled replay in record().
-		std::vector<XrVector3f> diag_verts;
-		std::vector<uint32_t> diag_indices;
 	};
 	std::map<std::string, mesh_buffers> meshes;
 	void flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh);

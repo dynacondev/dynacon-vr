@@ -453,15 +453,17 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .attachmentCount = 1,
 		        .pAttachments = &aa_add_attachment,
 		};
-		// DIAGNOSTIC SPLIT 2 (revert after the run): conservative struct
-		// REMOVED (pNext=null, binary-identical raster state) to test
-		// whether mere presence of the chained struct selects a
-		// different driver raster path. Everything else (cull back,
-		// ADD, 4-offset frag) unchanged: if faces stop disappearing,
-		// the struct presence is the trigger; if they still vanish,
-		// pure pre-clip/guardband mis-cull is the mechanism.
+		// Conservative overestimate, zero extra: emit every touched
+		// pixel (extra=0 is a multiple of the 0.5 granularity, within
+		// the 0.5 maxExtra — probed on Quest 3). Base halo ~0.5px lands
+		// as a soft toe via the smooth coverage (fail-safe).
+		vk::PipelineRasterizationConservativeStateCreateInfoEXT cr_state{
+		        .flags = {},
+		        .conservativeRasterizationMode = vk::ConservativeRasterizationModeEXT::eOverestimate,
+		        .extraPrimitiveOverestimationSize = 0.0f,
+		};
 		vk::PipelineRasterizationStateCreateInfo aa_rasterization = rasterization;
-		aa_rasterization.pNext = nullptr;
+		aa_rasterization.pNext = &cr_state;
 		// Backfaces culled: with ADD-saturate, a behind-surface fragment
 		// covering a rim pixel would sum the silhouette ramp to 1.0
 		// (thin double-rims always coincide). Front-side viewing only —
@@ -530,7 +532,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		aa_pipeline_mv = make_aa_mv_variant(renderpass_mv);
 		aa_raster_r8_pipeline_mv = make_aa_mv_variant(raster_r8_renderpass_mv);
-		spdlog::info("feather AA pipes built (DIAGNOSTIC 2: no CR struct, ADD, backface-culled, no depth)");
+		spdlog::info("feather AA pipes built (explicit bary, conservative overestimate, ADD, backface-culled, no depth)");
 	}
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
@@ -1203,10 +1205,6 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
-	// DIAGNOSTIC SPLIT 3 (revert with the split): CPU copy for the
-	// throttled clip-space replay in raster_silhouette_mv.
-	mesh.diag_verts.assign(soup.vertices.begin(), soup.vertices.end());
-	mesh.diag_indices.assign(soup.indices.begin(), soup.indices.end());
 	// AA de-indexed upload: 3 verts per triangle with per-corner
 	// bary ((1,0,0),(0,1,0),(0,0,1)), drawn non-indexed by the AA pipes.
 	// Same soup, same waitIdle cover above (map-change only).
@@ -2717,82 +2715,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			}
 		}
 		cmd.endRenderPass();
-		// DIAGNOSTIC SPLIT 3 (revert with the split): throttled
-		// clip-space replay of the AA draws. Measures guardband
-		// overflow (|fb| vs 32767) and near-plane straddle (w <= 0)
-		// on the exact verts/MVPs the rasterizer consumed. Render
-		// thread only; ~1 full scan per 180 raster calls per group.
-		if (use_aa and not use_depth and ((diag_ticks_++ % 180) == 0))
-		{
-			float W = (float)e.width, H = (float)e.height;
-			double min_w = 1e30;
-			double max_ax = 0, max_ay = 0, worst_span = 0;
-			size_t n_tris = 0, n_straddle = 0, n_over = 0, worst_tri = 0;
-			std::string worst_mesh;
-			int worst_eye = -1;
-			for (const auto & d: draws)
-			{
-				if (d.reverse)
-					continue;
-				auto mit = meshes.find(d.mesh);
-				if (mit == meshes.end() or mit->second.diag_indices.empty())
-					continue;
-				const auto & dv = mit->second.diag_verts;
-				const auto & di = mit->second.diag_indices;
-				for (int eye = 0; eye < 2; ++eye)
-				{
-					for (size_t t = 0; t + 2 < di.size(); t += 3)
-					{
-						glm::vec4 c[3];
-						bool straddle = false;
-						for (int k = 0; k < 3; ++k)
-						{
-							const XrVector3f & p = dv[di[t + k]];
-							c[k] = d.mvp[eye] * glm::vec4(p.x, p.y, p.z, 1);
-							if (c[k].w < min_w)
-								min_w = c[k].w;
-							if (c[k].w <= 1e-6f)
-								straddle = true;
-						}
-						++n_tris;
-						if (straddle)
-						{
-							++n_straddle;
-							continue;
-						}
-						double tri_span = 0;
-						for (int k = 0; k < 3; ++k)
-						{
-							double xf = (c[k].x / c[k].w * 0.5 + 0.5) * W;
-							double yf = (c[k].y / c[k].w * 0.5 + 0.5) * H;
-							double ax = xf < 0 ? -xf : xf;
-							double ay = yf < 0 ? -yf : yf;
-							if (ax > max_ax)
-								max_ax = ax;
-							if (ay > max_ay)
-								max_ay = ay;
-							if (ax > tri_span)
-								tri_span = ax;
-							if (ay > tri_span)
-								tri_span = ay;
-						}
-						if (tri_span > 32767.0)
-						{
-							++n_over;
-							if (tri_span > worst_span)
-							{
-								worst_span = tri_span;
-								worst_mesh = d.mesh;
-								worst_eye = eye;
-								worst_tri = t / 3;
-							}
-						}
-					}
-				}
-			}
-			spdlog::info("feather AA diag3: tris={} straddle(w<=0)={} over32k={} min_w={:.3g} maxfb=({:.0f},{:.0f}) worst={}/eye{}/tri{} span={:.0f}",
-			             n_tris, n_straddle, n_over, min_w, max_ax, max_ay, worst_mesh, worst_eye, worst_tri, worst_span);
-		}
 	};
 
 
