@@ -66,6 +66,11 @@ void main()
 	// at 1 bary unit restores spatial selectivity (outside offsets read
 	// true 0) while leaving normal triangles bit-identical.
 	vec3 fw = min(fwidth(vBary) + vec3(1e-4), vec3(1.0));
+	// Quantize UP to powers of two: neighbours within 2x snap to the
+	// same rung, so both sides of a shared edge evaluate the same ramp
+	// width and complements sum to exactly 1.0 again. Matching matters
+	// more than per-pixel exactness of fw; sharpness loss is <=2x.
+	fw = exp2(ceil(log2(fw)));
 	// Screen-space barycentric gradients: one pixel of travel.
 	vec3 gx = dFdx(vBary);
 	vec3 gy = dFdy(vBary);
