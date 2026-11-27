@@ -1246,20 +1246,13 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	// legal; max() over duplicates is neutral). Ping-pong parity:
 	// the other set may still be read by a prior in-flight command
 	// buffer (inline fallback while the async CB flies).
-	// 1:1 fast path: every input already at merge res means the
-	// bilinear upscale is an exact copy — sample NEAREST (1 tap, same
-	// values). Any mismatch (tiered half/quarter inputs, unknown
-	// extent) stays LINEAR so the feather band still filters.
-	bool all_fullres = true;
-	for (auto & in: inputs)
-	{
-		if (in.extent.width != extent.width or in.extent.height != extent.height)
-		{
-			all_fullres = false;
-			break;
-		}
-	}
-	vk::Sampler merge_sampler = all_fullres ? *sampler_nearest : *sampler;
+	// AA spike (Nov 2026): always LINEAR. The NEAREST 1:1 fast path is
+	// dropped so analytic-coverage grey edge pixels filter on upscale;
+	// flat interiors sample identically either way (all 4 taps agree).
+	// extent (the merge size) is currently implied by the views; kept for
+	// API stability with record_finish.
+	(void)extent;
+	vk::Sampler merge_sampler = *sampler;
 	set_parity = !set_parity;
 	vk::DescriptorSet set = *descriptor_sets[set_parity ? 1 : 0];
 	vk::DescriptorImageInfo infos[max_inputs];

@@ -24,6 +24,7 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <map>
 #include <spdlog/spdlog.h>
@@ -62,6 +63,16 @@ struct silhouette_mv_push
 };
 static_assert(sizeof(silhouette_mv_push) == 132);
 static_assert(sizeof(silhouette_mv_push) <= 256);
+
+// AA-spike vertex (mask_aa_mv.vert): position + explicit per-corner
+// barycentric. Uploaded de-indexed (3 verts/tri); stride shared with the
+// AA pipeline vertex input below.
+struct aa_vert
+{
+	XrVector3f pos;
+	float bary[3];
+};
+static_assert(sizeof(aa_vert) == sizeof(XrVector3f) + 3 * sizeof(float));
 
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
@@ -398,6 +409,73 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	raster_r8_pipeline_mv = make_raster_mv_variant(raster_r8_renderpass_mv, blend, nullptr);
 	raster_r8_depth_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, blend, &depth_write);
 	raster_r8_reverse_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, min_blend, &depth_test);
+
+	// AA-spike pipes (explicit-bary mask_aa_mv.vert/frag, REPLACE, no
+	// depth): same rasterization/multisample/blend/dynamic state and the
+	// same silhouette_mv_layout (push-only) as the binary pipes; only the
+	// vertex input (pos+bary) and shader modules differ. Tier-0 RGBA and
+	// tier-1 R8 variants; the shared pipeline_cache covers the compiles.
+	{
+		vk::VertexInputBindingDescription aa_binding{
+		        .binding = 0,
+		        .stride = sizeof(aa_vert),
+		        .inputRate = vk::VertexInputRate::eVertex,
+		};
+		vk::VertexInputAttributeDescription aa_attributes[2] = {
+		        {
+		                .location = 0,
+		                .binding = 0,
+		                .format = vk::Format::eR32G32B32Sfloat,
+		                .offset = offsetof(aa_vert, pos),
+		        },
+		        {
+		                .location = 1,
+		                .binding = 0,
+		                .format = vk::Format::eR32G32B32Sfloat,
+		                .offset = offsetof(aa_vert, bary),
+		        },
+		};
+		vk::PipelineVertexInputStateCreateInfo aa_vertex_input{
+		        .vertexBindingDescriptionCount = 1,
+		        .pVertexBindingDescriptions = &aa_binding,
+		        .vertexAttributeDescriptionCount = 2,
+		        .pVertexAttributeDescriptions = aa_attributes,
+		};
+		auto aa_vert_mod = load_shader(device, "mask_aa_mv.vert");
+		auto aa_frag_mod = load_shader(device, "mask_aa_mv.frag");
+		vk::PipelineShaderStageCreateInfo aa_stages[2] = {
+		        {
+		                .stage = vk::ShaderStageFlagBits::eVertex,
+		                .module = **aa_vert_mod,
+		                .pName = "main",
+		        },
+		        {
+		                .stage = vk::ShaderStageFlagBits::eFragment,
+		                .module = **aa_frag_mod,
+		                .pName = "main",
+		        },
+		};
+		auto make_aa_mv_variant = [&](vk::raii::RenderPass & rp) {
+			vk::GraphicsPipelineCreateInfo info{
+			        .stageCount = 2,
+			        .pStages = aa_stages,
+			        .pVertexInputState = &aa_vertex_input,
+			        .pInputAssemblyState = &input_assembly,
+			        .pViewportState = &viewport_state,
+			        .pRasterizationState = &rasterization,
+			        .pMultisampleState = &multisample,
+			        .pDepthStencilState = nullptr,
+			        .pColorBlendState = &blend,
+			        .pDynamicState = &dynamic,
+			        .layout = *silhouette_mv_layout,
+			        .renderPass = *rp,
+			};
+			return vk::raii::Pipeline(device, *pipeline_cache(device), info);
+		};
+		aa_pipeline_mv = make_aa_mv_variant(renderpass_mv);
+		aa_raster_r8_pipeline_mv = make_aa_mv_variant(raster_r8_renderpass_mv);
+		spdlog::info("feather AA pipes built (explicit bary, REPLACE, no depth)");
+	}
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
 	// so no clear and no prior contents needed.
@@ -1069,6 +1147,44 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
+	// AA-spike de-indexed upload: 3 verts per triangle with per-corner
+	// bary ((1,0,0),(0,1,0),(0,0,1)), drawn non-indexed by the AA pipes.
+	// Same soup, same waitIdle cover above (map-change only).
+	{
+		size_t tri_count = soup.indices.size() / 3;
+		std::vector<aa_vert> aa;
+		aa.reserve(tri_count * 3);
+		for (size_t t = 0; t < tri_count; ++t)
+		{
+			for (int k = 0; k < 3; ++k)
+			{
+				aa_vert v{};
+				v.pos = soup.vertices[soup.indices[t * 3 + k]];
+				v.bary[0] = (k == 0) ? 1.f : 0.f;
+				v.bary[1] = (k == 1) ? 1.f : 0.f;
+				v.bary[2] = (k == 2) ? 1.f : 0.f;
+				aa.push_back(v);
+			}
+		}
+		vk::DeviceSize aa_bytes = aa.size() * sizeof(aa_vert);
+		if (mesh.aa_staging_size < aa_bytes)
+		{
+			std::tie(mesh.aa_staging_buffer, mesh.aa_staging_memory) = make_buffer(
+			        aa_bytes,
+			        vk::BufferUsageFlagBits::eTransferSrc,
+			        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+			mesh.aa_staging_size = aa_bytes;
+		}
+		void * aa_mapped = mesh.aa_staging_memory.mapMemory(0, aa_bytes);
+		std::memcpy(aa_mapped, aa.data(), aa_bytes);
+		mesh.aa_staging_memory.unmapMemory();
+		std::tie(mesh.aa_vertex_buffer, mesh.aa_vertex_memory) = make_buffer(
+		        aa_bytes,
+		        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+		        vk::MemoryPropertyFlagBits::eDeviceLocal);
+		mesh.aa_pending_upload = aa_bytes;
+		mesh.aa_vertex_count = (uint32_t)aa.size();
+	}
 	// Model-space bounds for the stream-side frustum skip (upload-time
 	// only; per-frame tests transform the 8 corners by the draw MVP).
 	glm::vec3 lo{soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z};
@@ -2049,50 +2165,78 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 
 void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buffers & mesh)
 {
-	if (not mesh.pending_upload)
-		return;
-	auto [vertex_bytes, index_bytes] = *mesh.pending_upload;
-	mesh.pending_upload.reset();
+	if (mesh.pending_upload)
+	{
+		auto [vertex_bytes, index_bytes] = *mesh.pending_upload;
+		mesh.pending_upload.reset();
 
-	vk::BufferCopy vertex_copy{
-	        .srcOffset = 0,
-	        .dstOffset = 0,
-	        .size = vertex_bytes,
-	};
-	cmd.copyBuffer(*mesh.staging_buffer, *mesh.vertex_buffer, vertex_copy);
-	vk::BufferCopy index_copy{
-	        .srcOffset = vertex_bytes,
-	        .dstOffset = 0,
-	        .size = index_bytes,
-	};
-	cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
+		vk::BufferCopy vertex_copy{
+		        .srcOffset = 0,
+		        .dstOffset = 0,
+		        .size = vertex_bytes,
+		};
+		cmd.copyBuffer(*mesh.staging_buffer, *mesh.vertex_buffer, vertex_copy);
+		vk::BufferCopy index_copy{
+		        .srcOffset = vertex_bytes,
+		        .dstOffset = 0,
+		        .size = index_bytes,
+		};
+		cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
 
-	std::vector<vk::BufferMemoryBarrier> barriers = {
-	        vk::BufferMemoryBarrier{
-	                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-	                .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
-	                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .buffer = *mesh.vertex_buffer,
-	                .offset = 0,
-	                .size = vertex_bytes,
-	        },
-	        vk::BufferMemoryBarrier{
-	                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-	                .dstAccessMask = vk::AccessFlagBits::eIndexRead,
-	                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-	                .buffer = *mesh.index_buffer,
-	                .offset = 0,
-	                .size = index_bytes,
-	        },
-	};
-	cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-	                    vk::PipelineStageFlagBits::eVertexInput,
-	                    {},
-	                    {},
-	                    barriers,
-	                    {});
+		std::vector<vk::BufferMemoryBarrier> barriers = {
+		        vk::BufferMemoryBarrier{
+		                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		                .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
+		                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                .buffer = *mesh.vertex_buffer,
+		                .offset = 0,
+		                .size = vertex_bytes,
+		        },
+		        vk::BufferMemoryBarrier{
+		                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		                .dstAccessMask = vk::AccessFlagBits::eIndexRead,
+		                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                .buffer = *mesh.index_buffer,
+		                .offset = 0,
+		                .size = index_bytes,
+		        },
+		};
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                    vk::PipelineStageFlagBits::eVertexInput,
+		                    {},
+		                    {},
+		                    barriers,
+		                    {});
+	}
+	// AA-spike de-indexed upload (vertex-only, same discipline).
+	if (mesh.aa_pending_upload)
+	{
+		vk::DeviceSize aa_bytes = *mesh.aa_pending_upload;
+		mesh.aa_pending_upload.reset();
+		vk::BufferCopy aa_copy{
+		        .srcOffset = 0,
+		        .dstOffset = 0,
+		        .size = aa_bytes,
+		};
+		cmd.copyBuffer(*mesh.aa_staging_buffer, *mesh.aa_vertex_buffer, aa_copy);
+		vk::BufferMemoryBarrier aa_barrier{
+		        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
+		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .buffer = *mesh.aa_vertex_buffer,
+		        .offset = 0,
+		        .size = aa_bytes,
+		};
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                    vk::PipelineStageFlagBits::eVertexInput,
+		                    {},
+		                    {},
+		                    aa_barrier,
+		                    {});
+	}
 }
 
 void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set, bool nearest,
@@ -2137,6 +2281,19 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// 0), so clear-only and let the cutout punch below run if armed. Depth
 	// engages exactly when a reversed draw exists; positive-only calls
 	// rasterize as usual.
+	// AA spike (Nov 2026): analytic coverage on positives-only tier-0
+	// and tier-1 raster. Reversed groups stay on the binary mask_mv path
+	// (cuts untested with grey coverage); tiered/hidden paths below are
+	// untouched. No depth companions: REPLACE, no depth, same as binary.
+	if (has_reversed)
+	{
+		static bool aa_rev_logged = false;
+		if (not aa_rev_logged)
+		{
+			spdlog::info("feather AA skipped (reversed draws present): binary raster");
+			aa_rev_logged = true;
+		}
+	}
 	auto fill_stats = [&] {
 		if (cpu_stats)
 		{
@@ -2428,11 +2585,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		vk::Pipeline rev_pipe;
 		vk::RenderPass rp;
 		vk::RenderPass depth_rp;
+		// AA-spike pipe (mask_aa_mv, REPLACE, no depth) for the color-only
+		// FB above. Raw handle like the rest; null = binary only.
+		vk::Pipeline aa_pipe;
 	};
 	// Multiview silhouette raster: one draw broadcasts to both layers via
 	// mask_mv.vert (gl_ViewIndex selects the MVP). Same polarity passes as
 	// the depth path, same clears; one begin and one pipe bind per pass.
-	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth) {
+	// use_aa selects the analytic-coverage AA pipe + de-indexed draws
+	// (positives-only: caller guarantees !use_depth when AA is on).
+	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth, bool use_aa = false) {
+		use_aa = use_aa and not use_depth and (site.aa_pipe != vk::Pipeline{});
 		std::array<vk::ClearValue, 2> clears{};
 		clears[0].color.float32.fill(0);
 		clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
@@ -2448,20 +2611,29 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		for (int pass = 0; pass < (use_depth ? 2 : 1); ++pass)
 		{
 			bool rev_pass = use_depth && pass == 1;
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (use_depth ? site.depth_pipe : site.pipe));
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (use_aa ? site.aa_pipe : (use_depth ? site.depth_pipe : site.pipe)));
 			for (const auto & d: draws)
 			{
 				if (d.reverse != rev_pass)
 					continue;
 				auto mit = meshes.find(d.mesh);
-				if (mit == meshes.end() or mit->second.index_count == 0)
+				if (mit == meshes.end() or mit->second.index_count == 0 or
+				    (use_aa and mit->second.aa_vertex_count == 0))
 					continue;
-				cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-				cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
 				float v = d.reverse ? 1.f - d.opacity : d.opacity;
 				cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 				                                  silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = v});
-				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+				if (use_aa and mit->second.aa_vertex_count > 0)
+				{
+					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.aa_vertex_buffer, (vk::DeviceSize)0);
+					cmd.draw(mit->second.aa_vertex_count, 1, 0, 0);
+				}
+				else
+				{
+					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+					cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
+				}
 				++n_draws;
 			}
 		}
@@ -2641,7 +2813,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// Hard edge: rasterize silhouettes straight into the swapchain
 			// image. Exact, one multiview raster pass, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
-			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed);
+			// AA spike: analytic coverage when positives-only.
+			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv, *aa_pipeline_mv}, out_extent, has_reversed, !has_reversed);
 			if (reveal)
 				run_reveal(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *reveal_rgba_pipeline, out_extent);
 		}
@@ -2663,7 +2836,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		int erode = erode_radius(spread, 2.f);
 		{
 			section_clock raster_clk(&ms_raster);
-			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed);
+			// AA spike: analytic coverage when positives-only (grey input
+			// feeds the erode/blur chain linearly, like opacity fade).
+			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv, *aa_raster_r8_pipeline_mv}, half_extent, has_reversed, !has_reversed);
 		}
 		if (reveal)
 			run_reveal(*target_a.image, reveal_fb_for(*target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *reveal_r8_pipeline, half_extent);

@@ -86,10 +86,10 @@ public:
 	// One merge input: a just-recorded contributor image plus its
 	// multiview array view (both layers, BORROWED from the owning
 	// feather renderer — same-frame use only, never cached here).
-	// extent is the contributor image size: when every input matches
-	// the merge extent the bilinear upscale is an exact 1:1 copy, so
-	// the merge takes the NEAREST path (1 tap instead of 4). Zero
-	// extent (unknown) forces the safe LINEAR path.
+	// extent is the contributor image size (kept for API stability;
+	// currently implied by the views). AA spike: the merge always takes
+	// the LINEAR path (4 taps) so analytic-coverage grey edge pixels
+	// filter; the NEAREST 1:1 fast path is dropped.
 	// All contributors end COLOR_ATTACHMENT_OPTIMAL and transition to
 	// SHADER_READ_ONLY for the merge; every next record re-begins
 	// UNDEFINED+CLEAR, so no transition back is needed.

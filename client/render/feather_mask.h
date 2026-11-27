@@ -299,6 +299,12 @@ private:
 	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
+	// AA-spike pipes (explicit-bary mask_aa_mv.vert/frag, REPLACE, no
+	// depth): RGBA for tier-0 direct raster, R8 for tier-1 half-res
+	// raster. Positives-only groups; reversed groups stay binary.
+	// Same silhouette_mv_layout (push-only) as the binary pipes.
+	vk::raii::Pipeline aa_pipeline_mv{nullptr};
+	vk::raii::Pipeline aa_raster_r8_pipeline_mv{nullptr};
 
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
@@ -459,6 +465,17 @@ private:
 			vk::DeviceSize index_bytes = 0;
 		};
 		std::optional<upload_sizes> pending_upload;
+		// AA-spike de-indexed upload (3 verts per triangle + per-corner
+		// bary): expanded at set_mesh time from the same soup, drawn
+		// non-indexed. Dies with the entry (map-drop / reset_targets
+		// discipline identical to the indexed buffers above).
+		vk::raii::Buffer aa_vertex_buffer{nullptr};
+		vk::raii::DeviceMemory aa_vertex_memory{nullptr};
+		uint32_t aa_vertex_count = 0;
+		vk::raii::Buffer aa_staging_buffer{nullptr};
+		vk::raii::DeviceMemory aa_staging_memory{nullptr};
+		vk::DeviceSize aa_staging_size = 0;
+		std::optional<vk::DeviceSize> aa_pending_upload;
 		glm::vec3 aabb_min{0}, aabb_max{0};
 	};
 	std::map<std::string, mesh_buffers> meshes;
