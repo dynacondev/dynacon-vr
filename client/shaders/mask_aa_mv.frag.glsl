@@ -107,7 +107,12 @@ void main()
 	vec2 g0s = -(g1s + g2s);
 	vec3 den = max(vec3(length(g1s), length(g2s), length(g0s)), vec3(1e-6));
 	float b0 = 1.0 - vBary.x - vBary.y;
-	vec3 q0 = vec3(vBary.x, vBary.y, b0) / den;
+	// NOTE the component order: vBary.x is B0 (1 at p0) while vG1 is
+	// grad-B1 (1 at p1), so numerators are (y, b0, x) to pair each
+	// bary with its OWN gradient magnitude. min() is order-insensitive
+	// but this division is not — rotating it reintroduces
+	// height-dependent seams (verified numerically: -12% dips).
+	vec3 q0 = vec3(vBary.y, b0, vBary.x) / den;
 	vec2 e1 = g1s / den.x;
 	vec2 e2 = g2s / den.y;
 	vec2 e0 = g0s / den.z;
