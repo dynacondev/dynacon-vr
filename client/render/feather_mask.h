@@ -301,14 +301,17 @@ private:
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
 	// AA pipes (explicit-bary mask_aa_mv.vert/frag, conservative
-	// overestimate, ADD-saturate, no depth): RGBA for tier-0 direct
-	// raster, R8 for tier-1 half-res raster. Positives-only groups;
-	// reversed groups stay binary. Overestimate emits the neighbour
-	// fragment at shared-edge pixels; 2x2 ordered-grid smooth coverage
-	// ADD-sums interior straddles to 1.0 (silhouette stays single-sided).
-	// Same silhouette_mv_layout (push-only) as the binary pipes. Null
-	// when the device lacks VK_EXT_conservative_rasterization (record
-	// falls back to binary).
+	// overestimate, ADD-saturate, backface-culled, no depth): RGBA for
+	// tier-0 direct raster, R8 for tier-1 half-res raster.
+	// Positives-only groups; reversed groups stay binary. Overestimate
+	// emits the neighbour fragment at shared-edge pixels; 2x2
+	// ordered-grid smooth coverage ADD-sums interior straddles to 1.0
+	// (silhouette stays single-sided). Backfaces culled: a
+	// behind-surface fragment covering a rim pixel would otherwise sum
+	// the ramp to 1.0, so windows are front-side only (both-sides needs
+	// the stencil two-pass follow-up). Same silhouette_mv_layout
+	// (push-only) as the binary pipes. Null when the device lacks
+	// VK_EXT_conservative_rasterization (record falls back to binary).
 	vk::raii::Pipeline aa_pipeline_mv{nullptr};
 	vk::raii::Pipeline aa_raster_r8_pipeline_mv{nullptr};
 	// One-shot log state for the AA reversed fallback in record().

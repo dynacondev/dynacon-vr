@@ -28,7 +28,9 @@
 // ONE, saturated by the UNORM store) sums interior straddles to 1.0,
 // while a lone silhouette fragment keeps its smooth single-sided ramp —
 // continuous in subpixel phase, no quantization steps. No depth (order
-// independent, both-sides safe); reversed cuts stay binary MIN.
+// independent); backfaces are culled at rasterizer level (front-side
+// viewing only), so behind-geometry can never saturate the ramp.
+// Reversed cuts stay binary MIN.
 // Push block byte-identical to mask_mv (132B). View-agnostic (no
 // gl_ViewIndex use), so no multiview extension is required here — the
 // vertex stage selects the eye.

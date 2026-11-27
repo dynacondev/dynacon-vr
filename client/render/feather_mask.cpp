@@ -464,6 +464,16 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		vk::PipelineRasterizationStateCreateInfo aa_rasterization = rasterization;
 		aa_rasterization.pNext = &cr_state;
+		// Backfaces culled: with ADD-saturate, a behind-surface fragment
+		// covering a rim pixel would sum the silhouette ramp to 1.0
+		// (thin double-rims always coincide). Front-side viewing only —
+		// windows are invisible from behind; both-sides needs the
+		// stencil two-pass follow-up, not depth (order-dependent).
+		// Winding follows the shared convention (CCW front); soups
+		// with mirrored (winding-flipped) nodes would lose triangles
+		// here while the binary path still shows them — device A/B
+		// against binary coverage decides.
+		aa_rasterization.cullMode = vk::CullModeFlagBits::eBack;
 		vk::VertexInputBindingDescription aa_binding{
 		        .binding = 0,
 		        .stride = sizeof(aa_vert),
@@ -522,7 +532,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		aa_pipeline_mv = make_aa_mv_variant(renderpass_mv);
 		aa_raster_r8_pipeline_mv = make_aa_mv_variant(raster_r8_renderpass_mv);
-		spdlog::info("feather AA pipes built (explicit bary, conservative overestimate, ADD, no depth)");
+		spdlog::info("feather AA pipes built (explicit bary, conservative overestimate, ADD, backface-culled, no depth)");
 	}
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
