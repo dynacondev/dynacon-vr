@@ -20,10 +20,13 @@
 
 // AA twin of mask_mv.frag: analytic edge coverage from the explicit
 // barycentric varying, evaluated on a 2x2 ordered subpixel grid (+-0.25px)
-// and averaged. The ramp is edge-centered — smoothstep(-0.5*fw, +0.5*fw)
-// is point-symmetric, so watertight neighbours' complements sum to exactly
-// 1.0 at every tap (a one-sided 0..fw ramp would sum to ~0 at the edge
-// center instead). The rasterizer runs conservative-overestimate, so the
+// and averaged. The ramp is evaluated in pixel units (bary divided by
+// its screen-space gradient magnitude: signed pixel-distance to each
+// edge), edge-centered smoothstep(-0.5, +0.5) — point-symmetric, so
+// watertight neighbours' complements sum to exactly 1.0 at every tap
+// regardless of triangle heights (provided each 2x2 quad is covered
+// by a single triangle; subpixel-dense quads fall back per the note
+// below). The rasterizer runs conservative-overestimate, so the
 // neighbour across a shared edge shades this pixel too; ADD (blend ONE,
 // ONE, saturated by the UNORM store) sums interior straddles to 1.0,
 // while a lone silhouette fragment keeps its smooth single-sided ramp —
@@ -45,40 +48,39 @@ pc;
 
 layout(location = 0) out vec4 out_color;
 
-float smoothcov(vec3 b, vec3 fw)
+float smoothcov(vec3 q)
 {
-	// Edge-centered ramp: point-symmetric, so complements across a
-	// shared edge sum to exactly 1.0. Half-width 0.5*fw keeps the 1px
-	// ramp (silhouette reaches 1.0 half a pixel inside, 0 half a pixel
-	// outside — a soft outer toe, fail-safe).
-	vec3 a3 = smoothstep(-0.5 * fw, 0.5 * fw, b);
+	// Pixel-unit edge distances: the uniform 1px ramp reaches 1.0 half
+	// a pixel inside each edge, 0 half a pixel outside (silhouette
+	// keeps a smooth single-sided ramp with a soft outer toe,
+	// fail-safe). Under quad/primitive mixing (subpixel-dense quads)
+	// den is arbitrary: overestimated widths flatten toward 0.5 that
+	// ADD whitens; underestimated widths go binary but still complement
+	// by sign; lone dense silhouettes may alias ~0.5px.
+	vec3 a3 = smoothstep(vec3(-0.5), vec3(0.5), q);
 	return min(min(a3.x, a3.y), a3.z);
 }
 
 void main()
 {
-	// eps keeps smoothstep defined when fwidth is 0 (degenerate UV).
-	// Upper clamp at 1.0: on subpixel-dense tessellation adjacent quad
-	// pixels sit in different triangles, so dFdx measures inter-triangle
-	// jumps instead of the gradient and fw explodes — flattening the
-	// ramp into a near-constant ~0.5 that ADD saturates everywhere.
-	// Bary units are self-normalizing per triangle, so capping the ramp
-	// at 1 bary unit restores spatial selectivity (outside offsets read
-	// true 0) while leaving normal triangles bit-identical.
-	vec3 fw = min(fwidth(vBary) + vec3(1e-4), vec3(1.0));
-	// Quantize UP to powers of two: neighbours within 2x snap to the
-	// same rung, so both sides of a shared edge evaluate the same ramp
-	// width and complements sum to exactly 1.0 again. Matching matters
-	// more than per-pixel exactness of fw; sharpness loss is <=2x.
-	fw = exp2(ceil(log2(fw)));
 	// Screen-space barycentric gradients: one pixel of travel.
 	vec3 gx = dFdx(vBary);
 	vec3 gy = dFdy(vBary);
-	vec3 gp = gx + gy;
-	vec3 gm = gx - gy;
-	float cov = smoothcov(vBary - 0.25 * gp, fw)
-	          + smoothcov(vBary + 0.25 * gm, fw)
-	          + smoothcov(vBary - 0.25 * gm, fw)
-	          + smoothcov(vBary + 0.25 * gp, fw);
+	// Per-edge gradient magnitude; q = bary/magnitude is the signed
+	// pixel-distance to that edge. The 1e-6 floor only keeps the divide
+	// defined for degenerate (zero-gradient, i.e. zero-area: a linear
+	// bary constant over nonzero area forces all verts onto one line)
+	// input, which the rasterizer culls — it is NOT fail-safe-white:
+	// constant corner bary yields 0.5 gray, an outside fringe yields 0.
+	// NaN bary (singular plane solve, driver-dependent) propagates
+	// unsanitized, as in the previous revisions.
+	vec3 den = max(vec3(length(vec2(gx.x, gy.x)), length(vec2(gx.y, gy.y)), length(vec2(gx.z, gy.z))), vec3(1e-6));
+	vec3 gpi = (gx + gy) / den;
+	vec3 gmi = (gx - gy) / den;
+	vec3 q0 = vBary / den;
+	float cov = smoothcov(q0 - 0.25 * gpi)
+	          + smoothcov(q0 + 0.25 * gmi)
+	          + smoothcov(q0 - 0.25 * gmi)
+	          + smoothcov(q0 + 0.25 * gpi);
 	out_color = vec4(pc.opacity * cov * 0.25);
 }
