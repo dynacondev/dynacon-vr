@@ -453,13 +453,15 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .attachmentCount = 1,
 		        .pAttachments = &aa_add_attachment,
 		};
-		// Conservative overestimate, zero extra: emit every touched
-		// pixel (extra=0 is a multiple of the 0.5 granularity, within
-		// the 0.5 maxExtra — probed on Quest 3). Base halo ~0.5px lands
-		// as a soft toe via the smooth coverage (fail-safe).
+		// DIAGNOSTIC SPLIT (revert after the run): conservative
+		// rasterization DISABLED to separate a CR-path cull quirk from
+		// pure cull determination on half-on-screen grazing triangles.
+		// Everything else (cull back, ADD, 4-offset frag) unchanged: if
+		// faces stop disappearing, the quirk needs CR+cull+clip
+		// together; if they still vanish, CR is innocent.
 		vk::PipelineRasterizationConservativeStateCreateInfoEXT cr_state{
 		        .flags = {},
-		        .conservativeRasterizationMode = vk::ConservativeRasterizationModeEXT::eOverestimate,
+		        .conservativeRasterizationMode = vk::ConservativeRasterizationModeEXT::eDisabled,
 		        .extraPrimitiveOverestimationSize = 0.0f,
 		};
 		vk::PipelineRasterizationStateCreateInfo aa_rasterization = rasterization;
@@ -532,7 +534,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		aa_pipeline_mv = make_aa_mv_variant(renderpass_mv);
 		aa_raster_r8_pipeline_mv = make_aa_mv_variant(raster_r8_renderpass_mv);
-		spdlog::info("feather AA pipes built (explicit bary, conservative overestimate, ADD, backface-culled, no depth)");
+		spdlog::info("feather AA pipes built (DIAGNOSTIC: conservative DISABLED, ADD, backface-culled, no depth)");
 	}
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
