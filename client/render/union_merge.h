@@ -23,8 +23,9 @@
 // Quest 3), while each feather group / the debug cutout group / the
 // hidden group used to submit its own UNPREMULTIPLIED_ALPHA layer and
 // union them with REPLACE-then-ADD dst-alpha blending. This pass
-// MAX-combines every active contributor into a single full-res image
-// (any-mask-reveals-wins), submitted once with REPLACE.
+// MAX-combines every active contributor into a single image at the
+// config-max contributor res (full/half/quarter — the runtime upscales
+// the one submitted layer), submitted once with REPLACE.
 //
 // MAX preserves the safety theorems: hidden-wins-reversed (hidden only
 // adds coverage) and over-reveal (max >= every input). It differs from
@@ -128,8 +129,8 @@ public:
 	// the wire). render_wh is the warp grid size (requested render
 	// eye size); packed_wh is the per-eye packed size (from the
 	// decoded SBS extent). The CPU expands runs to a direct
-	// packed-index map per full-res merge pixel (merge->render scale
-	// baked in) into the SSBO every verdict frame.
+	// packed-index map per half-merge-res loop pixel (merge->render
+	// scale baked in) into the SSBO every verdict frame.
 	struct virt_input
 	{
 		vk::ImageView view = nullptr;
@@ -150,8 +151,8 @@ public:
 	static void warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format);
 
 	// (Re)create swapchain + targets + pipeline for format/size
-	// (full mask working res). waitIdle inside on rebuild; no-op
-	// when unchanged. Returns true when rebuilt.
+	// (config-max merge res: full/half/quarter). waitIdle inside on
+	// rebuild; no-op when unchanged. Returns true when rebuilt.
 	bool ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h);
 
 	bool ready() const
@@ -168,7 +169,7 @@ public:
 	void release();
 
 	// Record the MAX merge inputs: validate (1..max_inputs, valid
-	// borrowed views; empty, oversized or null-view returns false) and
+	// borrowed views; empty or null-view returns false) and
 	// write the merge descriptor set (contributor images cycle
 	// independently; two sets ping-pong by call parity so an
 	// inline-fallback record never rewrites the set a still-flight
@@ -379,7 +380,7 @@ private:
 		vk::raii::Framebuffer framebuffer{nullptr};
 	};
 	layer_target layer_;
-	// Owned merged target (swapchain format, full merge res): record()
+	// Owned merged target (swapchain format, config-max merge res): record()
 	// MAXes contributors here instead of the submit image, so the
 	// verdict apply has a stable input.
 	layer_target merged_;
@@ -387,7 +388,8 @@ private:
 	// compare output, upsampled 2x by the apply (LINEAR tent filter:
 	// smooth ~2px reveal ramp, flat areas bit-identical).
 	layer_target verdict_;
-	// Full merge res (== extent_): merged target + submit image.
+	// Merge res (== extent_, config-max: full/half/quarter): merged
+	// target + submit image.
 	vk::Extent2D layer_extent_{0, 0};
 	// Uniform half working res (opt #U): the layer raster + verdict
 	// loop + verdict target all run here (quarter pixels). The layer

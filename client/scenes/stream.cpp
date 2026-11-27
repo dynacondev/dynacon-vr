@@ -2185,9 +2185,79 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// per-group): created once here so the layer mesh sync,
 				// record_base and the merge below all share it. ensure()
 				// is idempotent (no-op when size/format unchanged).
+				// Merge size follows the config max, not visibility: the
+				// highest res any configured contributor needs (tier-0
+				// full, tier-1 half, tiered/hidden quarter), so placement
+				// flaps never resize (waitIdle'd rebuild). The runtime
+				// upscales the single merged layer on submit. Layer,
+				// verdict, copy and dilate all derive from the merge size
+				// (half), so their ratios are preserved at any size.
 				if (not merge_renderer)
 					merge_renderer = std::make_unique<union_merge_renderer>(device, physical_device);
-				merge_renderer->ensure(instance, session, swapchain.format(), mw, mh);
+				int merge_w = 0, merge_h = 0, merge_tier = 0;
+				for (auto & [oid, ost]: passthrough_objects)
+				{
+					(void)oid;
+					int cw = 0, ch = 0, ctier = 0;
+					if (ost.def.type == "3d-passthrough" or ost.def.type == "3d-depth-passthrough")
+					{
+						ctier = feather_mask_renderer::tier_for_feather(ost.def.feather_px);
+						if (ctier == 0)
+						{
+							cw = mw;
+							ch = mh;
+						}
+						else if (ctier == 1)
+						{
+							cw = hw;
+							ch = hh;
+						}
+						else
+						{
+							cw = qw;
+							ch = qh;
+						}
+					}
+					else if (ost.def.type == "3d-passthrough-hidden")
+					{
+						ctier = 2;
+						cw = qw;
+						ch = qh;
+					}
+					// Reversed/boundary claim no group: ignored for sizing.
+					// Debug/veil/fullscreen carriers are not config: a
+					// full-res debug input into a smaller merge filters
+					// through the merge LINEAR (accepted).
+					if (cw * ch > merge_w * merge_h)
+					{
+						merge_w = cw;
+						merge_h = ch;
+						merge_tier = ctier;
+					}
+				}
+				if (merge_w <= 0 or merge_h <= 0)
+				{
+					merge_w = mw;
+					merge_h = mh;
+				}
+				// Quarter merge quantizes binary edges (hidden silhouette,
+				// tier-0-unaware debug cutouts) at quarter res: up to ~2
+				// full-px edge placement error after the runtime upscale.
+				// Accepted for alert-grade layers (uncapped by design);
+				// confirm the hidden edge on device after retunes.
+				// Dilate is in copy texels (merge/2): the same slider value
+				// covers more world at smaller merges (conservative —
+				// wider exclusion — so fail-closed; retune per config).
+				{
+					static int last_merge_w = 0, last_merge_h = 0;
+					if (merge_w != last_merge_w or merge_h != last_merge_h)
+					{
+						last_merge_w = merge_w;
+						last_merge_h = merge_h;
+						spdlog::info("Union merge size: {}x{} (config-max tier {}, full {}x{})", merge_w, merge_h, merge_tier, mw, mh);
+					}
+				}
+				merge_renderer->ensure(instance, session, swapchain.format(), merge_w, merge_h);
 				// Marker window cutouts: raw pose of every live vote,
 				// expanded by the debug window. Fully manual path (no blur):
 				// the punch below is hard-edged by construction. Fills
@@ -3466,8 +3536,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				}
 				// Merge: MAX-combine every active contributor
 				// (hidden first, then feather groups in map order, then
-				// debug) into ONE full-res image, submitted once with
-				// REPLACE below.
+				// debug) into ONE image at config-max res, submitted once
+				// with REPLACE below.
 				// merge_this_frame is evaluated HERE (contributor activity
 				// time) and read back at submit — never recomputed there, so
 				// record and submit cannot disagree. The GPU bracket
@@ -3621,7 +3691,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 									bool finished = false;
 									if (merge_idx >= 0)
 									{
-										vk::Extent2D merge_ext{(uint32_t)mw, (uint32_t)mh};
+										// Merge size is the config-max picked at ensure()
+										// above (not full mw/mh): read the live
+										// swapchain so record/record_finish agree
+										// with layer_extent_ exactly.
+										vk::Extent2D merge_ext{(uint32_t)merge_renderer->swapchain().width(), (uint32_t)merge_renderer->swapchain().height()};
 										// Pairing decision FIRST: the verdict runs ahead
 										// of the fold in record_verdict(), so the same
 										// virt drives record_verdict() and record_finish()

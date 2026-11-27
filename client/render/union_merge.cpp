@@ -207,7 +207,8 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		targets.back().view = vk::raii::ImageView(*device, iv_info);
 	}
 	// Owned targets (not swapchain): layer + verdict at uniform half
-	// res (opt #U), merged at full merge res. Rebuilt under the same
+	// res (opt #U, relative to the merge size), merged at merge
+	// (config-max) res. Rebuilt under the same
 	// waitIdle above; the mesh buffers survive (extent-independent).
 	// The layer and verdict keep their own framebuffers (own RPs);
 	// merged rides the per-image fold framebuffer (null renderpass =
@@ -2131,8 +2132,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	cmd.nextSubpass(vk::SubpassContents::eInline);
 
 	// Apply pass into the acquired submit image. Verdict path:
-	// merged (NEAREST, full-res) x verdict (LINEAR 2x upscale of the
-	// half-res mask: smooth reveal ramp). Mask-only path (no verdict
+	// merged (NEAREST, merge-res) x verdict (LINEAR 2x upscale of the
+	// half-merge-res mask: smooth reveal ramp). Mask-only path (no verdict
 	// pass above): merged straight
 	// through (one tap, pixel-identical to x1). RGB zero; the
 	// submit-time REPLACE preserves dst color.

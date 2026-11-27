@@ -1179,7 +1179,7 @@ void scenes::stream::gui_passthrough()
 	int dilate = depth_dilate_px;
 	if (ImGui::SliderInt(_S("Sensor dilate (texels)"), &dilate, 0, 8))
 		depth_dilate_px = std::clamp(dilate, 0, 8);
-	ImGui::Text("%s", _S("Widens known geometry (windows + hidden) over sensor noise; the volume back wall stays exact."));
+	ImGui::Text("%s", _S("Widens known geometry (windows + hidden) over sensor noise; the volume back wall stays exact. Texels of the sensor copy (merge/2: wider world at smaller merges)."));
 	float dbias = depth_bias_m;
 	if (ImGui::SliderFloat(_S("Depth bias (m)"), &dbias, -0.05f, 0.25f, "%.3f"))
 		depth_bias_m = dbias;

@@ -33,8 +33,8 @@ layout(location = 0) out vec4 out_color;
 // sensor_tex: resampled sensor heightfield (R16F planar meters, sync-eye
 // grid, hands in), NEAREST: interpolating depths would blend
 // fore/background into false mid-depths (verdict-shader rule).
-// copy_tex: merged known geometry (R16F linear meters, same grid),
-// NEAREST. bias: depth_bias_m over the whole copy.
+// copy_tex: merged known geometry (R16F linear meters, same
+// normalized grid), NEAREST. bias: depth_bias_m over the whole copy.
 //
 // pass = sensor strictly nearer than copy + bias, both sides valid
 // (sensor FAR = no return, copy FAR = outside every volume and window
