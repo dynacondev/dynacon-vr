@@ -18,18 +18,24 @@
 
 #version 450
 
-#extension GL_EXT_multiview : require
-
 // AA-spike twin of mask_mv.frag: analytic edge coverage from the explicit
 // barycentric varying. coverage = min over smoothstep(0, fwidth, bary):
 // 1.0 interior, ~0.5 on the silhouette edge. REPLACE blend, no depth
 // (positives-only tier-0/tier-1 groups; reversed groups stay on the binary
-// mask_mv path). Push block byte-identical to mask_mv (132B).
+// mask_mv path). Push block byte-identical to mask_mv (132B). View-agnostic
+// (no gl_ViewIndex use), so no multiview extension is required here — the
+// vertex stage selects the eye.
 //
-// SPIKE NOTE: single-sample raster shades one side of a shared interior
-// edge (tie-break), so watertight interiors may show a ~0.5 hairline where
-// the binary path wrote 1.0. The device run decides: keep for
-// exterior-dominated windows or drop in favour of a post-mask edge filter.
+// SPIKE NOTES (device run decides):
+// - Single-sample raster shades one side of a shared interior edge
+//   (tie-break), so watertight interiors may show a ~0.5 hairline where
+//   the binary path wrote 1.0.
+// - REPLACE with no depth is order-dependent on overlap: a grey foreground
+//   edge REPLACEs (dims) a background 1.0 interior where binary 1-over-1
+//   was invisible. Disjoint/exterior-dominated windows are unaffected.
+// - Tier-0 binary punches (marker cutouts, sensor reveal) stamp hard
+//   values over the grey ramp with no reconciling blur (tier-1 reconciles
+//   via its blur chain).
 layout(location = 0) in vec3 vBary;
 
 layout(push_constant) uniform PushConstants

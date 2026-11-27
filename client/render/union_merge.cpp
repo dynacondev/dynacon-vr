@@ -409,11 +409,11 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	                                                                 .pBindings = bindings,
 	                                                         });
 	// Linear + ClampToEdge (feather sampler precedent): the bilinear
-	// tap IS the upscale for half/quarter-res inputs. NEAREST takes
-	// over in record() when every input matches the merge extent
-	// (tier-0 1:1 copy: exact, one tap). maxLod 0, no
-	// mipmap chain on swapchain images. NEVER linear-for-full-res by
-	// accident: the 4-tap bilinear of a 1:1 copy is pure waste.
+	// tap IS the upscale for half/quarter-res inputs, and (AA spike)
+	// for full-res tier-0 inputs too, so grey coverage edges filter.
+	// maxLod 0, no mipmap chain on swapchain images. The 4-tap cost on
+	// 1:1 copies is accepted for the trial (interiors are bit-identical
+	// either way); revert restores the NEAREST 1:1 fast path.
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eLinear,
 	        .minFilter = vk::Filter::eLinear,

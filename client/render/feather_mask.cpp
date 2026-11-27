@@ -1167,6 +1167,22 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 			}
 		}
 		vk::DeviceSize aa_bytes = aa.size() * sizeof(aa_vert);
+		if (aa_bytes == 0)
+		{
+			// Degenerate soup (indices present but no whole triangle):
+			// nothing to draw. Mirror the empty-soup discipline —
+			// no buffers, no pending copy (a zero-size buffer or
+			// copyBuffer is a validation error).
+			mesh.aa_vertex_count = 0;
+			mesh.aa_pending_upload.reset();
+			mesh.aa_vertex_buffer.clear();
+			mesh.aa_vertex_memory.clear();
+			mesh.aa_staging_buffer.clear();
+			mesh.aa_staging_memory.clear();
+			mesh.aa_staging_size = 0;
+		}
+		else
+		{
 		if (mesh.aa_staging_size < aa_bytes)
 		{
 			std::tie(mesh.aa_staging_buffer, mesh.aa_staging_memory) = make_buffer(
@@ -1184,6 +1200,7 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 		        vk::MemoryPropertyFlagBits::eDeviceLocal);
 		mesh.aa_pending_upload = aa_bytes;
 		mesh.aa_vertex_count = (uint32_t)aa.size();
+		}
 	}
 	// Model-space bounds for the stream-side frustum skip (upload-time
 	// only; per-frame tests transform the 8 corners by the draw MVP).
@@ -2287,11 +2304,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// untouched. No depth companions: REPLACE, no depth, same as binary.
 	if (has_reversed)
 	{
-		static bool aa_rev_logged = false;
-		if (not aa_rev_logged)
+		if (not aa_rev_logged_)
 		{
 			spdlog::info("feather AA skipped (reversed draws present): binary raster");
-			aa_rev_logged = true;
+			aa_rev_logged_ = true;
 		}
 	}
 	auto fill_stats = [&] {
@@ -2836,8 +2852,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		int erode = erode_radius(spread, 2.f);
 		{
 			section_clock raster_clk(&ms_raster);
-			// AA spike: analytic coverage when positives-only (grey input
-			// feeds the erode/blur chain linearly, like opacity fade).
+			// AA spike: analytic coverage when positives-only. Grey feeds
+			// the blur chain linearly (like opacity fade); box-min erode
+			// is nonlinear, so the fringe may erode ~1 texel deeper than
+			// the binary contour — the device run compares contours.
 			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv, *aa_raster_r8_pipeline_mv}, half_extent, has_reversed, !has_reversed);
 		}
 		if (reveal)

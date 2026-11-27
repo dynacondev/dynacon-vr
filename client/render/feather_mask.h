@@ -170,14 +170,15 @@ public:
 	// Cutouts are world-space quads (two triangles each) punched crisp
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP. Optional sensor reveal (depth_reveal above,
-	// null = off) ORs the sensor test into the binary working alpha
+	// null = off) ORs the sensor test into the working alpha (binary on
+	// the binary path, grey ramp under the AA spike when positives-only)
 	// before the blur chain.
 	// Sensor reveal for 3d-depth-passthrough (optional, null = off):
 	// resampled sensor heightfield + merged copy (borrowed views,
 	// same-frame use only — same discipline as submitted_view_array
 	// above) plus the config bias. When set, record() runs the reveal
-	// pass (single sensor<copy+bias test ORed into the binary working
-	// alpha) right after the silhouette raster and before the
+	// pass (single sensor<copy+bias test ORed into the working alpha)
+	// right after the silhouette raster and before the
 	// erode/blur chain, so the reveal feathers with the group. The
 	// write-back twin (sensor depths into the shared layer) is a
 	// union_merge pass the scene records after this returns.
@@ -305,6 +306,9 @@ private:
 	// Same silhouette_mv_layout (push-only) as the binary pipes.
 	vk::raii::Pipeline aa_pipeline_mv{nullptr};
 	vk::raii::Pipeline aa_raster_r8_pipeline_mv{nullptr};
+	// One-shot log state for the AA-spike reversed fallback in record().
+	// Render-thread only (record() records; the async CB only executes).
+	bool aa_rev_logged_ = false;
 
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
@@ -368,7 +372,8 @@ private:
 	vk::raii::Sampler sampler_nearest{nullptr};
 
 	// Depth reveal (3d-depth-passthrough): single test MAX-blended over
-	// the binary working alpha ahead of the erode/blur chain (the blend
+	// the working alpha (binary on the binary path, grey ramp under the
+	// AA spike when positives-only) ahead of the erode/blur chain (the blend
 	// unit does the OR — no work tap, which would be a feedback loop;
 	// R8 MIN-blend precedent from the reversed raster proves the blend
 	// path). R8 LOAD RP for the intermediates (tier-1 A, tiered seed —
@@ -467,8 +472,8 @@ private:
 		std::optional<upload_sizes> pending_upload;
 		// AA-spike de-indexed upload (3 verts per triangle + per-corner
 		// bary): expanded at set_mesh time from the same soup, drawn
-		// non-indexed. Dies with the entry (map-drop / reset_targets
-		// discipline identical to the indexed buffers above).
+		// non-indexed. Dies with the entry on map-drop/erase (meshes
+		// survive reset_targets(), like the indexed buffers above).
 		vk::raii::Buffer aa_vertex_buffer{nullptr};
 		vk::raii::DeviceMemory aa_vertex_memory{nullptr};
 		uint32_t aa_vertex_count = 0;
