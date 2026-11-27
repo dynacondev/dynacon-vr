@@ -19,6 +19,7 @@
 #include "passthrough_mesh.h"
 
 #include "utils/mapped_file.h"
+#include <array>
 #include <cmath>
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
@@ -127,6 +128,7 @@ void append_primitive(
 
 	// Bake node transform into positions
 	uint32_t base_vertex = out.vertices.size();
+	size_t index_start = out.indices.size();
 	fastgltf::iterateAccessor<glm::vec3>(asset, position_accessor, [&](glm::vec3 position) {
 		glm::vec3 world = glm::vec3(world_transform * glm::vec4(position, 1));
 		out.vertices.push_back({world.x, world.y, world.z});
@@ -153,15 +155,119 @@ void append_primitive(
 	if (out.indices.size() + indices.size() > max_triangles * 3)
 		throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
 
+	// Reject non-finite baked positions with the same skip discipline
+	// as malformed indices below: NaN/inf would otherwise pin the
+	// worklist (all comparisons false) until the budget throw, after
+	// burning ~100MB transiently.
+	for (size_t v = base_vertex; v < out.vertices.size(); ++v)
+	{
+		const XrVector3f & p = out.vertices[v];
+		if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+		{
+			spdlog::warn("passthrough_mesh: non-finite baked position, skipping primitive");
+			out.vertices.resize(base_vertex);
+			return;
+		}
+	}
+
+	// Bound baked edge length (world meters): with cull-back, a huge
+	// triangle straddling the near plane or projecting far outside the
+	// guardband mis-culls wholesale (pre-clip facing on unclipped
+	// coords is spec-legal; Adreno guardband is 32k-class, overflow
+	// measured to ~19M px). Small triangles bound both the straddle
+	// damage and the fully-in-front coordinate span. Threshold is
+	// pre-placement-scale: placements are ~uniform-1 (config default),
+	// larger scales re-open the hole proportionally. Midpoints are
+	// bitwise-identical across shared edges, so the output is watertight
+	// up to float rounding (no persistent T-junctions, no gaps); each
+	// half keeps the parent orientation, so flip_winding composes
+	// unchanged.
+	constexpr float kMaxBakeEdge = 0.25f;
+	constexpr float kMaxBakeEdge2 = kMaxBakeEdge * kMaxBakeEdge;
+	auto edge_len2 = [&](uint32_t u, uint32_t v) {
+		float dx = out.vertices[u].x - out.vertices[v].x;
+		float dy = out.vertices[u].y - out.vertices[v].y;
+		float dz = out.vertices[u].z - out.vertices[v].z;
+		return dx * dx + dy * dy + dz * dz;
+	};
+	std::vector<std::array<uint32_t, 3>> pending;
+	pending.reserve(indices.size() / 3 + 1);
 	for (size_t i = 0; i < indices.size(); i += 3)
 	{
 		uint32_t a = indices[i] + base_vertex;
 		uint32_t b = indices[i + 1] + base_vertex;
 		uint32_t c = indices[i + 2] + base_vertex;
 		if (flip_winding)
-			out.indices.insert(out.indices.end(), {a, c, b});
+			pending.push_back({a, c, b});
 		else
+			pending.push_back({a, b, c});
+	}
+	while (!pending.empty())
+	{
+		auto tri = pending.back();
+		pending.pop_back();
+		uint32_t a = tri[0], b = tri[1], c = tri[2];
+		float e_ab = edge_len2(a, b);
+		float e_bc = edge_len2(b, c);
+		float e_ca = edge_len2(c, a);
+		if (e_ab <= kMaxBakeEdge2 && e_bc <= kMaxBakeEdge2 && e_ca <= kMaxBakeEdge2)
+		{
+			if (out.indices.size() + 3 > max_triangles * 3)
+				throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
 			out.indices.insert(out.indices.end(), {a, b, c});
+			continue;
+		}
+		if (out.indices.size() + (pending.size() + 2) * 3 > max_triangles * 3)
+			throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
+		// Split the longest edge at its midpoint. The halves tile the
+		// parent (bitwise-identical midpoint everywhere: watertight up
+		// to float rounding) with the parent orientation (verified per
+		// edge case).
+		uint32_t e0 = a, e1 = b;
+		if (e_ab >= e_bc && e_ab >= e_ca)
+		{
+			e0 = a;
+			e1 = b;
+		}
+		else if (e_bc >= e_ca)
+		{
+			e0 = b;
+			e1 = c;
+		}
+		else
+		{
+			e0 = c;
+			e1 = a;
+		}
+		XrVector3f p0 = out.vertices[e0];
+		XrVector3f p1 = out.vertices[e1];
+		float mx = (p0.x + p1.x) * 0.5f;
+		float my = (p0.y + p1.y) * 0.5f;
+		float mz = (p0.z + p1.z) * 0.5f;
+		if (!std::isfinite(mx) || !std::isfinite(my) || !std::isfinite(mz))
+		{
+			spdlog::warn("passthrough_mesh: midpoint overflow, skipping primitive");
+			out.vertices.resize(base_vertex);
+			out.indices.resize(index_start);
+			return;
+		}
+		out.vertices.push_back({mx, my, mz});
+		uint32_t m = (uint32_t)out.vertices.size() - 1;
+		if (e0 == a && e1 == b)
+		{
+			pending.push_back({a, m, c});
+			pending.push_back({m, b, c});
+		}
+		else if (e0 == b && e1 == c)
+		{
+			pending.push_back({a, b, m});
+			pending.push_back({a, m, c});
+		}
+		else
+		{
+			pending.push_back({a, b, m});
+			pending.push_back({m, b, c});
+		}
 	}
 }
 
