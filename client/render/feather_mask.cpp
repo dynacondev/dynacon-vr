@@ -453,19 +453,15 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .attachmentCount = 1,
 		        .pAttachments = &aa_add_attachment,
 		};
-		// DIAGNOSTIC SPLIT (revert after the run): conservative
-		// rasterization DISABLED to separate a CR-path cull quirk from
-		// pure cull determination on half-on-screen grazing triangles.
-		// Everything else (cull back, ADD, 4-offset frag) unchanged: if
-		// faces stop disappearing, the quirk needs CR+cull+clip
-		// together; if they still vanish, CR is innocent.
-		vk::PipelineRasterizationConservativeStateCreateInfoEXT cr_state{
-		        .flags = {},
-		        .conservativeRasterizationMode = vk::ConservativeRasterizationModeEXT::eDisabled,
-		        .extraPrimitiveOverestimationSize = 0.0f,
-		};
+		// DIAGNOSTIC SPLIT 2 (revert after the run): conservative struct
+		// REMOVED (pNext=null, binary-identical raster state) to test
+		// whether mere presence of the chained struct selects a
+		// different driver raster path. Everything else (cull back,
+		// ADD, 4-offset frag) unchanged: if faces stop disappearing,
+		// the struct presence is the trigger; if they still vanish,
+		// pure pre-clip/guardband mis-cull is the mechanism.
 		vk::PipelineRasterizationStateCreateInfo aa_rasterization = rasterization;
-		aa_rasterization.pNext = &cr_state;
+		aa_rasterization.pNext = nullptr;
 		// Backfaces culled: with ADD-saturate, a behind-surface fragment
 		// covering a rim pixel would sum the silhouette ramp to 1.0
 		// (thin double-rims always coincide). Front-side viewing only —
@@ -534,7 +530,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		aa_pipeline_mv = make_aa_mv_variant(renderpass_mv);
 		aa_raster_r8_pipeline_mv = make_aa_mv_variant(raster_r8_renderpass_mv);
-		spdlog::info("feather AA pipes built (DIAGNOSTIC: conservative DISABLED, ADD, backface-culled, no depth)");
+		spdlog::info("feather AA pipes built (DIAGNOSTIC 2: no CR struct, ADD, backface-culled, no depth)");
 	}
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
