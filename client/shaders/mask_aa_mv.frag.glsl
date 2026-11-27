@@ -29,10 +29,12 @@
 // + clip position rederived from the same point). A screen-affine
 // numerator with a projective denominator mismatched by up to ~6% up
 // close (E1 residue); this pairing sums exactly at any perspective.
-// The ramp itself is edge-centered smoothstep(-0.5, +0.5) over
-// pixel-distances — point-symmetric, so watertight neighbours'
-// complements sum to exactly 1.0 at every tap regardless of triangle
-// heights. The rasterizer runs conservative-overestimate, so the
+// The ramp itself is an edge-centered linear clamp(q+0.5) over
+// pixel-distances — point-symmetric (complements still sum to exactly
+// 1.0) and, being affine, reproduced exactly by bilinear upscales at
+// any tier (no phase breathing; the earlier smoothstep curve shimmered
+// under magnification). Its C0 joints are buried under the blur chain
+// at tier>0 and subpixel at tier-0. The rasterizer runs conservative-overestimate, so the
 // neighbour across a shared edge shades this pixel too; ADD (blend ONE,
 // ONE, saturated by the UNORM store) sums interior straddles to 1.0,
 // while a lone silhouette fragment keeps its smooth single-sided ramp
@@ -67,7 +69,7 @@ float smoothcov(vec3 q)
 	// fail-safe). Degenerate input drives den to its floor, q0
 	// saturates, and the per-edge min drives coverage to 0 (fail-safe:
 	// zero-area tris emit no fragments anyway).
-	vec3 a3 = smoothstep(vec3(-0.5), vec3(0.5), q);
+	vec3 a3 = clamp(q + vec3(0.5), vec3(0.0), vec3(1.0)); // linear, not smoothstep: see header
 	return min(min(a3.x, a3.y), a3.z);
 }
 
