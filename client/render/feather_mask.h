@@ -215,7 +215,7 @@ public:
 	// in: LESS accumulates the furthest proximity exit (max distance),
 	// OVER-reveal (front-of-shape imprecision, accepted); GREATER here
 	// would under-reveal (unsafe miss) and is forbidden.
-	// The proximity field is a feather-owned D16 2-layer image (one
+	// The proximity field is a feather-owned D24S8 2-layer image (one
 	// raster per frame): RP1 renders into it, RP2 tests the silhouettes
 	// against it. Extent always equals the mask working extent (both
 	// (re)created from the same quarter-res in the scene prewarm).
@@ -304,9 +304,9 @@ private:
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// per-edge instanced quads (sil_band_mv.vert/frag, 4 verts/edge as
-	// a triangle strip, REPLACE blend, depth-tested GREATER_OR_EQUAL
-	// with write off, cull-none), evaluated per eye from the calling
-	// view's MVP. R8 pipe renders the working intermediates under
+	// a triangle strip, blend-off overwrite, stencil-gated three-draw
+	// partition with write off, cull-none), evaluated per eye from the
+	// calling view's MVP. R8 pipe renders the working intermediates under
 	// band_r8_depth_rp; RGBA8 renders tier-0 submits under
 	// band_rgba_depth_rp (dedicated color+depth LOAD twins: Pass 1
 	// wrote both, the band tests depth and overwrites color). Depth
@@ -446,7 +446,7 @@ private:
 		vk::raii::Framebuffer blur_fb_mv{nullptr};
 		// Multiview raster target: same array view under the raster MV pass.
 		vk::raii::Framebuffer raster_fb_mv{nullptr};
-		// Depth-tested raster companions (D16, same extent as the color
+		// Depth-tested raster companions (D24S8, same extent as the color
 		// target above): depth image shared by both layers. Built for
 		// raster sources only (A, down levels); blur-only targets (B,
 		// eblur) leave these null.
@@ -541,7 +541,7 @@ private:
 	// (radius 1, y in [-1,1]), drawn with the same depth-only pipe.
 	buffer_allocation hidden_cylinder_verts_;
 	uint32_t hidden_cylinder_vert_count = 0;
-	// Feather-owned hidden proximity field (D16 2-layer image + array view
+	// Feather-owned hidden proximity field (D24S8 2-layer image + array view
 	// the proximity framebuffer below bakes against; P4: one proximity raster
 	// per frame). (Re)created by ensure_hidden_field (waitIdle'd scene
 	// prewarm); reset_targets() on rebuild. output_depth_array_view is
@@ -593,7 +593,7 @@ private:
 		}
 	};
 	std::unordered_map<VkImage, frame_targets> targets;
-	// Submitted-size D16 depth array view for the tier-0 MV depth raster:
+	// Submitted-size D24S8 depth array view for the tier-0 MV depth raster:
 	// cached by extent (swapchain-independent, survives reset_targets();
 	// only a handful of quantized submit sizes ever exist).
 	struct depth_entry
@@ -604,7 +604,7 @@ private:
 	};
 	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
 	vk::ImageView output_depth_array_view(vk::Extent2D extent);
-	// D16 depth image + array view at an extent (depth-test-only raster:
+	// D24S8 depth image + array view at an extent (depth-test-only raster:
 	// never sampled, device-local). Backs output_depth above and the
 	// intermediate raster companions in ensure_targets.
 	depth_entry make_depth_entry(vk::Extent2D extent);

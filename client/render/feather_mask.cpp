@@ -142,10 +142,11 @@ struct section_clock
 constexpr vk::Format blur_format = vk::Format::eR8Unorm;
 
 // Depth for the reversed-draw raster path and the explicit band
-// occlusion test (D16 depth-test-only: never sampled, device-local;
-// D16 attachment support is mandatory per spec, so no format
-// fallback). The band ALSO needs stencil (coverage mark): D24S8,
-// gated loudly in the ctor like the R16F merge gate.
+// occlusion test (depth-test-only: never sampled, device-local).
+// The band ALSO needs stencil (coverage mark), so D24S8 —
+// gated loudly in the ctor like the R16F merge gate (D24S8
+// DEPTH_STENCIL_ATTACHMENT support is not universally mandatory,
+// hence the explicit throw rather than a silent fallback).
 constexpr vk::Format depth_format = vk::Format::eD24UnormS8Uint;
 
 // Downsample level extent (level 1 = half): exact halving, so the 2x2 box
@@ -273,10 +274,10 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        // (near = 1, far = 0), matching scene_renderer. LESS here
 	        // inverts the interference (behind cuts, front doesn't).
 	        .depthCompareOp = vk::CompareOp::eGreater,
-	        // Stencil coverage mark for the explicit band (draws 1-2):
-	        // REPLACE 1 wherever any triangle covers. Reversed cuts use
-	        // depth_test below (stencil untouched, cuts stay binary and
-	        // skip the band).
+	        // Stencil coverage mark for the explicit band (outer + lo/hi
+	        // draws below): REPLACE 1 wherever any triangle covers.
+	        // Reversed cuts use depth_test below (stencil untouched, cuts
+	        // stay binary and skip the band).
 	        .stencilTestEnable = VK_TRUE,
 	        .front = {.failOp = vk::StencilOp::eKeep,
 	                  .passOp = vk::StencilOp::eReplace,
@@ -1071,8 +1072,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	}
 
 	// Explicit silhouette band pipes (one instanced quad per loop
-	// edge, REPLACE blend, depth-tested GREATER_OR_EQUAL with write
-	// off, cull-none; multiview broadcast like every raster path
+	// edge, REPLACE blend, stencil-gated three-draw partition with
+	// write off, cull-none; multiview broadcast like every raster path
 	// here). R8 bakes against band_r8_depth_rp (working
 	// intermediates), RGBA8 against band_rgba_depth_rp (tier-0
 	// submits): dedicated color+depth LOAD twins with per-image cached
@@ -2210,7 +2211,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 		}
 		if (needs_depth)
 		{
-			// Depth-tested seed-raster companion: D16 image + array views
+			// Depth-tested seed-raster companion: D24S8 image + array views
 			// + one layers=1 color+depth framebuffer (MV raster pass).
 			depth_entry depth = make_depth_entry(half_targets);
 			target->depth_image = std::move(depth.image);
@@ -2319,7 +2320,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			if (needs_depth)
 			{
 				// Seed raster runs on down_targets[seed-1].raster_fb_mv;
-				// the depth path pairs the array color view with a D16
+				// the depth path pairs the array color view with a D24S8
 				// array view under the MV R8+depth pass.
 				depth_entry depth = make_depth_entry(le);
 				target->depth_image = std::move(depth.image);
@@ -2471,8 +2472,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	bool has_positive = std::ranges::any_of(draws, [](const instance_draw & d) { return !d.reverse; });
 	// Reversed-only raster is a provable no-op (MIN against clear 0 writes
 	// 0), so clear-only and let the cutout punch below run if armed. Depth
-	// engages exactly when a reversed draw exists; positive-only calls
-	// rasterize as usual.
+	// engages when a reversed draw exists (two-pass use_depth) or when
+	// the band will depth-test (positives-only band_depth single pass);
+	// positive-only calls without the band rasterize as usual.
 	auto fill_stats = [&] {
 		if (cpu_stats)
 		{
