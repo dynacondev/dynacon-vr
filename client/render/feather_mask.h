@@ -260,11 +260,16 @@ public:
 
 	// Drop cached framebuffers/views (swapchain recreated: old image
 	// handles are dead and driver handle recycling could otherwise alias
-	// a stale framebuffer onto a new image).
+	// a stale framebuffer onto a new image). Band framebuffers bake
+	// retired image views too.
 	void reset_targets()
 	{
 		targets.clear();
 		hidden_targets.clear();
+		band_r8_fb.clear();
+		band_r8_fb_src = VK_NULL_HANDLE;
+		band_rgba_fb.clear();
+		band_rgba_fb_src = VK_NULL_HANDLE;
 	}
 
 	// Ensure intermediates for an extent (idempotent, change-gated). Public
@@ -310,6 +315,18 @@ private:
 	vk::raii::PipelineLayout band_layout{nullptr};
 	vk::raii::Pipeline band_r8_pipeline{nullptr};
 	vk::raii::Pipeline band_rgba_pipeline{nullptr};
+	// Band occlusion-test renderpasses (color+depth LOAD twins: the
+	// raster wrote both, the band tests depth and overwrites color).
+	// R8 for the working intermediates, RGBA8 for tier-0 submits;
+	// framebuffers cached creation-only per site below (reveal-cache
+	// pattern). Depth LOADs (preserves Pass-1), stores DONT_CARE
+	// (depth is dead after the band); color LOAD/STOREs.
+	vk::raii::RenderPass band_r8_depth_rp{nullptr};
+	vk::raii::RenderPass band_rgba_depth_rp{nullptr};
+	vk::raii::Framebuffer band_r8_fb{nullptr};
+	vk::Image band_r8_fb_src = VK_NULL_HANDLE;
+	vk::raii::Framebuffer band_rgba_fb{nullptr};
+	vk::Image band_rgba_fb_src = VK_NULL_HANDLE;
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
 	// cutout re-begins the submit framebuffer_mv under

@@ -78,6 +78,15 @@ struct band_push
 static_assert(sizeof(band_push) == 140);
 static_assert(sizeof(band_push) <= 256);
 
+// Depth-bias forgiveness for the band occlusion test (depth units,
+// added to the quad before the GREATER_OR_EQUAL compare): the quad
+// is a flat ±1px approximation of the true surface, so strict
+// testing would speckle the inner half wherever the surface curves
+// away within tolerance. Too large re-admits occluded pixels (the
+// step-shape artifact this test exists to kill). Device-tuned;
+// start 4.0.
+constexpr float band_depth_bias = 4.0f;
+
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
 // layout).
@@ -1092,11 +1101,74 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .viewportCount = 1,
 	        .scissorCount = 1,
 	};
+	auto make_band_depth_rp = [&](vk::Format color_format) {
+		uint32_t band_view_mask = 0b11, band_corr_mask = 0b11;
+		vk::RenderPassMultiviewCreateInfo band_mv_info{
+		        .subpassCount = 1,
+		        .pViewMasks = &band_view_mask,
+		        .correlationMaskCount = 1,
+		        .pCorrelationMasks = &band_corr_mask,
+		};
+		vk::AttachmentDescription band_atts[2] = {
+		        {
+		                .format = color_format,
+		                .samples = vk::SampleCountFlagBits::e1,
+		                .loadOp = vk::AttachmentLoadOp::eLoad,
+		                .storeOp = vk::AttachmentStoreOp::eStore,
+		                .initialLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		                .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
+		        },
+		        {
+		                .format = depth_format,
+		                .samples = vk::SampleCountFlagBits::e1,
+		                .loadOp = vk::AttachmentLoadOp::eLoad,
+		                .storeOp = vk::AttachmentStoreOp::eDontCare,
+		                .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+		                .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+		                .initialLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		                .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		        },
+		};
+		vk::AttachmentReference band_color_ref{
+		        .attachment = 0,
+		        .layout = vk::ImageLayout::eColorAttachmentOptimal,
+		};
+		vk::AttachmentReference band_depth_ref{
+		        .attachment = 1,
+		        .layout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		};
+		vk::SubpassDescription band_sub{
+		        .pipelineBindPoint = vk::PipelineBindPoint::eGraphics,
+		        .colorAttachmentCount = 1,
+		        .pColorAttachments = &band_color_ref,
+		        .pDepthStencilAttachment = &band_depth_ref,
+		};
+		return vk::raii::RenderPass(device, vk::RenderPassCreateInfo{
+		                                                .pNext = &band_mv_info,
+		                                                .attachmentCount = 2,
+		                                                .pAttachments = band_atts,
+		                                                .subpassCount = 1,
+		                                                .pSubpasses = &band_sub,
+		                                        });
+	};
+	band_r8_depth_rp = make_band_depth_rp(blur_format);
+	band_rgba_depth_rp = make_band_depth_rp(format);
 	vk::PipelineRasterizationStateCreateInfo band_rasterization{
 	        .polygonMode = vk::PolygonMode::eFill,
 	        .cullMode = vk::CullModeFlagBits::eNone,
 	        .frontFace = vk::FrontFace::eCounterClockwise,
+	        .depthBiasEnable = VK_TRUE,
+	        .depthBiasConstantFactor = band_depth_bias,
 	        .lineWidth = 1,
+	};
+	vk::PipelineDepthStencilStateCreateInfo band_depth{
+	        .depthTestEnable = VK_TRUE,
+	        .depthWriteEnable = VK_FALSE,
+	        // Reversed-Z (near = 1, far = 0, GREATER everywhere here):
+	        // nearer occluders hold larger values, so the quad passes
+	        // exactly where its edge surface is frontmost (bias forgives
+	        // the flat-quad approximation; see band_depth_bias).
+	        .depthCompareOp = vk::CompareOp::eGreaterOrEqual,
 	};
 	vk::PipelineMultisampleStateCreateInfo band_multisample{
 	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
@@ -1124,7 +1196,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .pViewportState = &band_viewport_state,
 		        .pRasterizationState = &band_rasterization,
 		        .pMultisampleState = &band_multisample,
-		        .pDepthStencilState = nullptr,
+		        .pDepthStencilState = &band_depth,
 		        .pColorBlendState = &band_blend,
 		        .pDynamicState = &band_dynamic,
 		        .layout = *band_layout,
@@ -1132,9 +1204,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		return vk::raii::Pipeline(device, *pipe_cache, band_pipe_info);
 	};
-	band_r8_pipeline = make_band_pipe(reveal_r8_rp);
-	band_rgba_pipeline = make_band_pipe(cutout_load_renderpass);
-	spdlog::info("feather silhouette band pipes built (explicit loop, REPLACE, no depth)");
+	band_r8_pipeline = make_band_pipe(band_r8_depth_rp);
+	band_rgba_pipeline = make_band_pipe(band_rgba_depth_rp);
+	spdlog::info("feather silhouette band pipes built (explicit loop, depth-tested REPLACE, no depth write)");
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -1960,9 +2032,14 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 	targets_extent = extent;
 	targets_has_intermediates = with_intermediates;
 	// Working images are recreated below: drop the cached reveal
-	// framebuffer (creation-only rebuild on next reveal record).
+	// framebuffer (creation-only rebuild on next reveal record) and
+	// the band framebuffers (same discipline, per-site below).
 	reveal_fb.clear();
 	reveal_fb_src = VK_NULL_HANDLE;
+	band_r8_fb.clear();
+	band_r8_fb_src = VK_NULL_HANDLE;
+	band_rgba_fb.clear();
+	band_rgba_fb_src = VK_NULL_HANDLE;
 	if (not with_intermediates)
 	{
 		// Tier-0 direct raster never touches the blur/downsample
@@ -2526,10 +2603,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	auto it = targets.find(image);
 	// Swapchain-image targets track the submitted (output) size, which is
 	// half for feathered groups; intermediates below track full extent.
-	// Depth companions build lazily on first reversed use (a later
-	// reversed frame rebuilds via the has_depth clause).
-	if (it == targets.end() or it->second.extent.width != out_extent.width or it->second.extent.height != out_extent.height or
-	    (has_reversed and not it->second.has_depth))
+	// Depth companion always built: positives-only raster writes depth
+	// for the explicit silhouette band's occlusion test (reversed
+	// groups keep their two-pass depth-tested path on the same FB).
+	if (it == targets.end() or it->second.extent.width != out_extent.width or it->second.extent.height != out_extent.height)
 	{
 		if (it != targets.end())
 		{
@@ -2575,29 +2652,22 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                .layers = 1,
 		        });
 		// Depth-tested raster companion for tier-0 direct raster: one
-		// layers=1 color+depth FB under depth_renderpass_mv, built lazily
-		// on first reversed use (has_depth); positive-only targets stay
-		// lean.
-		bool has_depth = false;
-		vk::raii::Framebuffer depth_framebuffer_mv{nullptr};
-		if (has_reversed)
-		{
-			vk::ImageView depth_array_view = output_depth_array_view(out_extent);
-			vk::ImageView mv_depth_atts[2] = {mv_raw_array, depth_array_view};
-			depth_framebuffer_mv = vk::raii::Framebuffer(device,
-			        vk::FramebufferCreateInfo{
-			                .renderPass = *depth_renderpass_mv,
-			                .attachmentCount = 2,
-			                .pAttachments = mv_depth_atts,
-			                .width = out_extent.width,
-			                .height = out_extent.height,
-			                .layers = 1,
-			        });
-			has_depth = true;
-		}
-		it = targets.emplace(image, frame_targets(out_extent, has_depth, std::move(mv_array_view), std::move(mv_framebuffer))).first;
-		if (has_reversed)
-			it->second.depth_framebuffer_mv = std::move(depth_framebuffer_mv);
+		// layers=1 color+depth FB under depth_renderpass_mv. Always
+		// present: the band's occlusion test needs depth even for
+		// positives-only groups (reversed groups reuse the same FB).
+		vk::ImageView depth_array_view = output_depth_array_view(out_extent);
+		vk::ImageView mv_depth_atts[2] = {mv_raw_array, depth_array_view};
+		vk::raii::Framebuffer depth_framebuffer_mv(device,
+		        vk::FramebufferCreateInfo{
+		                .renderPass = *depth_renderpass_mv,
+		                .attachmentCount = 2,
+		                .pAttachments = mv_depth_atts,
+		                .width = out_extent.width,
+		                .height = out_extent.height,
+		                .layers = 1,
+		        });
+		it = targets.emplace(image, frame_targets(out_extent, true, std::move(mv_array_view), std::move(mv_framebuffer))).first;
+		it->second.depth_framebuffer_mv = std::move(depth_framebuffer_mv);
 	}
 
 	vk::ClearValue clear{};
@@ -2627,15 +2697,21 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// Multiview silhouette raster: one draw broadcasts to both layers via
 	// mask_mv.vert (gl_ViewIndex selects the MVP). Same polarity passes as
 	// the depth path, same clears; one begin and one pipe bind per pass.
-	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth) {
+	// write_depth runs positives-only groups through the depth-write
+	// pipe in a single pass so the band below can occlusion-test
+	// (reversed groups keep the two-pass use_depth path and skip the
+	// band). Color output is identical either way (overwrite).
+	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth, bool write_depth = false) {
+		write_depth = write_depth and not use_depth;
+		bool fb_depth = use_depth or write_depth;
 		std::array<vk::ClearValue, 2> clears{};
 		clears[0].color.float32.fill(0);
 		clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
 		vk::RenderPassBeginInfo begin_info{
-		        .renderPass = use_depth ? site.depth_rp : site.rp,
-		        .framebuffer = use_depth ? site.depth_fb : site.color_fb,
+		        .renderPass = fb_depth ? site.depth_rp : site.rp,
+		        .framebuffer = fb_depth ? site.depth_fb : site.color_fb,
 		        .renderArea = {.offset = {0, 0}, .extent = e},
-		        .clearValueCount = use_depth ? 2u : 1u,
+		        .clearValueCount = fb_depth ? 2u : 1u,
 		        .pClearValues = clears.data(),
 		};
 		cmd.beginRenderPass(begin_info, vk::SubpassContents::eInline);
@@ -2643,7 +2719,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		for (int pass = 0; pass < (use_depth ? 2 : 1); ++pass)
 		{
 			bool rev_pass = use_depth && pass == 1;
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (use_depth ? site.depth_pipe : site.pipe));
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (fb_depth ? site.depth_pipe : site.pipe));
 			for (const auto & d: draws)
 			{
 				if (d.reverse != rev_pass)
@@ -2664,12 +2740,38 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// one instanced quad per baked loop edge on the just-rasterized
-	// target (LOAD re-begin, REPLACE blend). Internal triangulation
-	// never emits (only the loop's area-XOR covers), so interiors
-	// stay bit-exact and erode sees binary interiors. Reversed
-	// groups skip (cuts stay binary); band time folds into the
-	// raster stage diagnostics.
-	auto run_band = [&](vk::Image img, vk::Framebuffer fb, vk::RenderPass rp, vk::Pipeline pipe, vk::Extent2D e) {
+	// target (LOAD re-begin, depth-tested REPLACE). Internal
+	// triangulation never emits (only the loop's area-XOR covers), and
+	// the GREATER_OR_EQUAL occlusion test (reversed-Z) kills quads
+	// where other mask geometry is nearer — step-shape overhangs and
+	// hidden back edges keep binary instead of darkening valid
+	// pixels. Reversed groups skip (cuts stay binary); band time
+	// folds into the raster stage diagnostics.
+	// Cached color+depth LOAD framebuffer per band site (creation-only,
+	// like triple_fb/reveal_fb above): band_r8 over R8 working targets,
+	// band_rgba over tier-0 submits.
+	auto band_fb_for = [&](vk::Image img, vk::ImageView color_view, vk::ImageView depth_view, vk::Extent2D e,
+	                       bool rgba) -> vk::Framebuffer {
+		vk::raii::Framebuffer * cache = rgba ? &band_rgba_fb : &band_r8_fb;
+		vk::Image * key = rgba ? &band_rgba_fb_src : &band_r8_fb_src;
+		if (*key != img)
+		{
+			*key = img;
+			vk::ImageView atts[2] = {color_view, depth_view};
+			*cache = vk::raii::Framebuffer(device,
+			        vk::FramebufferCreateInfo{
+			                .renderPass = rgba ? *band_rgba_depth_rp : *band_r8_depth_rp,
+			                .attachmentCount = 2,
+			                .pAttachments = atts,
+			                .width = e.width,
+			                .height = e.height,
+			                .layers = 1,
+			        });
+		}
+		return **cache;
+	};
+	auto run_band = [&](vk::Image img, vk::Image depth_img, vk::ImageView color_view, vk::ImageView depth_view,
+	                    vk::Extent2D e, bool rgba) {
 		if (has_reversed)
 			return;
 		bool any = false;
@@ -2696,15 +2798,34 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                 vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eColorAttachmentRead,
 		                 vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
+		// Depth write→test hazard (hidden-path precedent): Pass 1
+		// wrote depth_img, the band below depth-tests against it.
+		// Layout stays DEPTH_ATTACHMENT on both sides.
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
+		                    vk::PipelineStageFlagBits::eEarlyFragmentTests, {}, {}, {},
+		                    vk::ImageMemoryBarrier{
+		                            .srcAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentWrite,
+		                            .dstAccessMask = vk::AccessFlagBits::eDepthStencilAttachmentRead,
+		                            .oldLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		                            .newLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
+		                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		                            .image = depth_img,
+		                            .subresourceRange = {
+		                                    .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		                                    .levelCount = 1,
+		                                    .layerCount = 2,
+		                            },
+		                    });
 		vk::RenderPassBeginInfo band_begin{
-		        .renderPass = rp,
-		        .framebuffer = fb,
+		        .renderPass = rgba ? *band_rgba_depth_rp : *band_r8_depth_rp,
+		        .framebuffer = band_fb_for(img, color_view, depth_view, e, rgba),
 		        .renderArea = {.offset = {0, 0}, .extent = e},
 		        .clearValueCount = 0,
 		};
 		cmd.beginRenderPass(band_begin, vk::SubpassContents::eInline);
 		set_full_viewport(e);
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipe);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rgba ? *band_rgba_pipeline : *band_r8_pipeline);
 		for (const auto & d: draws)
 		{
 			if (d.reverse)
@@ -2888,15 +3009,25 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// swapchain image).
 		tier_out = tier;
 
+		// Band depth source for tier-0 submits (always built above).
+		auto submit_depth_image = [&]() -> vk::Image {
+			auto dit = output_depth.find({out_extent.width, out_extent.height});
+			return dit == output_depth.end() ? vk::Image{} : (vk::Image)*dit->second.image;
+		};
+		// Band runs on positives-only groups (reversed skips inside
+		// run_band too): raster writes depth so the band can
+		// occlusion-test. Color output identical either way.
+		bool band_depth = has_positive and not has_reversed;
 		if (tier == 0)
 		{
 			section_clock raster_clk(&ms_raster);
 			// Hard edge: rasterize silhouettes straight into the swapchain
 			// image. Exact, one multiview raster pass, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
-			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed);
+			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed, band_depth);
 			// Explicit silhouette band on the submit (native res here).
-			run_band(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *band_rgba_pipeline, out_extent);
+			if (band_depth)
+				run_band(image, submit_depth_image(), *it->second.view_array, output_depth_array_view(out_extent), out_extent, true);
 			if (reveal)
 				run_reveal(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *reveal_rgba_pipeline, out_extent);
 		}
@@ -2918,9 +3049,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		int erode = erode_radius(spread, 2.f);
 		{
 			section_clock raster_clk(&ms_raster);
-			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed);
+			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed, band_depth);
 			// Explicit silhouette band on the half-res seed (native res).
-			run_band(*target_a.image, reveal_fb_for(*target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *band_r8_pipeline, half_extent);
+			if (band_depth)
+				run_band(*target_a.image, *target_a.depth_image, *target_a.view_array, *target_a.depth_view_array, half_extent, false);
 		}
 		if (reveal)
 			run_reveal(*target_a.image, reveal_fb_for(*target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *reveal_r8_pipeline, half_extent);
@@ -3029,11 +3161,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// below runs once per level for both eyes (multiview).
 			{
 				section_clock raster_clk(&ms_raster);
-				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed);
+				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed, band_depth);
 				// Explicit silhouette band on the seed (native res).
-				run_band(*down_targets[seed_level - 1].image,
-				         reveal_fb_for(*down_targets[seed_level - 1].image, *down_targets[seed_level - 1].view_array, de_seed),
-				         *reveal_r8_rp, *band_r8_pipeline, de_seed);
+				if (band_depth)
+					run_band(*down_targets[seed_level - 1].image, *down_targets[seed_level - 1].depth_image,
+					         *down_targets[seed_level - 1].view_array, *down_targets[seed_level - 1].depth_view_array, de_seed, false);
 			}
 			if (reveal)
 				run_reveal(*down_targets[seed_level - 1].image,
