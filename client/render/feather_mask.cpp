@@ -78,18 +78,18 @@ struct band_push
 static_assert(sizeof(band_push) == 140);
 static_assert(sizeof(band_push) <= 256);
 
-// Depth-bias forgiveness for the band occlusion test: a positive
-// constant factor increases the fragment depth value, and under this
-// reversed-Z (near = 1, GREATER_OR_EQUAL compare) larger means nearer,
-// so the bias nudges each flat ±1px quad toward near. Quads sitting
-// slightly FARTHER than the true surface (the flat-quad approximation
-// error) still pass; quads behind a genuinely nearer occluder still
-// fail while the gap exceeds the bias. Sign is load-bearing: negative
-// would over-kill (AA loss, fail-safe — the binary raster underneath
-// survives), while too-large positive re-admits occluded pixels (the
-// step-shape overhang this test exists to kill). Magnitude is in
-// depth-buffer LSBs (constant × r, r = minimum resolvable difference
-// ≈ 1 D16 LSB ≈ 1.5e-5 NDC), not NDC units. Device-tuned; start 4.0.
+// Depth-bias forgiveness for the band inner window: the bias is
+// applied + in one sub-draw and - in the other, forming a symmetric
+// window around the stored surface for the flat ±1px quads (strict
+// testing would speckle the inner half wherever the surface curves
+// away within tolerance). Under this reversed-Z (near = 1) larger
+// means nearer. The window only needs to cover flatness error over
+// ~2px — orders below any real inter-face gap — so nothing valid
+// lives inside it except the edge's own surface. Too large
+// re-admits front-over-behind pixels (the step artifact); too small
+// drops the inner ramp. Magnitude is in depth-buffer LSBs
+// (constant × r, r ≈ 1 D24 LSB), not NDC units. Device-tuned;
+// start 4.0.
 constexpr float band_depth_bias = 4.0f;
 
 // Erosion push block: source texel size, pass direction and box radius
@@ -141,10 +141,12 @@ struct section_clock
 // blend-factor vocabulary needs an alpha channel).
 constexpr vk::Format blur_format = vk::Format::eR8Unorm;
 
-// Depth for the reversed-draw raster path (D16 depth-test-only: never
-// sampled, device-local like the intermediates; D16 attachment support is
-// mandatory per spec, so no format fallback).
-constexpr vk::Format depth_format = vk::Format::eD16Unorm;
+// Depth for the reversed-draw raster path and the explicit band
+// occlusion test (D16 depth-test-only: never sampled, device-local;
+// D16 attachment support is mandatory per spec, so no format
+// fallback). The band ALSO needs stencil (coverage mark): D24S8,
+// gated loudly in the ctor like the R16F merge gate.
+constexpr vk::Format depth_format = vk::Format::eD24UnormS8Uint;
 
 // Downsample level extent (level 1 = half): exact halving, so the 2x2 box
 // mapping stays exact. Shared with ensure_targets: sizes must match.
@@ -271,6 +273,25 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        // (near = 1, far = 0), matching scene_renderer. LESS here
 	        // inverts the interference (behind cuts, front doesn't).
 	        .depthCompareOp = vk::CompareOp::eGreater,
+	        // Stencil coverage mark for the explicit band (draws 1-2):
+	        // REPLACE 1 wherever any triangle covers. Reversed cuts use
+	        // depth_test below (stencil untouched, cuts stay binary and
+	        // skip the band).
+	        .stencilTestEnable = VK_TRUE,
+	        .front = {.failOp = vk::StencilOp::eKeep,
+	                  .passOp = vk::StencilOp::eReplace,
+	                  .depthFailOp = vk::StencilOp::eKeep,
+	                  .compareOp = vk::CompareOp::eAlways,
+	                  .compareMask = 0xFF,
+	                  .writeMask = 0xFF,
+	                  .reference = 1},
+	        .back = {.failOp = vk::StencilOp::eKeep,
+	                 .passOp = vk::StencilOp::eReplace,
+	                 .depthFailOp = vk::StencilOp::eKeep,
+	                 .compareOp = vk::CompareOp::eAlways,
+	                 .compareMask = 0xFF,
+	                 .writeMask = 0xFF,
+	                 .reference = 1},
 	};
 	vk::PipelineDepthStencilStateCreateInfo depth_test{
 	        .depthTestEnable = VK_TRUE,
@@ -286,6 +307,14 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// hidden init.
 	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(silhouette_mv_push))
 		throw std::runtime_error("feather silhouette multiview needs 132B push constants");
+	// D24S8 for the band occlusion window + coverage stencil (merged
+	// R16F precedent: loud throw, no silent fallback — without stencil
+	// the band cannot tell background from valid-behind pixels).
+	{
+		auto df = physical_device.getFormatProperties(depth_format);
+		if ((df.optimalTilingFeatures & vk::FormatFeatureFlagBits::eDepthStencilAttachment) == vk::FormatFeatureFlags{})
+			throw std::runtime_error("feather silhouette band needs D24S8 DEPTH_STENCIL_ATTACHMENT (stencil coverage mark)");
+	}
 	{
 		vk::PushConstantRange mv_push_range{
 		        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
@@ -372,9 +401,13 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .format = depth_format,
 		                .samples = vk::SampleCountFlagBits::e1,
 		                .loadOp = vk::AttachmentLoadOp::eClear,
-		                .storeOp = vk::AttachmentStoreOp::eDontCare,
-		                .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
-		                .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
+		                // Depth AND stencil STORE: the band LOADs both
+		                // right after (occlusion window + coverage
+		                // mark). DONT_CARE here would let the tile
+		                // allocator discard them between the passes.
+		                .storeOp = vk::AttachmentStoreOp::eStore,
+		                .stencilLoadOp = vk::AttachmentLoadOp::eClear,
+		                .stencilStoreOp = vk::AttachmentStoreOp::eStore,
 		                .initialLayout = vk::ImageLayout::eUndefined,
 		                .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
 		        },
@@ -1129,7 +1162,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .samples = vk::SampleCountFlagBits::e1,
 		                .loadOp = vk::AttachmentLoadOp::eLoad,
 		                .storeOp = vk::AttachmentStoreOp::eDontCare,
-		                .stencilLoadOp = vk::AttachmentLoadOp::eDontCare,
+		                .stencilLoadOp = vk::AttachmentLoadOp::eLoad,
 		                .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
 		                .initialLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
 		                .finalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal,
@@ -1159,41 +1192,56 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	band_r8_depth_rp = make_band_depth_rp(blur_format);
 	band_rgba_depth_rp = make_band_depth_rp(format);
-	vk::PipelineRasterizationStateCreateInfo band_rasterization{
-	        .polygonMode = vk::PolygonMode::eFill,
-	        .cullMode = vk::CullModeFlagBits::eNone,
-	        .frontFace = vk::FrontFace::eCounterClockwise,
-	        .depthBiasEnable = VK_TRUE,
-	        .depthBiasConstantFactor = band_depth_bias,
-	        .lineWidth = 1,
+	auto band_stencil = [&](uint32_t ref, vk::CompareOp op) {
+		vk::StencilOpState state{
+		        .failOp = vk::StencilOp::eKeep,
+		        .passOp = vk::StencilOp::eKeep,
+		        .depthFailOp = vk::StencilOp::eKeep,
+		        .compareOp = op,
+		        .compareMask = 0xFF,
+		        .writeMask = 0x00,
+		        .reference = ref,
+		};
+		return std::pair<vk::StencilOpState, vk::StencilOpState>{state, state};
 	};
-	vk::PipelineDepthStencilStateCreateInfo band_depth{
-	        .depthTestEnable = VK_TRUE,
-	        .depthWriteEnable = VK_FALSE,
-	        // Reversed-Z (near = 1, far = 0, GREATER everywhere here):
-	        // nearer occluders hold larger values, so the quad passes
-	        // exactly where its edge surface is frontmost (bias forgives
-	        // the flat-quad approximation; see band_depth_bias).
-	        .depthCompareOp = vk::CompareOp::eGreaterOrEqual,
-	};
-	vk::PipelineMultisampleStateCreateInfo band_multisample{
-	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
-	};
-	vk::PipelineColorBlendAttachmentState band_blend_attachment{
-	        .blendEnable = VK_FALSE,
-	        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-	                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
-	};
-	vk::PipelineColorBlendStateCreateInfo band_blend{
-	        .attachmentCount = 1,
-	        .pAttachments = &band_blend_attachment,
-	};
-	vk::DynamicState band_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
-	vk::PipelineDynamicStateCreateInfo band_dynamic{
-	        .dynamicStateCount = 2,
-	        .pDynamicStates = band_dynamics,
-	};
-	auto make_band_pipe = [&](vk::raii::RenderPass & rp) {
+	auto make_band_pipe = [&](vk::raii::RenderPass & rp, bool depth_test, vk::CompareOp depth_op, float bias,
+	                          uint32_t stencil_ref) {
+		vk::PipelineRasterizationStateCreateInfo band_rasterization{
+		        .polygonMode = vk::PolygonMode::eFill,
+		        .cullMode = vk::CullModeFlagBits::eNone,
+		        .frontFace = vk::FrontFace::eCounterClockwise,
+		        .depthBiasEnable = depth_test ? VK_TRUE : VK_FALSE,
+		        .depthBiasConstantFactor = bias,
+		        .lineWidth = 1,
+		};
+		auto [stencil_front, stencil_back] = band_stencil(stencil_ref, vk::CompareOp::eEqual);
+		vk::PipelineDepthStencilStateCreateInfo band_depth{
+		        .depthTestEnable = depth_test ? VK_TRUE : VK_FALSE,
+		        .depthWriteEnable = VK_FALSE,
+		        // Reversed-Z (near = 1): lo passes at-or-nearer than
+		        // stored (+bias window), hi at-or-farther (-bias).
+		        .depthCompareOp = depth_op,
+		        .stencilTestEnable = VK_TRUE,
+		        .front = stencil_front,
+		        .back = stencil_back,
+		};
+		vk::PipelineMultisampleStateCreateInfo band_multisample{
+		        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+		};
+		vk::PipelineColorBlendAttachmentState band_blend_attachment{
+		        .blendEnable = VK_FALSE,
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		};
+		vk::PipelineColorBlendStateCreateInfo band_blend{
+		        .attachmentCount = 1,
+		        .pAttachments = &band_blend_attachment,
+		};
+		vk::DynamicState band_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+		vk::PipelineDynamicStateCreateInfo band_dynamic{
+		        .dynamicStateCount = 2,
+		        .pDynamicStates = band_dynamics,
+		};
 		vk::GraphicsPipelineCreateInfo band_pipe_info{
 		        .stageCount = 2,
 		        .pStages = band_stages,
@@ -1210,9 +1258,19 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		return vk::raii::Pipeline(device, *pipe_cache, band_pipe_info);
 	};
-	band_r8_pipeline = make_band_pipe(band_r8_depth_rp);
-	band_rgba_pipeline = make_band_pipe(band_rgba_depth_rp);
-	spdlog::info("feather silhouette band pipes built (explicit loop, depth-tested REPLACE, no depth write)");
+	// Outer (background only): stencil == 0, no depth test — no valid
+	// surface anywhere behind the quad.
+	band_r8_outer_pipeline = make_band_pipe(band_r8_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0);
+	band_rgba_outer_pipeline = make_band_pipe(band_rgba_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0);
+	// Inner window (own surface only): stencil == 1 with a symmetric
+	// ±bias depth window around the stored surface. lo passes
+	// at-or-nearer, hi at-or-farther; both write the same ramp so
+	// overlap is harmless.
+	band_r8_lo_pipeline = make_band_pipe(band_r8_depth_rp, true, vk::CompareOp::eGreaterOrEqual, band_depth_bias, 1);
+	band_r8_hi_pipeline = make_band_pipe(band_r8_depth_rp, true, vk::CompareOp::eLessOrEqual, -band_depth_bias, 1);
+	band_rgba_lo_pipeline = make_band_pipe(band_rgba_depth_rp, true, vk::CompareOp::eGreaterOrEqual, band_depth_bias, 1);
+	band_rgba_hi_pipeline = make_band_pipe(band_rgba_depth_rp, true, vk::CompareOp::eLessOrEqual, -band_depth_bias, 1);
+	spdlog::info("feather silhouette band pipes built (explicit loop, stencil-gated outer + depth-window inner)");
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -1400,7 +1458,7 @@ vk::ImageView feather_mask_renderer::output_depth_array_view(vk::Extent2D extent
 		                .viewType = vk::ImageViewType::e2DArray,
 		                .format = depth_format,
 		                .subresourceRange = {
-		                        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		                        .aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
 		                        .baseMipLevel = 0,
 		                        .levelCount = 1,
 		                        .baseArrayLayer = 0,
@@ -2161,9 +2219,9 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			        vk::ImageViewCreateInfo{
 			                .image = (VkImage)*target->depth_image,
 			                .viewType = vk::ImageViewType::e2DArray,
-			                .format = vk::Format::eD16Unorm,
+			                .format = depth_format,
 			                .subresourceRange = {
-			                        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+			                        .aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
 			                        .baseMipLevel = 0,
 			                        .levelCount = 1,
 			                        .baseArrayLayer = 0,
@@ -2270,9 +2328,9 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 				        vk::ImageViewCreateInfo{
 				                .image = (VkImage)*target->depth_image,
 				                .viewType = vk::ImageViewType::e2DArray,
-				                .format = vk::Format::eD16Unorm,
+				                .format = depth_format,
 				                .subresourceRange = {
-				                        .aspectMask = vk::ImageAspectFlagBits::eDepth,
+				                        .aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
 				                        .baseMipLevel = 0,
 				                        .levelCount = 1,
 				                        .baseArrayLayer = 0,
@@ -2753,17 +2811,16 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// one instanced quad per baked loop edge on the just-rasterized
-	// target (LOAD re-begin, depth-tested REPLACE). Internal
-	// triangulation never emits (only the loop's area-XOR covers), and
-	// the GREATER_OR_EQUAL occlusion test (reversed-Z) kills quads
-	// where other mask geometry is nearer — step-shape overhangs and
-	// hidden back edges keep binary instead of darkening valid
-	// pixels. Equal-depth (coplanar) overlaps pass and ramp — accepted
-	// as the frontmost-edge AA. Kill-side failure is fail-safe (a dead
-	// quad leaves the binary raster underneath, never a hole), so the
-	// worst case of a mistuned test is the old overhang, not un-AA.
-	// Reversed groups skip (cuts stay binary); band time folds into
-	// the raster stage diagnostics.
+	// target (LOAD re-begin, REPLACE). Stencil marks coverage (Pass 1
+	// wrote 1 wherever any triangle covers); the three draws partition
+	// every case — outer paints background-only pixels (stencil == 0,
+	// no depth test), lo/hi paint own-surface pixels (stencil == 1
+	// with a symmetric ±bias depth window). Occluded and
+	// front-over-behind quads fail everywhere, so step overhangs and
+	// hidden back edges keep binary instead of darkening valid pixels.
+	// Kill-side failure is fail-safe (a dead quad leaves the binary
+	// raster underneath, never a hole). Reversed groups skip (cuts
+	// stay binary); band time folds into the raster stage diagnostics.
 	// Cached color+depth LOAD framebuffer per band site (creation-only
 	// per color image — never replace, see the header: the single-slot
 	// triple/reveal precedent would destroy a previous frame's entry
@@ -2811,8 +2868,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		if (not any)
 			return;
 		section_clock band_clk(&ms_raster);
-		// WAW execution barrier (reveal precedent): the raster wrote
-		// img as COLOR_ATTACHMENT; the LOAD band below reads it back.
 		transfer_barrier(img,
 		                 vk::ImageLayout::eColorAttachmentOptimal,
 		                 vk::ImageLayout::eColorAttachmentOptimal,
@@ -2820,9 +2875,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                 vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eColorAttachmentRead,
 		                 vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
-		// Depth write→test hazard (hidden-path precedent): Pass 1
-		// wrote depth_img, the band below depth-tests against it.
-		// Layout stays DEPTH_ATTACHMENT on both sides.
+		// Depth+stencil write→test hazard (hidden-path precedent):
+		// Pass 1 wrote both, the band below tests both. Layout stays
+		// DEPTH_ATTACHMENT on both sides.
 		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
 		                    vk::PipelineStageFlagBits::eEarlyFragmentTests, {}, {}, {},
 		                    vk::ImageMemoryBarrier{
@@ -2834,7 +2889,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		                            .image = depth_img,
 		                            .subresourceRange = {
-		                                    .aspectMask = vk::ImageAspectFlagBits::eDepth,
+		                                    .aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
 		                                    .levelCount = 1,
 		                                    .layerCount = 2,
 		                            },
@@ -2847,19 +2902,31 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(band_begin, vk::SubpassContents::eInline);
 		set_full_viewport(e);
-		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rgba ? *band_rgba_pipeline : *band_r8_pipeline);
-		for (const auto & d: draws)
+		// Three draws partition every case: outer paints background
+		// only (stencil == 0); lo/hi paint own-surface pixels only
+		// (stencil == 1 with a symmetric ±bias depth window). All
+		// write the same ramp, so cross-draw overlap is harmless.
+		vk::Pipeline band_pipes[3] = {
+		        rgba ? *band_rgba_outer_pipeline : *band_r8_outer_pipeline,
+		        rgba ? *band_rgba_lo_pipeline : *band_r8_lo_pipeline,
+		        rgba ? *band_rgba_hi_pipeline : *band_r8_hi_pipeline,
+		};
+		for (vk::Pipeline pipe: band_pipes)
 		{
-			if (d.reverse)
-				continue;
-			auto mit = meshes.find(d.mesh);
-			if (mit == meshes.end() or mit->second.edge_count == 0)
-				continue;
-			cmd.pushConstants<band_push>(*band_layout, vk::ShaderStageFlagBits::eVertex, 0,
-			                             band_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity, .vp_w = (float)e.width, .vp_h = (float)e.height});
-			cmd.bindVertexBuffers(1, (vk::Buffer)*mit->second.edge_buffer, (vk::DeviceSize)0);
-			cmd.draw(4, mit->second.edge_count, 0, 0);
-			++n_draws;
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipe);
+			for (const auto & d: draws)
+			{
+				if (d.reverse)
+					continue;
+				auto mit = meshes.find(d.mesh);
+				if (mit == meshes.end() or mit->second.edge_count == 0)
+					continue;
+				cmd.pushConstants<band_push>(*band_layout, vk::ShaderStageFlagBits::eVertex, 0,
+				                             band_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity, .vp_w = (float)e.width, .vp_h = (float)e.height});
+				cmd.bindVertexBuffers(1, (vk::Buffer)*mit->second.edge_buffer, (vk::DeviceSize)0);
+				cmd.draw(4, mit->second.edge_count, 0, 0);
+				++n_draws;
+			}
 		}
 		cmd.endRenderPass();
 	};
