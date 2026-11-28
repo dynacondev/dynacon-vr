@@ -64,6 +64,20 @@ struct silhouette_mv_push
 static_assert(sizeof(silhouette_mv_push) == 132);
 static_assert(sizeof(silhouette_mv_push) <= 256);
 
+// Explicit silhouette band push block (sil_band_mv.vert): per-eye MVP
+// pair + opacity + target size in pixels for the screen-space quad
+// expansion. 140B exceeds the 128-byte minimum; Adreno 740 provides
+// 256B (asserted where the band layout is built).
+struct band_push
+{
+	std::array<glm::mat4, 2> mvp;
+	float opacity = 1;
+	float vp_w = 0;
+	float vp_h = 0;
+};
+static_assert(sizeof(band_push) == 140);
+static_assert(sizeof(band_push) <= 256);
+
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
 // layout).
@@ -1008,6 +1022,113 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		reveal_rgba_pipeline = vk::raii::Pipeline(device, *pipeline_cache(device), rev_rgba_pipe_info);
 	}
+
+	// Explicit silhouette band pipes (one instanced quad per loop
+	// edge, REPLACE blend, no depth, cull-none; multiview broadcast
+	// like every raster path here). R8 bakes against the reveal LOAD
+	// twin (working intermediates), RGBA8 against the cutout LOAD
+	// twin (tier-0 submits): loadOp is not part of compatibility,
+	// so the raster framebuffers are shared. Push-only layout (the
+	// file-scope band_push above); Adreno 740 provides 256B (same
+	// assertion as the silhouette layout above).
+	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(band_push))
+		throw std::runtime_error("feather silhouette band needs 140B push constants");
+	{
+		vk::PushConstantRange band_push_range{
+		        .stageFlags = vk::ShaderStageFlagBits::eVertex,
+		        .offset = 0,
+		        .size = sizeof(band_push),
+		};
+		vk::PipelineLayoutCreateInfo band_layout_info{
+		        .pushConstantRangeCount = 1,
+		        .pPushConstantRanges = &band_push_range,
+		};
+		band_layout = vk::raii::PipelineLayout(device, band_layout_info);
+	}
+	auto band_vert = load_shader(device, "sil_band_mv.vert");
+	auto band_frag = load_shader(device, "sil_band_mv.frag");
+	vk::PipelineShaderStageCreateInfo band_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **band_vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **band_frag,
+	                .pName = "main",
+	        },
+	};
+	// Per-instance edge record (a/b/c0/c1, 4x vec3, 48B stride):
+	// gl_VertexIndex (0..3) selects the strip corner, gl_InstanceIndex
+	// the edge. No per-vertex binding; binding 0 stays unbound.
+	vk::VertexInputBindingDescription band_binding{
+	        .binding = 1,
+	        .stride = sizeof(passthrough_mesh::silhouette_edge),
+	        .inputRate = vk::VertexInputRate::eInstance,
+	};
+	vk::VertexInputAttributeDescription band_attributes[4] = {
+	        {.location = 0, .binding = 1, .format = vk::Format::eR32G32B32Sfloat, .offset = 0},
+	        {.location = 1, .binding = 1, .format = vk::Format::eR32G32B32Sfloat, .offset = 12},
+	        {.location = 2, .binding = 1, .format = vk::Format::eR32G32B32Sfloat, .offset = 24},
+	        {.location = 3, .binding = 1, .format = vk::Format::eR32G32B32Sfloat, .offset = 36},
+	};
+	vk::PipelineVertexInputStateCreateInfo band_vertex_input{
+	        .vertexBindingDescriptionCount = 1,
+	        .pVertexBindingDescriptions = &band_binding,
+	        .vertexAttributeDescriptionCount = 4,
+	        .pVertexAttributeDescriptions = band_attributes,
+	};
+	vk::PipelineInputAssemblyStateCreateInfo band_input_assembly{
+	        .topology = vk::PrimitiveTopology::eTriangleStrip,
+	};
+	vk::PipelineViewportStateCreateInfo band_viewport_state{
+	        .viewportCount = 1,
+	        .scissorCount = 1,
+	};
+	vk::PipelineRasterizationStateCreateInfo band_rasterization{
+	        .polygonMode = vk::PolygonMode::eFill,
+	        .cullMode = vk::CullModeFlagBits::eNone,
+	        .frontFace = vk::FrontFace::eCounterClockwise,
+	        .lineWidth = 1,
+	};
+	vk::PipelineMultisampleStateCreateInfo band_multisample{
+	        .rasterizationSamples = vk::SampleCountFlagBits::e1,
+	};
+	vk::PipelineColorBlendAttachmentState band_blend_attachment{
+	        .blendEnable = VK_FALSE,
+	        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+	                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+	};
+	vk::PipelineColorBlendStateCreateInfo band_blend{
+	        .attachmentCount = 1,
+	        .pAttachments = &band_blend_attachment,
+	};
+	vk::DynamicState band_dynamics[2] = {vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	vk::PipelineDynamicStateCreateInfo band_dynamic{
+	        .dynamicStateCount = 2,
+	        .pDynamicStates = band_dynamics,
+	};
+	auto make_band_pipe = [&](vk::raii::RenderPass & rp) {
+		vk::GraphicsPipelineCreateInfo band_pipe_info{
+		        .stageCount = 2,
+		        .pStages = band_stages,
+		        .pVertexInputState = &band_vertex_input,
+		        .pInputAssemblyState = &band_input_assembly,
+		        .pViewportState = &band_viewport_state,
+		        .pRasterizationState = &band_rasterization,
+		        .pMultisampleState = &band_multisample,
+		        .pDepthStencilState = nullptr,
+		        .pColorBlendState = &band_blend,
+		        .pDynamicState = &band_dynamic,
+		        .layout = *band_layout,
+		        .renderPass = *rp,
+		};
+		return vk::raii::Pipeline(device, *pipe_cache, band_pipe_info);
+	};
+	band_r8_pipeline = make_band_pipe(reveal_r8_rp);
+	band_rgba_pipeline = make_band_pipe(cutout_load_renderpass);
+	spdlog::info("feather silhouette band pipes built (explicit loop, REPLACE, no depth)");
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -1070,6 +1191,45 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
+	// Explicit silhouette loop: position-keyed edge map from the
+	// post-closure soup (map-change only, same waitIdle cover).
+	// Inline positions, no storage buffers; empty soup clears.
+	{
+		auto [bedges, bstats] = passthrough_mesh::build_silhouette_edges(soup);
+		vk::DeviceSize edge_bytes = bedges.size() * sizeof(passthrough_mesh::silhouette_edge);
+		if (edge_bytes == 0)
+		{
+			mesh.edge_count = 0;
+			mesh.edge_pending_upload.reset();
+			mesh.edge_buffer.clear();
+			mesh.edge_memory.clear();
+			mesh.edge_staging_buffer.clear();
+			mesh.edge_staging_memory.clear();
+			mesh.edge_staging_size = 0;
+		}
+		else
+		{
+			if (mesh.edge_staging_size < edge_bytes)
+			{
+				std::tie(mesh.edge_staging_buffer, mesh.edge_staging_memory) = make_buffer(
+				        edge_bytes,
+				        vk::BufferUsageFlagBits::eTransferSrc,
+				        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
+				mesh.edge_staging_size = edge_bytes;
+			}
+			void * edge_mapped = mesh.edge_staging_memory.mapMemory(0, edge_bytes);
+			std::memcpy(edge_mapped, bedges.data(), edge_bytes);
+			mesh.edge_staging_memory.unmapMemory();
+			std::tie(mesh.edge_buffer, mesh.edge_memory) = make_buffer(
+			        edge_bytes,
+			        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+			        vk::MemoryPropertyFlagBits::eDeviceLocal);
+			mesh.edge_pending_upload = edge_bytes;
+			mesh.edge_count = (uint32_t)bedges.size();
+			spdlog::info("feather silhouette loop: {} edges ({} boundary, {} non-manifold, {} inconsistent) for {}",
+			             bstats.edges, bstats.boundary, bstats.non_manifold, bstats.inconsistent, key);
+		}
+	}
 	// Model-space bounds for the stream-side frustum skip (upload-time
 	// only; per-frame tests transform the 8 corners by the draw MVP).
 	glm::vec3 lo{soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z};
@@ -2095,6 +2255,33 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 		                    barriers,
 		                    {});
 	}
+	// Explicit silhouette loop upload (instance-rate vertex fetch).
+	if (mesh.edge_pending_upload)
+	{
+		vk::DeviceSize edge_bytes = *mesh.edge_pending_upload;
+		mesh.edge_pending_upload.reset();
+		vk::BufferCopy edge_copy{
+		        .srcOffset = 0,
+		        .dstOffset = 0,
+		        .size = edge_bytes,
+		};
+		cmd.copyBuffer(*mesh.edge_staging_buffer, *mesh.edge_buffer, edge_copy);
+		vk::BufferMemoryBarrier edge_barrier{
+		        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+		        .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
+		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+		        .buffer = *mesh.edge_buffer,
+		        .offset = 0,
+		        .size = edge_bytes,
+		};
+		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                    vk::PipelineStageFlagBits::eVertexInput,
+		                    {},
+		                    {},
+		                    edge_barrier,
+		                    {});
+	}
 }
 
 void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set, bool nearest,
@@ -2469,6 +2656,64 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		}
 		cmd.endRenderPass();
 	};
+	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
+	// one instanced quad per baked loop edge on the just-rasterized
+	// target (LOAD re-begin, REPLACE blend). Internal triangulation
+	// never emits (only the loop's area-XOR covers), so interiors
+	// stay bit-exact and erode sees binary interiors. Reversed
+	// groups skip (cuts stay binary); band time folds into the
+	// raster stage diagnostics.
+	auto run_band = [&](vk::Image img, vk::Framebuffer fb, vk::RenderPass rp, vk::Pipeline pipe, vk::Extent2D e) {
+		if (has_reversed)
+			return;
+		bool any = false;
+		for (const auto & d: draws)
+		{
+			if (d.reverse)
+				continue;
+			auto mit = meshes.find(d.mesh);
+			if (mit != meshes.end() and mit->second.edge_count > 0)
+			{
+				any = true;
+				break;
+			}
+		}
+		if (not any)
+			return;
+		section_clock band_clk(&ms_raster);
+		// WAW execution barrier (reveal precedent): the raster wrote
+		// img as COLOR_ATTACHMENT; the LOAD band below reads it back.
+		transfer_barrier(img,
+		                 vk::ImageLayout::eColorAttachmentOptimal,
+		                 vk::ImageLayout::eColorAttachmentOptimal,
+		                 vk::AccessFlagBits::eColorAttachmentWrite,
+		                 vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eColorAttachmentRead,
+		                 vk::PipelineStageFlagBits::eColorAttachmentOutput,
+		                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
+		vk::RenderPassBeginInfo band_begin{
+		        .renderPass = rp,
+		        .framebuffer = fb,
+		        .renderArea = {.offset = {0, 0}, .extent = e},
+		        .clearValueCount = 0,
+		};
+		cmd.beginRenderPass(band_begin, vk::SubpassContents::eInline);
+		set_full_viewport(e);
+		cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipe);
+		for (const auto & d: draws)
+		{
+			if (d.reverse)
+				continue;
+			auto mit = meshes.find(d.mesh);
+			if (mit == meshes.end() or mit->second.edge_count == 0)
+				continue;
+			cmd.pushConstants<band_push>(*band_layout, vk::ShaderStageFlagBits::eVertex, 0,
+			                             band_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity, .vp_w = (float)e.width, .vp_h = (float)e.height});
+			cmd.bindVertexBuffers(1, (vk::Buffer)*mit->second.edge_buffer, (vk::DeviceSize)0);
+			cmd.draw(4, mit->second.edge_count, 0, 0);
+			++n_draws;
+		}
+		cmd.endRenderPass();
+	};
 
 
 	// No silhouette draws (and no reversed cuts): clear-only, then the
@@ -2644,6 +2889,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// image. Exact, one multiview raster pass, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
 			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed);
+			// Explicit silhouette band on the submit (native res here).
+			run_band(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *band_rgba_pipeline, out_extent);
 			if (reveal)
 				run_reveal(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *reveal_rgba_pipeline, out_extent);
 		}
@@ -2666,6 +2913,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		{
 			section_clock raster_clk(&ms_raster);
 			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed);
+			// Explicit silhouette band on the half-res seed (native res).
+			run_band(*target_a.image, reveal_fb_for(*target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *band_r8_pipeline, half_extent);
 		}
 		if (reveal)
 			run_reveal(*target_a.image, reveal_fb_for(*target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *reveal_r8_pipeline, half_extent);
@@ -2775,6 +3024,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			{
 				section_clock raster_clk(&ms_raster);
 				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed);
+				// Explicit silhouette band on the seed (native res).
+				run_band(*down_targets[seed_level - 1].image,
+				         reveal_fb_for(*down_targets[seed_level - 1].image, *down_targets[seed_level - 1].view_array, de_seed),
+				         *reveal_r8_rp, *band_r8_pipeline, de_seed);
 			}
 			if (reveal)
 				run_reveal(*down_targets[seed_level - 1].image,

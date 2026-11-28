@@ -299,6 +299,17 @@ private:
 	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
+	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
+	// per-edge instanced quads (sil_band_mv.vert/frag, 4 verts/edge as
+	// a triangle strip, REPLACE blend, no depth, cull-none), evaluated
+	// per eye from the calling view's MVP. R8 pipe renders the working
+	// intermediates under the reveal LOAD twin; RGBA8 renders tier-0
+	// submits under the cutout LOAD twin (loadOp is not part of
+	// compatibility, framebuffers shared). Push-only layout (140B:
+	// MVP pair + opacity + viewport size), no descriptors.
+	vk::raii::PipelineLayout band_layout{nullptr};
+	vk::raii::Pipeline band_r8_pipeline{nullptr};
+	vk::raii::Pipeline band_rgba_pipeline{nullptr};
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
 	// cutout re-begins the submit framebuffer_mv under
@@ -458,6 +469,18 @@ private:
 			vk::DeviceSize index_bytes = 0;
 		};
 		std::optional<upload_sizes> pending_upload;
+		// Explicit silhouette loop (closed-volume dynamic AA): inline
+		// positions per edge (a/b/c0/c1, c1==c0 = forced emit),
+		// built once at map load, drawn instanced (4 verts/edge)
+		// by the band pass. Dies with the entry like the buffers
+		// above; meshes without triangles carry none.
+		vk::raii::Buffer edge_buffer{nullptr};
+		vk::raii::DeviceMemory edge_memory{nullptr};
+		uint32_t edge_count = 0;
+		vk::raii::Buffer edge_staging_buffer{nullptr};
+		vk::raii::DeviceMemory edge_staging_memory{nullptr};
+		vk::DeviceSize edge_staging_size = 0;
+		std::optional<vk::DeviceSize> edge_pending_upload;
 		glm::vec3 aabb_min{0}, aabb_max{0};
 	};
 	std::map<std::string, mesh_buffers> meshes;
