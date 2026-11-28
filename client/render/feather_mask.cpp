@@ -1095,7 +1095,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	}
 
 	// Explicit silhouette band pipes (one instanced quad per loop
-	// edge, REPLACE blend, stencil-gated two-draw partition, no depth
+	// edge, order-independent nearest-edge-wins blend (outer MAX over
+	// the 0 background, inner MIN into the 1 interior),
+	// stencil-gated two-draw partition, no depth
 	// test anywhere, cull-none; multiview broadcast like every raster
 	// path here). R8 bakes against band_r8_depth_rp (working
 	// intermediates), RGBA8 against band_rgba_depth_rp (tier-0
@@ -1252,7 +1254,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// kept) — the mask 0xFF is load-bearing (0x01 would alias count 2
 	// into the outer test).
 	auto make_band_pipe = [&](vk::raii::RenderPass & rp, vk::PipelineShaderStageCreateInfo * stages,
-	                          uint32_t cmp_mask, uint32_t reference) {
+	                          uint32_t cmp_mask, uint32_t reference, vk::BlendOp blend_op) {
 		vk::PipelineRasterizationStateCreateInfo band_rasterization{
 		        .polygonMode = vk::PolygonMode::eFill,
 		        .cullMode = vk::CullModeFlagBits::eNone,
@@ -1270,8 +1272,20 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		vk::PipelineMultisampleStateCreateInfo band_multisample{
 		        .rasterizationSamples = vk::SampleCountFlagBits::e1,
 		};
+		// Nearest-edge-wins within each draw (order-independent):
+		// outer MAXes over the 0 background (nearest edge = highest
+		// cov), inner MINs into the 1 interior (nearest edge = lowest
+		// cov). Single-quad pixels are unaffected (MAX(0,cov) = cov,
+		// MIN(1,cov) = cov). Factors are One/One per the min_blend
+		// precedent (ignored for MIN/MAX ops).
 		vk::PipelineColorBlendAttachmentState band_blend_attachment{
-		        .blendEnable = VK_FALSE,
+		        .blendEnable = VK_TRUE,
+		        .srcColorBlendFactor = vk::BlendFactor::eOne,
+		        .dstColorBlendFactor = vk::BlendFactor::eOne,
+		        .colorBlendOp = blend_op,
+		        .srcAlphaBlendFactor = vk::BlendFactor::eOne,
+		        .dstAlphaBlendFactor = vk::BlendFactor::eOne,
+		        .alphaBlendOp = blend_op,
 		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
 		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
 		};
@@ -1300,15 +1314,15 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		return vk::raii::Pipeline(device, *pipe_cache, band_pipe_info);
 	};
-	// Outer (background only): stencil == 0.
-	band_r8_outer_pipeline = make_band_pipe(band_r8_depth_rp, band_stages, 0xFF, 0);
-	band_rgba_outer_pipeline = make_band_pipe(band_rgba_depth_rp, band_stages, 0xFF, 0);
+	// Outer (background only): stencil == 0, MAX (nearest edge wins).
+	band_r8_outer_pipeline = make_band_pipe(band_r8_depth_rp, band_stages, 0xFF, 0, vk::BlendOp::eMax);
+	band_rgba_outer_pipeline = make_band_pipe(band_rgba_depth_rp, band_stages, 0xFF, 0, vk::BlendOp::eMax);
 	// Inner (own surface only): stencil == 1 + front-triangle clip in
-	// the fragment (2+ = overlap interior, binary kept). No depth
-	// test, no bias — exact.
-	band_r8_inner_pipeline = make_band_pipe(band_r8_depth_rp, band_inner_stages, 0xFF, 1);
-	band_rgba_inner_pipeline = make_band_pipe(band_rgba_depth_rp, band_inner_stages, 0xFF, 1);
-	spdlog::info("feather silhouette band pipes built (explicit loop, stencil outer + triangle-clip inner)");
+	// the fragment (2+ = overlap interior, binary kept), MIN (nearest
+	// edge wins). No depth test, no bias — exact.
+	band_r8_inner_pipeline = make_band_pipe(band_r8_depth_rp, band_inner_stages, 0xFF, 1, vk::BlendOp::eMin);
+	band_rgba_inner_pipeline = make_band_pipe(band_rgba_depth_rp, band_inner_stages, 0xFF, 1, vk::BlendOp::eMin);
+	spdlog::info("feather silhouette band pipes built (explicit loop, stencil outer-MAX + triangle-clip inner-MIN)");
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -2848,7 +2862,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// one instanced quad per baked loop edge on the just-rasterized
-	// target (LOAD re-begin, REPLACE color). Stencil counts front-facing
+	// target (LOAD re-begin, nearest-edge-wins color: outer MAX, inner
+	// MIN). Stencil counts front-facing
 	// coverage (Pass 1 INCRs once per front triangle); the two draws
 	// partition every case — outer paints background-only pixels
 	// (stencil == 0), inner paints single-covered own-surface pixels

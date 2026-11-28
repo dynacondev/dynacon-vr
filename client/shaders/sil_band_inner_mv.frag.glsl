@@ -21,11 +21,13 @@
 #extension GL_EXT_multiview : require
 
 // Explicit silhouette band inner fragment: linear coverage ramped only
-// inside the edge's own front triangle (stencil == 1 proves some mask
-// covers the pixel; containment proves it is THIS edge's surface).
-// Front-over-behind and occluded quads fall outside the triangle, so
-// valid geometry behind keeps binary with no depth test, no bias, no
-// tuning — the test is resolution-exact by construction. Closed
+// inside the edge's own front triangle (stencil == 1 proves single
+// front-facing coverage; containment proves it is THIS edge's
+// surface). Front-over-behind and occluded quads fall outside the
+// triangle, so valid geometry behind keeps binary with no depth test,
+// no bias, no tuning — the test is resolution-exact by construction.
+// Inner-draw blend is MIN (nearest-edge-wins into the 1 interior;
+// overlapping quads take the lowest cov, i.e. the nearest edge). Closed
 // boundary (== 0 paints) keeps the shared edge row gap-free; the
 // fallback (discard) preserves binary underneath (fail-safe).
 // Degenerate triangles (needle/collinear: all s_i ~ 0) paint —

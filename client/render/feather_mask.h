@@ -325,14 +325,15 @@ private:
 	// color LOAD/STOREs. Push-only layout
 	// (140B: MVP pair + opacity + viewport size), no descriptors.
 	vk::raii::PipelineLayout band_layout{nullptr};
-	// Band draw set (REPLACE, no depth test anywhere, no bias, no
-	// tuning): outer paints background-only pixels (stencil == 0);
-	// inner paints single-covered own-surface pixels (stencil == 1 AND
-	// inside the edge's front triangle — deterministic clip,
-	// depth-free). Overlaps (2+) paint in neither, so over/under-lap
-	// interiors keep binary; occluded and front-over-behind quads fail
-	// the clip, so step overhangs and hidden back edges keep binary;
-	// true rims ramp both halves. R8 + RGBA8 variants.
+	// Band draw set (no depth test anywhere, no bias, no tuning;
+	// order-independent nearest-edge-wins: outer MAX, inner MIN):
+	// outer paints background-only pixels (stencil == 0); inner paints
+	// single-covered own-surface pixels (stencil == 1 AND inside the
+	// edge's front triangle — deterministic clip, depth-free).
+	// Overlaps (2+) paint in neither, so over/under-lap interiors keep
+	// binary; occluded and front-over-behind quads fail the clip, so
+	// step overhangs and hidden back edges keep binary; true rims ramp
+	// both halves. R8 + RGBA8 variants.
 	vk::raii::Pipeline band_r8_outer_pipeline{nullptr};
 	vk::raii::Pipeline band_r8_inner_pipeline{nullptr};
 	vk::raii::Pipeline band_rgba_outer_pipeline{nullptr};

@@ -23,12 +23,13 @@
 // Explicit silhouette band fragment: linear coverage from the signed
 // pixel distance to the loop edge, positive inside. clamp(d + 0.5) is
 // the 1px tent: 1.0 a pixel inside, 0.0 a pixel outside, affine so any
-// downstream bilinear upscale reproduces it exactly. Blend OFF
-// (REPLACE): inner-fringe pixels must darken from the binary 1.0,
-// which MAX/MIN/ADD cannot do. No textures, no derivatives, ~6 ALU;
-// interior pixels never execute this shader (no band quad covers
-// them), so internal triangulation is invisible by construction and
-// box-min erode downstream sees the same binary interiors as before.
+// downstream bilinear upscale reproduces it exactly. Outer-draw blend
+// is MAX (nearest-edge-wins over the 0 background; overlapping quads
+// take the highest cov, i.e. the nearest edge). No textures, no
+// derivatives, ~6 ALU; interior pixels never execute this shader (no
+// band quad covers them), so internal triangulation is invisible by
+// construction and box-min erode downstream sees the same binary
+// interiors as before.
 layout(location = 0) flat in vec2 fA;
 layout(location = 1) flat in vec2 fB;
 layout(location = 2) flat in float fSide;
