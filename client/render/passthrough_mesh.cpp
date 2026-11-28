@@ -30,6 +30,8 @@
 #include <glm/gtc/quaternion.hpp>
 #include <numeric>
 #include <spdlog/spdlog.h>
+#include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 
 // File-scope bake helpers (needed both inside append_primitive's anonymous
@@ -62,7 +64,107 @@ constexpr size_t max_triangles = 4'000'000;
 // Conforming closure over [range_vert, ...)/[range_start, ...): force-split
 // tris at hanging vertices. Defined after the anonymous namespace (it is
 // called both per-primitive and globally from flatten_gltf).
-void conforming_closure_range(passthrough_mesh::triangle_soup & out, uint32_t range_vert, size_t range_start);
+void conforming_closure_range(passthrough_mesh::triangle_soup & out, uint32_t range_vert, size_t range_start); // fwd (defined below)
+
+// Explicit silhouette loop extraction (closed-volume dynamic AA): one
+// record per unique position-keyed edge with both opposite vertices.
+// Sort-based (3T directed edges, 64-bit canonical keys), linear sweep.
+// Boundary/non-manifold/inconsistent groups encode c1==c0 (forced emit,
+// fail-safe over-reveal). Runs at map load; off the frame path.
+std::pair<std::vector<passthrough_mesh::silhouette_edge>, passthrough_mesh::silhouette_edge_stats>
+passthrough_mesh::build_silhouette_edges(const passthrough_mesh::triangle_soup & soup)
+{
+	std::vector<silhouette_edge> edges;
+	silhouette_edge_stats stats{};
+	if (soup.indices.size() < 3 or soup.vertices.empty())
+		return {edges, stats};
+	// Canonical position ids (cross-primitive duplicates share one key).
+	std::unordered_map<weld_key, uint32_t, weld_hash> canon;
+	canon.reserve(soup.vertices.size() * 2);
+	uint32_t next_canon = 0;
+	std::vector<uint32_t> vcanon(soup.vertices.size(), UINT32_MAX);
+	for (size_t v = 0; v < soup.vertices.size(); ++v)
+	{
+		const XrVector3f & p = soup.vertices[v];
+		weld_key k{std::bit_cast<uint32_t>(p.x), std::bit_cast<uint32_t>(p.y), std::bit_cast<uint32_t>(p.z)};
+		auto it = canon.find(k);
+		if (it == canon.end())
+		{
+			canon.emplace(k, next_canon);
+			vcanon[v] = next_canon++;
+		}
+		else
+			vcanon[v] = it->second;
+	}
+	struct directed
+	{
+		uint64_t key;
+		uint32_t a, b, c;
+	};
+	size_t tri_count = soup.indices.size() / 3;
+	std::vector<directed> dirs;
+	dirs.reserve(tri_count * 3);
+	for (size_t t = 0; t < tri_count; ++t)
+	{
+		uint32_t i0 = soup.indices[t * 3], i1 = soup.indices[t * 3 + 1], i2 = soup.indices[t * 3 + 2];
+		if (i0 >= soup.vertices.size() or i1 >= soup.vertices.size() or i2 >= soup.vertices.size())
+			continue;
+		if (i0 == i1 or i1 == i2 or i2 == i0)
+			continue;
+		uint32_t c0 = vcanon[i0], c1 = vcanon[i1], c2 = vcanon[i2];
+		if (c0 == UINT32_MAX or c1 == UINT32_MAX or c2 == UINT32_MAX)
+			continue;
+		auto push = [&](uint32_t u, uint32_t v, uint32_t w) {
+			uint32_t cu = vcanon[u], cv = vcanon[v];
+			uint64_t key = cu < cv ? ((uint64_t)cu << 32 | cv) : ((uint64_t)cv << 32 | cu);
+			dirs.push_back({key, u, v, w});
+		};
+		push(i0, i1, i2);
+		push(i1, i2, i0);
+		push(i2, i0, i1);
+	}
+	std::sort(dirs.begin(), dirs.end(), [](const directed & l, const directed & r) { return l.key < r.key; });
+	edges.reserve(tri_count * 3 / 2);
+	for (size_t i = 0; i < dirs.size();)
+	{
+		size_t j = i + 1;
+		while (j < dirs.size() and dirs[j].key == dirs[i].key)
+			++j;
+		size_t n = j - i;
+		auto pos_of = [&](uint32_t v) -> XrVector3f { return soup.vertices[v]; };
+		if (n == 2)
+		{
+			const auto & e0 = dirs[i], & e1 = dirs[i + 1];
+			bool opposite = (e0.a == e1.b and e0.b == e1.a);
+			if (opposite)
+			{
+				edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e1.c)});
+			}
+			else
+			{
+				// Inconsistent winding: force emit (safe direction).
+				edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e0.c)});
+				++stats.inconsistent;
+			}
+		}
+		else if (n == 1)
+		{
+			const auto & e0 = dirs[i];
+			edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e0.c)});
+			++stats.boundary;
+		}
+		else
+		{
+			// Non-manifold (3+): keep first twin pair, force emit.
+			const auto & e0 = dirs[i];
+			edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e0.c)});
+			++stats.non_manifold;
+		}
+		i = j;
+	}
+	stats.edges = edges.size();
+	return {std::move(edges), stats};
+}
 
 namespace
 {
