@@ -301,9 +301,10 @@ private:
 	vk::raii::Pipeline reverse_pipeline_mv{nullptr};
 	// Stencil-mark twin of the binary raster (positives-only single
 	// pass): identical color overwrite, no depth test/write, stencil
-	// REPLACE 1 wherever any triangle covers. The band gates on the
-	// mark (outer) and the mark + front-triangle clip (inner); the
-	// mark pipe is what `mark_cover` engages below.
+	// counts front-facing coverage (front INCR_AND_CLAMP, back Keep).
+	// The band gates on the count (outer == 0) and the count +
+	// front-triangle clip (inner == 1); the mark pipe is what
+	// `mark_cover` engages below.
 	vk::raii::Pipeline mark_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
@@ -325,12 +326,13 @@ private:
 	// (140B: MVP pair + opacity + viewport size), no descriptors.
 	vk::raii::PipelineLayout band_layout{nullptr};
 	// Band draw set (REPLACE, no depth test anywhere, no bias, no
-	// tuning): outer paints background-only pixels (stencil bit0 == 0);
-	// inner paints own-surface pixels (stencil bit0 == 1 AND inside
-	// the edge's front triangle — deterministic clip, depth-free).
-	// Occluded and front-over-behind quads fail the clip, so step
-	// overhangs and hidden back edges keep binary; true rims ramp
-	// both halves. R8 + RGBA8 variants.
+	// tuning): outer paints background-only pixels (stencil == 0);
+	// inner paints single-covered own-surface pixels (stencil == 1 AND
+	// inside the edge's front triangle — deterministic clip,
+	// depth-free). Overlaps (2+) paint in neither, so over/under-lap
+	// interiors keep binary; occluded and front-over-behind quads fail
+	// the clip, so step overhangs and hidden back edges keep binary;
+	// true rims ramp both halves. R8 + RGBA8 variants.
 	vk::raii::Pipeline band_r8_outer_pipeline{nullptr};
 	vk::raii::Pipeline band_r8_inner_pipeline{nullptr};
 	vk::raii::Pipeline band_rgba_outer_pipeline{nullptr};
@@ -586,8 +588,8 @@ private:
 		vk::raii::Framebuffer framebuffer_mv{nullptr};
 		// Depth-tested raster companion for tier-0 direct raster (color +
 		// depth): one layers=1 color+depth FB under depth_renderpass_mv.
-		// Always present: positives-only groups write depth for the
-		// band's occlusion test; reversed groups reuse the same FB for
+		// Always present: positives-only groups mark stencil for the
+		// band; reversed groups reuse the same FB for
 		// their two-pass depth-tested path.
 		vk::raii::Framebuffer depth_framebuffer_mv{nullptr};
 		frame_targets(vk::Extent2D extent_,
