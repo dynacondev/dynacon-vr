@@ -19,7 +19,6 @@
 #include "passthrough_mesh.h"
 
 #include "utils/mapped_file.h"
-#include <array>
 #include <bit>
 #include <cmath>
 #include <fastgltf/core.hpp>
@@ -136,10 +135,10 @@ passthrough_mesh::build_silhouette_edges(const passthrough_mesh::triangle_soup &
 		if (n == 2)
 		{
 			const auto & e0 = dirs[i], & e1 = dirs[i + 1];
-			// Canon-id compare (not raw indices): subdivision children
-			// and cross-primitive duplicates share bits under distinct
-			// indices, so raw compare misclassifies every such shared
-			// edge as inconsistent and force-emits the band everywhere.
+			// Canon-id compare (not raw indices): cross-primitive
+			// duplicates share bits under distinct indices, so raw
+			// compare misclassifies every such shared edge as
+			// inconsistent and force-emits the band everywhere.
 			bool opposite = (e0.ca == e1.cb and e0.cb == e1.ca);
 			if (opposite)
 			{
@@ -334,44 +333,15 @@ void append_primitive(
 		}
 	}
 
-	// Bound baked edge length (world meters): with cull-back, a huge
-	// triangle straddling the near plane or projecting far outside the
-	// guardband mis-culls wholesale (pre-clip facing on unclipped
-	// coords is spec-legal; Adreno guardband is 32k-class, overflow
-	// measured to ~19M px). Small triangles bound both the straddle
-	// damage and the fully-in-front coordinate span. Threshold is
-	// pre-placement-scale: placements are ~uniform-1 (config default),
-	// larger scales re-open the hole proportionally. Midpoints are
-	// bitwise-identical across shared edges, so the output has no
-	// positional gaps (up to float rounding); the conforming closure
-	// below additionally removes topological T-junctions (hanging
-	// vertices whose long-vs-halved edge specs disagree in the
-	// rasterizer's fixed-point equations: deficit pinholes). Each
-	// half keeps the parent orientation, so flip_winding composes
-	// unchanged.
-	constexpr float kMaxBakeEdge = 0.10f;
-	constexpr float kMaxBakeEdge2 = kMaxBakeEdge * kMaxBakeEdge;
-	auto edge_len2 = [&](uint32_t u, uint32_t v) {
-		float dx = out.vertices[u].x - out.vertices[v].x;
-		float dy = out.vertices[u].y - out.vertices[v].y;
-		float dz = out.vertices[u].z - out.vertices[v].z;
-		return dx * dx + dy * dy + dz * dz;
-	};
-	auto v3 = [&](uint32_t v) {
-		const XrVector3f & p = out.vertices[v];
-		return glm::vec3(p.x, p.y, p.z);
-	};
-	// Longest^2 / 2area (1.155 equilateral, huge for needles).
-	auto aspect_of = [](const glm::vec3 & a, const glm::vec3 & b, const glm::vec3 & c) {
-		glm::vec3 e1 = b - a, e2 = c - a, e3 = c - b;
-		float area2 = glm::length(glm::cross(e1, e2));
-		if (!(area2 > 0))
-			return std::numeric_limits<float>::max();
-		float m = std::max({glm::dot(e1, e1), glm::dot(e2, e2), glm::dot(e3, e3)});
-		return m / area2;
-	};
-	std::vector<std::array<uint32_t, 3>> pending;
-	pending.reserve(indices.size() / 3 + 1);
+	// Direct emit (no bake-time subdivision): every soup-consuming
+	// raster pipe is cull-none, so the historic cull-back mis-cull of
+	// huge near-plane-straddling triangles cannot occur — hardware
+	// clipping handles arbitrary edge lengths. The conforming closure
+	// below still heals native-model T-junctions (fixed-point deficit
+	// pinholes bite cull-none raster identically). flip_winding
+	// composes at emit (it used to compose in the removed splitter).
+	// Budget was enforced above for the whole primitive (indices size
+	// unchanged since), and the closure guards its own splits.
 	for (size_t i = 0; i < indices.size(); i += 3)
 	{
 		uint32_t a = indices[i];
@@ -380,115 +350,9 @@ void append_primitive(
 		if (a == b || b == c || c == a)
 			continue; // welded-degenerate: zero area, rasterizer-culls anyway
 		if (flip_winding)
-			pending.push_back({a, c, b});
+			out.indices.insert(out.indices.end(), {a, c, b});
 		else
-			pending.push_back({a, b, c});
-	}
-	while (!pending.empty())
-	{
-		auto tri = pending.back();
-		pending.pop_back();
-		uint32_t a = tri[0], b = tri[1], c = tri[2];
-		float e_ab = edge_len2(a, b);
-		float e_bc = edge_len2(b, c);
-		float e_ca = edge_len2(c, a);
-		if (e_ab <= kMaxBakeEdge2 && e_bc <= kMaxBakeEdge2 && e_ca <= kMaxBakeEdge2)
-		{
-			if (out.indices.size() + 3 > max_triangles * 3)
-				throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
 			out.indices.insert(out.indices.end(), {a, b, c});
-			continue;
-		}
-		if (out.indices.size() + (pending.size() + 2) * 3 > max_triangles * 3)
-			throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
-		// Aspect-capped split: among splits that strictly shrink the max
-		// edge, pick the one minimizing the worst child aspect; tie-break
-		// longest edge. Blind longest-edge splitting preserves needles
-		// (children stay needles); the cap prefers splits that actually
-		// improve shape. The longest edge usually qualifies; tied-max/NaN
-		// fall back to the longest-edge halve below, so progress is
-		// guaranteed. The halves tile the parent (bitwise-identical
-		// scalar midpoint everywhere: watertight up to float rounding)
-		// with the parent orientation (cyclic order preserved).
-		float parent_max = std::max({e_ab, e_bc, e_ca});
-		uint32_t e0 = a, e1 = b, w = c;
-		{
-			float best_worst = std::numeric_limits<float>::max();
-			float best_len = -1.0f;
-			bool have = false;
-			uint32_t eu[3] = {a, b, c};
-			uint32_t ev[3] = {b, c, a};
-			uint32_t ew[3] = {c, a, b};
-			for (int k = 0; k < 3; ++k)
-			{
-				uint32_t u = eu[k], v = ev[k], ow = ew[k];
-				float len = edge_len2(u, v);
-				glm::vec3 pu = v3(u), pv = v3(v), pw = v3(ow);
-				glm::vec3 m = (pu + pv) * 0.5f;
-				auto d2 = [](const glm::vec3 & x, const glm::vec3 & y) {
-					glm::vec3 d = x - y;
-					return glm::dot(d, d);
-				};
-				float cmax = std::max({d2(pu, m), d2(m, pw), d2(pu, pw), d2(m, pv), d2(pv, pw)});
-				if (!(cmax < parent_max))
-					continue; // no progress: longest edge survives
-				float worst = std::max(aspect_of(pu, m, pw), aspect_of(m, pv, pw));
-				if (worst < best_worst || (worst == best_worst && len > best_len))
-				{
-					best_worst = worst;
-					best_len = len;
-					e0 = u;
-					e1 = v;
-					w = ow;
-					have = true;
-				}
-			}
-			if (!have)
-			{
-				// Degenerate-adjacent fallback (NaN-safe): halve the longest.
-				if (e_ab >= e_bc && e_ab >= e_ca)
-				{
-					e0 = a;
-					e1 = b;
-					w = c;
-				}
-				else if (e_bc >= e_ca)
-				{
-					e0 = b;
-					e1 = c;
-					w = a;
-				}
-				else
-				{
-					e0 = c;
-					e1 = a;
-					w = b;
-				}
-			}
-		}
-		// Midpoint from the selected edge endpoints (identical float ops
-		// everywhere: shared edges stay bitwise-identical). The finite
-		// check doubles as the NaN guard: NaN comparisons select nothing
-		// above, the fallback halves the longest, and a NaN midpoint
-		// skips the primitive here instead of looping to the budget.
-		XrVector3f p0 = out.vertices[e0];
-		XrVector3f p1 = out.vertices[e1];
-		float mx = (p0.x + p1.x) * 0.5f;
-		float my = (p0.y + p1.y) * 0.5f;
-		float mz = (p0.z + p1.z) * 0.5f;
-		if (!std::isfinite(mx) || !std::isfinite(my) || !std::isfinite(mz))
-		{
-			spdlog::warn("passthrough_mesh: midpoint overflow, skipping primitive");
-			out.vertices.resize(base_vertex);
-			out.indices.resize(index_start);
-			return;
-		}
-		out.vertices.push_back({mx, my, mz});
-		uint32_t m = (uint32_t)out.vertices.size() - 1;
-		// Halves (e0,m,w)+(m,e1,w): cyclic reorderings of the verified
-		// per-edge cases, so orientation is preserved by construction.
-		pending.push_back({e0, m, w});
-		pending.push_back({m, e1, w});
 	}
 	conforming_closure_range(out, base_vertex, index_start);
 }
