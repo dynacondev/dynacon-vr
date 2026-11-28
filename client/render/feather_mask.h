@@ -333,7 +333,15 @@ private:
 	// Overlaps (2+) paint in neither, so over/under-lap interiors keep
 	// binary; occluded and front-over-behind quads fail the clip, so
 	// step overhangs and hidden back edges keep binary; true rims ramp
-	// both halves. R8 + RGBA8 variants.
+	// both halves. Grazing-fold residual (accepted): at near-tangent
+	// folds of curved surfaces, several non-adjacent front-facing rings
+	// cover the same inner-half pixel, so the count reads 2+ and the
+	// inner draw keeps binary — outer-only AA there. The count cannot
+	// distinguish same-object folds (want ramp) from cross-object
+	// overlaps (want binary) without surface identity, and depth cannot
+	// either (both have real gaps); any relaxation re-opens the
+	// over/under-lap seam. Fail-safe solid, confined to near-tangent
+	// slivers. R8 + RGBA8 variants.
 	vk::raii::Pipeline band_r8_outer_pipeline{nullptr};
 	vk::raii::Pipeline band_r8_inner_pipeline{nullptr};
 	vk::raii::Pipeline band_rgba_outer_pipeline{nullptr};
