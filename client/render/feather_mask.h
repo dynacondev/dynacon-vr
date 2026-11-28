@@ -313,7 +313,7 @@ private:
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// per-edge instanced quads (sil_band_mv.vert + sil_band_mv.frag
 	// outer / sil_band_inner_mv.frag inner, 4 verts/edge as a triangle
-	// strip, blend-off overwrite, stencil-gated two-draw partition, no
+	// strip, nearest-edge-wins blend (outer MAX, inner MIN), stencil-gated two-draw partition, no
 	// depth test anywhere, cull-none), evaluated per eye from the
 	// calling view's MVP. R8 pipe renders the working intermediates under
 	// band_r8_depth_rp; RGBA8 renders tier-0 submits under
