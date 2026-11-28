@@ -333,15 +333,23 @@ void append_primitive(
 		}
 	}
 
-	// Direct emit (no bake-time subdivision): every soup-consuming
-	// raster pipe is cull-none, so the historic cull-back mis-cull of
-	// huge near-plane-straddling triangles cannot occur — hardware
-	// clipping handles arbitrary edge lengths. The conforming closure
-	// below still heals native-model T-junctions (fixed-point deficit
-	// pinholes bite cull-none raster identically). flip_winding
-	// composes at emit (it used to compose in the removed splitter).
-	// Budget was enforced above for the whole primitive (indices size
-	// unchanged since), and the closure guards its own splits.
+	// Direct emit (no bake-time subdivision): the feather silhouette /
+	// R8 / mark / reveal / band / hidden-silhouette pipes and the merge
+	// layer + occluder pipes are all cull-none, so the historic
+	// cull-back mis-cull of huge near-plane-straddling triangles cannot
+	// occur there — hardware clipping handles arbitrary edge lengths.
+	// One exception: the merge volume back-wall pipe is cull-front
+	// (exit-wall resolve) and consumes soup, so a huge volume triangle
+	// straddling the near plane can still mis-cull there (head at or
+	// inside a depth-volume wall). Accepted residual: the miss leaves
+	// the dilated occluder or the FAR clear, i.e. fail-open over-reveal
+	// — the same direction as every other behind-camera fallback.
+	// The conforming closure below still heals native-model T-junctions
+	// (fixed-point deficit pinholes bite cull-none raster identically).
+	// flip_winding composes at emit (it used to compose in the removed
+	// splitter). Budget was enforced above for the whole primitive
+	// (indices size unchanged since), and the closure guards its own
+	// splits.
 	for (size_t i = 0; i < indices.size(); i += 3)
 	{
 		uint32_t a = indices[i];
