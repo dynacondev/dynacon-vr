@@ -155,7 +155,8 @@ passthrough_mesh::build_silhouette_edges(const passthrough_mesh::triangle_soup &
 		}
 		else
 		{
-			// Non-manifold (3+): keep first twin pair, force emit.
+			// Non-manifold (3+): force emit (fail-safe over-reveal; no
+			// per-view fold test exists for >2 incident triangles).
 			const auto & e0 = dirs[i];
 			edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e0.c)});
 			++stats.non_manifold;

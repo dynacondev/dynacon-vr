@@ -1062,6 +1062,12 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// Per-instance edge record (a/b/c0/c1, 4x vec3, 48B stride):
 	// gl_VertexIndex (0..3) selects the strip corner, gl_InstanceIndex
 	// the edge. No per-vertex binding; binding 0 stays unbound.
+	// Layout pin: the shader reads a/b/c0/c1 at 0/12/24/36
+	// (XrVector3f x4, no padding). Fail the build if the struct drifts.
+	static_assert(sizeof(passthrough_mesh::silhouette_edge) == 48);
+	static_assert(offsetof(passthrough_mesh::silhouette_edge, b) == 12);
+	static_assert(offsetof(passthrough_mesh::silhouette_edge, c0) == 24);
+	static_assert(offsetof(passthrough_mesh::silhouette_edge, c1) == 36);
 	vk::VertexInputBindingDescription band_binding{
 	        .binding = 1,
 	        .stride = sizeof(passthrough_mesh::silhouette_edge),
