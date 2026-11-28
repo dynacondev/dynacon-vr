@@ -23,9 +23,9 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Foveated virtual-depth decode + exact global verdict at HALF merge
-// res (uniform half: quarter pixels; the apply upsamples 2x with a
-// LINEAR tent filter for a smooth reveal ramp). One fullscreen pass,
+// Foveated virtual-depth decode + exact verdict at the pinned half
+// merge res (the apply samples it NEAREST 1:1; the smooth reveal ramp
+// comes from the half-res feather blur itself). One fullscreen pass,
 // no intermediate depth canvas: the verdict compares the uniform
 // raster layer against the foveated SBS depth through the shared
 // foveation tables (same tables as color: same gaze center and source
@@ -51,8 +51,8 @@ layout(location = 0) out vec4 out_color;
 //
 // Tables: CPU-expanded per frame from the shared compact runs into a
 // direct packed-index map per loop pixel (merge->render scale baked
-// in at half res). Layout: [x0(W)] [x1(W)] [y0(H)] [y1(H)] uint32s,
-// W/H = half merge extent. SSBO (not UBO): the expanded map exceeds
+// in at the pinned half res). Layout: [x0(W)] [x1(W)] [y0(H)] [y1(H)]
+// uint32s, W/H = merge extent. SSBO (not UBO): the expanded map exceeds
 // the guaranteed maxUniformBufferRange.
 //
 // SBS encoding: 10-bit 2mm/LSB luma, valid codes 0-1020 (0-2.040m);

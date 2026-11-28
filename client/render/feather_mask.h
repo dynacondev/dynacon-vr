@@ -22,20 +22,20 @@
 //
 // Per frame (both eyes): rasterize the calibrated mesh silhouette binary
 // at half resolution into intermediate A, separable Gaussian blur H into
-// B and V upscale into the submitted swapchain image (the sampler's
-// bilinear step is the final upscale, free). The blur decouples feather
-// width from shape resolution: opaque interiors stay pixel-exact while
-// the band is genuinely smooth (robust to the compositor sampling with or
-// without filtering). Fixed 5-tap kernel (sigma 2, tails truncated);
-// feather-px maps to
-// tap spread, recommended range 4-12 (see docs/configuration.md).
+// B and V upscale into the submitted half-res swapchain image (the
+// compositor's bilinear step is the final upscale, free). The blur
+// decouples feather width from shape resolution: opaque interiors stay
+// pixel-exact while the band is genuinely smooth (robust to the
+// compositor sampling with or without filtering). Fixed 5-tap kernel
+// (sigma 2, tails truncated); feather-px maps to tap spread, clamped
+// 0..32 (spread = f/24 at half res; f=0 runs the same path with an
+// identity blur and keeps the AA band).
 //
 // Feathering is internal-only: a separable box-min erosion runs on the
 // blur input, so the blur band lands inside the silhouette instead of
 // straddling it — exact inset for any feather width (two 1D min passes
-// compose a (2r+1)^2 box, r = ceil bleed). Tier-0 hard edges skip
-// erosion (already exact); reversed cuts erode consistently with fills
-// (coverage erosion grows holes, shrinks fills).
+// compose a (2r+1)^2 box, r = ceil bleed). Reversed cuts erode
+// consistently with fills (coverage erosion grows holes, shrinks fills).
 //
 // Swapchain images only allow COLOR_ATTACHMENT output, which is why the
 // silhouette is a raster pass and not a buffer copy.
@@ -116,24 +116,13 @@ public:
 		bool reverse = false;
 	};
 
-	// Tier selection from feather-px, shared with the scene (which sizes
-	// member swapchains from it: tier-0 submits full, tier-1 half, tiered
-	// quarter). Single source of truth: record() and the scene must agree,
-	// or sizing (and the merged tier-1 gate on out == half) misfires.
-	static int tier_for_feather(float feather_px)
+	// Feather spread from feather-px (shared with the scene only for
+	// diagnostics): clamped 0..32, spread = f/24 at half res. Single
+	// source of truth for the blur/erode mapping.
+	static float spread_for_feather(float feather_px)
 	{
-		float f = feather_px;
-		if (f <= 0)
-			return 0;
-		if (f > 128.f)
-			f = 128.f;
-		if (f <= 16)
-			return 1;
-		if (f <= 48)
-			return 2;
-		if (f <= 96)
-			return 4;
-		return 8;
+		float f = std::clamp(feather_px, 0.f, 32.f);
+		return f / 24.f;
 	}
 
 	// Per-record host-side cost breakdown (steady_clock, milliseconds).
@@ -145,13 +134,12 @@ public:
 	// interest); CPU sections here identify the host-hot stage.
 	struct mask_stage_cpu
 	{
-		double raster_ms = 0; // Stage 1 silhouettes (or tier-0 direct raster)
+		double raster_ms = 0; // Stage 1 silhouettes at half res
 		double erode_ms = 0;  // separable box-min erosion (H+V, any radius)
-		double blur_ms = 0;   // blur H+V (tier 1) or downsample+H+V (tiered)
+		double blur_ms = 0;   // blur H+V (spread-scaled single kernel)
 		double punch_ms = 0;  // marker-window cutout punch
 		double depth_ms = 0;  // sensor reveal MAX pass (3d-depth-passthrough, 0 when off)
 		double total_ms = 0;  // whole record() body, incl. target setup
-		int tier = -1;        // selected tier, -1 = bypass/clear-only/empty
 		size_t draws = 0;   // drawIndexed calls: silhouettes (one per MV
 		                      // broadcast)
 		float box_frac = 1;   // scissor-box area fraction (0-1) at working
@@ -162,11 +150,10 @@ public:
 	// Record silhouettes + blur chain for both eyes into the layers of an
 	// acquired swapchain image. No-op when no mesh is set. The image must
 	// be unused (UNDEFINED is fine); it is left in COLOR_ATTACHMENT_OPTIMAL
-	// for the compositor. extent sizes the intermediates (full); out_extent sizes
-	// the submitted image and its passes (half for feathered groups: V
-	// writes half pixels, the compositor upscales on submit; equal for
-	// tier-0). Feather selects the tier as documented; rasterize=false
-	// clears only.
+	// for the compositor. extent sizes the intermediates (full working);
+	// out_extent is the submitted half-res image (V writes half pixels,
+	// the compositor upscales on submit). Feather maps to blur spread as
+	// documented; rasterize=false clears only.
 	// Cutouts are world-space quads (two triangles each) punched crisp
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP. Optional sensor reveal (depth_reveal above,
@@ -207,7 +194,7 @@ public:
 	// (spheres + body cylinders) into a
 	// depth field, RP2 rasters the silhouettes with a depth test against
 	// it, so only in-radius fragments write mask. Quarter-res working +
-	// submit; tier-0 direct raster (no blur/erode ever).
+	// submit; direct raster (no blur/erode ever).
 	// spheres/cylinders: one MVP pair per proximity volume (model =
 	// translate(center) * scale(radius) for spheres, translate(column
 	// center) * scale(r, depth/2, r) for the head-hung body columns),
@@ -267,19 +254,13 @@ public:
 		targets.clear();
 		hidden_targets.clear();
 		band_r8_fbs.clear();
-		band_rgba_fbs.clear();
 	}
 
-	// Ensure intermediates for an extent (idempotent, change-gated). Public
-	// so the scene can warm targets at map arrival, before first draws;
-	// record() calls it too (same gate, no double work).
-	// with_intermediates=false skips (and drops) the blur/downsample
-	// workspaces: tier-0 direct raster never touches them (it rasters
-	// straight into the submitted images; reversed depth uses
-	// output_depth). Saves ~17 MB
-	// per tier-0 group at 2k masks. The gate keys on (extent, flag) so a
-	// tier change rebuilds correctly.
-	void ensure_targets(vk::Extent2D extent, bool with_intermediates = true);
+	// Ensure half-res intermediates for an extent (idempotent,
+	// change-gated). Public so the scene can warm targets at map
+	// arrival, before first draws; record() calls it too (same gate,
+	// no double work).
+	void ensure_targets(vk::Extent2D extent);
 
 private:
 	vk::raii::Device & device;
@@ -288,34 +269,26 @@ private:
 	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
 	vk::raii::RenderPass renderpass_mv{nullptr};
-	vk::raii::RenderPass depth_renderpass_mv{nullptr};
 	vk::raii::RenderPass raster_r8_renderpass_mv{nullptr};
 	vk::raii::RenderPass raster_r8_depth_renderpass_mv{nullptr};
 	vk::raii::PipelineLayout silhouette_mv_layout{nullptr};
+	// RGBA silhouette pipe for the marker cutout punch only (submit
+	// target is RGBA8; blend-off overwrite). All silhouette raster
+	// runs at half res through the R8 pipes below.
 	vk::raii::Pipeline pipeline_mv{nullptr};
-	vk::raii::Pipeline depth_pipeline_mv{nullptr};
-	vk::raii::Pipeline reverse_pipeline_mv{nullptr};
-	// Stencil-mark twin of the binary raster (positives-only single
-	// pass): identical color overwrite, no depth test/write, stencil
-	// counts front-facing coverage (front INCR_AND_CLAMP, back Keep).
-	// The band gates on the count (outer == 0) and the count +
-	// front-triangle clip (inner == 1); the mark pipe is what
-	// `mark_cover` engages below.
-	vk::raii::Pipeline mark_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_mark_pipeline_mv{nullptr};
-	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
+	// Explicit silhouette band (closed-volume dynamic AA, half res):
 	// per-edge instanced quads (sil_band_mv.vert + sil_band_mv.frag
 	// outer / sil_band_inner_mv.frag inner, 4 verts/edge as a triangle
 	// strip, nearest-edge-wins blend (outer MAX, inner MIN), stencil-gated two-draw partition, no
 	// depth test anywhere, cull-none), evaluated per eye from the
-	// calling view's MVP. R8 pipe renders the working intermediates under
-	// band_r8_depth_rp; RGBA8 renders tier-0 submits under
-	// band_rgba_depth_rp (dedicated stencil-carrying LOAD twins: Pass 1
-	// marked coverage, the band tests stencil + front-triangle clip and
-	// overwrites color). Depth LOAD/STOREs are DONT_CARE (nothing reads
+	// calling view's MVP. R8 pipe renders the half-res working
+	// intermediates under band_r8_depth_rp (dedicated stencil-carrying
+	// LOAD twin: Pass 1 marked coverage, the band tests stencil +
+	// front-triangle clip and overwrites color). Depth LOAD/STOREs are DONT_CARE (nothing reads
 	// working depth — the next use is a CLEAR with initialLayout
 	// UNDEFINED, which legally discards); stencil LOADs the mark;
 	// color LOAD/STOREs. Push-only layout
@@ -337,13 +310,10 @@ private:
 	// overlaps (want binary) without surface identity, and depth cannot
 	// either (both have real gaps); any relaxation re-opens the
 	// over/under-lap seam. Fail-safe solid, confined to near-tangent
-	// slivers. R8 + RGBA8 variants.
+	// slivers. R8 only (half-res working target).
 	vk::raii::Pipeline band_r8_outer_pipeline{nullptr};
 	vk::raii::Pipeline band_r8_inner_pipeline{nullptr};
-	vk::raii::Pipeline band_rgba_outer_pipeline{nullptr};
-	vk::raii::Pipeline band_rgba_inner_pipeline{nullptr};
 	vk::raii::RenderPass band_r8_depth_rp{nullptr};
-	vk::raii::RenderPass band_rgba_depth_rp{nullptr};
 	// Band LOAD framebuffers: one per color image, creation-only
 	// (never replace a live entry — the async mask CB may still
 	// reference it on inline-fallback frames while the previous async
@@ -353,45 +323,36 @@ private:
 	// are fixed-size; working images are recreated only in the
 	// waitIdle'd ensure_targets), so keying on the image suffices.
 	// Cleared only under waitIdle: reset_targets (callers waitIdle
-	// except for band-empty inactive groups), ensure_targets
-	// (working images recreated), and the submit-resize rebuild in
-	// record() (rgba: a new submit extent bakes new views).
+	// except for band-empty inactive groups) and ensure_targets
+	// (working images recreated).
 	std::unordered_map<VkImage, vk::raii::Framebuffer> band_r8_fbs;
-	std::unordered_map<VkImage, vk::raii::Framebuffer> band_rgba_fbs;
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
 	// cutout re-begins the submit framebuffer_mv under
 	// cutout_load_renderpass (LOAD twin of the V-upscale pass) with
 	// pipeline_mv at opacity 1.
 
-	// Separable Gaussian blur (fullscreen triangle, sampled input).
-	// Two format variants: R8 for the intermediates, RGBA8 for the V
-	// upscale into swapchain images. Same shaders/layouts (format-free);
-	// only renderpass + pipeline objects split. Multiview (viewMask =
+	// Separable Gaussian blur V upscale (fullscreen triangle, sampled
+	// input): RGBA8 into the submitted swapchain image. R8 work (erode
+	// H/V, blur H) lives inside triple_rp below. Multiview (viewMask =
 	// both eyes): one fullscreen draw broadcasts to both layers.
 	vk::raii::RenderPass blur_renderpass_mv{nullptr};
-	vk::raii::RenderPass blur_r8_renderpass_mv{nullptr};
 	// Merged erode-H/erode-V/blur-H triple (one renderpass, 3
 	// subpasses): sampler reads across subpasses keep tile residency
 	// without input attachments (neighborhood taps need real
-	// sampling). Tier-1 [A,B] and tiered [h,eblur] share it: same
-	// formats, same load/store/initial/final pattern (loadOp is not
+	// sampling). Fixed [A,B] pair: same formats, same
+	// load/store/initial/final pattern (loadOp is not
 	// part of renderpass compatibility anyway).
 	vk::raii::RenderPass triple_rp{nullptr};
 	vk::raii::PipelineLayout blur_layout{nullptr};
-	// Fullscreen pipelines (multiview: one draw broadcasts to both
-	// eyes). The _mv fragment twins read each view's layer.
+	// Fullscreen pipeline (multiview: one draw broadcasts to both
+	// eyes). The _mv fragment twin reads each view's layer.
 	vk::raii::Pipeline blur_pipeline_mv{nullptr};
-	vk::raii::Pipeline blur_r8_pipeline_mv{nullptr};
-	// Box-downsample pipeline (fullscreen triangle, shared layout: it only
-	// reads the push block's src_texel prefix).
-	vk::raii::Pipeline downsample_pipeline_mv{nullptr};
-	// Separable box-min erosion for internal-only feathering at any
-	// width: two 1D min passes (H then V, radius = ceil bleed) compose an
-	// exact (2r+1)^2 box. Same fullscreen vertex shader/layout as blur
+	// Separable box-min erosion for internal-only feathering: two 1D
+	// min passes (H then V, radius = ceil bleed) compose an exact
+	// (2r+1)^2 box. Same fullscreen vertex shader/layout as blur
 	// (24-byte push). Erode runs only in triple subpasses 0/1 (blur-H in
-	// 2, subpass index baked in); one pipe set shared by both triple use
-	// sites (tier-1 [A,B] and tiered [h,eblur]).
+	// 2, subpass index baked in).
 	vk::raii::Pipeline triple_erode_0{nullptr};
 	vk::raii::Pipeline triple_erode_1{nullptr};
 	vk::raii::Pipeline triple_blur_h{nullptr};
@@ -401,9 +362,9 @@ private:
 	// that complete before submit, so every draw would otherwise read the
 	// LAST update (all passes sampling the final image, i.e. unwritten
 	// data). Distinct sets make each binding stable across the frame.
-	// Index: 0 = triple blur-H, 2 = blur-V upscale; 4,5 = downsample
-	// levels 2,3; 7 = erode-H, 8 = erode-V. Sets 1, 3, 6 are unused
-	// (kept so the pool size and set indices stay stable).
+	// Index: 0 = triple blur-H, 2 = blur-V upscale; 7 = erode-H,
+	// 8 = erode-V. Sets 1, 3-6 are unused (kept so the pool size and
+	// set indices stay stable).
 	// One set per pass (not
 	// per eye): the multiview passes sample the array view, so no
 	// per-eye slots exist. Erosion needs two sets because its H and V
@@ -415,21 +376,16 @@ private:
 	// texel centers (integer offsets), where LINEAR == NEAREST
 	// mathematically but executes the full bilinear path per tap.
 	// Blur keeps the linear sampler (its fractional taps deliberately
-	// exploit hardware bilinear); downsample keeps it too (its ±0.5
-	// offsets would hit nearest tie-breaks).
+	// exploit hardware bilinear).
 	vk::raii::Sampler sampler_nearest{nullptr};
 
 	// Depth reveal (3d-depth-passthrough): single test MAX-blended over
-	// the working alpha (binary) ahead of the erode/blur chain (the blend
-	// unit does the OR — no work tap, which would be a feedback loop;
-	// R8 MIN-blend precedent from the reversed raster proves the blend
-	// path). R8 LOAD RP for the intermediates (tier-1 A, tiered seed —
-	// the reveal blurs with the rest of the chain) plus a pipe under the
-	// RGBA8 cutout LOAD twin for tier-0 submits (hard edge kept). Full
-	// footprint every record (both bindings, Adreno partial-write
-	// rule); ping-ponged sets (async mask CB may still read the other,
-	// merge precedent); 4B bias push. Runs in every tier (seed
-	// resolution on tiered: quarter for tier 2, eighth for tier 8).
+	// the half-res working alpha (binary) ahead of the erode/blur chain
+	// (the blend unit does the OR — no work tap, which would be a
+	// feedback loop; R8 MIN-blend precedent from the reversed raster
+	// proves the blend path). R8 LOAD RP for the half-res working
+	// target; ping-ponged sets (async mask CB may still read the other,
+	// merge precedent); 4B bias push.
 	// Reversed cuts raster as usual first; the reveal MAXes over them
 	// (physical visibility wins, hidden-wins-reversed precedent).
 	vk::raii::RenderPass reveal_r8_rp{nullptr};
@@ -438,31 +394,27 @@ private:
 	std::vector<vk::raii::DescriptorSet> reveal_sets;
 	bool reveal_parity = false;
 	vk::raii::PipelineLayout reveal_pipeline_layout{nullptr};
-	vk::raii::Pipeline reveal_r8_pipeline{nullptr};   // MAX over R8 working target
-	vk::raii::Pipeline reveal_rgba_pipeline{nullptr}; // MAX over RGBA8 submit (tier-0)
+	vk::raii::Pipeline reveal_r8_pipeline{nullptr}; // MAX over R8 working target
 	// Cached LOAD framebuffer for the R8 working target under
 	// reveal_r8_rp (creation-only, keyed like triple_fb below).
 	vk::raii::Framebuffer reveal_fb{nullptr};
 	vk::Image reveal_fb_src = VK_NULL_HANDLE;
 
-	// Blur intermediates (full mask resolution, own images: full usage
+	// Blur intermediates (half mask resolution, own images: full usage
 	// control, unlike swapchain images). Recreated when the extent changes.
 	struct blur_target
 	{
 		image_allocation image;
-		// Multiview sampling + render target: 2D-array view over both
-		// layers and one layers=1 framebuffer (view mask routes both
-		// eyes). The _mv fullscreen
-		// passes read via view_array (sampler2DArray indexed by
-		// gl_ViewIndex) and render into blur_fb_mv.
+		// Multiview sampling target: 2D-array view over both layers
+		// (view mask routes both eyes). The _mv fullscreen passes read
+		// via view_array (sampler2DArray indexed by gl_ViewIndex).
 		vk::raii::ImageView view_array{nullptr};
-		vk::raii::Framebuffer blur_fb_mv{nullptr};
 		// Multiview raster target: same array view under the raster MV pass.
 		vk::raii::Framebuffer raster_fb_mv{nullptr};
 		// Depth-tested raster companions (D24S8, same extent as the color
 		// target above): depth image shared by both layers. Built for
-		// raster sources only (A, down levels); blur-only targets (B,
-		// eblur) leave these null.
+		// the raster source (A) only; the triple-scratch target (B)
+		// leaves these null.
 		image_allocation depth_image;
 		vk::raii::ImageView depth_view_array{nullptr};
 		// Multiview depth companion: one layers=1 color+depth FB under the raster MV depth pass.
@@ -471,22 +423,13 @@ private:
 	blur_target target_a;
 	blur_target target_b;
 	// Merged-triple framebuffer (one renderpass, both layers): built
-	// lazily on first record — the (src, tmp) image pair is fixed per
-	// renderer (tier is fixed per group), so no rebuilds after that.
-	// Creation-only (never destroys live targets), hence no waitIdle.
+	// lazily on first record — the (src, tmp) image pair is fixed (A,B),
+	// so no rebuilds after that. Creation-only (never destroys live
+	// targets), hence no waitIdle.
 	vk::raii::Framebuffer triple_fb{nullptr};
 	vk::Image triple_src = VK_NULL_HANDLE;
 	vk::Image triple_tmp = VK_NULL_HANDLE;
-	// Downsample chain (D) and tier blur workspaces (E) at half, quarter
-	// and eighth mask resolution (index 0..2). Tier k blurs at 1/k size
-	// with the same fixed kernel, so tap density (and cost) stays flat
-	// while feather-px grows; the band stays continuous by exact mapping.
-	blur_target down_targets[3];
-	blur_target eblur_targets[3];
 	vk::Extent2D targets_extent{0, 0};
-	// Whether the intermediates above currently exist (tier-0 groups
-	// skip them — see ensure_targets; part of the rebuild gate).
-	bool targets_has_intermediates = false;
 
 	// Marker cutout LOAD pass (RGBA8 multiview): LOAD twin of the
 	// V-upscale pass above; the cutout punch re-begins the submit
@@ -549,8 +492,7 @@ private:
 	// Feather-owned hidden proximity field (D24S8 2-layer image + array view
 	// the proximity framebuffer below bakes against; P4: one proximity raster
 	// per frame). (Re)created by ensure_hidden_field (waitIdle'd scene
-	// prewarm); reset_targets() on rebuild. output_depth_array_view is
-	// declared with output_depth below.
+	// prewarm); reset_targets() on rebuild.
 	image_allocation hidden_sphere_depth_;
 	vk::raii::ImageView hidden_sphere_view_array_{nullptr};
 	vk::Extent2D hidden_sphere_extent_{0, 0};
@@ -577,17 +519,10 @@ private:
 		vk::Extent2D extent;
 		// Multiview submit target: array view (both layers) + layers=1
 		// framebuffer under blur_renderpass_mv. All output is multiview
-		// (raster, V upscale, cutout punch — the
-		// cutout re-begins this framebuffer under
-		// cutout_load_renderpass).
+		// (V upscale, cutout punch — the cutout re-begins this
+		// framebuffer under cutout_load_renderpass).
 		vk::raii::ImageView view_array{nullptr};
 		vk::raii::Framebuffer framebuffer_mv{nullptr};
-		// Depth-tested raster companion for tier-0 direct raster (color +
-		// depth): one layers=1 color+depth FB under depth_renderpass_mv.
-		// Always present: positives-only groups mark stencil for the
-		// band; reversed groups reuse the same FB for
-		// their two-pass depth-tested path.
-		vk::raii::Framebuffer depth_framebuffer_mv{nullptr};
 		frame_targets(vk::Extent2D extent_,
 		              vk::raii::ImageView view_array_ = nullptr,
 		              vk::raii::Framebuffer framebuffer_mv_ = nullptr) :
@@ -598,18 +533,13 @@ private:
 		}
 	};
 	std::unordered_map<VkImage, frame_targets> targets;
-	// Submitted-size D24S8 depth array view for the tier-0 MV depth raster:
-	// cached by extent (swapchain-independent, survives reset_targets();
-	// only a handful of quantized submit sizes ever exist).
+	// D24S8 depth image + array view at an extent (depth-test-only raster:
+	// never sampled, device-local). Backs the intermediate raster
+	// companions in ensure_targets.
 	struct depth_entry
 	{
 		image_allocation image;
-		vk::raii::ImageView view_array{nullptr};
+		vk::ImageView view_array{nullptr};
 	};
-	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
-	vk::ImageView output_depth_array_view(vk::Extent2D extent);
-	// D24S8 depth image + array view at an extent (depth-test-only raster:
-	// never sampled, device-local). Backs output_depth above and the
-	// intermediate raster companions in ensure_targets.
 	depth_entry make_depth_entry(vk::Extent2D extent);
 };

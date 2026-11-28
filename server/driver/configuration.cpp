@@ -562,11 +562,23 @@ configuration::configuration()
 					if (o.type == "3d-passthrough-reversed" or is_boundary or is_hidden)
 						U_LOG_W("passthrough object \"%s\": feather-px is not accepted for %s, ignoring", o.id.c_str(), o.type.c_str());
 					else
+					{
 						o.feather_px = item["feather-px"];
+						if (o.feather_px < 0)
+						{
+							U_LOG_W("passthrough object \"%s\": negative feather-px, clamping to 0", o.id.c_str());
+							o.feather_px = 0;
+						}
+						else if (o.feather_px > 32)
+						{
+							U_LOG_W("passthrough object \"%s\": feather-px %.1f clamped to 32 (half-res single-kernel range)", o.id.c_str(), (double)o.feather_px);
+							o.feather_px = 32;
+						}
+					}
 				}
 				else if (is_depth)
 				{
-					// Depth volumes default to 12px (tier-1/half) when unconfigured.
+					// Depth volumes default to 12px (half-res) when unconfigured.
 					o.feather_px = 12;
 				}
 				if (item.contains("transition-distance"))

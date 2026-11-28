@@ -339,7 +339,7 @@ vk::Extent3D render_extent(const wivrn::from_headset::headset_info_packet & info
 }
 
 // Warp grid: full render size, never the stream staging size. The warp
-// must preserve the app's detail (the foveator downsamples after) —
+// must preserve the app's detail (the foveation step runs after) —
 // sizing it at stream res silently pins warped display to transport
 // res even when the game renders full res.
 vk::Extent2D warp_extent(const wivrn::from_headset::headset_info_packet & info)

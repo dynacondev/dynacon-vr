@@ -122,10 +122,11 @@ struct configuration
 		float scale = 1;
 		// Passthrough window feather width in screen pixels (render-only,
 		// applied live). Mask stacks group by this value so each object
-		// feathers independently. Not accepted for
-		// 3d-passthrough-reversed, 3d-boundary(-reversed) and
-		// 3d-passthrough-hidden (warned + ignored). 3d-depth-passthrough
-		// defaults to 12 (tier-1/half) when unconfigured.
+		// feathers independently. Clamped 0..32 (single half-res kernel
+		// range); 0 keeps the AA band with no blur. Not accepted for 3d-passthrough-reversed,
+		// 3d-boundary(-reversed) and 3d-passthrough-hidden (warned +
+		// ignored). 3d-depth-passthrough defaults to 12 (half res) when
+		// unconfigured.
 		float feather_px = 24;
 		// Boundary fade width in meters (3d-boundary(-reversed) only):
 		// the scene cross-fades over +/- this distance around the mesh

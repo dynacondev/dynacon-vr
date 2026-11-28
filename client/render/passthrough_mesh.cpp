@@ -403,7 +403,7 @@ void append_node(
 // identical endpoints. The rasterizer evaluates each side's edge equation
 // in fixed point; a long edge on one side vs two halves on the other can
 // disagree by snapping and drop the pixel on both sides (deficit pinhole,
-// which tier-1 erode widens into a hairline). Midpoints computed from
+// which the erode widens into a hairline). Midpoints computed from
 // identical endpoints are bitwise-identical, so the lookup below never
 // creates vertices — it only reuses existing ones. Midpoint probes
 // only (no third-point/uneven splits): residual non-midpoint junctions

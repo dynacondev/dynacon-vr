@@ -174,13 +174,9 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	// above suppressing recovery forever against stale targets.
 	vk::Format new_format = format;
 	vk::Extent2D new_extent{(uint32_t)w, (uint32_t)h};
-	// Uniform-half working res (opt #U) must divide evenly: the
-	// apply's 2x verdict upscale samples symmetric texel pairs only
-	// for even dims (NEAREST broadcast positions; LINEAR tent over
-	// them). Merge dims are 64-aligned, so this always holds; assert
-	// it loudly.
+	// Merge dims are even (pinned half of 64-aligned full), asserted loudly.
 	assert(w % 2 == 0 and h % 2 == 0);
-	vk::Extent2D half_extent{(uint32_t)w / 2, (uint32_t)h / 2};
+	vk::Extent2D merge_extent = new_extent;
 	swapchain_ = xr::swapchain(inst, sess, *device, new_format, w, h, 1, 2);
 	spdlog::info("Union merge swapchain: {}x{} ({} images)", w, h, swapchain_.image_count());
 	init_pipelines(new_format);
@@ -206,9 +202,8 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		};
 		targets.back().view = vk::raii::ImageView(*device, iv_info);
 	}
-	// Owned targets (not swapchain): layer + verdict at uniform half
-	// res (opt #U, relative to the merge size), merged at merge
-	// (config-max) res. Rebuilt under the same
+	// Owned targets (not swapchain): layer + verdict + merged all at
+	// the pinned half-res merge size. Rebuilt under the same
 	// waitIdle above; the mesh buffers survive (extent-independent).
 	// The layer and verdict keep their own framebuffers (own RPs);
 	// merged rides the per-image fold framebuffer (null renderpass =
@@ -263,22 +258,22 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		}
 		return t;
 	};
-	layer_ = make_owned(layer_format, half_extent,
+	layer_ = make_owned(layer_format, merge_extent,
 	                     vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
 	                             vk::ImageUsageFlagBits::eTransferSrc,
 	                     &geom_renderpass);
 	merged_ = make_owned(new_format, new_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, nullptr);
-	verdict_ = make_owned(verdict_format, half_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &verdict_rp);
+	verdict_ = make_owned(verdict_format, merge_extent, vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled, &verdict_rp);
 	// Sensor-compare copy + dilate scratch (R16F half res): sampled by
 	// the feather compare, written by record_copy below. TRANSFER_SRC
 	// (layer clone) + TRANSFER_DST (copy receive) on top of the
 	// attachment/sampled use. FBs ride the LOAD twin (copy raster) and
 	// the dilate RP (H+V fullscreen).
-	copy_ = make_owned(layer_format, half_extent,
+	copy_ = make_owned(layer_format, merge_extent,
 	                     vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled |
 	                             vk::ImageUsageFlagBits::eTransferDst,
 	                     nullptr);
-	copy_tmp_ = make_owned(layer_format, half_extent,
+	copy_tmp_ = make_owned(layer_format, merge_extent,
 	                         vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eSampled,
 	                         nullptr);
 	{
@@ -287,8 +282,8 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        .renderPass = *geom_load_rp,
 		        .attachmentCount = 1,
 		        .pAttachments = &copy_view,
-		        .width = half_extent.width,
-		        .height = half_extent.height,
+		        .width = merge_extent.width,
+		        .height = merge_extent.height,
 		        .layers = 1,
 		};
 		copy_load_fb = vk::raii::Framebuffer(*device, copy_load_fb_info);
@@ -296,8 +291,8 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        .renderPass = *dilate_rp,
 		        .attachmentCount = 1,
 		        .pAttachments = &copy_view,
-		        .width = half_extent.width,
-		        .height = half_extent.height,
+		        .width = merge_extent.width,
+		        .height = merge_extent.height,
 		        .layers = 1,
 		};
 		copy_dilate_fb = vk::raii::Framebuffer(*device, copy_dilate_fb_info);
@@ -306,8 +301,8 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        .renderPass = *dilate_rp,
 		        .attachmentCount = 1,
 		        .pAttachments = &tmp_view,
-		        .width = half_extent.width,
-		        .height = half_extent.height,
+		        .width = merge_extent.width,
+		        .height = merge_extent.height,
 		        .layers = 1,
 		};
 		copy_tmp_dilate_fb = vk::raii::Framebuffer(*device, tmp_dilate_fb_info);
@@ -321,13 +316,12 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		                                                        .renderPass = *geom_load_rp,
 		                                                        .attachmentCount = 1,
 		                                                        .pAttachments = &layer_view,
-		                                                        .width = half_extent.width,
-		                                                        .height = half_extent.height,
+		                                                        .width = merge_extent.width,
+		                                                        .height = merge_extent.height,
 		                                                        .layers = 1,
 		                                                });
 	}
 	layer_extent_ = new_extent;
-	half_extent_ = half_extent;
 	// Folded framebuffer, one per submit image (submit view varies):
 	// {merged, submit}. Attachments and order must match the fold RP
 	// definition in init_pipelines.
@@ -346,7 +340,7 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 	}
 	// Foveation index maps (SSBO pair, host-visible): per-eye packed
 	// index per half-res loop pixel, same layout as the shader reads.
-	verdict_tables_bytes = vk::DeviceSize(2 * (half_extent.width + half_extent.height)) * sizeof(uint32_t);
+	verdict_tables_bytes = vk::DeviceSize(2 * (merge_extent.width + merge_extent.height)) * sizeof(uint32_t);
 	for (auto & t: verdict_tables)
 	{
 		t = buffer_allocation(
@@ -361,9 +355,9 @@ bool union_merge_renderer::ensure(xr::instance & inst, xr::session & sess, vk::F
 		        },
 		        "union merge verdict tables");
 	}
-	spdlog::info("Union merge layer targets: layer {}x{} merged {}x{} verdict {}x{} tables {}B",
-	             half_extent.width, half_extent.height, new_extent.width, new_extent.height,
-	             half_extent.width, half_extent.height, verdict_tables_bytes);
+	spdlog::info("Union merge layer targets (pinned half): layer {}x{} merged {}x{} verdict {}x{} tables {}B",
+	             new_extent.width, new_extent.height, new_extent.width, new_extent.height,
+	             new_extent.width, new_extent.height, verdict_tables_bytes);
 	// Commit only after the whole rebuild succeeded (see above).
 	format_ = new_format;
 	extent_ = new_extent;
@@ -408,9 +402,9 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	                                                                 .bindingCount = max_inputs,
 	                                                                 .pBindings = bindings,
 	                                                         });
-	// Linear + ClampToEdge (feather sampler precedent): the bilinear
-	// tap IS the upscale for half/quarter-res inputs (and the 2x
-	// full-res tier-0 copy, filtered like the rest of the chain).
+	// Linear + ClampToEdge (feather sampler precedent): all merge
+	// inputs arrive at the merge size (1:1 taps; flat interiors sample
+	// identically either way).
 	// maxLod 0, no mipmap chain on swapchain images. The 4-tap cost on
 	// 1:1 copies is accepted (interiors are bit-identical either way).
 	vk::SamplerCreateInfo sampler_info{
@@ -1025,8 +1019,9 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	}
 
 	// Standalone verdict renderpass (single attachment, multiview):
-	// the verdict runs ahead of the fold in its own RP (it renders at
-	// a different size — opt #U half res). CLEAR-to-1 (opt #A box) +
+	// the verdict runs ahead of the fold in its own RP (CLEAR-to-1
+	// semantics + content-box scissor differ from the fold, not the
+	// size: same pinned half extent). CLEAR-to-1 (opt #A box) +
 	// STORE + SHADER_READ final (viz samples it after the frame).
 	vk::AttachmentDescription verdict_attachment{
 	        .format = verdict_format,
@@ -1064,8 +1059,9 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	// Verdict + apply sampler/descriptor state (static 2-slot CIS
 	// layouts for layer/virt, FRAG-only, same Adreno-safe pattern as
 	// the merge): verdict reads layer NEAREST + SBS virt (handle-generation
-	// sampler); apply reads merged NEAREST (exact) + half-res verdict
-	// LINEAR (2x tent-filtered upscale = smooth reveal ramp).
+	// sampler); apply reads merged NEAREST (exact) + verdict NEAREST
+	// (1:1 — the smooth reveal ramp comes from the half-res feather
+	// blur itself).
 	vk::SamplerCreateInfo nearest_info{
 	        .magFilter = vk::Filter::eNearest,
 	        .minFilter = vk::Filter::eNearest,
@@ -1245,9 +1241,9 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	// legal; max() over duplicates is neutral). Ping-pong parity:
 	// the other set may still be read by a prior in-flight command
 	// buffer (inline fallback while the async CB flies).
-	// Always LINEAR: the bilinear tap IS the upscale for
-	// half/quarter-res inputs; flat interiors sample identically
-	// either way (all 4 taps agree).
+	// Always LINEAR: all merge inputs arrive at the merge size, so
+	// the 1:1 taps filter identically-sized images; flat interiors
+	// sample identically either way (all 4 taps agree).
 	// extent (the merge size) is currently implied by the views; kept for
 	// API stability with record_finish.
 	(void)extent;
@@ -1350,18 +1346,18 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 		if (empty or behind)
 		{
 			verdict_box_empty_ = empty and not behind;
-			verdict_box_ = behind ? vk::Rect2D{{0, 0}, half_extent_}
+			verdict_box_ = behind ? vk::Rect2D{{0, 0}, layer_extent_}
 			                      : vk::Rect2D{{0, 0}, {0, 0}};
 		}
 		else
 		{
-			// Half-res working pixels (opt #U): the verdict loop below runs
-		// at half res, so the box is mapped there directly.
-		const float W = (float)half_extent_.width, H = (float)half_extent_.height;
+			// Pinned half-res working pixels: the verdict loop below runs
+		// at the merge size, so the box is mapped there directly.
+		const float W = (float)layer_extent_.width, H = (float)layer_extent_.height;
 			int32_t px0 = std::max<int32_t>(0, (int32_t)((minx * 0.5f + 0.5f) * W) - 2);
 			int32_t py0 = std::max<int32_t>(0, (int32_t)((miny * 0.5f + 0.5f) * H) - 2);
-			int32_t px1 = std::min<int32_t>((int32_t)half_extent_.width, (int32_t)((maxx * 0.5f + 0.5f) * W) + 2);
-			int32_t py1 = std::min<int32_t>((int32_t)half_extent_.height, (int32_t)((maxy * 0.5f + 0.5f) * H) + 2);
+			int32_t px1 = std::min<int32_t>((int32_t)layer_extent_.width, (int32_t)((maxx * 0.5f + 0.5f) * W) + 2);
+			int32_t py1 = std::min<int32_t>((int32_t)layer_extent_.height, (int32_t)((maxy * 0.5f + 0.5f) * H) + 2);
 			verdict_box_empty_ = (px1 <= px0) or (py1 <= py0);
 			verdict_box_ = verdict_box_empty_ ? vk::Rect2D{{0, 0}, {0, 0}}
 			                                  : vk::Rect2D{{px0, py0}, {(uint32_t)(px1 - px0), (uint32_t)(py1 - py0)}};
@@ -1376,7 +1372,7 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	vk::RenderPassBeginInfo begin{
 	        .renderPass = *geom_renderpass,
 	        .framebuffer = *layer_.framebuffer,
-	        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+	        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
 	        .clearValueCount = 1,
 	        .pClearValues = &clear,
 	};
@@ -1384,15 +1380,15 @@ void union_merge_renderer::record_base(vk::raii::CommandBuffer & cmd, std::span<
 	cmd.setViewport(0, vk::Viewport{
 	                        .x = 0,
 	                        .y = 0,
-	                        .width = (float)half_extent_.width,
-	                        .height = (float)half_extent_.height,
+	                        .width = (float)layer_extent_.width,
+	                        .height = (float)layer_extent_.height,
 	                        .minDepth = 0,
 	                        .maxDepth = 1,
 	                });
 	// Full-layer scissor, set explicitly: prior passes in this command
 	// buffer may leave narrowed boxes behind (per-draw unions). The
 	// raster covers the whole (half-res) layer by design.
-	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *geom_pipeline);
 	for (const auto & d: draws)
 	{
@@ -1469,7 +1465,7 @@ bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<
 	vk::ImageCopy copy_region{
 	        .srcSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 2},
 	        .dstSubresource = {.aspectMask = vk::ImageAspectFlagBits::eColor, .layerCount = 2},
-	        .extent = {half_extent_.width, half_extent_.height, 1},
+	        .extent = {layer_extent_.width, layer_extent_.height, 1},
 	};
 	cmd.copyImage(*layer_.image, vk::ImageLayout::eTransferSrcOptimal, *copy_.image,
 	              vk::ImageLayout::eTransferDstOptimal, copy_region);
@@ -1505,7 +1501,7 @@ bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<
 		vk::RenderPassBeginInfo occl_begin{
 		        .renderPass = *geom_load_rp,
 		        .framebuffer = *copy_load_fb,
-		        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+		        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
 		        .clearValueCount = 0,
 		        .pClearValues = nullptr,
 		};
@@ -1513,12 +1509,12 @@ bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<
 		cmd.setViewport(0, vk::Viewport{
 		                        .x = 0,
 		                        .y = 0,
-		                        .width = (float)half_extent_.width,
-		                        .height = (float)half_extent_.height,
+		                        .width = (float)layer_extent_.width,
+		                        .height = (float)layer_extent_.height,
 		                        .minDepth = 0,
 		                        .maxDepth = 1,
 		                });
-		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
 		draw_list(occluders, occluder_meshes, *geom_pipeline);
 		cmd.endRenderPass();
 		img_barrier(*copy_.image, vk::ImageLayout::eColorAttachmentOptimal, vk::ImageLayout::eShaderReadOnlyOptimal,
@@ -1567,7 +1563,7 @@ bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<
 			vk::RenderPassBeginInfo dil_begin{
 			        .renderPass = *dilate_rp,
 			        .framebuffer = fb,
-			        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+			        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
 			        .clearValueCount = 0,
 			        .pClearValues = nullptr,
 			};
@@ -1575,17 +1571,17 @@ bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<
 			cmd.setViewport(0, vk::Viewport{
 			                        .x = 0,
 			                        .y = 0,
-			                        .width = (float)half_extent_.width,
-			                        .height = (float)half_extent_.height,
+			                        .width = (float)layer_extent_.width,
+			                        .height = (float)layer_extent_.height,
 			                        .minDepth = 0,
 			                        .maxDepth = 1,
 			                });
-			cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+			cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
 			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *dilate_pipeline);
 			cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *dilate_pipeline_layout, 0, set, {});
 			dilate_push pc{
-			        .texel = {(float)half_extent_.width ? 1.f / (float)half_extent_.width : 0.f,
-			                  (float)half_extent_.height ? 1.f / (float)half_extent_.height : 0.f},
+			        .texel = {(float)layer_extent_.width ? 1.f / (float)layer_extent_.width : 0.f,
+			                  (float)layer_extent_.height ? 1.f / (float)layer_extent_.height : 0.f},
 			        .dir = {horizontal ? 1.f : 0.f, horizontal ? 0.f : 1.f},
 			        .radius = (float)radius,
 			};
@@ -1619,7 +1615,7 @@ bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<
 		vk::RenderPassBeginInfo vol_begin{
 		        .renderPass = *geom_load_rp,
 		        .framebuffer = *copy_load_fb,
-		        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+		        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
 		        .clearValueCount = 0,
 		        .pClearValues = nullptr,
 		};
@@ -1627,12 +1623,12 @@ bool union_merge_renderer::record_copy(vk::raii::CommandBuffer & cmd, std::span<
 		cmd.setViewport(0, vk::Viewport{
 		                        .x = 0,
 		                        .y = 0,
-		                        .width = (float)half_extent_.width,
-		                        .height = (float)half_extent_.height,
+		                        .width = (float)layer_extent_.width,
+		                        .height = (float)layer_extent_.height,
 		                        .minDepth = 0,
 		                        .maxDepth = 1,
 		                });
-		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+		cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
 		draw_list(volumes, volume_meshes, *backwall_pipeline);
 		cmd.endRenderPass();
 	}
@@ -1709,7 +1705,7 @@ bool union_merge_renderer::record_depth_writeback(vk::raii::CommandBuffer & cmd,
 	vk::RenderPassBeginInfo wb_begin{
 	        .renderPass = *geom_load_rp,
 	        .framebuffer = *layer_load_fb,
-	        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+	        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
 	        .clearValueCount = 0,
 	        .pClearValues = nullptr,
 	};
@@ -1717,8 +1713,8 @@ bool union_merge_renderer::record_depth_writeback(vk::raii::CommandBuffer & cmd,
 	cmd.setViewport(0, vk::Viewport{
 	                        .x = 0,
 	                        .y = 0,
-	                        .width = (float)half_extent_.width,
-	                        .height = (float)half_extent_.height,
+	                        .width = (float)layer_extent_.width,
+	                        .height = (float)layer_extent_.height,
 	                        .minDepth = 0,
 	                        .maxDepth = 1,
 	                });
@@ -1726,7 +1722,7 @@ bool union_merge_renderer::record_depth_writeback(vk::raii::CommandBuffer & cmd,
 	// buffer leave narrowed boxes behind (verdict content box, per-draw
 	// unions) — inheriting one would clip the write-back with no
 	// validation complaint.
-	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *writeback_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *writeback_pipeline_layout, 0, wset, {});
 	struct writeback_push
@@ -1929,7 +1925,7 @@ void union_merge_renderer::record_verdict(vk::raii::CommandBuffer & cmd,
 	vk::RenderPassBeginInfo begin{
 	        .renderPass = *verdict_rp,
 	        .framebuffer = *verdict_.framebuffer,
-	        .renderArea = {.offset = {0, 0}, .extent = half_extent_},
+	        .renderArea = {.offset = {0, 0}, .extent = layer_extent_},
 	        .clearValueCount = 1,
 	        .pClearValues = &verdict_clear,
 	};
@@ -1937,14 +1933,14 @@ void union_merge_renderer::record_verdict(vk::raii::CommandBuffer & cmd,
 	cmd.setViewport(0, vk::Viewport{
 	                        .x = 0,
 	                        .y = 0,
-	                        .width = (float)half_extent_.width,
-	                        .height = (float)half_extent_.height,
+	                        .width = (float)layer_extent_.width,
+	                        .height = (float)layer_extent_.height,
 	                        .minDepth = 0,
 	                        .maxDepth = 1,
 	                });
 	// Full-layer scissor default; narrowed to the content box for the
 	// draw when non-empty (opt #A, box already in half pixels).
-	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = half_extent_});
+	cmd.setScissor(0, vk::Rect2D{.offset = {0, 0}, .extent = layer_extent_});
 	// Content-box verdict: draw only the box — outside it the CLEAR
 	// above already wrote reveal-1, exact. Empty box skips the update
 	// + draw entirely (SSBO expand included); the timestamp below
@@ -1965,7 +1961,7 @@ void union_merge_renderer::record_verdict(vk::raii::CommandBuffer & cmd,
 		// scale baked in; packed dims from the paired depth frame.
 		auto & tables = verdict_tables[verdict_set_parity ? 1 : 0];
 		{
-			const int W = (int)half_extent_.width, H = (int)half_extent_.height;
+			const int W = (int)layer_extent_.width, H = (int)layer_extent_.height;
 			const int render_w = virt_in.render_w, render_h = virt_in.render_h;
 			const int packed_w = virt_in.packed_w, packed_h = virt_in.packed_h;
 			assert(W > 0 and H > 0);
@@ -2073,9 +2069,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	if (image_index >= targets.size())
 		return false;
 
-	// Single merge size: the submit image and the owned merged target
-	// share it (ensure() rebuilds them together); layer and verdict
-	// have their own extents now. The apply below reads extent.
+	// Single pinned half-res size: submit image, merged target, layer
+	// and verdict all share it. The apply below reads extent.
 	assert(extent.width == layer_extent_.width and extent.height == layer_extent_.height);
 
 	// Folded merge→apply: merge s0 (MAX into the owned tile-local
@@ -2124,8 +2119,8 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	cmd.nextSubpass(vk::SubpassContents::eInline);
 
 	// Apply pass into the acquired submit image. Verdict path:
-	// merged (NEAREST, merge-res) x verdict (LINEAR 2x upscale of the
-	// half-merge-res mask: smooth reveal ramp). Mask-only path (no verdict
+	// merged (NEAREST) x verdict (NEAREST, 1:1 — the smooth reveal ramp
+	// now comes from the half-res feather blur itself). Mask-only path (no verdict
 	// pass above): merged straight
 	// through (one tap, pixel-identical to x1). RGB zero; the
 	// submit-time REPLACE preserves dst color.
@@ -2158,16 +2153,13 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	// (validation-silent; suspected first-touch bookkeeping for the
 	// newly-written binding) — writing both bindings from the start
 	// avoids that path entirely.
-	// Verdict tap filter (soft edge): LINEAR, not NEAREST. The
-	// half-res verdict tap IS the 2x upscale, and a tent filter turns
-	// the 2px stairstep (plus any 1px upscale-classification fringe)
-	// into a smooth ~2px reveal ramp instead of crawling binary edges.
-	// This interpolates the post-decision binary mask (pure alpha
-	// blending), never depths: no halo possible. Flat areas are
-	// bit-identical (all taps agree). The sampler is the long-lived
-	// merge sampler; the full-footprint write pattern is unchanged.
+	// Verdict tap filter: NEAREST (1:1 — layer and verdict share the
+	// pinned half-res domain, so no upscale is needed). This samples
+	// the post-decision binary mask exactly (pure alpha blending),
+	// never depths: no halo possible. The full-footprint write pattern
+	// is unchanged.
 	vk::DescriptorImageInfo apply_verdict_info{
-	        .sampler = *sampler,
+	        .sampler = *sampler_nearest,
 	        .imageView = *verdict_.view_array,
 	        // SHADER_READ: the verdict is written by its own RP ahead
 	        // of the fold (ends SHADER_READ + access barrier in
@@ -2188,7 +2180,7 @@ bool union_merge_renderer::record_finish(vk::raii::CommandBuffer & cmd,
 	// Apply subpass s1: merged (tile-local GENERAL from s0 above) x
 	// verdict (SHADER_READ texture from its own RP), or merged straight
 	// through on the mask path. Merged stays NEAREST (exact alpha);
-	// the verdict LINEAR tap is the upscale. Fullscreen scissor
+	// the verdict tap stays NEAREST (1:1, no upscale). Fullscreen scissor
 	// inherited from s0.
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, do_verdict ? *fold_apply_pipeline : *fold_maskapply_pipeline);
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eGraphics, *apply_layout, 0, aset, {});

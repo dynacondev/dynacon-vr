@@ -677,7 +677,7 @@ private:
 		// never the shared pool).
 		xr::swapchain swapchain;
 		bool wait_warned = false; // image-wait timeout already reported
-		XrExtent2Di extent{0, 0}; // submitted size (tier-selected)
+		XrExtent2Di extent{0, 0}; // submitted size (half for feather/debug groups, quarter for hidden)
 		bool active = false; // submitting this frame
 		// Acquired swapchain image this frame (-1 = none): lets the
 		// merge borrow the recorded image + its array view
@@ -700,7 +700,7 @@ private:
 	// does (real groups punch cutouts themselves), and promoted to the
 	// boundary-veil carrier while the veil is active with no group to
 	// carry its floor (boundary-only / all-culled configs). Empty
-	// draws (clear-only record), tier 0; the submit-time bias lifts the
+	// draws (clear-only record, feather-0 identity path); the submit-time bias lifts the
 	// cleared image to a uniform floor.
 	mask_group debug_group;
 	// Set when the record phase built marker-window cutouts this frame
@@ -709,14 +709,14 @@ private:
 	bool cutouts_punched = false;
 
 	// Hidden passthrough objects (3d-passthrough-hidden): hard-edged cutout
-	// on a dedicated mask layer. The mask reuses the feather renderer at
-	// tier 0 (direct raster, no blur chain) but lives outside mask_groups:
+	// on a dedicated mask layer. The mask reuses the feather renderer on
+	// the hidden path (direct raster, no blur chain) but lives outside mask_groups:
 	// its own swapchain, never feathered, never cut by reversed draws
 	// (hidden always wins). Merged like every other input at submit.
 	// Render thread only.
 	// NOTE: hidden_group.feather_px (and debug_group.feather_px)
 	// intentionally untouched (stale defaults): the hidden record and
-	// the debug record pass tier/behavior literals.
+	// the debug record pass explicit literals instead.
 	mask_group hidden_group;
 	// Merge (single submitted alpha layer for the flat feed):
 	// MAX-combines every active contributor (feather groups +

@@ -473,7 +473,7 @@ Each `passthrough` entry has:
 - `scale`: uniform object scale, number or single-element array
   (default `1`, applied last)
 - `feather-px`: passthrough window feather width in screen pixels
-  (default `24`, `12` for `3d-depth-passthrough`; `0` disables feathering). Mask stacks group by this
+  (default `24`, `12` for `3d-depth-passthrough`, clamped `0..32`; `0` keeps the AA band with no blur). Mask stacks group by this
   value so each object feathers independently; applied live. Depth
   volumes reuse their feather value and feather through the same
   erode/blur chain. Not accepted for `3d-passthrough-reversed`,

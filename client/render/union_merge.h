@@ -24,8 +24,8 @@
 // hidden group used to submit its own UNPREMULTIPLIED_ALPHA layer and
 // union them with REPLACE-then-ADD dst-alpha blending. This pass
 // MAX-combines every active contributor into a single image at the
-// config-max contributor res (full/half/quarter — the runtime upscales
-// the one submitted layer), submitted once with REPLACE.
+// pinned half res (the runtime upscales the one submitted layer),
+// submitted once with REPLACE.
 //
 // MAX preserves the safety theorems: hidden-wins-reversed (hidden only
 // adds coverage) and over-reveal (max >= every input). It differs from
@@ -87,10 +87,9 @@ public:
 	// multiview array view (both layers, BORROWED from the owning
 	// feather renderer — same-frame use only, never cached here).
 	// extent is the contributor image size (kept for API stability;
-	// currently implied by the views). The merge always takes the
-	// LINEAR path (4 taps): the bilinear tap IS the upscale for
-	// half/quarter-res inputs; flat interiors sample identically
-	// either way (all 4 taps agree).
+	// currently implied by the views). All contributors are half res;
+	// the merge LINEAR tap filters identically-sized inputs (flat
+	// interiors sample identically either way).
 	// All contributors end COLOR_ATTACHMENT_OPTIMAL and transition to
 	// SHADER_READ_ONLY for the merge; every next record re-begins
 	// UNDEFINED+CLEAR, so no transition back is needed.
@@ -151,9 +150,9 @@ public:
 	// Throwaway compile so the first real merge pays ~nothing.
 	static void warm_pipelines(vk::raii::Device & device, vk::raii::PhysicalDevice & physical_device, vk::Format format);
 
-	// (Re)create swapchain + targets + pipeline for format/size
-	// (config-max merge res: full/half/quarter). waitIdle inside on
-	// rebuild; no-op when unchanged. Returns true when rebuilt.
+	// (Re)create swapchain + targets + pipeline for the pinned
+	// half-res size. waitIdle inside on rebuild; no-op when unchanged.
+	// Returns true when rebuilt.
 	bool ensure(xr::instance & inst, xr::session & sess, vk::Format format, int w, int h);
 
 	bool ready() const
@@ -298,11 +297,11 @@ public:
 			return *copy_.view_array;
 		return {};
 	}
-	// Half-res working size (the layer raster + verdict target live
-	// here; viz upsamples by sampling).
+	// Pinned half-res working size (the layer raster + verdict target
+	// live here; viz upsamples by sampling).
 	vk::Extent2D debug_layer_extent() const
 	{
-		return half_extent_;
+		return layer_extent_;
 	}
 
 private:
@@ -322,7 +321,8 @@ private:
 
 	vk::raii::PipelineLayout pipeline_layout{nullptr};
 	// 8 static sampler2DArray bindings (see the shader): linear +
-	// ClampToEdge, the bilinear tap is the half/quarter upscale.
+	// ClampToEdge. All merge inputs arrive at the merge size (1:1
+	// taps; flat interiors sample identically either way).
 	vk::raii::DescriptorSetLayout descriptor_layout{nullptr};
 	vk::raii::DescriptorPool descriptor_pool{nullptr};
 	// Ping-pong pair (see record()): rewritten per call, never while
@@ -368,7 +368,7 @@ private:
 	// framebuffers live in fold_fbs below).
 	std::vector<target> targets;
 
-	// Common depth layer (R16F linear meters, uniform half res): one
+	// Common depth layer (R16F linear meters, pinned half res): one
 	// owned 2-layer image + array view + layers=1 framebuffer (view mask
 	// routes both eyes), rebuilt in ensure() alongside the swapchain
 	// targets above. MIN-blended by record_base, sampled by the verdict.
@@ -381,24 +381,21 @@ private:
 		vk::raii::Framebuffer framebuffer{nullptr};
 	};
 	layer_target layer_;
-	// Owned merged target (swapchain format, config-max merge res): record()
+	// Owned merged target (swapchain format, pinned half res): record()
 	// MAXes contributors here instead of the submit image, so the
 	// verdict apply has a stable input.
 	layer_target merged_;
-	// Binary verdict (R8, uniform half res): fused foveated-decode +
-	// compare output, upsampled 2x by the apply (LINEAR tent filter:
-	// smooth ~2px reveal ramp, flat areas bit-identical).
+	// Binary verdict (R8, pinned half res): fused foveated-decode +
+	// compare output, sampled NEAREST 1:1 by the apply (the smooth
+	// reveal ramp comes from the half-res feather blur itself).
 	layer_target verdict_;
-	// Merge res (== extent_, config-max: full/half/quarter): merged
-	// target + submit image.
+	// Pinned half-res merge + common layer + verdict (all == extent_):
+	// merged target + submit image + layer raster + verdict loop +
+	// verdict target. The layer and verdict are compared texel-to-texel
+	// in this domain; the apply samples both NEAREST (1:1, no upscale).
+	// Always even (asserted in ensure: merge dims derive from 64-aligned
+	// full via hw/hh).
 	vk::Extent2D layer_extent_{0, 0};
-	// Uniform half working res (opt #U): the layer raster + verdict
-	// loop + verdict target all run here (quarter pixels). The layer
-	// and verdict are compared texel-to-texel in this domain; the
-	// apply upsamples the verdict 2x (LINEAR tent ramp over the
-	// exact NEAREST broadcast positions).
-	// Always even (asserted in ensure: merge dims are 64-aligned).
-	vk::Extent2D half_extent_{0, 0};
 
 	// Geometry raster: R16F MIN-blend pipeline (CLEAR/STORE/OPTIMAL,
 	// CULL_NONE like the silhouette raster) + VERT-only MVP-pair push
@@ -407,10 +404,10 @@ private:
 	vk::raii::PipelineLayout geom_layout{nullptr};
 	vk::raii::Pipeline geom_pipeline{nullptr};
 	// Verdict (fused SBS decode + exact compare) in its own
-	// single-attachment RP: half-res R8 (opt #U), CLEAR-to-1 + box draw
-	// (opt #A), STORE + SHADER_READ final (viz samples it after the
-	// frame). Fullscreen passes, no push, static sampler2DArray
-	// bindings (Adreno rule, same as the merge shader).
+	// single-attachment RP: half-res R8, CLEAR-to-1 + box draw,
+	// STORE + SHADER_READ final (viz samples it after the frame).
+	// Fullscreen passes, no push, static sampler2DArray bindings
+	// (Adreno rule, same as the merge shader).
 	vk::raii::RenderPass verdict_rp{nullptr};
 	// Verdict YCbCr immutable-sampler state (VUID-...-02738): the depth
 	// SBS view carries a conversion, so binding 1 needs an immutable
@@ -467,7 +464,7 @@ private:
 	// Expanded index-map scratch (capacity persists after the first
 	// verdict frame): avoids a ~2*(W+H) uint32 heap alloc per frame.
 	std::vector<uint32_t> verdict_map_scratch;
-	// Sensor-compare copy (3d-depth-passthrough, R16F half res): clone
+	// Sensor-compare copy (3d-depth-passthrough, R16F pinned half res): clone
 	// of the shared layer plus hidden occluders, MIN-dilated, plus
 	// volume back walls. Pass FBs ride the LOAD twin of the geom RP
 	// (raster) and the dilate RP (fullscreen H+V). Rebuilt in ensure()
@@ -517,10 +514,9 @@ private:
 	vk::raii::PipelineLayout apply_layout{nullptr};
 	// (Fold subpass apply pipelines live with the fold members above:
 	// fold_apply_pipeline s1 paired, fold_maskapply_pipeline s1 mask.)
-	// NEAREST + ClampToEdge (layer tap in the verdict, merged tap in
-	// the apply: both inputs are already filtered). The half-res
-	// verdict is LINEAR-tapped in the apply (tent ramp); merged stays
-	// NEAREST (exact alpha).
+	// NEAREST + ClampToEdge throughout (layer tap in the verdict,
+	// merged + verdict taps in the apply: all inputs already filtered,
+	// all domains 1:1).
 	vk::raii::Sampler sampler_nearest{nullptr};
 
 	// One uploaded window mesh per object id. Staging is per mesh and

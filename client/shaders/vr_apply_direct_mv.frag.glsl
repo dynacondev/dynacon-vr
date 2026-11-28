@@ -23,16 +23,14 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Verdict apply: merged contributor alpha (merge res, NEAREST — the
-// feather bands are already filtered) times the half-merge-res binary
-// verdict (LINEAR tent filter: sampling a half-merge-res texture at
-// merge-res uv upsamples 2x with a smooth ~2px reveal ramp instead of
-// NEAREST steps — the crawl/stairstep fix; flat areas stay
-// bit-identical). No push. RGB stays zero (downstream the REPLACE
-// blend preserves dst color and the veil bias touches alpha only,
-// same as the plain merge it replaces). Always paired: the mask-only
-// path (unpaired depth) takes vr_apply_mask_mv instead and never
-// binds this pipeline.
+// Verdict apply: merged contributor alpha (NEAREST — the feather
+// bands are already filtered) times the binary verdict (NEAREST 1:1 —
+// layer and verdict share the pinned half-res domain; the smooth
+// reveal ramp comes from the half-res feather blur itself). No push.
+// RGB stays zero (downstream the REPLACE blend preserves dst color
+// and the veil bias touches alpha only, same as the plain merge it
+// replaces). Always paired: the mask-only path (unpaired depth)
+// takes vr_apply_mask_mv instead and never binds this pipeline.
 layout(set = 0, binding = 0) uniform sampler2DArray merged_tex;
 layout(set = 0, binding = 1) uniform sampler2DArray verdict_tex;
 

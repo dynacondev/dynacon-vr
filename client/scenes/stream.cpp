@@ -2173,10 +2173,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 			{
 				int mw = std::max(64, (extents[0].width + 32) / 64 * 64);
 				int mh = std::max(64, (extents[0].height + 32) / 64 * 64);
-				// Member swapchains submit below full (tiered): tier-0 stays
-				// full (exact hard edge), tier-1 submits half, tiered submits
-				// quarter (V writes the submitted size, the compositor
-				// upscales). Intermediates stay keyed off full mw/mh.
+				// Member swapchains submit half res (V writes the submitted
+				// size, the compositor upscales). Intermediates stay keyed
+				// off full mw/mh.
 				int hw = std::max(64, mw / 2);
 				int hh = std::max(64, mh / 2);
 				int qw = std::max(64, mw / 4);
@@ -2185,76 +2184,28 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				// per-group): created once here so the layer mesh sync,
 				// record_base and the merge below all share it. ensure()
 				// is idempotent (no-op when size/format unchanged).
-				// Merge size follows the config max, not visibility: the
-				// highest res any configured contributor needs (tier-0
-				// full, tier-1 half, tiered/hidden quarter), so placement
+				// Merge size is pinned at half res, not visibility: placement
 				// flaps never resize (waitIdle'd rebuild). The runtime
 				// upscales the single merged layer on submit. Layer,
-				// verdict, copy and dilate all derive from the merge size
-				// (half), so their ratios are preserved at any size.
+				// verdict, copy and dilate all derive from the merge size,
+				// so their ratios are preserved.
 				if (not merge_renderer)
 					merge_renderer = std::make_unique<union_merge_renderer>(device, physical_device);
-				int merge_w = 0, merge_h = 0, merge_tier = 0;
-				for (auto & [oid, ost]: passthrough_objects)
-				{
-					(void)oid;
-					int cw = 0, ch = 0, ctier = 0;
-					if (ost.def.type == "3d-passthrough" or ost.def.type == "3d-depth-passthrough")
-					{
-						ctier = feather_mask_renderer::tier_for_feather(ost.def.feather_px);
-						if (ctier == 0)
-						{
-							cw = mw;
-							ch = mh;
-						}
-						else if (ctier == 1)
-						{
-							cw = hw;
-							ch = hh;
-						}
-						else
-						{
-							cw = qw;
-							ch = qh;
-						}
-					}
-					else if (ost.def.type == "3d-passthrough-hidden")
-					{
-						ctier = 2;
-						cw = qw;
-						ch = qh;
-					}
-					// Reversed/boundary claim no group: ignored for sizing.
-					// Debug/veil/fullscreen carriers are not config: a
-					// full-res debug input into a smaller merge filters
-					// through the merge LINEAR (accepted).
-					if (cw * ch > merge_w * merge_h)
-					{
-						merge_w = cw;
-						merge_h = ch;
-						merge_tier = ctier;
-					}
-				}
-				if (merge_w <= 0 or merge_h <= 0)
-				{
-					merge_w = mw;
-					merge_h = mh;
-				}
-				// Quarter merge quantizes binary edges (hidden silhouette,
-				// tier-0-unaware debug cutouts) at quarter res: up to ~2
-				// full-px edge placement error after the runtime upscale.
-				// Accepted for alert-grade layers (uncapped by design);
-				// confirm the hidden edge on device after retunes.
-				// Dilate is in copy texels (merge/2): the same slider value
-				// covers more world at smaller merges (conservative —
-				// wider exclusion — so fail-closed; retune per config).
+				// Merge + common layer pinned at half res (all feather
+				// groups and debug submit half; hidden stays quarter and
+				// filters through the merge LINEAR).
+				int merge_w = hw, merge_h = hh;
+				// Hidden quarter-res inputs filter through the merge LINEAR
+				// (accepted for alert-grade layers). Dilate is in half-res
+				// copy texels now (was merge/2): the same slider value
+				// covers less world than before — retune per config.
 				{
 					static int last_merge_w = 0, last_merge_h = 0;
 					if (merge_w != last_merge_w or merge_h != last_merge_h)
 					{
 						last_merge_w = merge_w;
 						last_merge_h = merge_h;
-						spdlog::info("Union merge size: {}x{} (config-max tier {}, full {}x{})", merge_w, merge_h, merge_tier, mw, mh);
+						spdlog::info("Union merge size: {}x{} (pinned half, full {}x{})", merge_w, merge_h, mw, mh);
 					}
 				}
 				merge_renderer->ensure(instance, session, swapchain.format(), merge_w, merge_h);
@@ -2317,9 +2268,8 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					{
 						pg.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
 					}
-					int ptier = feather_mask_renderer::tier_for_feather(pf);
-					int pgw = (ptier == 0) ? mw : (ptier == 1) ? hw : qw;
-					int pgh = (ptier == 0) ? mh : (ptier == 1) ? hh : qh;
+					int pgw = hw;
+					int pgh = hh;
 					if (not pg.swapchain or pg.swapchain.width() != pgw or pg.swapchain.height() != pgh)
 					{
 						device.waitIdle();
@@ -2327,7 +2277,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						pg.renderer->reset_targets();
 						spdlog::info("Feather mask swapchain: {}x{} (feather {}px, {} images)", pgw, pgh, pf, pg.swapchain.image_count());
 					}
-					pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh}, ptier != 0);
+					pg.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
 				}
 				for (auto & [oid, ost]: passthrough_objects)
 				{
@@ -2881,14 +2831,12 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					auto & g = mask_groups[f];
 					// Eager setup: member swapchain + intermediates ready
 					// before first draws, so first-visible frames pay
-					// record+submit only. Tier-0 groups keep a full-res
-					// swapchain (exact hard edge); tier-1 submits half,
-					// tiered submits quarter (V writes the submitted size,
-					// the compositor upscales). g.extent tracks the submitted
-					// size; record() still works intermediates at full.
-					int tier = feather_mask_renderer::tier_for_feather(f);
-					int gw = (tier == 0) ? mw : (tier == 1) ? hw : qw;
-					int gh = (tier == 0) ? mh : (tier == 1) ? hh : qh;
+					// record+submit only. All groups submit half res (V
+					// writes the submitted size, the compositor upscales).
+					// g.extent tracks the submitted size; record() works
+					// intermediates at half.
+					int gw = hw;
+					int gh = hh;
 					if (not g.swapchain or g.swapchain.width() != gw or g.swapchain.height() != gh)
 					{
 						// Rare path (first frame, feather/config change):
@@ -2899,7 +2847,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						g.renderer->reset_targets();
 						spdlog::info("Feather mask swapchain: {}x{} (feather {}px, {} images)", gw, gh, f, g.swapchain.image_count());
 					}
-					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh}, tier != 0);
+					g.renderer->ensure_targets({(uint32_t)mw, (uint32_t)mh});
 					std::vector<feather_mask_renderer::instance_draw> draws;
 					// Frustum skip: drop draws fully outside both eyes (the
 					// empty-draws path below then skips acquire/record for
@@ -3080,12 +3028,11 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_blur_ms += mstats.blur_ms;
 					mask_depth_ms += mstats.depth_ms;
 					mask_draws += (int)mstats.draws;
-					// Box-coverage diagnostics for the scissor cull (see
-					// flag above; tier-0 has no scissored passes to report).
-					if (log_boxes and mstats.tier > 0)
+					// Box-coverage diagnostics for the scissor cull.
+					if (log_boxes)
 					{
-						spdlog::info("MaskBox: feather {}px box {:.0f}% tier {} draws {} depth {:.2f}ms",
-						             f, mstats.box_frac * 100.f, mstats.tier, (int)mstats.draws, mstats.depth_ms);
+						spdlog::info("MaskBox: feather {}px box {:.0f}% draws {} depth {:.2f}ms",
+						             f, mstats.box_frac * 100.f, (int)mstats.draws, mstats.depth_ms);
 					}
 					if (not mask_split_written)
 					{
@@ -3101,7 +3048,7 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					mask_split_written = true;
 					rec_cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, *rec_pool, qsplit);
 				}
-				// Debug group record (cutouts only, full-res, clear + hard
+				// Debug group record (cutouts only, half-res, clear + hard
 				// punch): runs while claimed above. During the veil (or
 				// the depth/effects debug fullscreen) it also runs with
 				// empty cutouts (clear-only): the promoted carrier lifted
@@ -3109,14 +3056,19 @@ void scenes::stream::render(const XrFrameState & frame_state)
 				if ((live.empty() and not cutouts.empty()) or boundary_veil or depth_fullscreen_passthrough() or session.effects_fullscreen_passthrough())
 				{
 					auto & g = debug_group;
-					if (g.extent.width != mw or g.extent.height != mh)
+					// Claim-site above creates the renderer under the same
+					// condition; re-check here so this record path never
+					// dereferences a null renderer if the two ever diverge.
+					if (not g.renderer)
+						g.renderer = std::make_unique<feather_mask_renderer>(device, physical_device, swapchain.format());
+					if (g.extent.width != hw or g.extent.height != hh)
 					{
 						// Match the mask-group recreation discipline above:
 						// wait for in-flight GPU work before destroying
 						// the swapchain out from under it.
 						device.waitIdle();
-						g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), mw, mh, 1, 2);
-						g.extent = {(int32_t)mw, (int32_t)mh};
+						g.swapchain = xr::swapchain(instance, session, device, swapchain.format(), hw, hh, 1, 2);
+						g.extent = {(int32_t)hw, (int32_t)hh};
 						g.renderer->reset_targets();
 					}
 					int mask_index = g.swapchain.acquire();
@@ -3141,9 +3093,9 @@ void scenes::stream::render(const XrFrameState & frame_state)
 						feather_mask_renderer::mask_stage_cpu mstats{};
 						try
 						{
-							// Full-res submit (feather 0 = tier 0): the hard
-							// punch needs no blur intermediates.
-							vk::Extent2D mex{(uint32_t)mw, (uint32_t)mh};
+							// Half-res submit: clear + crisp punch, no blur
+							// intermediates needed for empty draws.
+							vk::Extent2D mex{(uint32_t)hw, (uint32_t)hh};
 							g.renderer->record(rec_cmd, g.swapchain.image(mask_index), mex, {}, true, 0,
 							                   cutouts, server_mvp, &mstats, mex);
 						}
@@ -3166,19 +3118,17 @@ void scenes::stream::render(const XrFrameState & frame_state)
 					debug_group.active = false;
 				// Hidden objects (3d-passthrough-hidden): dedicated hard-edged
 				// mask merged into the single submit layer below.
-				// Separate renderer +
-				// swapchain from the feather groups (tier 0 direct raster, no
-				// blur chain, no cutouts); reversed draws are never appended,
-				// so hidden always wins for safety.
+				// Separate renderer + swapchain from the feather groups
+				// (hard-edged direct raster, no blur chain, no cutouts);
+				// reversed draws are never appended, so hidden always
+				// wins for safety.
 				// Steady full-opacity cutout of the revealed feed.
 				auto record_hidden_mask = [&]() {
 					auto & g = hidden_group;
 					// Quarter-res working + submit (alert-grade layers):
-					// tier-0 stays a hard-edged direct raster (no blur
-					// chain ever — tier comes from feather_px = 0, not
-					// resolution), the compositor upscales the
-					// quarter-rect (binary alpha: edge carries a ~1-texel
-					// upscale ramp). Reuses the tiered-quarter qw/qh size.
+					// hard-edged direct raster (no blur chain ever), the
+					// compositor upscales the quarter-rect (binary alpha:
+					// edge carries a ~1-texel upscale ramp).
 					int hmw = qw;
 					int hmh = qh;
 					{
