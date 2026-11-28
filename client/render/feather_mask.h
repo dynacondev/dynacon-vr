@@ -266,10 +266,8 @@ public:
 	{
 		targets.clear();
 		hidden_targets.clear();
-		band_r8_fb.clear();
-		band_r8_fb_src = VK_NULL_HANDLE;
-		band_rgba_fb.clear();
-		band_rgba_fb_src = VK_NULL_HANDLE;
+		band_r8_fbs.clear();
+		band_rgba_fbs.clear();
 	}
 
 	// Ensure intermediates for an extent (idempotent, change-gated). Public
@@ -306,27 +304,35 @@ private:
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// per-edge instanced quads (sil_band_mv.vert/frag, 4 verts/edge as
-	// a triangle strip, REPLACE blend, no depth, cull-none), evaluated
-	// per eye from the calling view's MVP. R8 pipe renders the working
-	// intermediates under the reveal LOAD twin; RGBA8 renders tier-0
-	// submits under the cutout LOAD twin (loadOp is not part of
-	// compatibility, framebuffers shared). Push-only layout (140B:
-	// MVP pair + opacity + viewport size), no descriptors.
+	// a triangle strip, REPLACE blend, depth-tested GREATER_OR_EQUAL
+	// with write off, cull-none), evaluated per eye from the calling
+	// view's MVP. R8 pipe renders the working intermediates under
+	// band_r8_depth_rp; RGBA8 renders tier-0 submits under
+	// band_rgba_depth_rp (dedicated color+depth LOAD twins: Pass 1
+	// wrote both, the band tests depth and overwrites color). Depth
+	// LOADs (preserves Pass-1), stores DONT_CARE (depth is dead after
+	// the band — the next use is a CLEAR with initialLayout UNDEFINED,
+	// which legally discards); color LOAD/STOREs. Push-only layout
+	// (140B: MVP pair + opacity + viewport size), no descriptors.
 	vk::raii::PipelineLayout band_layout{nullptr};
 	vk::raii::Pipeline band_r8_pipeline{nullptr};
 	vk::raii::Pipeline band_rgba_pipeline{nullptr};
-	// Band occlusion-test renderpasses (color+depth LOAD twins: the
-	// raster wrote both, the band tests depth and overwrites color).
-	// R8 for the working intermediates, RGBA8 for tier-0 submits;
-	// framebuffers cached creation-only per site below (reveal-cache
-	// pattern). Depth LOADs (preserves Pass-1), stores DONT_CARE
-	// (depth is dead after the band); color LOAD/STOREs.
 	vk::raii::RenderPass band_r8_depth_rp{nullptr};
 	vk::raii::RenderPass band_rgba_depth_rp{nullptr};
-	vk::raii::Framebuffer band_r8_fb{nullptr};
-	vk::Image band_r8_fb_src = VK_NULL_HANDLE;
-	vk::raii::Framebuffer band_rgba_fb{nullptr};
-	vk::Image band_rgba_fb_src = VK_NULL_HANDLE;
+	// Band LOAD framebuffers: one per color image, creation-only
+	// (never replace a live entry — the async mask CB may still
+	// reference it on inline-fallback frames while the previous async
+	// submit is in flight; the single-slot triple/reveal precedent is
+	// unsafe here because swapchain images cycle every frame). The
+	// same image always bakes the same extent/views (swapchain images
+	// are fixed-size; working images are recreated only in the
+	// waitIdle'd ensure_targets), so keying on the image suffices.
+	// Cleared only under waitIdle: reset_targets (callers waitIdle
+	// except for band-empty inactive groups), ensure_targets
+	// (working images recreated), and the submit-resize rebuild in
+	// record() (rgba: a new submit extent bakes new views).
+	std::unordered_map<VkImage, vk::raii::Framebuffer> band_r8_fbs;
+	std::unordered_map<VkImage, vk::raii::Framebuffer> band_rgba_fbs;
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
 	// cutout re-begins the submit framebuffer_mv under
@@ -561,19 +567,17 @@ private:
 		vk::raii::ImageView view_array{nullptr};
 		vk::raii::Framebuffer framebuffer_mv{nullptr};
 		// Depth-tested raster companion for tier-0 direct raster (color +
-		// depth): one layers=1 color+depth FB under depth_renderpass_mv,
-		// built lazily on first reversed use (has_depth); positive-only
-		// targets stay lean.
+		// depth): one layers=1 color+depth FB under depth_renderpass_mv.
+		// Always present: positives-only groups write depth for the
+		// band's occlusion test; reversed groups reuse the same FB for
+		// their two-pass depth-tested path.
 		vk::raii::Framebuffer depth_framebuffer_mv{nullptr};
-		bool has_depth = false;
 		frame_targets(vk::Extent2D extent_,
-		              bool has_depth_,
 		              vk::raii::ImageView view_array_ = nullptr,
 		              vk::raii::Framebuffer framebuffer_mv_ = nullptr) :
 		        extent(extent_),
 		        view_array(std::move(view_array_)),
-		        framebuffer_mv(std::move(framebuffer_mv_)),
-		        has_depth(has_depth_)
+		        framebuffer_mv(std::move(framebuffer_mv_))
 		{
 		}
 	};

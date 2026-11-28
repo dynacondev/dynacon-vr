@@ -78,13 +78,18 @@ struct band_push
 static_assert(sizeof(band_push) == 140);
 static_assert(sizeof(band_push) <= 256);
 
-// Depth-bias forgiveness for the band occlusion test (depth units,
-// added to the quad before the GREATER_OR_EQUAL compare): the quad
-// is a flat ±1px approximation of the true surface, so strict
-// testing would speckle the inner half wherever the surface curves
-// away within tolerance. Too large re-admits occluded pixels (the
-// step-shape artifact this test exists to kill). Device-tuned;
-// start 4.0.
+// Depth-bias forgiveness for the band occlusion test: a positive
+// constant factor increases the fragment depth value, and under this
+// reversed-Z (near = 1, GREATER_OR_EQUAL compare) larger means nearer,
+// so the bias nudges each flat ±1px quad toward near. Quads sitting
+// slightly FARTHER than the true surface (the flat-quad approximation
+// error) still pass; quads behind a genuinely nearer occluder still
+// fail while the gap exceeds the bias. Sign is load-bearing: negative
+// would over-kill (AA loss, fail-safe — the binary raster underneath
+// survives), while too-large positive re-admits occluded pixels (the
+// step-shape overhang this test exists to kill). Magnitude is in
+// depth-buffer LSBs (constant × r, r = minimum resolvable difference
+// ≈ 1 D16 LSB ≈ 1.5e-5 NDC), not NDC units. Device-tuned; start 4.0.
 constexpr float band_depth_bias = 4.0f;
 
 // Erosion push block: source texel size, pass direction and box radius
@@ -1033,13 +1038,14 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	}
 
 	// Explicit silhouette band pipes (one instanced quad per loop
-	// edge, REPLACE blend, no depth, cull-none; multiview broadcast
-	// like every raster path here). R8 bakes against the reveal LOAD
-	// twin (working intermediates), RGBA8 against the cutout LOAD
-	// twin (tier-0 submits): loadOp is not part of compatibility,
-	// so the raster framebuffers are shared. Push-only layout (the
-	// file-scope band_push above); Adreno 740 provides 256B (same
-	// assertion as the silhouette layout above).
+	// edge, REPLACE blend, depth-tested GREATER_OR_EQUAL with write
+	// off, cull-none; multiview broadcast like every raster path
+	// here). R8 bakes against band_r8_depth_rp (working
+	// intermediates), RGBA8 against band_rgba_depth_rp (tier-0
+	// submits): dedicated color+depth LOAD twins with per-image cached
+	// framebuffers (see band_fb_for). Push-only layout (the file-scope
+	// band_push above); Adreno 740 provides 256B (same assertion as
+	// the silhouette layout above).
 	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(band_push))
 		throw std::runtime_error("feather silhouette band needs 140B push constants");
 	{
@@ -2033,18 +2039,18 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 	targets_has_intermediates = with_intermediates;
 	// Working images are recreated below: drop the cached reveal
 	// framebuffer (creation-only rebuild on next reveal record) and
-	// the band framebuffers (same discipline, per-site below).
+	// the band framebuffers (same waitIdle'd cover: this function
+	// waitIdles above, so no live CB references the old entries).
 	reveal_fb.clear();
 	reveal_fb_src = VK_NULL_HANDLE;
-	band_r8_fb.clear();
-	band_r8_fb_src = VK_NULL_HANDLE;
-	band_rgba_fb.clear();
-	band_rgba_fb_src = VK_NULL_HANDLE;
+	band_r8_fbs.clear();
+	band_rgba_fbs.clear();
 	if (not with_intermediates)
 	{
 		// Tier-0 direct raster never touches the blur/downsample
 		// workspaces: it rasters straight into the submitted images
-		// (per-image targets map), reversed depth uses output_depth.
+		// (per-image targets map); reversed depth and the band's
+		// occlusion test use output_depth.
 		// Drop any present
 		// (tier downgrade) and skip the ~17 MB alloc. Views die before
 		// the images they reference (existing order below).
@@ -2613,10 +2619,13 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// The merge samples these array views cross-frame
 			// (a prior async merge CB may still fly on inline-fallback
 			// frames): never destroy a live entry out from under it.
-			// Rare path (submit resize, first reversed frame) — the
-			// idle is affordable here, unlike on the frame path.
+			// Rare path (submit resize) — the idle is affordable here,
+			// unlike on the frame path. The waitIdle also covers the
+			// rgba band framebuffers below: a new submit extent bakes
+			// new color/depth views, so stale entries must go.
 			device.waitIdle();
 			targets.erase(it);
+			band_rgba_fbs.clear();
 		}
 		// NOTE: the view below is a named local, not an &* temporary: the
 		// framebuffer create-info stores the pointer, so the VkImageView
@@ -2666,7 +2675,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                .height = out_extent.height,
 		                .layers = 1,
 		        });
-		it = targets.emplace(image, frame_targets(out_extent, true, std::move(mv_array_view), std::move(mv_framebuffer))).first;
+		it = targets.emplace(image, frame_targets(out_extent, std::move(mv_array_view), std::move(mv_framebuffer))).first;
 		it->second.depth_framebuffer_mv = std::move(depth_framebuffer_mv);
 	}
 
@@ -2683,7 +2692,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// tier-res targets with only the viewport changing.
 	// Raster target bundle: color-only and depth (color+depth) MV
 	// framebuffers for one raster site. The caller engages depth
-	// whenever a reversed draw exists.
+	// whenever a reversed draw exists, or whenever the band will
+	// depth-test (positives-only write_depth single pass). Both depth
+	// companions are always built (intermediates in ensure_targets,
+	// tier-0 submits in the targets map above), so site.depth_fb is
+	// never null on any raster path.
 	struct raster_site
 	{
 		vk::Framebuffer color_fb;
@@ -2745,20 +2758,29 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// the GREATER_OR_EQUAL occlusion test (reversed-Z) kills quads
 	// where other mask geometry is nearer — step-shape overhangs and
 	// hidden back edges keep binary instead of darkening valid
-	// pixels. Reversed groups skip (cuts stay binary); band time
-	// folds into the raster stage diagnostics.
-	// Cached color+depth LOAD framebuffer per band site (creation-only,
-	// like triple_fb/reveal_fb above): band_r8 over R8 working targets,
-	// band_rgba over tier-0 submits.
+	// pixels. Equal-depth (coplanar) overlaps pass and ramp — accepted
+	// as the frontmost-edge AA. Kill-side failure is fail-safe (a dead
+	// quad leaves the binary raster underneath, never a hole), so the
+	// worst case of a mistuned test is the old overhang, not un-AA.
+	// Reversed groups skip (cuts stay binary); band time folds into
+	// the raster stage diagnostics.
+	// Cached color+depth LOAD framebuffer per band site (creation-only
+	// per color image — never replace, see the header: the single-slot
+	// triple/reveal precedent would destroy a previous frame's entry
+	// while the async mask CB still references it). band_r8 over R8
+	// working targets, band_rgba over tier-0 submits.
 	auto band_fb_for = [&](vk::Image img, vk::ImageView color_view, vk::ImageView depth_view, vk::Extent2D e,
 	                       bool rgba) -> vk::Framebuffer {
-		vk::raii::Framebuffer * cache = rgba ? &band_rgba_fb : &band_r8_fb;
-		vk::Image * key = rgba ? &band_rgba_fb_src : &band_r8_fb_src;
-		if (*key != img)
+		auto & map = rgba ? band_rgba_fbs : band_r8_fbs;
+		auto it = map.find(img);
+		if (it == map.end())
 		{
-			*key = img;
+			// Same image always bakes the same extent/views (header):
+			// no key on extent, no replace path. Stale extents are
+			// dropped under waitIdle (reset_targets, ensure_targets,
+			// submit-resize rebuild above), never here.
 			vk::ImageView atts[2] = {color_view, depth_view};
-			*cache = vk::raii::Framebuffer(device,
+			it = map.emplace(img, vk::raii::Framebuffer(device,
 			        vk::FramebufferCreateInfo{
 			                .renderPass = rgba ? *band_rgba_depth_rp : *band_r8_depth_rp,
 			                .attachmentCount = 2,
@@ -2766,9 +2788,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			                .width = e.width,
 			                .height = e.height,
 			                .layers = 1,
-			        });
+			        })).first;
 		}
-		return **cache;
+		return *it->second;
 	};
 	auto run_band = [&](vk::Image img, vk::Image depth_img, vk::ImageView color_view, vk::ImageView depth_view,
 	                    vk::Extent2D e, bool rgba) {
@@ -3009,10 +3031,15 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// swapchain image).
 		tier_out = tier;
 
-		// Band depth source for tier-0 submits (always built above).
+		// Band depth source for tier-0 submits: the same output_depth
+		// entry the targets build above baked its depth FB against
+		// (same extent key, same array view — idempotent lookup, so no
+		// stale-image aliasing after a submit resize; output_depth
+		// entries are never erased). Guaranteed present here.
 		auto submit_depth_image = [&]() -> vk::Image {
 			auto dit = output_depth.find({out_extent.width, out_extent.height});
-			return dit == output_depth.end() ? vk::Image{} : (vk::Image)*dit->second.image;
+			assert(dit != output_depth.end());
+			return (vk::Image)*dit->second.image;
 		};
 		// Band runs on positives-only groups (reversed skips inside
 		// run_band too): raster writes depth so the band can
