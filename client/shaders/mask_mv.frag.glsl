@@ -20,10 +20,9 @@
 
 // Multiview silhouette fragment: flat silhouette (opacity
 // replicated to all channels), push block widened to the multiview pair
-// so the shared 140B layout reads opacity at the right offset (a
+// so the shared 132B layout reads opacity at the right offset (a
 // mismatched single-MVP block here would read mvp[1][0][0] as alpha —
-// orientation-dependent garbage through the DST_ALPHA blend). Declares
-// the 132B prefix subset (inv_view tail unread here).
+// orientation-dependent garbage through the DST_ALPHA blend).
 layout(push_constant) uniform PushConstants
 {
 	mat4 mvp[2];
