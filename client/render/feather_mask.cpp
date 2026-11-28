@@ -2790,7 +2790,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// Raster target bundle: color-only and depth (color+depth) MV
 	// framebuffers for one raster site. The caller engages depth
 	// whenever a reversed draw exists, and the mark pipe (stencil
-	// REPLACE, no depth test) for positives-only band groups.
+	// INCR count, no depth test) for positives-only band groups.
 	struct raster_site
 	{
 		vk::Framebuffer color_fb;
@@ -2848,7 +2848,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	};
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// one instanced quad per baked loop edge on the just-rasterized
-	// target (LOAD re-begin, REPLACE). Stencil counts front-facing
+	// target (LOAD re-begin, REPLACE color). Stencil counts front-facing
 	// coverage (Pass 1 INCRs once per front triangle); the two draws
 	// partition every case — outer paints background-only pixels
 	// (stencil == 0), inner paints single-covered own-surface pixels
@@ -2856,6 +2856,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// (2+) paint in neither (binary union kept). Occluded and
 	// front-over-behind quads fail the clip, so step overhangs and
 	// hidden back edges keep binary instead of darkening valid pixels.
+	// Back-viewed open sheets count 0 (backfaces don't INCR), so the
+	// outer draw alone repaints the binary ramp and the interior stays
+	// binary — fail-safe, no hole. INCR_AND_CLAMP saturates at 255
+	// instead of wrapping, so the ==0/==1 tests never alias a wrapped
+	// count — deep stacks keep binary.
 	// Kill-side failure is fail-safe (a dead quad leaves the binary
 	// raster underneath, never a hole). Reversed groups skip (cuts
 	// stay binary); band time folds into the raster stage diagnostics.
