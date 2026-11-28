@@ -100,6 +100,7 @@ passthrough_mesh::build_silhouette_edges(const passthrough_mesh::triangle_soup &
 	{
 		uint64_t key;
 		uint32_t a, b, c;
+		uint32_t ca, cb;
 	};
 	size_t tri_count = soup.indices.size() / 3;
 	std::vector<directed> dirs;
@@ -117,7 +118,7 @@ passthrough_mesh::build_silhouette_edges(const passthrough_mesh::triangle_soup &
 		auto push = [&](uint32_t u, uint32_t v, uint32_t w) {
 			uint32_t cu = vcanon[u], cv = vcanon[v];
 			uint64_t key = cu < cv ? ((uint64_t)cu << 32 | cv) : ((uint64_t)cv << 32 | cu);
-			dirs.push_back({key, u, v, w});
+			dirs.push_back({key, u, v, w, cu, cv});
 		};
 		push(i0, i1, i2);
 		push(i1, i2, i0);
@@ -135,7 +136,11 @@ passthrough_mesh::build_silhouette_edges(const passthrough_mesh::triangle_soup &
 		if (n == 2)
 		{
 			const auto & e0 = dirs[i], & e1 = dirs[i + 1];
-			bool opposite = (e0.a == e1.b and e0.b == e1.a);
+			// Canon-id compare (not raw indices): subdivision children
+			// and cross-primitive duplicates share bits under distinct
+			// indices, so raw compare misclassifies every such shared
+			// edge as inconsistent and force-emits the band everywhere.
+			bool opposite = (e0.ca == e1.cb and e0.cb == e1.ca);
 			if (opposite)
 			{
 				edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e1.c)});

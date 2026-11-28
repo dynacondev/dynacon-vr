@@ -71,7 +71,10 @@ void main()
 	vec2 p1 = (cc1.xy / cc1.w * 0.5 + 0.5) * vp;
 	float area0 = (pb.x - pa.x) * (p0.y - pa.y) - (pb.y - pa.y) * (p0.x - pa.x);
 	float area1 = (pa.x - pb.x) * (p1.y - pb.y) - (pa.y - pb.y) * (p1.x - pb.x);
-	bool sil = forced || (mw > 1e-6 && area0 * area1 < 0.0);
+	// Behind-camera gate covers the forced path too: negative-w
+	// division yields garbage pixel positions, so collapse (the binary
+	// raster clips those correctly on its own).
+	bool sil = mw > 1e-6 && (forced || area0 * area1 < 0.0);
 	vec2 e = pb - pa;
 	float len = length(e);
 	if (!sil || len < 1e-6)
