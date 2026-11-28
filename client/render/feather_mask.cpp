@@ -33,17 +33,6 @@
 
 namespace
 {
-uint32_t find_memory_type(vk::raii::PhysicalDevice & physical_device, uint32_t type_bits, vk::MemoryPropertyFlags properties)
-{
-	auto mem = physical_device.getMemoryProperties();
-	for (uint32_t i = 0; i < mem.memoryTypeCount; ++i)
-	{
-		if ((type_bits & (1u << i)) and (mem.memoryTypes[i].propertyFlags & properties) == properties)
-			return i;
-	}
-	throw std::runtime_error("feather_mask: no suitable memory type");
-}
-
 struct blur_push
 {
 	float texel[2];
@@ -1325,26 +1314,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	spdlog::info("feather silhouette band pipes built (explicit loop, stencil outer-MAX + triangle-clip inner-MIN)");
 }
 
-std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
-                                                                                       vk::BufferUsageFlags usage,
-                                                                                       vk::MemoryPropertyFlags properties)
-{
-	vk::BufferCreateInfo buffer_info{
-	        .size = size,
-	        .usage = usage,
-	        .sharingMode = vk::SharingMode::eExclusive,
-	};
-	vk::raii::Buffer buffer(device, buffer_info);
-	auto requirements = buffer.getMemoryRequirements();
-	vk::MemoryAllocateInfo alloc_info{
-	        .allocationSize = requirements.size,
-	        .memoryTypeIndex = find_memory_type(physical_device, requirements.memoryTypeBits, properties),
-	};
-	vk::raii::DeviceMemory memory(device, alloc_info);
-	buffer.bindMemory(*memory, 0);
-	return {std::move(buffer), std::move(memory)};
-}
-
 void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_mesh::triangle_soup & soup)
 {
 	if (soup.indices.empty() or soup.vertices.empty())
@@ -1362,27 +1331,48 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	vk::DeviceSize index_bytes = soup.indices.size() * sizeof(uint32_t);
 	vk::DeviceSize total = vertex_bytes + index_bytes;
 
-	if (mesh.staging_size < total)
-	{
-		std::tie(mesh.staging_buffer, mesh.staging_memory) = make_buffer(
-		        total,
-		        vk::BufferUsageFlagBits::eTransferSrc,
-		        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-		mesh.staging_size = total;
-	}
-	void * mapped = mesh.staging_memory.mapMemory(0, total);
+	// waitIdle'd above: fresh VMA allocations replace the old buffers
+	// outright (swap-assign destroys the prior entry after the swap —
+	// safe, no in-flight frame reads them).
+	mesh.staging_buffer = buffer_allocation{
+	        device,
+	        vk::BufferCreateInfo{
+	                .size = total,
+	                .usage = vk::BufferUsageFlagBits::eTransferSrc,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	        },
+	        VmaAllocationCreateInfo{
+	                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	        },
+	};
+	void * mapped = mesh.staging_buffer.map();
 	std::memcpy(mapped, soup.vertices.data(), vertex_bytes);
 	std::memcpy((char *)mapped + vertex_bytes, soup.indices.data(), index_bytes);
-	mesh.staging_memory.unmapMemory();
+	mesh.staging_buffer.unmap();
 
-	std::tie(mesh.vertex_buffer, mesh.vertex_memory) = make_buffer(
-	        vertex_bytes,
-	        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
-	        vk::MemoryPropertyFlagBits::eDeviceLocal);
-	std::tie(mesh.index_buffer, mesh.index_memory) = make_buffer(
-	        index_bytes,
-	        vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst,
-	        vk::MemoryPropertyFlagBits::eDeviceLocal);
+	mesh.vertex_buffer = buffer_allocation{
+	        device,
+	        vk::BufferCreateInfo{
+	                .size = vertex_bytes,
+	                .usage = vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	        },
+	        VmaAllocationCreateInfo{
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	        },
+	};
+	mesh.index_buffer = buffer_allocation{
+	        device,
+	        vk::BufferCreateInfo{
+	                .size = index_bytes,
+	                .usage = vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+	                .sharingMode = vk::SharingMode::eExclusive,
+	        },
+	        VmaAllocationCreateInfo{
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	        },
+	};
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
 	// Explicit silhouette loop: position-keyed edge map from the
@@ -1395,29 +1385,37 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 		{
 			mesh.edge_count = 0;
 			mesh.edge_pending_upload.reset();
-			mesh.edge_buffer.clear();
-			mesh.edge_memory.clear();
-			mesh.edge_staging_buffer.clear();
-			mesh.edge_staging_memory.clear();
-			mesh.edge_staging_size = 0;
+			mesh.edge_buffer = buffer_allocation{};
+			mesh.edge_staging_buffer = buffer_allocation{};
 		}
 		else
 		{
-			if (mesh.edge_staging_size < edge_bytes)
-			{
-				std::tie(mesh.edge_staging_buffer, mesh.edge_staging_memory) = make_buffer(
-				        edge_bytes,
-				        vk::BufferUsageFlagBits::eTransferSrc,
-				        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-				mesh.edge_staging_size = edge_bytes;
-			}
-			void * edge_mapped = mesh.edge_staging_memory.mapMemory(0, edge_bytes);
+			mesh.edge_staging_buffer = buffer_allocation{
+			        device,
+			        vk::BufferCreateInfo{
+			                .size = edge_bytes,
+			                .usage = vk::BufferUsageFlagBits::eTransferSrc,
+			                .sharingMode = vk::SharingMode::eExclusive,
+			        },
+			        VmaAllocationCreateInfo{
+			                .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+			                .usage = VMA_MEMORY_USAGE_AUTO,
+			        },
+			};
+			void * edge_mapped = mesh.edge_staging_buffer.map();
 			std::memcpy(edge_mapped, bedges.data(), edge_bytes);
-			mesh.edge_staging_memory.unmapMemory();
-			std::tie(mesh.edge_buffer, mesh.edge_memory) = make_buffer(
-			        edge_bytes,
-			        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
-			        vk::MemoryPropertyFlagBits::eDeviceLocal);
+			mesh.edge_staging_buffer.unmap();
+			mesh.edge_buffer = buffer_allocation{
+			        device,
+			        vk::BufferCreateInfo{
+			                .size = edge_bytes,
+			                .usage = vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
+			                .sharingMode = vk::SharingMode::eExclusive,
+			        },
+			        VmaAllocationCreateInfo{
+			                .usage = VMA_MEMORY_USAGE_AUTO,
+			        },
+			};
 			mesh.edge_pending_upload = edge_bytes;
 			mesh.edge_count = (uint32_t)bedges.size();
 			spdlog::info("feather silhouette loop: {} edges ({} boundary, {} non-manifold, {} inconsistent) for {}",
@@ -1482,14 +1480,14 @@ feather_mask_renderer::depth_entry feather_mask_renderer::make_depth_entry(vk::E
 	        .sharingMode = vk::SharingMode::eExclusive,
 	        .initialLayout = vk::ImageLayout::eUndefined,
 	};
-	entry.image = vk::raii::Image(device, image_info);
-	auto requirements = entry.image.getMemoryRequirements();
-	vk::MemoryAllocateInfo alloc_info{
-	        .allocationSize = requirements.size,
-	        .memoryTypeIndex = find_memory_type(physical_device, requirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal),
+	entry.image = image_allocation{
+	        device,
+	        image_info,
+	        VmaAllocationCreateInfo{
+	                .usage = VMA_MEMORY_USAGE_AUTO,
+	        },
+	        "feather output depth",
 	};
-	entry.memory = vk::raii::DeviceMemory(device, alloc_info);
-	entry.image.bindMemory(*entry.memory, 0);
 	return entry;
 }
 
@@ -1506,7 +1504,7 @@ vk::ImageView feather_mask_renderer::output_depth_array_view(vk::Extent2D extent
 	{
 		it->second.view_array = vk::raii::ImageView(device,
 		        vk::ImageViewCreateInfo{
-		                .image = *it->second.image,
+		                .image = (vk::Image)it->second.image,
 		                .viewType = vk::ImageViewType::e2DArray,
 		                .format = depth_format,
 		                .subresourceRange = {
@@ -2123,8 +2121,8 @@ void feather_mask_renderer::record_hidden(vk::raii::CommandBuffer & cmd,
 		if (not draw_union(d, scissor))
 			continue;
 		cmd.setScissor(0, scissor);
-		cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-		cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+		cmd.bindVertexBuffers(0, (vk::Buffer)mit->second.vertex_buffer, (vk::DeviceSize)0);
+		cmd.bindIndexBuffer((vk::Buffer)mit->second.index_buffer, 0, vk::IndexType::eUint32);
 		cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 		                                 silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity});
 		cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
@@ -2173,10 +2171,8 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			target->raster_fb_mv.clear();
 			target->raster_depth_fb_mv.clear();
 			target->depth_view_array.clear();
-			target->image.clear();
-			target->memory.clear();
-			target->depth_image.clear();
-			target->depth_memory.clear();
+			target->image = image_allocation{};
+			target->depth_image = image_allocation{};
 		}
 		spdlog::info("Feather mask blur targets: skipped (tier-0 direct raster) {}x{}", extent.width, extent.height);
 		return;
@@ -2211,14 +2207,14 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 		        .sharingMode = vk::SharingMode::eExclusive,
 		        .initialLayout = vk::ImageLayout::eUndefined,
 		};
-		target->image = vk::raii::Image(device, image_info);
-		auto requirements = target->image.getMemoryRequirements();
-		vk::MemoryAllocateInfo alloc_info{
-		        .allocationSize = requirements.size,
-		        .memoryTypeIndex = find_memory_type(physical_device, requirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal),
+		target->image = image_allocation{
+		        device,
+		        image_info,
+		        VmaAllocationCreateInfo{
+		                .usage = VMA_MEMORY_USAGE_AUTO,
+		        },
+		        "feather blur target",
 		};
-		target->memory = vk::raii::DeviceMemory(device, alloc_info);
-		target->image.bindMemory(*target->memory, 0);
 		// Multiview sampling + render target: array view over both
 		// layers, plus one layers=1 framebuffer per begun pass for the
 		// raster source only (A). Target B is triple scratch: written via
@@ -2227,7 +2223,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 		// reset/cleared like the rest, never begun).
 		target->view_array = vk::raii::ImageView(device,
 		        vk::ImageViewCreateInfo{
-		                .image = *target->image,
+		                .image = (vk::Image)target->image,
 		                .viewType = vk::ImageViewType::e2DArray,
 		                .format = blur_format,
 		                .subresourceRange = {
@@ -2266,10 +2262,9 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			// + one layers=1 color+depth framebuffer (MV raster pass).
 			depth_entry depth = make_depth_entry(half_targets);
 			target->depth_image = std::move(depth.image);
-			target->depth_memory = std::move(depth.memory);
 			target->depth_view_array = vk::raii::ImageView(device,
 			        vk::ImageViewCreateInfo{
-			                .image = (VkImage)*target->depth_image,
+			                .image = (vk::Image)target->depth_image,
 			                .viewType = vk::ImageViewType::e2DArray,
 			                .format = depth_format,
 			                .subresourceRange = {
@@ -2325,17 +2320,17 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 			target->raster_depth_fb_mv.clear();
 			target->depth_view_array.clear();
 			bool needs_depth = (target == &down_targets[li]);
-			target->image = vk::raii::Image(device, image_info);
-			auto requirements = target->image.getMemoryRequirements();
-			vk::MemoryAllocateInfo alloc_info{
-			        .allocationSize = requirements.size,
-			        .memoryTypeIndex = find_memory_type(physical_device, requirements.memoryTypeBits, vk::MemoryPropertyFlagBits::eDeviceLocal),
+			target->image = image_allocation{
+			        device,
+			        image_info,
+			        VmaAllocationCreateInfo{
+			                .usage = VMA_MEMORY_USAGE_AUTO,
+			        },
+			        "feather down/eblur target",
 			};
-			target->memory = vk::raii::DeviceMemory(device, alloc_info);
-			target->image.bindMemory(*target->memory, 0);
 			target->view_array = vk::raii::ImageView(device,
 			        vk::ImageViewCreateInfo{
-			                .image = *target->image,
+			                .image = (vk::Image)target->image,
 			                .viewType = vk::ImageViewType::e2DArray,
 			                .format = blur_format,
 			                .subresourceRange = {
@@ -2375,10 +2370,9 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 				// array view under the MV R8+depth pass.
 				depth_entry depth = make_depth_entry(le);
 				target->depth_image = std::move(depth.image);
-				target->depth_memory = std::move(depth.memory);
 				target->depth_view_array = vk::raii::ImageView(device,
 				        vk::ImageViewCreateInfo{
-				                .image = (VkImage)*target->depth_image,
+				                .image = (vk::Image)target->depth_image,
 				                .viewType = vk::ImageViewType::e2DArray,
 				                .format = depth_format,
 				                .subresourceRange = {
@@ -2419,13 +2413,13 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 		        .dstOffset = 0,
 		        .size = vertex_bytes,
 		};
-		cmd.copyBuffer(*mesh.staging_buffer, *mesh.vertex_buffer, vertex_copy);
+		cmd.copyBuffer((vk::Buffer)mesh.staging_buffer, (vk::Buffer)mesh.vertex_buffer, vertex_copy);
 		vk::BufferCopy index_copy{
 		        .srcOffset = vertex_bytes,
 		        .dstOffset = 0,
 		        .size = index_bytes,
 		};
-		cmd.copyBuffer(*mesh.staging_buffer, *mesh.index_buffer, index_copy);
+		cmd.copyBuffer((vk::Buffer)mesh.staging_buffer, (vk::Buffer)mesh.index_buffer, index_copy);
 
 		std::vector<vk::BufferMemoryBarrier> barriers = {
 		        vk::BufferMemoryBarrier{
@@ -2433,7 +2427,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 		                .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
 		                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		                .buffer = *mesh.vertex_buffer,
+		                .buffer = (vk::Buffer)mesh.vertex_buffer,
 		                .offset = 0,
 		                .size = vertex_bytes,
 		        },
@@ -2442,7 +2436,7 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 		                .dstAccessMask = vk::AccessFlagBits::eIndexRead,
 		                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		                .buffer = *mesh.index_buffer,
+		                .buffer = (vk::Buffer)mesh.index_buffer,
 		                .offset = 0,
 		                .size = index_bytes,
 		        },
@@ -2464,13 +2458,13 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 		        .dstOffset = 0,
 		        .size = edge_bytes,
 		};
-		cmd.copyBuffer(*mesh.edge_staging_buffer, *mesh.edge_buffer, edge_copy);
+		cmd.copyBuffer((vk::Buffer)mesh.edge_staging_buffer, (vk::Buffer)mesh.edge_buffer, edge_copy);
 		vk::BufferMemoryBarrier edge_barrier{
 		        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
 		        .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
 		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .buffer = *mesh.edge_buffer,
+		        .buffer = (vk::Buffer)mesh.edge_buffer,
 		        .offset = 0,
 		        .size = edge_bytes,
 		};
@@ -2922,8 +2916,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				float v = d.reverse ? 1.f - d.opacity : d.opacity;
 				cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
 				                                  silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = v});
-				cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-				cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+				cmd.bindVertexBuffers(0, (vk::Buffer)mit->second.vertex_buffer, (vk::DeviceSize)0);
+				cmd.bindIndexBuffer((vk::Buffer)mit->second.index_buffer, 0, vk::IndexType::eUint32);
 				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
 				++n_draws;
 			}
@@ -3094,7 +3088,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					continue;
 				cmd.pushConstants<band_push>(*band_layout, vk::ShaderStageFlagBits::eVertex, 0,
 				                             band_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity, .vp_w = (float)e.width, .vp_h = (float)e.height});
-				cmd.bindVertexBuffers(1, (vk::Buffer)*mit->second.edge_buffer, (vk::DeviceSize)0);
+				cmd.bindVertexBuffers(1, (vk::Buffer)mit->second.edge_buffer, (vk::DeviceSize)0);
 				cmd.draw(4, mit->second.edge_count, 0, 0);
 				++n_draws;
 			}
@@ -3277,7 +3271,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		auto submit_depth_image = [&]() -> vk::Image {
 			auto dit = output_depth.find({out_extent.width, out_extent.height});
 			assert(dit != output_depth.end());
-			return (vk::Image)*dit->second.image;
+			return (vk::Image)dit->second.image;
 		};
 		// Band runs on positives-only groups with loop edges (reversed
 		// skips inside run_band too): raster marks stencil so the band
@@ -3331,17 +3325,17 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_mark_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed, mark_cover);
 			// Explicit silhouette band on the half-res seed (native res).
 			if (mark_cover)
-				run_band(*target_a.image, *target_a.depth_image, *target_a.view_array, *target_a.depth_view_array, half_extent, false);
+				run_band((vk::Image)target_a.image, (vk::Image)target_a.depth_image, *target_a.view_array, *target_a.depth_view_array, half_extent, false);
 		}
 		if (reveal)
-			run_reveal(*target_a.image, reveal_fb_for(*target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *reveal_r8_pipeline, half_extent);
-		make_readable(*target_a.image);
+			run_reveal((vk::Image)target_a.image, reveal_fb_for((vk::Image)target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *reveal_r8_pipeline, half_extent);
+		make_readable((vk::Image)target_a.image);
 		// Merged triple (one renderpass, subpasses 0/1/2): erode H into
 		// B, erode V back into A, blur H into B — tile-resident, ordered
 		// by subpass dependencies (no explicit barriers inside). Pushes,
 		// sets and sampler discipline identical to the standalone
 		// passes (nearest for erode taps, GENERAL descriptors inside).
-		vk::Framebuffer triple_fb = triple_fb_for(*target_a.image, *target_b.image, *target_a.view_array, *target_b.view_array, half_extent);
+		vk::Framebuffer triple_fb = triple_fb_for((vk::Image)target_a.image, (vk::Image)target_b.image, *target_a.view_array, *target_b.view_array, half_extent);
 		vk::ClearValue triple_clears[2]{};
 		vk::RenderPassBeginInfo begin_triple{
 		        .renderPass = *triple_rp,
@@ -3385,7 +3379,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			cmd.draw(3, 1, 0, 0);
 			cmd.endRenderPass();
 		}
-		make_readable(*target_b.image, vk::ImageLayout::eGeneral);
+		make_readable((vk::Image)target_b.image, vk::ImageLayout::eGeneral);
 		{
 			section_clock blur_v_clk(&ms_blur);
 			update_source(*target_b.view_array, 2);
@@ -3443,14 +3437,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_mark_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed, mark_cover);
 				// Explicit silhouette band on the seed (native res).
 				if (mark_cover)
-					run_band(*down_targets[seed_level - 1].image, *down_targets[seed_level - 1].depth_image,
+					run_band((vk::Image)down_targets[seed_level - 1].image, (vk::Image)down_targets[seed_level - 1].depth_image,
 					         *down_targets[seed_level - 1].view_array, *down_targets[seed_level - 1].depth_view_array, de_seed, false);
 			}
 			if (reveal)
-				run_reveal(*down_targets[seed_level - 1].image,
-				           reveal_fb_for(*down_targets[seed_level - 1].image, *down_targets[seed_level - 1].view_array, de_seed),
+				run_reveal((vk::Image)down_targets[seed_level - 1].image,
+				           reveal_fb_for((vk::Image)down_targets[seed_level - 1].image, *down_targets[seed_level - 1].view_array, de_seed),
 				           *reveal_r8_rp, *reveal_r8_pipeline, de_seed);
-			make_readable(*down_targets[seed_level - 1].image);
+			make_readable((vk::Image)down_targets[seed_level - 1].image);
 			section_clock blur_clk(&ms_blur);
 			// Levels seed_level+1..N from the selected tier; sizes shared
 			// with ensure via level_extent() (exact halving required for
@@ -3463,7 +3457,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				blur_target & dst = down_targets[l - 1];
 				vk::Extent2D de = level_extent(extent, l);
 				update_source(down_src, l + 2);
-				make_writable(*dst.image);
+				make_writable((vk::Image)dst.image);
 				vk::RenderPassBeginInfo begin_down{
 				        .renderPass = *blur_r8_renderpass_mv,
 				        .framebuffer = *dst.blur_fb_mv,
@@ -3483,19 +3477,19 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.pushConstants<blur_push>(*blur_layout, vk::ShaderStageFlagBits::eFragment, 0, push);
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
-				make_readable(*dst.image);
+				make_readable((vk::Image)dst.image);
 				down_src = *dst.view_array;
 				down_src_extent = de;
 				h_src_level = l;
 			}
 			blur_target & h_src = down_targets[h_src_level - 1];
-			make_readable(*h_src.image);
+			make_readable((vk::Image)h_src.image);
 			// Merged triple (one renderpass, subpasses 0/1/2): erode H
 			// into eblur, erode V back into h, blur H into eblur —
 			// tile-resident, ordered by subpass dependencies. Same
 			// pushes/sets/samplers as the standalone passes (nearest
 			// for erode taps, GENERAL descriptors inside).
-			vk::Framebuffer triple_fb = triple_fb_for(*h_src.image, *eblur.image, *h_src.view_array, *eblur.view_array, te);
+			vk::Framebuffer triple_fb = triple_fb_for((vk::Image)h_src.image, (vk::Image)eblur.image, *h_src.view_array, *eblur.view_array, te);
 			vk::ClearValue triple_clears[2]{};
 			vk::RenderPassBeginInfo begin_triple{
 			        .renderPass = *triple_rp,
@@ -3538,7 +3532,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				cmd.draw(3, 1, 0, 0);
 				cmd.endRenderPass();
 			}
-			make_readable(*eblur.image, vk::ImageLayout::eGeneral);
+			make_readable((vk::Image)eblur.image, vk::ImageLayout::eGeneral);
 			update_source(*eblur.view_array, 2);
 			vk::RenderPassBeginInfo begin_v{
 			        .renderPass = *blur_renderpass_mv,

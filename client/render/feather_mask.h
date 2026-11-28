@@ -287,10 +287,6 @@ private:
 	vk::Format format;
 	std::shared_ptr<vk::raii::PipelineCache> pipe_cache;
 
-	std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> make_buffer(vk::DeviceSize size,
-	                                                                vk::BufferUsageFlags usage,
-	                                                                vk::MemoryPropertyFlags properties);
-
 	vk::raii::RenderPass renderpass_mv{nullptr};
 	vk::raii::RenderPass depth_renderpass_mv{nullptr};
 	vk::raii::RenderPass raster_r8_renderpass_mv{nullptr};
@@ -453,8 +449,7 @@ private:
 	// control, unlike swapchain images). Recreated when the extent changes.
 	struct blur_target
 	{
-		vk::raii::Image image{nullptr};
-		vk::raii::DeviceMemory memory{nullptr};
+		image_allocation image;
 		// Multiview sampling + render target: 2D-array view over both
 		// layers and one layers=1 framebuffer (view mask routes both
 		// eyes). The _mv fullscreen
@@ -468,8 +463,7 @@ private:
 		// target above): depth image shared by both layers. Built for
 		// raster sources only (A, down levels); blur-only targets (B,
 		// eblur) leave these null.
-		vk::raii::Image depth_image{nullptr};
-		vk::raii::DeviceMemory depth_memory{nullptr};
+		image_allocation depth_image;
 		vk::raii::ImageView depth_view_array{nullptr};
 		// Multiview depth companion: one layers=1 color+depth FB under the raster MV depth pass.
 		vk::raii::Framebuffer raster_depth_fb_mv{nullptr};
@@ -507,14 +501,10 @@ private:
 	// applies at the start of the next record().
 	struct mesh_buffers
 	{
-		vk::raii::Buffer vertex_buffer{nullptr};
-		vk::raii::DeviceMemory vertex_memory{nullptr};
-		vk::raii::Buffer index_buffer{nullptr};
-		vk::raii::DeviceMemory index_memory{nullptr};
+		buffer_allocation vertex_buffer;
+		buffer_allocation index_buffer;
 		uint32_t index_count = 0;
-		vk::raii::Buffer staging_buffer{nullptr};
-		vk::raii::DeviceMemory staging_memory{nullptr};
-		vk::DeviceSize staging_size = 0;
+		buffer_allocation staging_buffer;
 		struct upload_sizes
 		{
 			vk::DeviceSize vertex_bytes = 0;
@@ -526,12 +516,9 @@ private:
 		// built once at map load, drawn instanced (4 verts/edge)
 		// by the band pass. Dies with the entry like the buffers
 		// above; meshes without triangles carry none.
-		vk::raii::Buffer edge_buffer{nullptr};
-		vk::raii::DeviceMemory edge_memory{nullptr};
+		buffer_allocation edge_buffer;
 		uint32_t edge_count = 0;
-		vk::raii::Buffer edge_staging_buffer{nullptr};
-		vk::raii::DeviceMemory edge_staging_memory{nullptr};
-		vk::DeviceSize edge_staging_size = 0;
+		buffer_allocation edge_staging_buffer;
 		std::optional<vk::DeviceSize> edge_pending_upload;
 		glm::vec3 aabb_min{0}, aabb_max{0};
 	};
@@ -616,8 +603,7 @@ private:
 	// only a handful of quantized submit sizes ever exist).
 	struct depth_entry
 	{
-		vk::raii::Image image{nullptr};
-		vk::raii::DeviceMemory memory{nullptr};
+		image_allocation image;
 		vk::raii::ImageView view_array{nullptr};
 	};
 	std::map<std::pair<uint32_t, uint32_t>, depth_entry> output_depth;
