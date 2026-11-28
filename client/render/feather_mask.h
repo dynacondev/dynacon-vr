@@ -123,11 +123,8 @@ public:
 	static int tier_for_feather(float feather_px)
 	{
 		float f = feather_px;
-		// TEMP DIAGNOSTIC (revert after): force hard-edge tier-0 through
-		// the half-res tier-1 path to inspect AA up close (2x runtime
-		// magnification). Shared with the scene so sizing stays in agreement.
 		if (f <= 0)
-			return 1;
+			return 0;
 		if (f > 128.f)
 			f = 128.f;
 		if (f <= 16)
@@ -173,8 +170,7 @@ public:
 	// Cutouts are world-space quads (two triangles each) punched crisp
 	// through the finished mask at full alpha (mask 1 = reality), sharing
 	// one view-only MVP. Optional sensor reveal (depth_reveal above,
-	// null = off) ORs the sensor test into the working alpha (binary on
-	// the binary path, grey ramp under the AA when positives-only)
+	// null = off) ORs the sensor test into the working alpha (binary)
 	// before the blur chain.
 	// Sensor reveal for 3d-depth-passthrough (optional, null = off):
 	// resampled sensor heightfield + merged copy (borrowed views,
@@ -303,24 +299,6 @@ private:
 	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
-	// AA pipes (plane-coefficient mask_aa_mv.vert/frag, conservative
-	// overestimate, ADD-saturate, backface-culled, no depth): RGBA for
-	// tier-0 direct raster, R8 for tier-1 half-res raster.
-	// Positives-only groups; reversed groups stay binary. Overestimate
-	// emits the neighbour fragment at shared-edge pixels; 2x2
-	// ordered-grid smooth coverage ADD-sums interior straddles to 1.0
-	// (silhouette stays single-sided). Backfaces culled: a
-	// behind-surface fragment covering a rim pixel would otherwise sum
-	// the ramp to 1.0, so windows are front-side only (both-sides needs
-	// the stencil two-pass follow-up). Same silhouette_mv_layout
-	// (push-only) as the binary pipes. Null when the device lacks
-	// VK_EXT_conservative_rasterization (record falls back to binary).
-	vk::raii::Pipeline aa_pipeline_mv{nullptr};
-	vk::raii::Pipeline aa_raster_r8_pipeline_mv{nullptr};
-	// One-shot log state for the AA reversed fallback in record().
-	// Render-thread only (record() records; the async CB only executes).
-	bool aa_rev_logged_ = false;
-
 	// All raster paths are multiview now (silhouette, hidden, cutout);
 	// no per-eye raster renderpasses or pipelines remain. The marker
 	// cutout re-begins the submit framebuffer_mv under
@@ -383,8 +361,7 @@ private:
 	vk::raii::Sampler sampler_nearest{nullptr};
 
 	// Depth reveal (3d-depth-passthrough): single test MAX-blended over
-	// the working alpha (binary on the binary path, grey ramp under the
-	// AA when positives-only) ahead of the erode/blur chain (the blend
+	// the working alpha (binary) ahead of the erode/blur chain (the blend
 	// unit does the OR — no work tap, which would be a feedback loop;
 	// R8 MIN-blend precedent from the reversed raster proves the blend
 	// path). R8 LOAD RP for the intermediates (tier-1 A, tiered seed —
@@ -481,17 +458,6 @@ private:
 			vk::DeviceSize index_bytes = 0;
 		};
 		std::optional<upload_sizes> pending_upload;
-		// AA de-indexed upload (3 verts per triangle + per-corner
-		// bary): expanded at set_mesh time from the same soup, drawn
-		// non-indexed. Dies with the entry on map-drop/erase (meshes
-		// survive reset_targets(), like the indexed buffers above).
-		vk::raii::Buffer aa_vertex_buffer{nullptr};
-		vk::raii::DeviceMemory aa_vertex_memory{nullptr};
-		uint32_t aa_vertex_count = 0;
-		vk::raii::Buffer aa_staging_buffer{nullptr};
-		vk::raii::DeviceMemory aa_staging_memory{nullptr};
-		vk::DeviceSize aa_staging_size = 0;
-		std::optional<vk::DeviceSize> aa_pending_upload;
 		glm::vec3 aabb_min{0}, aabb_max{0};
 	};
 	std::map<std::string, mesh_buffers> meshes;
@@ -511,7 +477,7 @@ private:
 	vk::raii::Pipeline hidden_sphere_pipe{nullptr};
 	vk::raii::Pipeline hidden_silhouette_pipe{nullptr};
 	// (silhouette_mv_layout above, built in the ctor, serves the hidden
-	// pipes too — identical 140B range, one layout for all MV mask pipes).
+	// pipes too — identical 132B range, one layout for all MV mask pipes).
 	buffer_allocation hidden_sphere_verts_;
 	uint32_t hidden_sphere_vert_count = 0;
 	// Body-column twin of the sphere verts: closed unit cylinder

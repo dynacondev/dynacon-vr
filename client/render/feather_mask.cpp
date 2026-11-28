@@ -53,38 +53,16 @@ struct blur_push
 };
 
 // Silhouette raster push block. Mirrors mask_mv.vert/frag.glsl: per-eye
-// mvp selected by gl_ViewIndex. 140B exceeds the 128-byte Vulkan minimum —
+// mvp selected by gl_ViewIndex. 132B exceeds the 128-byte Vulkan minimum —
 // Adreno 740 (Quest 3) provides 256B; the ctor and ensure_hidden throw
-// loudly below when the device reports less. Binary mask_mv shaders
-// declare the 132B prefix subset (legal: ranges may exceed the declared
-// block); only the AA shaders read inv_view.
+// loudly below when the device reports less.
 struct silhouette_mv_push
 {
 	std::array<glm::mat4, 2> mvp;
 	float opacity = 1;
-	// Reciprocal viewport scale (2/W, 2/H) for the AA analytic
-	// screen-space gradients. Set at the AA record site; zeros
-	// elsewhere (unread by the binary shaders). Two floats (not a
-	// vec2): vec2 is 8-aligned in std140 and would land at 136
-	// while C++ packs it at 132.
-	float inv_view_w = 0;
-	float inv_view_h = 0;
 };
-static_assert(sizeof(silhouette_mv_push) == 140);
+static_assert(sizeof(silhouette_mv_push) == 132);
 static_assert(sizeof(silhouette_mv_push) <= 256);
-
-// AA vertex (mask_aa_mv.vert): position + triangle plane coefficients
-// (B_i(p) = g_i.p + c_i, identical on all 3 verts of a triangle).
-// Uploaded de-indexed (3 verts/tri); stride shared with the AA
-// pipeline vertex input below.
-struct aa_vert
-{
-	XrVector3f pos;
-	float c[2];
-	XrVector3f grad1;
-	XrVector3f grad2;
-};
-static_assert(sizeof(aa_vert) == sizeof(XrVector3f) * 3 + 2 * sizeof(float));
 
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
@@ -275,11 +253,11 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	// Multiview raster path (one draw broadcasts to both eyes):
 	// CLEAR/STORE/OPTIMAL attachments plus viewMask=both. Uses
 	// mask_mv.vert/frag (plain gl_ViewIndex indexing, no mat3/ternary)
-	// with the 140B MVP-pair push (silhouette_mv_push shape); layout is
+	// with the 132B MVP-pair push (silhouette_mv_push shape); layout is
 	// dedicated here so the raster MV pipes never depend on the lazy
 	// hidden init.
 	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(silhouette_mv_push))
-		throw std::runtime_error("feather silhouette multiview needs 140B push constants");
+		throw std::runtime_error("feather silhouette multiview needs 132B push constants");
 	{
 		vk::PushConstantRange mv_push_range{
 		        .stageFlags = vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment,
@@ -421,143 +399,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	raster_r8_pipeline_mv = make_raster_mv_variant(raster_r8_renderpass_mv, blend, nullptr);
 	raster_r8_depth_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, blend, &depth_write);
 	raster_r8_reverse_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, min_blend, &depth_test);
-
-	// AA pipes (plane-coefficient mask_aa_mv.vert/frag, conservative
-	// overestimate, ADD-saturate, no depth): same dynamic state and the
-	// same silhouette_mv_layout (push-only) as the binary pipes; vertex
-	// input (pos+c+gradients), rasterization (conservative) and
-	// blend (ADD) differ. Tier-0 RGBA and tier-1 R8 variants; the shared
-	// pipeline_cache covers the compiles.
-	//
-	// Coverage model: overestimate emits the neighbour fragment at
-	// shared-edge pixels too; each fragment evaluates smooth coverage
-	// on a 2x2 ordered subpixel grid and they ADD (watertight mesh =>
-	// complements sum to 1.0 interior, silhouette stays single-sided).
-	// ADD saturates via the UNORM store clamp (fail-safe over-reveal).
-	// Reversed cuts stay binary MIN. Requires
-	// VK_EXT_conservative_rasterization at device creation: without it
-	// the pipes stay null and record() falls back to binary raster.
-	bool has_cr = false;
-	for (const auto & e: physical_device.enumerateDeviceExtensionProperties())
-	{
-		if (std::strcmp(e.extensionName.data(), VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME) == 0)
-		{
-			has_cr = true;
-			break;
-		}
-	}
-	if (not has_cr)
-		spdlog::warn("feather AA disabled (no VK_EXT_conservative_rasterization): binary raster");
-	else
-	{
-		vk::PipelineColorBlendAttachmentState aa_add_attachment{
-		        .blendEnable = VK_TRUE,
-		        .srcColorBlendFactor = vk::BlendFactor::eOne,
-		        .dstColorBlendFactor = vk::BlendFactor::eOne,
-		        .colorBlendOp = vk::BlendOp::eAdd,
-		        .srcAlphaBlendFactor = vk::BlendFactor::eOne,
-		        .dstAlphaBlendFactor = vk::BlendFactor::eOne,
-		        .alphaBlendOp = vk::BlendOp::eAdd,
-		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
-		};
-		vk::PipelineColorBlendStateCreateInfo aa_add_blend{
-		        .attachmentCount = 1,
-		        .pAttachments = &aa_add_attachment,
-		};
-		// Conservative overestimate, zero extra: emit every touched
-		// pixel (extra=0 is a multiple of the 0.5 granularity, within
-		// the 0.5 maxExtra — probed on Quest 3). Base halo ~0.5px lands
-		// as a soft toe via the smooth coverage (fail-safe).
-		vk::PipelineRasterizationConservativeStateCreateInfoEXT cr_state{
-		        .flags = {},
-		        .conservativeRasterizationMode = vk::ConservativeRasterizationModeEXT::eOverestimate,
-		        .extraPrimitiveOverestimationSize = 0.0f,
-		};
-		vk::PipelineRasterizationStateCreateInfo aa_rasterization = rasterization;
-		aa_rasterization.pNext = &cr_state;
-		// Backfaces culled: with ADD-saturate, a behind-surface fragment
-		// covering a rim pixel would sum the silhouette ramp to 1.0
-		// (thin double-rims always coincide). Front-side viewing only —
-		// windows are invisible from behind; both-sides needs the
-		// stencil two-pass follow-up, not depth (order-dependent).
-		// Winding follows the shared convention (CCW front); soups
-		// with mirrored (winding-flipped) nodes would lose triangles
-		// here while the binary path still shows them — device A/B
-		// against binary coverage decides.
-		aa_rasterization.cullMode = vk::CullModeFlagBits::eBack;
-		vk::VertexInputBindingDescription aa_binding{
-		        .binding = 0,
-		        .stride = sizeof(aa_vert),
-		        .inputRate = vk::VertexInputRate::eVertex,
-		};
-		vk::VertexInputAttributeDescription aa_attributes[4] = {
-		        {
-		                .location = 0,
-		                .binding = 0,
-		                .format = vk::Format::eR32G32B32Sfloat,
-		                .offset = offsetof(aa_vert, pos),
-		        },
-		        {
-		                .location = 1,
-		                .binding = 0,
-		                .format = vk::Format::eR32G32Sfloat,
-		                .offset = offsetof(aa_vert, c),
-		        },
-		        {
-		                .location = 2,
-		                .binding = 0,
-		                .format = vk::Format::eR32G32B32Sfloat,
-		                .offset = offsetof(aa_vert, grad1),
-		        },
-		        {
-		                .location = 3,
-		                .binding = 0,
-		                .format = vk::Format::eR32G32B32Sfloat,
-		                .offset = offsetof(aa_vert, grad2),
-		        },
-		};
-		vk::PipelineVertexInputStateCreateInfo aa_vertex_input{
-		        .vertexBindingDescriptionCount = 1,
-		        .pVertexBindingDescriptions = &aa_binding,
-		        .vertexAttributeDescriptionCount = 4,
-		        .pVertexAttributeDescriptions = aa_attributes,
-		};
-		auto aa_vert_mod = load_shader(device, "mask_aa_mv.vert");
-		auto aa_frag_mod = load_shader(device, "mask_aa_mv.frag");
-		vk::PipelineShaderStageCreateInfo aa_stages[2] = {
-		        {
-		                .stage = vk::ShaderStageFlagBits::eVertex,
-		                .module = **aa_vert_mod,
-		                .pName = "main",
-		        },
-		        {
-		                .stage = vk::ShaderStageFlagBits::eFragment,
-		                .module = **aa_frag_mod,
-		                .pName = "main",
-		        },
-		};
-		auto make_aa_mv_variant = [&](vk::raii::RenderPass & rp) {
-			vk::GraphicsPipelineCreateInfo info{
-			        .stageCount = 2,
-			        .pStages = aa_stages,
-			        .pVertexInputState = &aa_vertex_input,
-			        .pInputAssemblyState = &input_assembly,
-			        .pViewportState = &viewport_state,
-			        .pRasterizationState = &aa_rasterization,
-			        .pMultisampleState = &multisample,
-			        .pDepthStencilState = nullptr,
-			        .pColorBlendState = &aa_add_blend,
-			        .pDynamicState = &dynamic,
-			        .layout = *silhouette_mv_layout,
-			        .renderPass = *rp,
-			};
-			return vk::raii::Pipeline(device, *pipeline_cache(device), info);
-		};
-		aa_pipeline_mv = make_aa_mv_variant(renderpass_mv);
-		aa_raster_r8_pipeline_mv = make_aa_mv_variant(raster_r8_renderpass_mv);
-		spdlog::info("feather AA pipes built (plane-coefficient, conservative overestimate, ADD, backface-culled, no depth)");
-	}
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
 	// so no clear and no prior contents needed.
@@ -1229,89 +1070,6 @@ void feather_mask_renderer::set_mesh(const std::string & key, const passthrough_
 	        vk::MemoryPropertyFlagBits::eDeviceLocal);
 	mesh.pending_upload = {vertex_bytes, index_bytes};
 	mesh.index_count = (uint32_t)soup.indices.size();
-	// AA de-indexed upload: 3 verts per triangle with triangle plane
-	// coefficients (c1, c2; B_i(p) = g_i.p + c_i, identical on all 3
-	// verts) plus static object-space gradients, drawn non-indexed by
-	// the AA pipes. Same soup, same waitIdle cover above (map-change
-	// only).
-	{
-		size_t tri_count = soup.indices.size() / 3;
-		std::vector<aa_vert> aa;
-		aa.reserve(tri_count * 3);
-		for (size_t t = 0; t < tri_count; ++t)
-		{
-			glm::vec3 p[3];
-			for (int k = 0; k < 3; ++k)
-			{
-				const XrVector3f & v = soup.vertices[soup.indices[t * 3 + k]];
-				p[k] = glm::vec3(v.x, v.y, v.z);
-			}
-			// Object-space barycentric plane coefficients: B_i(p) = g_i.p
-			// + c_i with c_i = 1 - g_i.p_i. Static (geometry only); the
-			// shader evaluates them at the exact fragment point.
-			glm::vec3 e1 = p[1] - p[0], e2 = p[2] - p[0];
-			glm::vec3 N = glm::cross(e1, e2);
-			float d = glm::dot(N, N);
-			glm::vec3 g1(0.0f), g2(0.0f);
-			float c1 = -1.0f, c2 = -1.0f;
-			if (d >= 1e-18f)
-			{
-				g1 = glm::cross(e2, N) / d;
-				g2 = glm::cross(N, e1) / d;
-				c1 = 1.0f - glm::dot(g1, p[1]);
-				c2 = 1.0f - glm::dot(g2, p[2]);
-			}
-			// Degenerate guard values (g=0, c=-1): B=(-1,-1,3) drives the
-			// per-edge min to 0 coverage even if a zero-area triangle
-			// ever rasterizes (it normally emits no fragments at all).
-			for (int k = 0; k < 3; ++k)
-			{
-				aa_vert v{};
-				const XrVector3f & sp = soup.vertices[soup.indices[t * 3 + k]];
-				v.pos = sp;
-				v.c[0] = c1;
-				v.c[1] = c2;
-				v.grad1 = {g1.x, g1.y, g1.z};
-				v.grad2 = {g2.x, g2.y, g2.z};
-				aa.push_back(v);
-			}
-		}
-		vk::DeviceSize aa_bytes = aa.size() * sizeof(aa_vert);
-		if (aa_bytes == 0)
-		{
-			// Degenerate soup (indices present but no whole triangle):
-			// nothing to draw. Mirror the empty-soup discipline —
-			// no buffers, no pending copy (a zero-size buffer or
-			// copyBuffer is a validation error).
-			mesh.aa_vertex_count = 0;
-			mesh.aa_pending_upload.reset();
-			mesh.aa_vertex_buffer.clear();
-			mesh.aa_vertex_memory.clear();
-			mesh.aa_staging_buffer.clear();
-			mesh.aa_staging_memory.clear();
-			mesh.aa_staging_size = 0;
-		}
-		else
-		{
-		if (mesh.aa_staging_size < aa_bytes)
-		{
-			std::tie(mesh.aa_staging_buffer, mesh.aa_staging_memory) = make_buffer(
-			        aa_bytes,
-			        vk::BufferUsageFlagBits::eTransferSrc,
-			        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-			mesh.aa_staging_size = aa_bytes;
-		}
-		void * aa_mapped = mesh.aa_staging_memory.mapMemory(0, aa_bytes);
-		std::memcpy(aa_mapped, aa.data(), aa_bytes);
-		mesh.aa_staging_memory.unmapMemory();
-		std::tie(mesh.aa_vertex_buffer, mesh.aa_vertex_memory) = make_buffer(
-		        aa_bytes,
-		        vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst,
-		        vk::MemoryPropertyFlagBits::eDeviceLocal);
-		mesh.aa_pending_upload = aa_bytes;
-		mesh.aa_vertex_count = (uint32_t)aa.size();
-		}
-	}
 	// Model-space bounds for the stream-side frustum skip (upload-time
 	// only; per-frame tests transform the 8 corners by the draw MVP).
 	glm::vec3 lo{soup.vertices[0].x, soup.vertices[0].y, soup.vertices[0].z};
@@ -1462,12 +1220,12 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 
 	if (not hidden_ready)
 	{
-		// Multiview silhouette pushes (140B MVP pair + viewport scale)
-		// exceed the 128-byte Vulkan minimum: Adreno 740 (Quest 3) provides 256B. Throw loudly
+		// Multiview silhouette pushes (132B MVP pair) exceed the
+		// 128-byte Vulkan minimum: Adreno 740 (Quest 3) provides 256B. Throw loudly
 		// here — not silently on device — when unsupported (see the
 		// silhouette_mv_push note above the ctor).
 		if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(silhouette_mv_push))
-			throw std::runtime_error("hidden multiview needs 140B push constants");
+			throw std::runtime_error("hidden multiview needs 132B push constants");
 		hidden_ready = true;
 		// Unit-sphere verts (shared proximity-depth generator).
 		auto sphere = passthrough_mesh::unit_sphere_positions();
@@ -1662,7 +1420,7 @@ void feather_mask_renderer::ensure_hidden(vk::Image image, vk::Extent2D extent)
 		        .depthWriteEnable = VK_TRUE,
 		        .depthCompareOp = vk::CompareOp::eLess,
 		};
-		// Reuse the ctor-built silhouette MV layout (identical 140B
+		// Reuse the ctor-built silhouette MV layout (identical 132B
 		// silhouette_mv_push range): one layout for all MV mask pipes.
 		hidden_sphere_pipe = vk::raii::Pipeline(device, *pipe_cache,
 		                                        vk::GraphicsPipelineCreateInfo{
@@ -2337,33 +2095,6 @@ void feather_mask_renderer::flush_upload(vk::raii::CommandBuffer & cmd, mesh_buf
 		                    barriers,
 		                    {});
 	}
-	// AA de-indexed upload (vertex-only, same discipline).
-	if (mesh.aa_pending_upload)
-	{
-		vk::DeviceSize aa_bytes = *mesh.aa_pending_upload;
-		mesh.aa_pending_upload.reset();
-		vk::BufferCopy aa_copy{
-		        .srcOffset = 0,
-		        .dstOffset = 0,
-		        .size = aa_bytes,
-		};
-		cmd.copyBuffer(*mesh.aa_staging_buffer, *mesh.aa_vertex_buffer, aa_copy);
-		vk::BufferMemoryBarrier aa_barrier{
-		        .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
-		        .dstAccessMask = vk::AccessFlagBits::eVertexAttributeRead,
-		        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-		        .buffer = *mesh.aa_vertex_buffer,
-		        .offset = 0,
-		        .size = aa_bytes,
-		};
-		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
-		                    vk::PipelineStageFlagBits::eVertexInput,
-		                    {},
-		                    {},
-		                    aa_barrier,
-		                    {});
-	}
 }
 
 void feather_mask_renderer::update_source(vk::ImageView view, uint32_t set, bool nearest,
@@ -2408,20 +2139,6 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// 0), so clear-only and let the cutout punch below run if armed. Depth
 	// engages exactly when a reversed draw exists; positive-only calls
 	// rasterize as usual.
-	// AA (Nov 2026): conservative-overestimate analytic coverage on
-	// positives-only tier-0 and tier-1 raster (2x2 ordered subpixel grid
-	// averaged per fragment, ADD-saturated across neighbours: interior
-	// straddles sum to 1.0). Reversed groups stay on the binary mask_mv
-	// path (cuts untested with grey coverage); tiered/hidden paths below
-	// are untouched. No depth companions, order independent.
-	if (has_reversed)
-	{
-		if (not aa_rev_logged_)
-		{
-			spdlog::info("feather AA skipped (reversed draws present): binary raster");
-			aa_rev_logged_ = true;
-		}
-	}
 	auto fill_stats = [&] {
 		if (cpu_stats)
 		{
@@ -2713,19 +2430,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		vk::Pipeline rev_pipe;
 		vk::RenderPass rp;
 		vk::RenderPass depth_rp;
-		// AA pipe (mask_aa_mv, conservative overestimate, ADD, no depth)
-		// for the color-only FB above. Raw handle like the rest; null =
-		// binary only (e.g. extension missing).
-		vk::Pipeline aa_pipe;
 	};
 	// Multiview silhouette raster: one draw broadcasts to both layers via
 	// mask_mv.vert (gl_ViewIndex selects the MVP). Same polarity passes as
 	// the depth path, same clears; one begin and one pipe bind per pass.
-	// use_aa selects the analytic-coverage AA pipe + de-indexed draws
-	// (positives-only: caller guarantees !use_depth when AA is on).
-	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth, bool use_aa = false) {
-		use_aa = use_aa and not use_depth and (site.aa_pipe != vk::Pipeline{});
-		use_aa = use_aa and not use_depth and (site.aa_pipe != vk::Pipeline{});
+	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth) {
 		std::array<vk::ClearValue, 2> clears{};
 		clears[0].color.float32.fill(0);
 		clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
@@ -2741,29 +2450,20 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		for (int pass = 0; pass < (use_depth ? 2 : 1); ++pass)
 		{
 			bool rev_pass = use_depth && pass == 1;
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (use_aa ? site.aa_pipe : (use_depth ? site.depth_pipe : site.pipe)));
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (use_depth ? site.depth_pipe : site.pipe));
 			for (const auto & d: draws)
 			{
 				if (d.reverse != rev_pass)
 					continue;
 				auto mit = meshes.find(d.mesh);
-				if (mit == meshes.end() or mit->second.index_count == 0 or
-				    (use_aa and mit->second.aa_vertex_count == 0))
+				if (mit == meshes.end() or mit->second.index_count == 0)
 					continue;
 				float v = d.reverse ? 1.f - d.opacity : d.opacity;
 				cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
-				                                  silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = v, .inv_view_w = 2.f / (float)e.width, .inv_view_h = 2.f / (float)e.height});
-				if (use_aa and mit->second.aa_vertex_count > 0)
-				{
-					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.aa_vertex_buffer, (vk::DeviceSize)0);
-					cmd.draw(mit->second.aa_vertex_count, 1, 0, 0);
-				}
-				else
-				{
-					cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
-					cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
-					cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
-				}
+				                                  silhouette_mv_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = v});
+				cmd.bindVertexBuffers(0, (vk::Buffer)*mit->second.vertex_buffer, (vk::DeviceSize)0);
+				cmd.bindIndexBuffer(*mit->second.index_buffer, 0, vk::IndexType::eUint32);
+				cmd.drawIndexed(mit->second.index_count, 1, 0, 0, 0);
 				++n_draws;
 			}
 		}
@@ -2943,8 +2643,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// Hard edge: rasterize silhouettes straight into the swapchain
 			// image. Exact, one multiview raster pass, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
-			// AA: conservative analytic coverage (ADD) when positives-only.
-			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv, *aa_pipeline_mv}, out_extent, has_reversed, !has_reversed);
+			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed);
 			if (reveal)
 				run_reveal(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *reveal_rgba_pipeline, out_extent);
 		}
@@ -2966,11 +2665,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		int erode = erode_radius(spread, 2.f);
 		{
 			section_clock raster_clk(&ms_raster);
-			// AA: conservative analytic coverage (ADD) when positives-only. Grey feeds
-			// the blur chain linearly (like opacity fade); box-min erode
-			// is nonlinear, so the fringe may erode ~1 texel deeper than
-			// the binary contour — the device run compares contours.
-			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv, *aa_raster_r8_pipeline_mv}, half_extent, has_reversed, !has_reversed);
+			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed);
 		}
 		if (reveal)
 			run_reveal(*target_a.image, reveal_fb_for(*target_a.image, *target_a.view_array, half_extent), *reveal_r8_rp, *reveal_r8_pipeline, half_extent);
@@ -3079,13 +2774,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// below runs once per level for both eyes (multiview).
 			{
 				section_clock raster_clk(&ms_raster);
-				// TEMP DIAGNOSTIC pairs with the tier-0->2 force above:
-				// engage the AA pipe on the tiered seed raster (positives-only),
-				// otherwise the magnified quarter-res inspection shows binary.
-				// Seed-relative gradient units (default): the ramp spans a
-				// full seed texel so the nearest-magnified lens below shows
-				// the grey staircase directly.
-				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv, *aa_raster_r8_pipeline_mv}, de_seed, has_reversed, !has_reversed);
+				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed);
 			}
 			if (reveal)
 				run_reveal(*down_targets[seed_level - 1].image,
