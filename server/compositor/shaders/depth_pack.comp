@@ -13,7 +13,7 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <https://www.gnu.org/>.
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
 /*
@@ -21,35 +21,38 @@
  *
  * Reads the warp's target-view splat depth (R32Uint, DEPTH_SCALE-encoded
  * NDC, 0xffffffff sentinel = no splat) for both eyes at full render size
- * and packs a side-by-side 10-bit image: left eye in x[0..half),
- * right eye in x[half..2*half), where half/height track half the stream
- * resolution per eye (SBS width = full stream width).
+ * and packs a foveated side-by-side 10-bit image: left eye in
+ * x[0..half), right eye in x[half..2*half), each eye at per-eye stream
+ * resolution with the SAME foveation tables as color (shared gaze center
+ * and source size — the tables live in color's per-slot UBO, read-only
+ * here, never re-uploaded).
  *
- * Resample happens FIRST in the encoded NDC/uint domain with MIN pooling
+ * Gather is a variable-footprint MIN over the shared table spans
  * (foreground wins, order-independent): bilinear filtering of nonlinear
  * NDC would blend foreground/background into false mid-depths and halo
  * every silhouette. The sentinel is the max uint, so a plain min ignores
  * holes automatically; all-sentinel windows stay sentinel.
+ * No manual row flip: the shared y-tables already encode the
+ * GL-ordered splat to top-down-wire mapping (same flip color
+ * foveation bakes in). Re-introducing one would mirror vertically
+ * with no validation complaint.
  *
- * Linearisation runs only at depth resolution (~1M px/eye at 2K stream,
- * not ~4M): zt back to eye meters via the dst frustum near/far (same
- * math as depth_viz's linearize_depth, mirrored here), then 2mm/LSB
- * quantize CLAMPED at 2.040m (code 1020): beyond-range content (sky
- * pinned at 1.0, holes, sentinel) reads as a near wall, so VR occludes
- * passthrough there instead of flagging far (which would let
- * passthrough win over far VR). Codes 1021-1023 are a guard band for
- * lossy overshoot; the client decodes them as far.
- *
- * Row convention: output row 0 = scene top (top-down on the wire, like
- * the foveated color streams and the client volume canvas). The warp
- * splat is GL-ordered (row 0 = scene bottom), so source rows are read
- * flipped. The client compares in D space: showReal = sensorD <
- * min(volumeD, virtualD).
+ * Linearisation runs only at depth resolution: zt back to eye meters
+ * via the dst frustum near/far (same math as depth_viz's
+ * linearize_depth, mirrored here), then 2mm/LSB quantize: valid codes
+ * 0-1020 (0-2.040m); holes, sky pinned at 1.0 and beyond-range all pin
+ * to 1023 (far). Codes 1021-1023 are a guard band absorbing lossy
+ * wobble; the client decodes anything past 1020 as far. The client
+ * compares in meters: reveal = !(virt strictly nearer than the
+ * rasterized window), far-vs-far is a VR win.
  */
 
 #version 450
 
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+// Must match foveation.comp's table layout (same shared buffer).
+#define MAX_DIM 4097
 
 layout(set = 0, binding = 0, r32ui) readonly uniform uimage2D splat_l;
 layout(set = 0, binding = 1, r32ui) readonly uniform uimage2D splat_r;
@@ -57,10 +60,28 @@ layout(set = 0, binding = 1, r32ui) readonly uniform uimage2D splat_r;
 // 10-bit in R16). Geometry derives from the actual image (never
 // hardcoded).
 layout(set = 0, binding = 2, r16) writeonly uniform image2D dst_y;
+// CbCr plane of the same staging image, 2D R16G16 view on layer 3
+// (half-res 4:2:0). The pack writes the neutral chroma itself: a
+// vkCmdClearColorImage here would be illegal (VUID-02498 aspect,
+// VUID-01545 YCbCr-conversion format), and the driver silently drops
+// it — which reads as +335 codes of green lift client-side.
+layout(set = 0, binding = 3, rg16) writeonly uniform image2D dst_cbcr;
+// Shared color foveation tables (per-slot storage buffer, read-only
+// here): x[2*MAX_DIM], y[2*MAX_DIM], per-eye stride MAX_DIM.
+layout(set = 0, binding = 4) readonly buffer Tables
+{
+	uint fx[2 * MAX_DIM];
+	uint fy[2 * MAX_DIM];
+}
+tables;
+// Hole-depth views (donor splat codes for fill-repaired holes,
+// sentinel elsewhere): read-only here, same GENERAL layout as the
+// splat views.
+layout(set = 0, binding = 5, r32ui) readonly uniform uimage2D hole_l;
+layout(set = 0, binding = 6, r32ui) readonly uniform uimage2D hole_r;
 
 layout(push_constant) uniform Push
 {
-	vec2 src_size; // full-res splat extent (both eyes share it)
 	float near_l;
 	float far_l;
 	float near_r;
@@ -72,11 +93,12 @@ pc;
 #define DEPTH_SENTINEL 0xffffffffu
 #define LSB_PER_M 500.0
 #define DEPTH_MAX_CODE 1023u
-// Clamp: beyond-range VR reads as a near wall (occludes passthrough)
-// instead of flagging far. Codes above this are a guard band for lossy
-// overshoot, decoded as far client-side.
-#define DEPTH_CLAMP_CODE 1020u
-#define MAX_VIRT_M 2.040
+// Valid codes 0-1020 (0-2.040m); holes/sky/beyond-range pin to FAR_CODE.
+// 1021-1023 is a guard band absorbing lossy wobble, decoded as far
+// client-side.
+#define VALID_MAX_CODE 1020u
+#define FAR_CODE 1023u
+#define VALID_MAX_M 2.040
 
 float linearize(float d, float n, float f)
 {
@@ -95,46 +117,84 @@ void main()
 	if (out_xy.x >= out_size.x || out_xy.y >= out_size.y)
 		return;
 
-	// Wire convention (see wivrn_packets.h): row 0 = scene top, matching
-	// the volume canvas and the foveated color streams. The warp splat is
-	// GL-ordered (row 0 = scene bottom), so the source window is read
-	// vertically flipped. Geometry derives from the actual image (never
-	// hardcoded): left eye x[0..half), right eye x[half..2*half).
+	// Left eye x[0..half), right eye x[half..2*half): the eye index
+	// selects the table slice, the in-eye coordinate the span.
 	int half_w = out_size.x / 2;
-	bool right = out_xy.x >= half_w;
-	ivec2 eye_xy = ivec2(right ? out_xy.x - half_w : out_xy.x, out_size.y - 1 - out_xy.y);
+	int iz = out_xy.x >= half_w ? 1 : 0;
+	int ix = out_xy.x - iz * half_w;
+	int iy = out_xy.y;
 
-	vec2 scale = pc.src_size / vec2(float(half_w), float(out_size.y));
-	vec2 f0 = vec2(eye_xy) * scale;
-	vec2 f1 = (vec2(eye_xy) + vec2(1.0)) * scale;
-	ivec2 i0 = ivec2(floor(f0));
-	ivec2 i1 = ivec2(min(ceil(f1), pc.src_size));
+	// Shared-table spans (same decode as foveation.comp): the tables
+	// already map GL-ordered splat rows to top-down output rows.
+	uint xmin = tables.fx[MAX_DIM * iz + ix];
+	uint xmax = tables.fx[MAX_DIM * iz + ix + 1];
+	uint ymin = tables.fy[MAX_DIM * iz + iy];
+	uint ymax = tables.fy[MAX_DIM * iz + iy + 1];
+	if (xmin > xmax)
+	{
+		uint tmp = xmin;
+		xmin = xmax;
+		xmax = tmp;
+	}
+	if (ymin > ymax)
+	{
+		uint tmp = ymin;
+		ymin = ymax;
+		ymax = tmp;
+	}
+	// Belt-and-braces clamp against the splat: the shared tables always
+	// cover exactly this image (same slot, same commit), but an OOB
+	// imageLoad is silent undefined behavior, never a validation error.
+	ivec2 splat_size = imageSize(splat_l);
+	xmin = min(xmin, uint(splat_size.x));
+	xmax = min(xmax, uint(splat_size.x));
+	ymin = min(ymin, uint(splat_size.y));
+	ymax = min(ymax, uint(splat_size.y));
 
 	uint best = DEPTH_SENTINEL;
-	for (int y = i0.y; y < i1.y; ++y)
+	for (uint y = ymin; y < ymax; ++y)
 	{
-		for (int x = i0.x; x < i1.x; ++x)
+		for (uint x = xmin; x < xmax; ++x)
 		{
-			uint v = right ? imageLoad(splat_r, ivec2(x, y)).x
-			               : imageLoad(splat_l, ivec2(x, y)).x;
+			uint v = iz == 1 ? imageLoad(splat_r, ivec2(x, y)).x
+			                 : imageLoad(splat_l, ivec2(x, y)).x;
+			// Fill-repaired disocclusion: prefer the donor's
+			// background depth over the splat sentinel (unfilled
+			// holes stay sentinel and pin FAR below as before).
+			if (v == DEPTH_SENTINEL)
+				v = iz == 1 ? imageLoad(hole_r, ivec2(x, y)).x
+				            : imageLoad(hole_l, ivec2(x, y)).x;
 			best = min(best, v);
 		}
 	}
 
-	float virt_m;
+	float u10;
 	if (best == DEPTH_SENTINEL)
 	{
-		virt_m = MAX_VIRT_M; // hole: clamps to near-max, VR wins
+		u10 = FAR_CODE; // hole: far
 	}
 	else
 	{
 		float zt = float(best) / DEPTH_SCALE;
 		if (zt >= 1.0)
-			virt_m = MAX_VIRT_M; // sky pinned at far: clamp, VR wins
+			u10 = FAR_CODE; // sky pinned at far: far
 		else
-			virt_m = min(linearize(zt, right ? pc.near_r : pc.near_l, right ? pc.far_r : pc.far_l), MAX_VIRT_M);
+		{
+			float virt_m = linearize(zt, iz == 1 ? pc.near_r : pc.near_l, iz == 1 ? pc.far_r : pc.far_l);
+			if (virt_m > VALID_MAX_M)
+				u10 = FAR_CODE; // beyond-range: far
+			else
+				u10 = uint(clamp(virt_m * LSB_PER_M + 0.5, 0.0, float(VALID_MAX_CODE)));
+		}
 	}
 
-	uint u10 = uint(clamp(virt_m * LSB_PER_M + 0.5, 0.0, float(DEPTH_CLAMP_CODE)));
 	imageStore(dst_y, out_xy, vec4(float(u10) / float(DEPTH_MAX_CODE)));
+
+	// Neutral chroma for the luma-only depth payload: Plane 1 is
+	// half-res, so each even/even Y thread owns exactly one chroma
+	// texel (staging dims are always even — encoder sizes).
+	// UNORM16(0.5) = 0x8000, i.e. 10-bit neutral 512 in the upper
+	// bits under the 3PACK16 low-6-pad convention.
+	if ((out_xy.x & 1) == 0 && (out_xy.y & 1) == 0)
+		imageStore(dst_cbcr, out_xy / 2, vec4(0.5, 0.5, 0.0, 1.0));
 }

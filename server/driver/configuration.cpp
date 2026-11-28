@@ -562,7 +562,24 @@ configuration::configuration()
 					if (o.type == "3d-passthrough-reversed" or is_boundary or is_hidden)
 						U_LOG_W("passthrough object \"%s\": feather-px is not accepted for %s, ignoring", o.id.c_str(), o.type.c_str());
 					else
+					{
 						o.feather_px = item["feather-px"];
+						if (o.feather_px < 0)
+						{
+							U_LOG_W("passthrough object \"%s\": negative feather-px, clamping to 0", o.id.c_str());
+							o.feather_px = 0;
+						}
+						else if (o.feather_px > 32)
+						{
+							U_LOG_W("passthrough object \"%s\": feather-px %.1f clamped to 32 (half-res single-kernel range)", o.id.c_str(), (double)o.feather_px);
+							o.feather_px = 32;
+						}
+					}
+				}
+				else if (is_depth)
+				{
+					// Depth volumes default to 12px (half-res) when unconfigured.
+					o.feather_px = 12;
 				}
 				if (item.contains("transition-distance"))
 				{
@@ -662,6 +679,21 @@ configuration::configuration()
 				{
 					U_LOG_W("passthrough-fade-time negative, clamping to 0");
 					passthrough_fade_time_s = 0;
+				}
+			}
+		}
+
+		if (auto it = json.find("startup-fade-time"); it != json.end())
+		{
+			if (not it->is_number())
+				U_LOG_W("startup-fade-time must be a number of seconds, ignoring");
+			else
+			{
+				startup_fade_time_s = it->get<float>();
+				if (startup_fade_time_s < 0)
+				{
+					U_LOG_W("startup-fade-time negative, clamping to 0");
+					startup_fade_time_s = 0;
 				}
 			}
 		}

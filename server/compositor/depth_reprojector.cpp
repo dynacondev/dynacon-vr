@@ -240,6 +240,14 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 			        vk, splat_depth[slot][view], vk::Format::eR32Uint,
 			        vk::ImageUsageFlagBits::eStorage,
 			        std::format("reproject splat view {}:{}", slot, view).c_str());
+			hole_depth[slot][view] = make_target(
+			        vk, target_size, vk::Format::eR32Uint,
+			        vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferDst,
+			        std::format("reproject hole {}:{}", slot, view).c_str());
+			hole_view[slot][view] = make_view(
+			        vk, hole_depth[slot][view], vk::Format::eR32Uint,
+			        vk::ImageUsageFlagBits::eStorage,
+			        std::format("reproject hole view {}:{}", slot, view).c_str());
 			bgmax[slot][view] = make_target(
 			        vk, {(target_size.width + 63) / 64, (target_size.height + 63) / 64},
 			        vk::Format::eR32Uint, vk::ImageUsageFlagBits::eStorage,
@@ -364,6 +372,14 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	                .descriptorCount = 1,
 	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
 	        },
+	        // Hole-depth store: donor splat code per filled hole
+	        // (sentinel elsewhere — the image is cleared every warp).
+	        vk::DescriptorSetLayoutBinding{
+	                .binding = 3,
+	                .descriptorType = vk::DescriptorType::eStorageImage,
+	                .descriptorCount = 1,
+	                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+	        },
 	};
 	fill_ds_layout = make_ds_layout(vk, fill_bindings, "reproject fill set layout");
 	fill_layout = vk::raii::PipelineLayout{
@@ -378,7 +394,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 
 	// Per (slot, eye): splat takes 1 combined + 1 uniform + 1 storage,
 	// pull takes 1 combined + 1 uniform + 2 storage, bgmax takes
-	// 2 storage, fill takes 3 storage; 4 pairs total.
+	// 2 storage, fill takes 4 storage; 4 pairs total.
 	std::array pool_sizes{
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eCombinedImageSampler,
@@ -390,7 +406,7 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 	        },
 	        vk::DescriptorPoolSize{
 	                .type = vk::DescriptorType::eStorageImage,
-	                .descriptorCount = num_slots * 16,
+	                .descriptorCount = num_slots * 18,
 	        },
 	};
 	pool = vk::raii::DescriptorPool{
@@ -467,6 +483,10 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 			        .imageView = *bgmax_view[slot][view],
 			        .imageLayout = vk::ImageLayout::eGeneral,
 			};
+			vk::DescriptorImageInfo fill_hole_info{
+			        .imageView = *hole_view[slot][view],
+			        .imageLayout = vk::ImageLayout::eGeneral,
+			};
 			std::array static_writes{
 			        vk::WriteDescriptorSet{
 			                .dstSet = bgmax_sets[slot][view],
@@ -502,6 +522,13 @@ depth_reprojector::depth_reprojector(vk_bundle & vk, vk::Extent2D target_size, b
 			                .descriptorCount = 1,
 			                .descriptorType = vk::DescriptorType::eStorageImage,
 			                .pImageInfo = &fill_bgmax_info,
+			        },
+			        vk::WriteDescriptorSet{
+			                .dstSet = fill_sets[slot][view],
+			                .dstBinding = 3,
+			                .descriptorCount = 1,
+			                .descriptorType = vk::DescriptorType::eStorageImage,
+			                .pImageInfo = &fill_hole_info,
 			        },
 			};
 			vk.device.updateDescriptorSets(static_writes, {});
@@ -543,16 +570,26 @@ bool depth_reprojector::reproject(
 	math_matrix_4x4_inverse(&dst_view, &dst_inv_v);
 
 	reproject_splat_ubo splat_data{};
-	math_matrix_4x4_multiply(&render_inv_v, &render_inv_p, &splat_data.render_inv_vp);
-	math_matrix_4x4_multiply(&dst_proj, &dst_view, &splat_data.warp_vp);
+	// Fold the clip->clip product on the CPU (one mat4-vector per
+	// thread instead of two): world = render_inv * clip, then target
+	// = warp_vp * world, so target = (warp_vp * render_inv) * clip.
+	xrt_matrix_4x4 render_inv_vp, warp_vp;
+	math_matrix_4x4_multiply(&render_inv_v, &render_inv_p, &render_inv_vp);
+	math_matrix_4x4_multiply(&dst_proj, &dst_view, &warp_vp);
+	math_matrix_4x4_multiply(&warp_vp, &render_inv_vp, &splat_data.clip_to_target);
 	std::memcpy(splat_data.depth_rect, depth_rect.data(), sizeof(splat_data.depth_rect));
 	splat_data.depth_flip = flip_depth ? 1.f : 0.f;
 	splat_data.src_reverse_z = reverse_z ? 1.f : 0.f;
 	upload_ubo(splat_ubo[slot][view], splat_data);
 
 	reproject_pull_ubo pull_data{};
-	math_matrix_4x4_multiply(&dst_inv_v, &dst_inv_p, &pull_data.dst_inv);
-	math_matrix_4x4_multiply(&src_proj, &src_view, &pull_data.src_vp);
+	// Fold the clip->clip product on the CPU (one mat4-vector per
+	// thread instead of two): world = dst_inv * clip, then source =
+	// src_vp * world, so source = (src_vp * dst_inv) * clip.
+	xrt_matrix_4x4 dst_inv, src_vp;
+	math_matrix_4x4_multiply(&dst_inv_v, &dst_inv_p, &dst_inv);
+	math_matrix_4x4_multiply(&src_proj, &src_view, &src_vp);
+	math_matrix_4x4_multiply(&src_vp, &dst_inv, &pull_data.dst_to_src);
 	std::memcpy(pull_data.color_rect, color_rect.data(), sizeof(pull_data.color_rect));
 	pull_data.color_flip = flip_color ? 1.f : 0.f;
 	upload_ubo(pull_ubo[slot][view], pull_data);
@@ -652,9 +689,12 @@ bool depth_reprojector::reproject(
 	                                          : vk::AccessFlags2{};
 	vk::AccessFlags2 bgmax_access = ready ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
 	                                      : vk::AccessFlags2{};
+	vk::AccessFlags2 hole_access = ready ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
+	                                     : vk::AccessFlags2{};
 	const auto splat_start = ready ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
 	const auto target_start = ready ? vk::ImageLayout::eShaderReadOnlyOptimal : vk::ImageLayout::eUndefined;
 	const auto bgmax_start = ready ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
+	const auto hole_start = ready ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined;
 
 	std::array pre_barriers{
 	        vk::ImageMemoryBarrier2{
@@ -699,6 +739,20 @@ bool depth_reprojector::reproject(
 	                        .layerCount = 1,
 	                },
 	        },
+	        vk::ImageMemoryBarrier2{
+	                .srcStageMask = reuse_stage,
+	                .srcAccessMask = hole_access,
+	                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+	                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+	                .oldLayout = hole_start,
+	                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+	                .image = hole_depth[slot][view],
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = 1,
+	                },
+	        },
 	};
 	cmd.pipelineBarrier2({
 	        .imageMemoryBarrierCount = pre_barriers.size(),
@@ -718,6 +772,15 @@ bool depth_reprojector::reproject(
 	                .levelCount = 1,
 	                .layerCount = 1,
 	        });
+	// Hole-depth scratch starts each warp as all-sentinel (unfilled holes
+	// read back as FAR downstream, same as un-splatted texels).
+	cmd.clearColorImage(
+	        hole_depth[slot][view], vk::ImageLayout::eTransferDstOptimal, splat_empty,
+	        vk::ImageSubresourceRange{
+	                .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                .levelCount = 1,
+	                .layerCount = 1,
+	        });
 
 	std::array clear_barriers{
 	        vk::ImageMemoryBarrier2{
@@ -728,6 +791,20 @@ bool depth_reprojector::reproject(
 	                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
 	                .newLayout = vk::ImageLayout::eGeneral,
 	                .image = splat_depth[slot][view],
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = 1,
+	                },
+	        },
+	        vk::ImageMemoryBarrier2{
+	                .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+	                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+	                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead,
+	                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+	                .newLayout = vk::ImageLayout::eGeneral,
+	                .image = hole_depth[slot][view],
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
@@ -802,7 +879,10 @@ bool depth_reprojector::reproject(
 	cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *fill_layout, 0, fill_sets[slot][view], {});
 	cmd.dispatch(groups_x, groups_y, 1);
 
-	// Warp output ends SHADER_READ_ONLY, ready to feed foveation.
+	// Warp output ends SHADER_READ_ONLY, ready to feed foveation. The
+	// hole-depth scratch stays GENERAL (pack samples it there) but its
+	// fill writes need the same write->read visibility for the later
+	// pack dispatch.
 	std::array out_barriers{
 	        vk::ImageMemoryBarrier2{
 	                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -812,6 +892,20 @@ bool depth_reprojector::reproject(
 	                .oldLayout = vk::ImageLayout::eGeneral,
 	                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
 	                .image = target[slot][view],
+	                .subresourceRange = {
+	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+	                        .levelCount = 1,
+	                        .layerCount = 1,
+	                },
+	        },
+	        vk::ImageMemoryBarrier2{
+	                .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	                .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+	                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+	                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+	                .oldLayout = vk::ImageLayout::eGeneral,
+	                .newLayout = vk::ImageLayout::eGeneral,
+	                .image = hole_depth[slot][view],
 	                .subresourceRange = {
 	                        .aspectMask = vk::ImageAspectFlagBits::eColor,
 	                        .levelCount = 1,
@@ -835,6 +929,11 @@ std::array<vk::ImageView, 2> depth_reprojector::get_views(int slot)
 std::array<vk::ImageView, 2> depth_reprojector::get_splat_views(int slot)
 {
 	return {*splat_view[slot][0], *splat_view[slot][1]};
+}
+
+std::array<vk::ImageView, 2> depth_reprojector::get_hole_views(int slot)
+{
+	return {*hole_view[slot][0], *hole_view[slot][1]};
 }
 
 } // namespace wivrn

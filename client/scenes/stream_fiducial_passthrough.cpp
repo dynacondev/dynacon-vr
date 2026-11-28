@@ -357,16 +357,36 @@ void scenes::stream::update_boundary_fade(glm::vec3 head_pos, bool have_head, Xr
 			spdlog::info("passthrough-until-lock: fade complete");
 		}
 	}
+	// Startup fade: fullscreen passthrough on video (re)start, fading
+	// out over startup-fade-time (smoothstep 0->1). Overrides
+	// everything via min(): a starting feed always demands fullscreen
+	// while fading, zones / until-lock still hold it independently
+	// afterwards. Runs underneath (video below, flat on top via the
+	// same floor lift as the veil).
+	bool fading_startup = false;
+	if (startup_fading)
+	{
+		double elapsed = (now - startup_time) * 1e-9;
+		double t = startup_fade_s > 0 ? std::clamp(elapsed / startup_fade_s, 0.0, 1.0) : 1.0;
+		float s_startup = (float)(t * t * (3 - 2 * t));
+		s = std::min(s, s_startup);
+		fading_startup = t < 1.0;
+		if (not fading_startup)
+		{
+			startup_fading = false;
+			spdlog::info("startup fade: complete");
+		}
+	}
 	boundary_any = any_placed;
 	boundary_s = s;
-	bool veil = waiting_lock or fading_lock or (any_valid and s < 0.999f);
+	bool veil = waiting_lock or fading_lock or fading_startup or (any_valid and s < 0.999f);
 	// Transition edges always log (a swimming cutout is the felt
 	// defect); steady state gets a 5s heartbeat while zones are placed.
 	bool was_veil = boundary_veil;
 	boundary_veil = veil;
 	if (veil != was_veil)
 		spdlog::info("boundary veil: {} (s {:.3f})", veil ? "active" : "released", (double)s);
-	if ((any_placed or waiting_lock or fading_lock) and (veil != was_veil or now - last_boundary_log > 5'000'000'000LL))
+	if ((any_placed or waiting_lock or fading_lock or fading_startup) and (veil != was_veil or now - last_boundary_log > 5'000'000'000LL))
 	{
 		last_boundary_log = now;
 		spdlog::info("boundary fade: s {:.3f} veil {} head ({:.2f},{:.2f},{:.2f})", (double)s, veil,
@@ -742,6 +762,18 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		}
 	}
 
+	// Startup fade duration: live-applied every frame (deliberately
+	// outside the map_key fingerprint above: a duration edit must not
+	// reset tracking).
+	{
+		float want = std::max(0.f, map->startup_fade_time_s);
+		if (want != startup_fade_s)
+		{
+			spdlog::info("startup fade time: {:.1f}s", (double)want);
+			startup_fade_s = want;
+		}
+	}
+
 	// Resolver: one board hypothesis (vote) per (fiducial, marker,
 	// entity) = observed pose plus the marker's size, offset and latch
 	// time. ALL markers of a fiducial vote. Rebuilt every frame.
@@ -1058,17 +1090,17 @@ void scenes::stream::update_fiducial_passthrough(XrTime predicted_display_time, 
 		// Boundary zones place identically too (fused pose + mesh for
 		// the distance query); only the veil submit uses them.
 		bool is_boundary = def.type == "3d-boundary" or def.type == "3d-boundary-reversed";
-		bool is_depth = def.type == "3d-depth-passthrough";
 		bool is_hidden = def.type == "3d-passthrough-hidden";
-		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_depth and not is_hidden)
+		bool is_depth = def.type == "3d-depth-passthrough";
+		if (def.type != "3d-passthrough" and def.type != "3d-passthrough-reversed" and not is_boundary and not is_hidden and not is_depth)
 		{
 			spdlog::info("Passthrough object \"{}\": type \"{}\" not implemented, skipping", def.id, def.type);
 			continue;
 		}
 		auto & ost = passthrough_objects[def.id];
 		ost.def = def;
-		if ((is_boundary or is_hidden) and def.model_hash.empty())
-			ost.status = "no model configured (boundary/hidden needs model-path)";
+		if ((is_boundary or is_hidden or is_depth) and def.model_hash.empty())
+			ost.status = "no model configured (this type needs model-path)";
 		// Model geometry upload (shared across this object's instances).
 		if (not def.model_hash.empty())
 		{
@@ -1132,6 +1164,27 @@ void scenes::stream::gui_passthrough()
 	wivrn::ui::page_header(_S("Passthrough"), _S("QR marker tracking and alignment."));
 	gui_fiducial_status();
 
+	ImGui::SeparatorText(_S("VR occlusion"));
+	if (ImGui::Checkbox(_S("VR depth testing"), &vr_depth_test))
+	{
+		spdlog::info("VR depth testing {}", vr_depth_test ? "enabled" : "disabled (mask only, verdict submits merged directly)");
+		if (vr_depth_test)
+			vr_occlusion_logged = false; // re-log on re-engagement
+	}
+	ImGui::Text("%s", _S("Off = passthrough mask only (no VR-vs-depth compare). Skips the depth-layer raster + verdict pass (merged applies directly)."));
+	if (not vr_depth_test)
+		ImGui::Text("%s", _S("Layer/verdict viz views show stale targets while depth testing is off."));
+
+	ImGui::SeparatorText(_S("Depth passthrough"));
+	int dilate = depth_dilate_px;
+	if (ImGui::SliderInt(_S("Sensor dilate (texels)"), &dilate, 0, 8))
+		depth_dilate_px = std::clamp(dilate, 0, 8);
+	ImGui::Text("%s", _S("Widens known geometry (windows + hidden) over sensor noise; the volume back wall stays exact. Texels of the sensor copy (merge/2: wider world at smaller merges)."));
+	float dbias = depth_bias_m;
+	if (ImGui::SliderFloat(_S("Depth bias (m)"), &dbias, -0.05f, 0.25f, "%.3f"))
+		depth_bias_m = dbias;
+	ImGui::Text("%s", _S("Added to the merged copy before the sensor test; guards z-fighting on coincident geometry."));
+
 	ImGui::SeparatorText(_S("Fiducial marker debugging"));
 	ImGui::Checkbox(_S("Marker debug overlays"), &debug_overlays);
 	ImGui::BeginDisabled(not debug_overlays);
@@ -1150,36 +1203,74 @@ void scenes::stream::gui_passthrough()
 	if (ImGui::Button(_S("Run boundary self-test")))
 		xr::boundary_selftest();
 
-	ImGui::SeparatorText(_S("Depth overlay"));
-	if (env_depth_probed and not env_depth_supported)
+	ImGui::SeparatorText(_S("Debug visualization"));
+	ImGui::Text("%s", _S("Isolation views for the VR/passthrough comparison."));
+	{
+		int viz = (int)debug_viz;
+		bool viz_changed = false;
+		// Untranslated keys (translated at use): storing gettext_noop
+		// literals keeps them visible to xgettext (tools/update_messages.sh
+		// extracts _S:1/gettext_noop:1 literals; _S(variable) would not
+		// be extracted). _S returns a pointer into a temporary, so it
+		// cannot back a static table — it is called at use below.
+		static const struct viz_mode_entry
+		{
+			debug_viz_mode mode;
+			const char * label;
+		} viz_modes[] = {
+		        {debug_viz_mode::none, gettext_noop("None")},
+		        {debug_viz_mode::sensor, gettext_noop("Depth Sensor")},
+		        {debug_viz_mode::vr_depth, gettext_noop("VR Depth")},
+		        {debug_viz_mode::layer, gettext_noop("Composited Depth")},
+		        {debug_viz_mode::verdict, gettext_noop("VR vs Passthrough")},
+		        {debug_viz_mode::raster_vs_sensor, gettext_noop("Raster vs Sensor")},
+		        {debug_viz_mode::vr_raster, gettext_noop("VR + Raster")},
+		};
+		for (const auto & e : viz_modes)
+		{
+			if (ImGui::RadioButton(_S(e.label), viz == (int)e.mode) and viz != (int)e.mode)
+			{
+				viz = (int)e.mode;
+				viz_changed = true;
+			}
+		}
+		if (viz_changed)
+		{
+			debug_viz = (debug_viz_mode)viz;
+			spdlog::info("Debug viz: {}", debug_viz_mode_name(debug_viz));
+			// Pause only freezes sensor frames: disarm when leaving
+			// the sensor modes so an old frozen frame never silently
+			// re-arms on return (frozen buffer is also dropped with
+			// the provider in the render path).
+			if (debug_pause_sensor and debug_viz != debug_viz_mode::sensor and debug_viz != debug_viz_mode::raster_vs_sensor)
+			{
+				debug_pause_sensor = false;
+				spdlog::info("Depth sensor pause cleared (left sensor viz mode)");
+			}
+		}
+	}
+	if (env_depth_probed and not env_depth_supported and debug_viz == debug_viz_mode::sensor)
 		ImGui::Text("%s", _S("Environment depth not supported on this headset"));
-	ImGui::Checkbox(_S("Depth overlay"), &debug_depth_overlay);
-	ImGui::BeginDisabled(not debug_depth_overlay or (env_depth_probed and not env_depth_supported));
+	ImGui::BeginDisabled(debug_viz == debug_viz_mode::none);
+	if (ImGui::Checkbox(_S("Show VR underneath (instead of passthrough)"), &debug_viz_show_vr))
+		spdlog::info("Debug viz background: {}", debug_viz_show_vr ? "VR" : "passthrough");
 	float depth_pct = debug_depth_opacity * 100;
 	if (ImGui::SliderFloat(_S("Overlay opacity"), &depth_pct, 0, 100, "%.0f%%"))
 		debug_depth_opacity = std::clamp(depth_pct / 100, 0.f, 1.f);
-	ImGui::EndDisabled();
-	if (not depth_status.empty())
-		ImGui::Text("%s: %s", _S("Depth status"), depth_status.c_str());
-	// Depth-volume rotation reprojection (remap through the capture <->
-	// display relative rotation). Off = direct tap: the flip default
-	// above is what the shader receives, unchanged.
-	if (ImGui::Checkbox(_S("Rotation reprojection"), &volume_remap_enabled))
-		spdlog::info("Depth rotation reprojection {}", volume_remap_enabled ? "on" : "off");
-	// Depth time-bias test: shifts the assumed content age to hunt a
-	// constant sensor lag (+ = content older = larger correction, the
-	// trailing direction). 0 = unshifted. Log debounced per integer ms.
-	ImGui::BeginDisabled(not volume_remap_enabled);
-	if (ImGui::SliderFloat(_S("Depth time bias"), &volume_time_bias_ms, -50, 50, "%.0fms"))
+	ImGui::BeginDisabled(debug_viz != debug_viz_mode::sensor and debug_viz != debug_viz_mode::raster_vs_sensor);
+	if (ImGui::Checkbox(_S("Pause depth sensor (freeze last frame)"), &debug_pause_sensor))
 	{
-		int bias_ms = (int)std::round(volume_time_bias_ms);
-		if (bias_ms != volume_bias_logged_ms)
-		{
-			volume_bias_logged_ms = bias_ms;
-			spdlog::info("Depth time bias {}ms", bias_ms);
-		}
+		if (debug_pause_sensor and not frozen_depth_valid)
+			spdlog::info("Depth sensor pause armed (waiting for first frame)");
+		else
+			spdlog::info("Depth sensor {}", debug_pause_sensor ? "paused (frozen frame)" : "resumed (live)");
 	}
+	if (ImGui::Checkbox(_S("Custom warp (splat vs runtime)"), &debug_custom_splat))
+		spdlog::info("Depth viz warp {}", debug_custom_splat ? "custom splat" : "runtime");
 	ImGui::EndDisabled();
+	ImGui::EndDisabled();
+	if (not depth_status.empty() and debug_viz != debug_viz_mode::none)
+		ImGui::Text("%s: %s", _S("Viz status"), depth_status.c_str());
 
 	ImGui::SeparatorText(_S("Passthrough effects demo"));
 	{
@@ -1548,7 +1639,7 @@ void scenes::stream::gui_fiducial_status()
 		std::string label = ost.def.tag.empty() ? ost.def.id : ost.def.tag;
 		if (ost.def.type != "3d-passthrough" and ost.def.type != "3d-passthrough-reversed" and
 		    ost.def.type != "3d-boundary" and ost.def.type != "3d-boundary-reversed" and
-		    ost.def.type != "3d-depth-passthrough" and ost.def.type != "3d-passthrough-hidden")
+		    ost.def.type != "3d-passthrough-hidden" and ost.def.type != "3d-depth-passthrough")
 		{
 			ImGui::Text("%s %.40s: %s \"%s\" (%s)",
 			            _S("Object"), label.c_str(), _S("type"), ost.def.type.c_str(), _S("not implemented"));
@@ -1580,10 +1671,10 @@ void scenes::stream::gui_fiducial_status()
 				            _S("Object"), label.c_str(), _S("zone, no solution"), stale_s);
 			continue;
 		}
-		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
 		std::string hidden_tag = (ost.def.type == "3d-passthrough-hidden") ? _S(" (hidden)") : "";
+		std::string depth_tag = (ost.def.type == "3d-depth-passthrough") ? _S(" (depth)") : "";
 		ImGui::Text("%s %.40s%s%s%s: %zu tris, %s (stale %.1fs)",
-		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", depth_tag.c_str(), hidden_tag.c_str(), ost.triangle_count, _S("placed"), stale_s);
+		            _S("Object"), label.c_str(), reversed ? _S(" (reversed)") : "", "", (hidden_tag + depth_tag).c_str(), ost.triangle_count, _S("placed"), stale_s);
 	}
 	if (fiducial_trackers.empty())
 	{

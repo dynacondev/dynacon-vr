@@ -76,16 +76,30 @@ public:
 		}
 	}
 
-	bool should_skip(uint64_t frame_id, uint8_t) override
+	bool should_skip(uint64_t frame_id, uint8_t stream_idx) override
 	{
 		std::unique_lock lock(mutex);
 		bool pending = false; // has any data been sent?
+		uint64_t oldest = UINT64_MAX;
 		for (auto & i: items)
 		{
 			if (i.acked)
 				return false;
-			if (i.info.slotIndex != -1)
+			if (i.info.slotIndex != -1 and i.frame_index != uint64_t(-1))
+			{
 				pending = true;
+				oldest = std::min(oldest, i.frame_index);
+			}
+		}
+		// Stall timeout (mirrors default_idr_handler's 100-frame IDR
+		// wait): a lost ack must not skip forever. Let one frame
+		// through — get_ref finds no acked reference and resyncs the
+		// DPB from scratch.
+		if (pending and frame_id > oldest + 100)
+		{
+			U_LOG_W("DPB stall timeout on stream %d (%llu frames without ack), resyncing",
+			        stream_idx, (unsigned long long)(frame_id - oldest));
+			return false;
 		}
 		return pending;
 	}

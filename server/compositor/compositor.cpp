@@ -40,8 +40,8 @@
 #include "utils/wivrn_trace.h"
 
 #include <atomic>
-#include <cstring>
 #include <format>
+#include <string>
 
 #include "xrt/xrt_config_build.h" // IWYU pragma: keep
 #ifdef XRT_FEATURE_RENDERDOC
@@ -243,9 +243,9 @@ std::array<wivrn::compositor::depth_image, 2> make_depth_images(wivrn::vk_bundle
 	                .mipLevels = 1,
 	                .arrayLayers = 4, // depth lives in layer 3
 	                .samples = vk::SampleCountFlagBits::e1,
-	                // STORAGE (pack write) + TRANSFER_DST (chroma clear) +
-	                // TRANSFER_SRC (encoder copy-out, like the color image).
-	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eTransferDst,
+	                // STORAGE (pack Y + chroma stores) + TRANSFER_SRC (encoder copy-out,
+	                // like the color image).
+	                .usage = vk::ImageUsageFlagBits::eStorage | vk::ImageUsageFlagBits::eTransferSrc,
 	        },
 	        vk::ImageFormatListCreateInfo{
 	                .viewFormatCount = formats.size(),
@@ -336,6 +336,16 @@ vk::Extent3D render_extent(const wivrn::from_headset::headset_info_packet & info
 	        .height = info.render_eye_height,
 	        .depth = 1,
 	};
+}
+
+// Warp grid: full render size, never the stream staging size. The warp
+// must preserve the app's detail (the foveation step runs after) —
+// sizing it at stream res silently pins warped display to transport
+// res even when the game renders full res.
+vk::Extent2D warp_extent(const wivrn::from_headset::headset_info_packet & info)
+{
+	const auto re = render_extent(info);
+	return {re.width, re.height};
 }
 
 } // namespace
@@ -568,9 +578,23 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		return XRT_SUCCESS;
 	}
 
+	// GPU-completion gate for this slot's prior submit: on all-skip
+	// frames no encoder waits on the submit semaphore, so the worker
+	// clears busy with the submit potentially still pending. Never
+	// park the commit thread: drop like a busy slot (the GPU is more
+	// than a frame behind).
+	if (vk.device.waitForFences(*slot_fences[slot], true, 0) != vk::Result::eSuccess)
+	{
+		images[slot].busy = false;
+		triage_drop_acquire.fetch_add(1, std::memory_order_relaxed);
+		comp_frame_clear_locked(&frame.rendering);
+		return XRT_SUCCESS;
+	}
+
 	// Lazy timestamp read for this slot: these queries describe the last
 	// submit that used it, whose completion is implied by image slot
-	// having recycled — so the poll almost always hits and never parks.
+	// having recycled *and* the submit fence below polling signalled —
+	// so the poll almost always hits and never parks.
 	// A miss means the GPU is more than a frame behind: count it (it
 	// doubles as the wedge detector), never wait for it. Polls before
 	// the resetQueryPool below, which would discard the results.
@@ -611,7 +635,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	trace::instant_feedback("begin", frame.rendering.id, os_monotonic_get_ns());
 
 	// Per-slot frame context: everything this commit records or uploads
-	// lives in this slot, owned until image slot recycles (see TODO.md). Only
+	// lives in this slot, owned until image slot recycles (the submit
+	// fence, polled at acquire, proves the prior submit retired). Only
 	// this slot's pool is reset; the other slot may still execute.
 	auto & cmd = cmds[slot];
 	auto & query_pool = query_pools[slot];
@@ -671,6 +696,8 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			view_info.pose[view] = xrt_cast(data.pose);
 			view_info.fov[view] = xrt_cast(data.fov);
 			src_pose[view] = data.pose;
+			view_info.app_w[view] = static_cast<uint16_t>(data.sub.rect.extent.w);
+			view_info.app_h[view] = static_cast<uint16_t>(data.sub.rect.extent.h);
 			const auto & cnr = data.sub.norm_rect;
 			src_color_nrect[view] = {cnr.x, cnr.y, cnr.w, cnr.h};
 			if (has_depth_src)
@@ -684,8 +711,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 				src_depth_nrect[view] = {dnr.x, dnr.y, dnr.w, dnr.h};
 				src_near_z[view] = dvd.near_z;
 				src_far_z[view] = dvd.far_z;
+				view_info.app_depth_w[view] = static_cast<uint16_t>(dvd.sub.rect.extent.w);
+				view_info.app_depth_h[view] = static_cast<uint16_t>(dvd.sub.rect.extent.h);
 			}
 		}
+		view_info.app_layers = 1;
 	}
 	else
 	{
@@ -724,7 +754,12 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		{
 			view_info.pose[view] = xrt_cast(poses[view]);
 			view_info.fov[view] = xrt_cast(src_fov[view]);
+			// Squashed canvas sizes, not one app frame: the GUI marks
+			// these with the layer count instead of traffic lights.
+			view_info.app_w[view] = static_cast<uint16_t>(src_rect[view].extent.w);
+			view_info.app_h[view] = static_cast<uint16_t>(src_rect[view].extent.h);
 		}
+		view_info.app_layers = static_cast<uint8_t>(layer_accum.layer_count);
 
 		image_barriers.push_back(
 		        vk::ImageMemoryBarrier2{
@@ -745,6 +780,69 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 
 	// NOTE: the warp block lives below (after q1) so the timestamp
 	// queries bracket squash / warp / foveation in GPU order.
+
+	// App-submitted sizes, on change only: what the game actually
+	// rendered into its swapchains vs what we requested (render_eye).
+	// The client mirrors these in the Diagnostics tab; the log is the
+	// server-side record (no headset needed). Single-threaded commit
+	// path: plain statics are safe here. Integer compare first:
+	// std::format heap-allocates and this runs per commit.
+	{
+		const auto & req = session.get_info();
+		static bool last_fast = false;
+		static bool last_has_depth = false;
+		static uint16_t last_w[2]{}, last_h[2]{};
+		static uint16_t last_dw[2]{}, last_dh[2]{};
+		static uint8_t last_layers = 0;
+		static uint16_t last_rw = 0, last_rh = 0;
+		bool same = last_fast == triage_fast_path
+		        and last_has_depth == has_depth_src
+		        and last_layers == view_info.app_layers
+		        and last_rw == req.render_eye_width
+		        and last_rh == req.render_eye_height
+		        and last_w[0] == view_info.app_w[0] and last_h[0] == view_info.app_h[0]
+		        and last_w[1] == view_info.app_w[1] and last_h[1] == view_info.app_h[1]
+		        and last_dw[0] == view_info.app_depth_w[0] and last_dh[0] == view_info.app_depth_h[0]
+		        and last_dw[1] == view_info.app_depth_w[1] and last_dh[1] == view_info.app_depth_h[1];
+		if (not same)
+		{
+			last_fast = triage_fast_path;
+			last_has_depth = has_depth_src;
+			last_layers = view_info.app_layers;
+			last_rw = req.render_eye_width;
+			last_rh = req.render_eye_height;
+			for (int view = 0; view < 2; ++view)
+			{
+				last_w[view] = view_info.app_w[view];
+				last_h[view] = view_info.app_h[view];
+				last_dw[view] = view_info.app_depth_w[view];
+				last_dh[view] = view_info.app_depth_h[view];
+			}
+			std::string cur;
+			if (triage_fast_path)
+			{
+				if (has_depth_src)
+					cur = std::format("color L {}x{} R {}x{} depth L {}x{} R {}x{}, requested {}x{}",
+					                  view_info.app_w[0], view_info.app_h[0],
+					                  view_info.app_w[1], view_info.app_h[1],
+					                  view_info.app_depth_w[0], view_info.app_depth_h[0],
+					                  view_info.app_depth_w[1], view_info.app_depth_h[1],
+					                  req.render_eye_width, req.render_eye_height);
+				else
+					cur = std::format("color L {}x{} R {}x{} no depth submitted, requested {}x{}",
+					                  view_info.app_w[0], view_info.app_h[0],
+					                  view_info.app_w[1], view_info.app_h[1],
+					                  req.render_eye_width, req.render_eye_height);
+			}
+			else
+			{
+				cur = std::format("squashed {} layers, requested {}x{}",
+				                  unsigned(view_info.app_layers),
+				                  req.render_eye_width, req.render_eye_height);
+			}
+			U_LOG_I("app submitted %s", cur.c_str());
+		}
+	}
 
 	image_barriers.push_back(
 	        vk::ImageMemoryBarrier2{
@@ -889,15 +987,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 			view_info.pose[view] = xrt_cast(dst_pose[view]);
 			view_info.fov[view] = xrt_cast(dst_fov[view]);
 		}
-		const auto warp_extent = images[0].image.info().extent;
+		const auto warp_rect_extent = reprojector.target_extent();
 		const std::array<xrt_rect, 2> warp_rect{
 		        xrt_rect{
 		                .offset = {.w = 0, .h = 0},
-		                .extent = {.w = int(warp_extent.width), .h = int(warp_extent.height)},
+		                .extent = {.w = int(warp_rect_extent.width), .h = int(warp_rect_extent.height)},
 		        },
 		        xrt_rect{
 		                .offset = {.w = 0, .h = 0},
-		                .extent = {.w = int(warp_extent.width), .h = int(warp_extent.height)},
+		                .extent = {.w = int(warp_rect_extent.width), .h = int(warp_rect_extent.height)},
 		        },
 		};
 		view_info.foveation = foveation.foveate(
@@ -927,10 +1025,11 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        view_info.alpha);
 	}
 
-	// Virtual-depth pack (stream 3): MIN-pool the warp's target-view splat
-	// to half stream resolution per eye, linearise, quantize 2mm/LSB
-	// clamped at ~2.04m (beyond-range VR reads as near and occludes
-	// passthrough) into the SBS staging image (layer 3). Runs only on warped frames with
+	// Virtual-depth pack (stream 3): foveated MIN-gather over the
+	// warp's target-view splat (shared color tables, same gaze center
+	// and source size) down to per-eye stream res, linearise,
+	// quantize 2mm/LSB (valid 0-1020, far pins to 1023) into the SBS
+	// staging image (layer 3). Runs only on warped frames with
 	// valid near/far; otherwise images[slot].has_depth stays false and the
 	// worker never touches the depth encoder (strict pairing: no stale
 	// virtual depth on the client).
@@ -940,15 +1039,15 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		auto & depth = depth_images[slot];
 
 		// Same shape as the color top-of-commit barrier: contents are
-		// fully overwritten every packed frame (Y by the pack dispatch
-		// below, CbCr by the neutral clear), so Undefined discards and
+		// fully overwritten every packed frame (Y + CbCr both by the
+		// pack dispatch below), so Undefined discards and
 		// no first-use tracking is needed. Single eColor barrier (both
-		// planes): dst covers the transfer clear and the compute pack.
+		// planes): dst covers the compute pack.
 		std::array depth_pre{
 		        vk::ImageMemoryBarrier2{
 		                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
-		                .dstStageMask = vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader,
-		                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite,
+		                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+		                .dstAccessMask = vk::AccessFlagBits2::eShaderWrite,
 		                .oldLayout = vk::ImageLayout::eUndefined,
 		                .newLayout = vk::ImageLayout::eGeneral,
 		                .image = depth.image,
@@ -965,51 +1064,49 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        .pImageMemoryBarriers = depth_pre.data(),
 		});
 
-		// Neutral chroma for the luma-only depth payload (GENERAL is a
-		// legal layout for vkCmdClearColorImage; no ping-pong needed).
-		// memcpy: ClearColorValue union members are C arrays here (same
-		// as the splat clear in depth_reprojector), not assignable.
-		vk::ClearColorValue neutral{};
-		const float chroma[4] = {0.5f, 0.5f, 0.0f, 1.0f};
-		std::memcpy(neutral.float32, chroma, sizeof(chroma));
-		cmd.clearColorImage(
-		        depth.image,
-		        vk::ImageLayout::eGeneral,
-		        neutral,
-		        vk::ImageSubresourceRange{
-		                .aspectMask = vk::ImageAspectFlagBits::ePlane1,
-		                .levelCount = 1,
-		                .baseArrayLayer = 3,
-		                .layerCount = 1,
-		        });
+		// Neutral chroma used to ride a clearColorImage here, but that
+		// call is illegal on YCbCr-conversion planes
+		// (VUID-02498 aspect, VUID-01545 format — the driver silently
+		// dropped it, leaving Plane 1 zero-filled and lifting every
+		// decoded pixel by +335 codes under 709-full). The pack
+		// dispatch writes neutral 0.5 through the out_cbcr view instead.
 
 		const auto splat_views = reprojector.get_splat_views(slot);
-		const auto warp_extent = images[0].image.info().extent;
+		const auto hole_views = reprojector.get_hole_views(slot);
+		// Splat grid == warp grid (render size): the pack foveated-gathers
+		// from full warp res down to depth res, using color's per-slot
+		// tables (foveate() ran above this commit — same slot, read-only
+		// here, never re-uploaded).
+		const auto splat_extent = reprojector.target_extent();
 		if (packer.pack(
 		            vk.device,
 		            cmd,
 		            slot,
 		            splat_views[0],
 		            splat_views[1],
-		            vk::Extent2D{warp_extent.width, warp_extent.height},
+		            splat_extent,
 		            src_near_z[0],
 		            src_far_z[0],
 		            src_near_z[1],
 		            src_far_z[1],
 		            *depth.out_y,
-		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height}))
+		            *depth.out_cbcr,
+		            vk::Extent2D{depth_images[0].image.info().extent.width, depth_images[0].image.info().extent.height},
+		            foveation.tables_buffer(slot),
+		            hole_views[0],
+		            hole_views[1]))
 		{
 			auto & depth_enc = encoders[3];
 			// Mirrors the color encoder handoff: single eColor barrier
 			// over the layer the backend reads, so the release range
 			// matches the backend acquire's eColor range. src covers
-			// the pack (compute) and the neutral clear (transfer).
+			// the pack's storage writes (Y + CbCr planes).
 			if (depth_enc->need_transfer or depth_enc->target_queue == vk.queue.family_index)
 			{
 				std::array depth_post{
 				        vk::ImageMemoryBarrier2{
-				                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader | vk::PipelineStageFlagBits2KHR::eTransfer,
-				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite | vk::AccessFlagBits2::eTransferWrite,
+				                .srcStageMask = vk::PipelineStageFlagBits2KHR::eComputeShader,
+				                .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
 				                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
 				                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
 				                .oldLayout = vk::ImageLayout::eGeneral,
@@ -1095,12 +1192,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 		        .commandBuffer = cmd,
 		};
 		std::unique_lock lock{vk.queue.mutex};
+		vk.device.resetFences(*slot_fences[slot]);
 		vk.queue.queue.submit2(vk::SubmitInfo2{
 		        .commandBufferInfoCount = 1,
 		        .pCommandBufferInfos = &cmd_info,
 		        .signalSemaphoreInfoCount = 1,
 		        .pSignalSemaphoreInfos = &sem_info,
-		});
+		},
+		*slot_fences[slot]);
 	}
 	query_armed[slot] = true;
 
@@ -1181,13 +1280,14 @@ xrt_result_t compositor::layer_commit(xrt_graphics_sync_handle_t sync_handle)
 	comp_frame_clear_locked(&frame.rendering);
 
 	// Decoupled: no GPU-progress waits on the commit thread. This slot is
-	// owned until image slot recycles (which strictly postdates this
-	// submit's completion via the encoder semaphore/fifo chain), queries
-	// read lazily at the next acquire, and overload sheds via
-	// drop_busy/drop_acquire/drop_present — so nothing here needs
-	// completion. A slow GPU delays this frame's encode, never the next
-	// tick. (Garbage collection below needs no completion either: it
-	// only pops the app-governed destroy stack.)
+	// owned until image slot recycles; the per-slot submit fence
+	// (polled, never waited, at acquire) is what proves the prior
+	// submit retired — the encoder semaphore/fifo chain alone does not
+	// cover all-skip frames. Queries read lazily at the next acquire,
+	// and overload sheds via drop_busy/drop_acquire/drop_present — so
+	// nothing here needs completion. A slow GPU delays this frame's
+	// encode, never the next tick. (Garbage collection below needs no
+	// completion either: it only pops the app-governed destroy stack.)
 
 	// Now is a good point to garbage collect.
 	comp_swapchain_shared_garbage_collect(&cscs);
@@ -1380,7 +1480,7 @@ compositor::compositor(wivrn_session & session) :
         foveation(vk, images[0].image.info().extent),
         reprojector(
                 vk,
-                vk::Extent2D{images[0].image.info().extent.width, images[0].image.info().extent.height},
+                warp_extent(session.get_info()),
                 cached_reprojection_switches().source_reverse_z),
         packer(vk),
         depth_reprojection_enabled(cached_reprojection_switches().enabled)
@@ -1394,8 +1494,8 @@ compositor::compositor(wivrn_session & session) :
 	// allocation entirely when the depth stream is disabled.
 	if (settings[3].enabled)
 		depth_images = make_depth_images(vk, settings[3]);
-	// Per-slot frame context (see TODO.md): one pool+buffer+query pool
-	// per compositor image, so the commit for images[slot] only ever resets
+	// Per-slot frame context: one pool+buffer+query pool+fence per
+	// compositor image, so the commit for images[slot] only ever resets
 	// and records its own slot while the other slot may still execute.
 	for (size_t slot = 0; slot < num_frame_slots; ++slot)
 	{
@@ -1415,6 +1515,12 @@ compositor::compositor(wivrn_session & session) :
 		                .queryCount = 4,
 		        });
 		vk.name(query_pools[slot], std::format("compositor query pool {}", slot));
+		slot_fences[slot] = vk::raii::Fence(
+		        vk.device,
+		        vk::FenceCreateInfo{
+		                .flags = vk::FenceCreateFlagBits::eSignaled,
+		        });
+		vk.name(slot_fences[slot], std::format("compositor submit fence {}", slot));
 	}
 	comp_base * c_base = this;
 	// Ensure we can safely cast pointers

@@ -45,6 +45,12 @@ struct wivrn::android::decoder::mapped_hardware_buffer
 	vk::Extent2D extent{};
 	vk::raii::ImageView image_view = nullptr;
 	vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+	// Format generation this buffer was mapped with: pins the
+	// conversion + sampler the view was baked with, so a decoder-side
+	// renegotiation can install a new generation while in-flight
+	// frames keep the old one alive (never destroy a conversion out
+	// from under a live view).
+	std::shared_ptr<decoder::ycbcr_generation> generation = nullptr;
 };
 
 namespace
@@ -310,6 +316,11 @@ void decoder::on_image_available(AImageReader * reader)
 
 		auto vk_data = map_hardware_buffer(image.get());
 
+		// Pin the generation before the move below (moved-from
+		// shared_ptr reads as null).
+		auto generation = vk_data->generation;
+		assert(generation);
+
 		auto handle = std::make_shared<android_blit_handle>(
 		        info->feedback,
 		        info->view_info,
@@ -321,6 +332,30 @@ void decoder::on_image_available(AImageReader * reader)
 		        image_reader,
 		        std::move(image));
 
+		// Conversion definition for VUID-02738 consumers (immutable
+		// samplers): mirrors create_sampler exactly (709/Full overrides,
+		// resolved chroma filter), so a conversion built from this is
+		// identically defined to the view's. Single-threaded here (all
+		// writes to ahb_format happen on this thread via
+		// map_hardware_buffer), and the value is immutable once the
+		// handle is published.
+		handle->ycbcr.has_conversion = true;
+		handle->ycbcr.external_format = ahb_format.externalFormat;
+		handle->ycbcr.format = vk::Format::eUndefined;
+		handle->ycbcr.ycbcr_model = vk::SamplerYcbcrModelConversion::eYcbcr709;
+		handle->ycbcr.ycbcr_range = vk::SamplerYcbcrRange::eItuFull;
+		handle->ycbcr.components = ahb_format.samplerYcbcrConversionComponents;
+		handle->ycbcr.x_chroma_offset = ahb_format.suggestedXChromaOffset;
+		handle->ycbcr.y_chroma_offset = ahb_format.suggestedYChromaOffset;
+		handle->ycbcr.chroma_filter = (ahb_format.formatFeatures & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter)
+		        ? vk::Filter::eLinear
+		        : vk::Filter::eNearest;
+
+		// Generation sampler for image_view (see blit_handle::sampler):
+		// pinned by the handle's vk_data, always the generation this
+		// view was baked with — even if the decoder renegotiated since.
+		handle->sampler = *generation->sampler;
+
 		if (auto scene = weak_scene.lock())
 			scene->push_blit_handle(accumulator, std::move(handle));
 	}
@@ -329,25 +364,25 @@ void decoder::on_image_available(AImageReader * reader)
 	}
 }
 
-void decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & ahb_format)
+std::shared_ptr<decoder::ycbcr_generation> decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::AndroidHardwareBufferFormatPropertiesANDROID & format_props)
 {
-	assert(ahb_format.externalFormat != 0);
+	assert(format_props.externalFormat != 0);
 	spdlog::info("AndroidHardwareBufferProperties");
-	spdlog::info("  Vulkan format: {}", vk::to_string(ahb_format.format));
-	spdlog::info("  External format: {:#x}", ahb_format.externalFormat);
-	spdlog::info("  Format features: {}", vk::to_string(ahb_format.formatFeatures));
+	spdlog::info("  Vulkan format: {}", vk::to_string(format_props.format));
+	spdlog::info("  External format: {:#x}", format_props.externalFormat);
+	spdlog::info("  Format features: {}", vk::to_string(format_props.formatFeatures));
 	spdlog::info("  samplerYcbcrConversionComponents: ({}, {}, {}, {})",
-	             vk::to_string(ahb_format.samplerYcbcrConversionComponents.r),
-	             vk::to_string(ahb_format.samplerYcbcrConversionComponents.g),
-	             vk::to_string(ahb_format.samplerYcbcrConversionComponents.b),
-	             vk::to_string(ahb_format.samplerYcbcrConversionComponents.a));
-	spdlog::info("  Suggested YCbCr model: {}", vk::to_string(ahb_format.suggestedYcbcrModel));
-	spdlog::info("  Suggested YCbCr range: {}", vk::to_string(ahb_format.suggestedYcbcrRange));
-	spdlog::info("  Suggested X chroma offset: {}", vk::to_string(ahb_format.suggestedXChromaOffset));
-	spdlog::info("  Suggested Y chroma offset: {}", vk::to_string(ahb_format.suggestedYChromaOffset));
+	             vk::to_string(format_props.samplerYcbcrConversionComponents.r),
+	             vk::to_string(format_props.samplerYcbcrConversionComponents.g),
+	             vk::to_string(format_props.samplerYcbcrConversionComponents.b),
+	             vk::to_string(format_props.samplerYcbcrConversionComponents.a));
+	spdlog::info("  Suggested YCbCr model: {}", vk::to_string(format_props.suggestedYcbcrModel));
+	spdlog::info("  Suggested YCbCr range: {}", vk::to_string(format_props.suggestedYcbcrRange));
+	spdlog::info("  Suggested X chroma offset: {}", vk::to_string(format_props.suggestedXChromaOffset));
+	spdlog::info("  Suggested Y chroma offset: {}", vk::to_string(format_props.suggestedYChromaOffset));
 
 	vk::Filter yuv_filter;
-	if (ahb_format.formatFeatures & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter)
+	if (format_props.formatFeatures & vk::FormatFeatureFlagBits::eSampledImageYcbcrConversionLinearFilter)
 		yuv_filter = vk::Filter::eLinear;
 	else
 		yuv_filter = vk::Filter::eNearest;
@@ -356,15 +391,15 @@ void decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::Andro
 	vk::StructureChain ycbcr_create_info{
 	        vk::SamplerYcbcrConversionCreateInfo{
 	                .format = vk::Format::eUndefined,
-	                .ycbcrModel = ahb_format.suggestedYcbcrModel,
-	                .ycbcrRange = ahb_format.suggestedYcbcrRange,
-	                .components = ahb_format.samplerYcbcrConversionComponents,
-	                .xChromaOffset = ahb_format.suggestedXChromaOffset,
-	                .yChromaOffset = ahb_format.suggestedYChromaOffset,
+	                .ycbcrModel = format_props.suggestedYcbcrModel,
+	                .ycbcrRange = format_props.suggestedYcbcrRange,
+	                .components = format_props.samplerYcbcrConversionComponents,
+	                .xChromaOffset = format_props.suggestedXChromaOffset,
+	                .yChromaOffset = format_props.suggestedYChromaOffset,
 	                .chromaFilter = yuv_filter,
 	        },
 	        vk::ExternalFormatANDROID{
-	                .externalFormat = ahb_format.externalFormat,
+	                .externalFormat = format_props.externalFormat,
 	        },
 	};
 
@@ -372,7 +407,8 @@ void decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::Andro
 	ycbcr_create_info.get<vk::SamplerYcbcrConversionCreateInfo>().ycbcrRange = vk::SamplerYcbcrRange::eItuFull;
 	ycbcr_create_info.get<vk::SamplerYcbcrConversionCreateInfo>().ycbcrModel = vk::SamplerYcbcrModelConversion::eYcbcr709;
 
-	ycbcr_conversion = vk::raii::SamplerYcbcrConversion(device, ycbcr_create_info.get<vk::SamplerYcbcrConversionCreateInfo>());
+	auto generation = std::make_shared<ycbcr_generation>();
+	generation->conversion = vk::raii::SamplerYcbcrConversion(device, ycbcr_create_info.get<vk::SamplerYcbcrConversionCreateInfo>());
 
 	// Create VkSampler
 	vk::StructureChain sampler_info{
@@ -394,11 +430,12 @@ void decoder::create_sampler(const AHardwareBuffer_Desc & buffer_desc, vk::Andro
 	                .unnormalizedCoordinates = VK_FALSE,
 	        },
 	        vk::SamplerYcbcrConversionInfo{
-	                .conversion = *ycbcr_conversion,
+	                .conversion = *generation->conversion,
 	        },
 	};
 
-	ycbcr_sampler = vk::raii::Sampler(device, sampler_info.get());
+	generation->sampler = vk::raii::Sampler(device, sampler_info.get());
+	return generation;
 }
 
 std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AImage * image)
@@ -413,11 +450,15 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 
 	auto [properties, format_properties] = device.getAndroidHardwareBufferPropertiesANDROID<vk::AndroidHardwareBufferPropertiesANDROID, vk::AndroidHardwareBufferFormatPropertiesANDROID>(*hardware_buffer);
 
-	if (!*ycbcr_sampler || memcmp(&ahb_format, &format_properties, sizeof(format_properties)))
+	if (!current_ycbcr || memcmp(&ahb_format, &format_properties, sizeof(format_properties)))
 	{
 		memcpy(&ahb_format, &format_properties, sizeof(format_properties));
 		spdlog::info("decoded image size: {}x{}", buffer_desc.width, buffer_desc.height);
-		create_sampler(buffer_desc, ahb_format);
+		// Install first, then drop the old map: buffers created below
+		// pin the new generation, in-flight handles keep the old one
+		// alive through their own pins (never destroy a conversion
+		// while a view baked with it may still be sampled).
+		current_ycbcr = create_sampler(buffer_desc, ahb_format);
 		hardware_buffer_map.clear();
 		// TODO tell the reprojector to recreate the pipeline
 	}
@@ -482,7 +523,7 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 	                },
 	        },
 	        vk::SamplerYcbcrConversionInfo{
-	                .conversion = *ycbcr_conversion,
+	                .conversion = *current_ycbcr->conversion,
 	        },
 	};
 
@@ -494,6 +535,10 @@ std::shared_ptr<decoder::mapped_hardware_buffer> decoder::map_hardware_buffer(AI
 	handle->vimage = std::move(vimage);
 	handle->image_view = std::move(image_view);
 	handle->memory = std::move(memory);
+	// Pin the generation the view was baked with: the view holds a
+	// baked reference to this conversion, so it must outlive the
+	// decoder's next renegotiation.
+	handle->generation = current_ycbcr;
 	handle->extent = vk::Extent2D{
 	        .width = buffer_desc.width,
 	        .height = buffer_desc.height,

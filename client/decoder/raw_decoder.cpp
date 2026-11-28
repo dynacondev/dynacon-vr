@@ -222,6 +222,26 @@ void raw_decoder::frame_completed(
 	        item->semaphore_val,
 	        item->free);
 
+	// Conversion definition for VUID-02738 consumers. Only the
+	// multi-planar streams carry a conversion on their views (alpha is
+	// monochrome R8); parameters mirror the ctor's conversion exactly
+	// (defaults: identity swizzles, cosited-even chroma).
+	if (stream_index != 2)
+	{
+		handle->ycbcr.has_conversion = true;
+		handle->ycbcr.external_format = 0;
+		handle->ycbcr.format = vk::Format::eG8B8R82Plane420Unorm;
+		handle->ycbcr.ycbcr_model = vk::SamplerYcbcrModelConversion::eYcbcr709;
+		handle->ycbcr.ycbcr_range = vk::SamplerYcbcrRange::eItuFull;
+		handle->ycbcr.components = vk::ComponentMapping{};
+		handle->ycbcr.x_chroma_offset = vk::ChromaLocation::eCositedEven;
+		handle->ycbcr.y_chroma_offset = vk::ChromaLocation::eCositedEven;
+		handle->ycbcr.chroma_filter = vk::Filter::eNearest;
+	}
+	// Stable for the decoder's lifetime (built once in the ctor), so a
+	// plain copy is generation-correct.
+	handle->sampler = *sampler_;
+
 	auto res = device.waitForFences(*fence, true, UINT64_MAX);
 	if (res != vk::Result::eSuccess)
 		spdlog::warn("waitForFences failed");

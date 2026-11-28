@@ -2,6 +2,28 @@
 
 Lab notebook for coding agents working on this repo. Append lessons that cost real device round-trips.
 
+## Decoder YCbCr generations: views must pin the conversion they were baked with (Quest 3, Nov 2026)
+
+- Symptom: SIGSEGV (`SEGV_MAPERR`, tiny fault addr) inside Adreno `vkUpdateDescriptorSets`, on the first depth-paired frame after a mid-run AHB format renegotiation. Tombstone backtrace pointed at `union_merge::record_finish`'s apply update — but the writes were byte-identical to the working build and validation-silent, which misdirected toward the mask path for a full audit round.
+- Cause: pre-existing decoder lifecycle, not the mask code. `android_decoder::map_hardware_buffer` (decoder thread) destroyed `ycbcr_conversion`/`ycbcr_sampler` and cleared `hardware_buffer_map` on format change, while in-flight blit handles still referenced views baked with the dead conversion (`blit_handle::image_view` is a non-owning handle; `mapped_hardware_buffer` ownership via `vk_data` kept views alive but nothing kept the conversion). The render thread additionally read `decoder->sampler()` unlocked — both a data race and a dangling handle. A stale pre-renegotiation frame paired via the ±1 fallback then segfaulted the driver resolving the dead conversion (a mere mismatch would be VUID-01948, not a SEGV — the SEGV proves use-after-free).
+- Fix (`client/decoder/android_decoder.*`, `decoder.h`): per-format-generation shared ownership — `ycbcr_generation { conversion, sampler }` held by each mapped buffer and transitively by each blit handle; `blit_handle::sampler` carries the frame's own generation; the render thread never touches decoder-owned sampler state (`decoder::sampler()` virtual deleted). Stale frames now sample as merely-old depth. Same pattern applied to the defoveator (`stream_defoveator`: track baked samplers per pipeline, rebuild on generation change — it previously baked the first sampler forever) and to the call sites (`dh->sampler` everywhere, incl. video color/alpha + viz).
+- Rules:
+  1. Never store a decoder-owned Vulkan object in a longer-lived structure and never read one cross-thread without a generation pin: AHB renegotiation destroys conversion + sampler + views at any format change.
+  2. When a tombstone blames `updateDescriptorSets` with identical-to-working writes, suspect the objects behind the handles (destroyed conversion / dangling view), not the write structs — and check whether a renegotiation just happened (`decoded image size` + `verdict layout rebuilt` within ~100ms of the crash is the fingerprint).
+  3. Validation-silent + release-only-SEGV on this path means use-after-free, not a usage error: VVL would have named a mismatch (01948); it named nothing.
+- Residual (known, out of scope): `v4l2_decoder`'s destructor bypasses its own `held_by_vulkan` guard (source-change path throws correctly); Quest uses the android path. `stream_defoveator`'s pool has zero headroom (`maxSets = 4` = max live) — any future alloc-before-free reordering throws `OutOfPoolMemory`.
+- CORRECTION (device-verified after this entry was written): the generation fix above did NOT resolve the crash — it recurred identically before and after (same fault addr, register-identical tombstones across builds). The actual crasher was the apply descriptor update's write pattern (see next section); the generation pinning stands as latent-hazard hardening, but rule 2's fingerprint (`decoded image size` + renegotiation) was a red herring for this incident — the crash reproduces with no renegotiation at all, on the first paired frame of the session.
+
+## Adreno: always write the full descriptor footprint — partial writes across frames fault updateDescriptorSets (Quest 3, Nov 2026)
+
+- Symptom: deterministic SIGSEGV (`SEGV_MAPERR`, fault addr `0x2d`) inside Adreno `vkUpdateDescriptorSets`, on the first depth-paired frame of the session — placed object + depth on. Crashed identically across builds (register-identical tombstones); validation layer silent (usage is spec-legal), debug build clean. A 5-mode bisect isolated it: crash iff the apply update contained the binding-1 write (verdict R8 2DArray view + plain nearest sampler + `SHADER_READ_ONLY`); binding-0-only clean; skipping both clean; binding-1-only crashed with a different fault addr (`0x277`). Inline debug info pinned the fault to the apply `updateDescriptorSets` line itself.
+- Cause: `record_finish` wrote binding 0 alone on mask-only frames, then bindings 0+1 on the first paired frame — the first-ever binding-1 write to a binding-0-dirtied set faulted Adreno's (release-only) descriptor path. Suspected first-touch bookkeeping for the newly-written binding (unconfirmed driver internals); NOT a bad handle (all handles valid), NOT the conversion lifetime (crashed with the verdict update compiled out), NOT rendered-vs-unrendered (crashed with the verdict draw both skipped and executed).
+- Fix (`client/render/union_merge.cpp`): always write both bindings on every update, paired or mask-only — binding 1 carries the verdict view even when the mask pipeline (declares binding 0 only) never samples it, which is legal since the layout declares both. Device-verified: no crash since, paired frames render with live `umgpu` splits.
+- Rules:
+  1. Never grow a descriptor set's written footprint across frames on Adreno: first write must cover every binding the set layout declares (unused bindings get a valid-but-unsampled descriptor). The crash signature is unmistakable — first-use of a new binding in an update call, release-only SEGV inside the driver, VVL silent.
+  2. A "validation ran clean" result only exonerates code paths the validation run actually executed: the paired verdict path runs zero times per session until an object is placed with depth paired (here: zero times in ~54s). Drive the paired path under validation before claiming coverage.
+  3. When bisecting a driver crash, prefer empty-pass skips (keep renderpass shells, barriers, layouts; drop update+draw together) — every executed call stays identical to normal, so disappearance/appearance is conclusive. And symbolize with the exact-build `.so` (match tombstone BuildId): `llvm-addr2line -i` names the precise update call through the inline chain.
+
 ## Fullscreen black + per-frame "Invalid pose submitted": check GUI quads first (Quest 3)
 
 - Symptom: persistent full-frame black (video *and* overlay GUI gone), log shows `Invalid pose submitted` every frame, recovery as soon as GUI hides. Head tracking fine, no swapchain/LUT errors. First found via a combo dropdown whose popup overlapped the tooltip-strip viewport.
@@ -78,3 +100,138 @@ Lab notebook for coding agents working on this repo. Append lessons that cost re
   2. `locate()` only guarantees wrist + palm + index chain (`hand_tracker.cpp`); other fingers may be curled/occluded. The old all-26 bail never fired in debug builds (`#ifndef NDEBUG` pre-sets flags valid) — reproduces on device only.
   3. Debug via a transition log (`located input_source data_source buttons -> poke/aim` per side, fires on change only): `located=0` = joint bail, `input_source=0` = runtime routing, `buttons=1` = veto. Removed after validation; re-add if regressions return.
   4. Poke needs no runtime cooperation (joint-driven touch), so forcing poke when the runtime routes elsewhere is safe; the reverse (forcing aim) strands clicks. When in doubt, bias toward poke.
+
+## Validation-layer workflow (Quest 3, Nov 2026)
+
+- `assembleDebugWithValidationLayer` downloads VVL 1.4.321.0 android
+  binaries, bundles the `.so`, and the app auto-enables
+  `VK_LAYER_KHRONOS_validation` in non-NDEBUG builds
+  (`application.cpp`). The debug callback aborts on error-level
+  messages — each validation abort masks every later bug, so expect
+  fix-and-rerun iterations (this branch needed four: pool flags,
+  framebuffer layers, then two YCbCr rounds). Release builds run the
+  same code silently: validation hits are UB that Adreno tolerates
+  until it doesn't (GPU page fault → CP opcode errors → DeviceLost
+  surfacing as `vk::DeviceLostError` in a later `waitIdle` — the abort
+  message names the symptom, never the cause).
+- `vk_layer_settings.txt` (`DEBUG_ACTION_LOG_MSG,BREAK`, thread-safety
+  validation) is written but only takes effect if packaged; a bare
+  SIGTRAP with no message means BREAK fired without the log path.
+- Startup `VUID-vkCreateInstance-ppEnabledExtensionNames-01388`
+  (runtime enables `surface_protected_capabilities` without
+  `get_surface_capabilities2`): satisfied by requesting the latter
+  ourselves when enumerated — harmless if the runtime stops needing it.
+
+## YCbCr immutable samplers (Quest 3 AHB imports, Nov 2026)
+
+- Any fragment sampling of an AHB-imported YCbCr view through a
+  combined image sampler MUST use immutable samplers:
+  mutable layout + converted view = VUID-02738; immutable layout +
+  mismatched conversion = VUID-01948. Both abort debug builds and are
+  silent GPU-fault/undefined reads in release.
+- Proven pattern (defoveator + verdict): bake the DECODER's live
+  sampler as the immutable sampler, rebuild the full verdict state
+  (set layout + sets + pipeline layout + pipeline — a pipeline bakes
+  its set layout, never one without the other) when the conversion
+  definition OR the decoder sampler handle changes, waitIdle'd (rare).
+- Failed pattern (do NOT retry without new evidence): building a
+  separate conversion from copied AHB format params (format/model/range/
+  components/offsets/filter/external all matched on paper, chain built
+  per headers) still tripped 01948 against the decoder's view
+  conversion. Cause undetermined — params vs chain-construction quirk
+  vs VVL external-format strictness.
+- Every backend's converted views must feed the definition plumbing:
+  Android AHB (per-handle, always converted), raw 420 streams
+  (explicit format, no external node — the external node must NOT ride
+  along when format != Undefined), v4l2 capture (capture format).
+  ffmpeg/plain views stay mutable. The definition rides the blit handle
+  (immutable after map), never a shared decoder object (recreated on
+  format change — a shared reference would strand).
+- Pre-existing quirk (out of scope, noted not fixed): the defoveator
+  bakes the decoder sampler once and never rebuilds on mid-session
+  decoder recreation — same staleness class the verdict now handles.
+
+## Multiview framebuffers: layers=1 (spec, Nov 2026)
+
+- `VUID-VkFramebufferCreateInfo-renderPass-02531`: a render pass with
+  non-zero view masks requires framebuffer `layers == 1`. The eye
+  routing comes from the view mask into the 2-layer image views, not
+  from the framebuffer — `.layers = 2` (13 sites: merge + feather +
+  hidden + submit targets) was spec-invalid but Adreno-tolerated, which
+  is why stereo worked for years with zero signal until validation ran.
+- Fix is behavior-identical on a conformant driver (same pixels, same
+  layers) but touches every stereo pass: verify both-eyes-distinct on
+  device after any change here. `arrayLayers = 2` / `layerCount = 2` /
+  view/correlation masks / render areas are the actual 2-layer
+  machinery and must NOT change. Non-multiview passes (defoveator,
+  gizmo, imgui, depth overlay: per-eye loops, no MV pNext) correctly
+  keep their own values.
+
+## Descriptor pools: FREE flag or whole-pool reset (Nov 2026)
+
+- `vk::raii::DescriptorSet` destruction calls `vkFreeDescriptorSets` —
+  any pool whose sets die individually needs
+  `eFreeDescriptorSet`, or validation aborts (silent UB in release).
+  Fixed: feather pool, depth-overlay pool (plus clear-before-recreate:
+  destroying the pool first strands the live set). Pattern precedent:
+  union_merge pools already had it.
+- Alternative discipline (defoveator `ds_pool`): sets are raw handles
+  never freed individually — legal without the flag ONLY with
+  whole-pool destruction, plus an explicit `pool.reset()` in
+  `reset_pipelines` (abandoned sets otherwise leak the 4-set pool into
+  `OutOfPoolMemory` on re-ensure). Declared member order must destroy
+  sets before their pool. Comment the discipline where it applies or
+  the next reader will regress it.
+
+## GPU crash forensics (Adreno, Nov 2026)
+
+- Signature of a bad GPU read: `kgsl-3d0: GPU PAGE FAULT: addr = ...`
+  (deterministic low bits across runs = real overrun of a real
+  allocation, not a wild pointer), then `adreno-gen7-gmu: CP opcode
+  error` repeats, `gpu fault threshold exceeded`, `ErrorDeviceLost`,
+  abort in the next `waitIdle`. Triage order: faults first (they name
+  the victim allocation), CP errors second (wedged context), the abort
+  last (never the cause).
+- Victim identification: log `requirements.size` (and extents/format)
+  at every owned-image creation (merge targets, decoder AHB maps);
+  match against the kernel's fault-adjacent `vk_devicememory` ranges in
+  the same run (cross-run sizes vary ~24KB — same-run pairing only).
+- Validation aborts (debug) pre-empt DeviceLost runs: a crash that moves
+  earlier under validation is usually the validator catching the bug
+  upstream, not a new bug — compare write sites (01948 names the
+  binding), not just timestamps.
+
+## Verdict opt #7 revert: cached SSBO loads beat per-pixel run walks (Quest 3, Nov 2026)
+
+- Compact-run verdict (shader walks foveation runs, no CPU expand, ~1KB
+  SSBO) was valid on device but regressed `umgpu` verdict ~2.7ms to
+  ~4.5-6.4ms across many paired samples. Reverted (`464148d9` +
+  `48c207a8`), tree back to byte-identical pre-#7.
+- Why: the old 2 random SSBO loads/px were already cheap (34KB map
+  written once, streams through cache once per frame). The walk added
+  per-pixel trip-count divergence (warps spanning run boundaries
+  serialize) plus an integer divide per axis — Adreno emulates it.
+- Rule: `umcpu` decides whether CPU work is worth killing — it was
+  0.02-0.05ms before AND after, so the expand was never the cost.
+  Never trade 2 cached loads for per-pixel search on this GPU without
+  device numbers; the "uniform-ish ALU" prediction ignored divergence.
+- The verdict's remaining cost is the full-res pass itself (layer tap +
+  YCbCr conversion tap + R8 write, x2 eyes) — bandwidth territory (#8
+  fold), not ALU.
+
+## Depth has no plain Y-plane view on the client (Quest 3, Nov 2026)
+
+- Opt #9 (raw R16 tap of the depth Y plane) is blocked as framed — do
+  not retry without new evidence. The staging image's plain R16 views
+  (`compositor.cpp` `out_y`) never cross the encode; the client sees
+  only the H.265 Main10 decode via MediaCodec (opaque PRIVATE
+  AImageReader). Device log proves the import: Vulkan format
+  `Undefined`, external format `0x28e`, so every view of the image must
+  carry a YCbCr conversion — a conversion-free R16 plane view of a
+  UNDEFINED-format image is spec-illegal (no compatible plain format).
+- Switching the AImageReader off PRIVATE to get a Vulkan-mappable RGB
+  format would add a full-res decoder-side conversion, lose the
+  zero-copy import, and risk the 10-bit codes — expected net loss.
+- Even hypothetically, the prize is small: the verdict taps virt once
+  per surviving pixel already; the conversion-hardware delta on one tap
+  is minor next to the pass's read+write bandwidth.

@@ -41,10 +41,12 @@
 #include "xr/board_solver.h"
 #include "xr/environment_depth.h"
 #include "xr/fiducial_filter.h"
+#include "xr/hand_tracker.h"
 #include "xr/boundary.h"
 #include "xr/marker_tracker.h"
 #include "xr/space.h"
 #include <array>
+#include <deque>
 #include <cstddef>
 #include <filesystem>
 #include <map>
@@ -199,6 +201,7 @@ private:
 		devices,
 		tracking,
 		passthrough,
+		diagnostics,
 		theme,
 		system,
 	};
@@ -271,6 +274,10 @@ private:
 	// predictedDisplayTime of the last frame that took the video path (both
 	// decoder queues non-empty); the kiosk returns 2s after this goes stale
 	XrTime last_video_t = 0;
+	// Video-absent gap that re-shows the kiosk and re-arms the startup
+	// fade (shared: the fade mirrors the kiosk signal but ignores
+	// kiosk-mode / GUI state so it works with the kiosk off).
+	static constexpr XrDuration video_gap_holdoff = 2'000'000'000LL; // 2s
 	XrTime last_stream_kiosk_toggle = 0;
 	bool stream_chord_held = false;
 	std::optional<wivrn::kiosk_planes> kiosk_planes_;
@@ -495,86 +502,17 @@ private:
 	// sampled by accumulate_metrics into global_metrics.
 	double fid_detect_ms = 0, fid_solve_ms = 0, fid_place_ms = 0;
 	int fid_votes = 0, fid_tags = 0;
-	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0;
-	double volume_acquire_ms = 0; // runtime depth acquire IPC (volume sensor)
-	double volume_raster_ms = 0, volume_virt_ms = 0, volume_compare_ms = 0, volume_merge_ms = 0; // volume chain CPU
-	double vr_raster_ms = 0, vr_compare_ms = 0, vr_merge_ms = 0; // VR-occlusion chain CPU (eye-space virt<object MIN-cut)
-	// Volume GPU spans (seconds, last poll of volume_query_pool) + pool
-	// + validity for the poll discipline (mirrors mask_results_in_mask_pool:
-	// never read unwritten queries). volume_ts_async selects the fence
-	// that retires the writing command buffer (mask vs main).
-	vk::raii::QueryPool volume_query_pool = nullptr;
-	bool volume_ts_valid = false;
-	bool volume_ts_async = false;
-	struct volume_gpu_spans
-	{
-		float raster = 0, virt = 0, compare = 0, merge = 0;
-	};
-	volume_gpu_spans last_volume_gpu;
-	// Volume heartbeat snapshot (last volume group) + 5s window sums for
-	// the adb Volume: line (stable numbers under jitter).
-	int volume_last_tier = -1;
-	float volume_last_feather = 0;
-	int volume_last_draws = 0;
-	float volume_last_box_pct = 100; // merge-box % of seed (last group)
-	uint32_t volume_last_seed_w = 0, volume_last_seed_h = 0;
-	uint32_t volume_sensor_w = 0, volume_sensor_h = 0;
-	float volume_sensor_near = 0, volume_sensor_far = 0;
-	uint64_t volume_win_frames = 0, volume_win_sensor = 0;
-	double volume_win_acquire_ms = 0, volume_win_raster_ms = 0;
-	double volume_win_virt_ms = 0, volume_win_virt_gpu = 0;
-	uint64_t volume_win_virt_paired = 0; // volume frames with virtual depth paired
-	bool volume_frame_virt_paired = false; // set by the mask record loop, counted per frame below
-	uint64_t volume_win_virt_missing = 0; // color expected depth (view_info flag) but none paired
-	// VR-occlusion diagnostics (unconditional: unlike the Volume block
-	// above, VR cut candidates in 3d-passthrough windows count even when
-	// no 3d-depth-passthrough volume is placed). wanted = any feather
-	// group carried window positives this frame; paired/missing split
-	// that by tolerant (±1) depth pairing (missing only when depth_expected).
-	// Windowed + 5s heartbeat in accumulate_metrics ("VRoccl:" line).
-	bool vr_frame_wanted = false; // set by the mask record loop (any group, any_positive)
-	bool vr_frame_virt_paired = false; // set alongside volume_frame_virt_paired when any_vr ran
-	uint64_t vr_win_frames = 0, vr_win_paired = 0, vr_win_missing = 0;
-	XrTime vr_win_t0 = 0;
-	XrTime vr_last_log = 0;
-	// Throttles for the per-event pairing forensics in common_frame and
-	// the mask record loop (1s: isolated single-frame misses each log,
-	// sustained outages don't spam at 90Hz).
-	XrTime depth_miss_last_log = 0;
-	XrTime vr_cut_skip_last_log = 0;
-	double volume_win_compare_ms = 0, volume_win_merge_ms = 0;
-	double volume_win_raster_gpu = 0, volume_win_compare_gpu = 0, volume_win_merge_gpu = 0;
-	XrTime volume_last_log = 0;
-	bool volume_want_frame = false; // depth objects placed (sensor wanted this frame)
-	bool volume_remap_enabled = true; // depth-volume rotation reprojection (Passthrough tab); off = direct tap
-	bool volume_remap_logged = false; // one-shot H log for convention validation
-	// Depth time-bias test (Passthrough tab slider, ms, +/-50): assumes
-	// the depth content is bias_ms older than its pose claims (+ = older
-	// = larger correction, the trailing-lag direction). Extrapolates the
-	// reported depth pose backward along head motion; 0 = today's
-	// behavior bit-identically. Render thread only.
-	float volume_time_bias_ms = 0;
-	int volume_bias_logged_ms = 999; // debounced slider log (int ms)
-	// Eye velocity history (world frame, per-eye finite difference of
-	// consecutive predicted mask poses) feeding the bias above. Rigid
-	// head => per-eye differencing, no lever-arm approximation.
-	std::array<XrPosef, 2> volume_prev_mask_pose{};
-	XrTime volume_prev_mask_time = 0;
-	bool volume_have_prev_mask = false;
-	std::array<glm::vec3, 2> volume_eye_lin_vel{};
-	std::array<glm::vec3, 2> volume_eye_ang_vel{}; // axis * rate (rad/s)
-	// Sensor-mapping forensics (Volume heartbeat): content age from the
-	// v2 capture timestamp (0 = runtime gave none), depth-vs-eye pose
-	// divergence at record time, swapchain index for the effective Hz.
-	float volume_last_age_ms = 0;
-	double volume_win_age_sum = 0, volume_win_age_max = 0;
-	uint64_t volume_win_acquired = 0;
-	uint32_t volume_last_index = 0xFFFFFFFF;
-	uint64_t volume_win_new_content = 0;
-	float volume_last_dpos_mm = 0, volume_last_dang_deg = 0;
-	double volume_win_dpos_sum = 0, volume_win_dang_sum = 0;
-	XrTime volume_win_t0 = 0;
+	double mask_raster_ms = 0, mask_erode_ms = 0, mask_blur_ms = 0, mask_gizmo_ms = 0, mask_depth_ms = 0;
 	int mask_draws = 0;
+	// Union-merge split timings (milliseconds, CPU record cost):
+	// common-layer base, merge record, finish (verdict + apply).
+	// Assigned per merge block (zeroed when the merge sits out).
+	double um_base_ms = 0, um_merge_ms = 0, um_finish_ms = 0;
+	// Split-query guard: true when the last recorded mask phase wrote
+	// the um split queries (qmerge+2..+4) — i.e. the merge actually
+	// recorded with a paired verdict. Read (one frame delayed, like
+	// mask_results_in_mask_pool) before interpreting the split spans.
+	bool merge_um_split_ready = false;
 	// Frame-phase waits (milliseconds): fence wait at frame top,
 	// draw_gui, and render_end (end_frame IPC). Assigned
 	// unconditionally on the render path each frame, so no reset needed.
@@ -603,6 +541,12 @@ private:
 		// TopOfPipe stamps don't drain prior fragment work, so a late
 		// producer inflates the *following* span — read spikes by
 		// span, not as exact per-pass costs.
+		// Merge-split taps (union_merge qmerge+2/+3/+4 = after layer
+		// base, after verdict pass, after merge subpass): inline
+		// main-pool q7/q8/q9, async mask-pool q5/q6/q7. Written only
+		// when the merge recorded with a paired verdict (guarded by
+		// merge_um_split_ready); merge-end reuses q6 (inline) / q4
+		// (async). The merge-record span (q8-q7 inline) stays dark.
 		float defoveate_gpu_time = 0;
 		float gizmo_gpu_time = 0;
 		float mask_gpu_time = 0;
@@ -613,11 +557,22 @@ private:
 		float mask_first_gpu_time = 0;
 		float mask_rest_gpu_time = 0;
 		// Merge span: async = mask-pool q3/q4, inline =
-		// main-pool q5/q6. One fullscreen full-res pass. Stamped
+		// main-pool q5/q6. Layer raster + verdict RP + fold (merge +
+		// apply). Stamped
 		// unconditionally (zero span when the merge sits out) so the
 		// poll range never covers an unwritten query. Read spikes by
 		// span (TopOfPipe caveat).
 		float merge_gpu_time = 0;
+		// Union-merge split spans (seconds, TopOfPipe): written only
+		// when the merge recorded with a paired verdict (guarded by
+		// merge_um_split_ready, zeroed otherwise). qmerge+2 after the
+		// layer base, +3 after the verdict pass, +4 after the merge
+		// subpass. layer = q+2 - merge-start, verdict = q+3 - q+2,
+		// apply = merge-end - q+4. The merge subpass (q+4 - q+3)
+		// stays dark.
+		float um_layer_gpu = 0;
+		float um_verdict_gpu = 0;
+		float um_apply_gpu = 0;
 	};
 
 	// Last successfully polled GPU timestamps: the query readback is a
@@ -643,19 +598,6 @@ private:
 		float mask_raster_ms = 0;
 		float mask_erode_ms = 0;
 		float mask_blur_ms = 0;
-		float volume_acquire_ms = 0;
-		float volume_raster_ms = 0;
-		float volume_virt_ms = 0;
-		float volume_compare_ms = 0;
-		float volume_merge_ms = 0;
-		float vr_raster_ms = 0;
-		float vr_compare_ms = 0;
-		float vr_merge_ms = 0;
-		float volume_raster_gpu_ms = 0;
-		float volume_virt_gpu_ms = 0;
-		float volume_compare_gpu_ms = 0;
-		float volume_merge_gpu_ms = 0;
-		float virt_paired = 0; // depth frames paired / volume frames (windowed below)
 		float gizmo_ms = 0;
 		float mask_gpu_ms = 0;
 		float defoveate_gpu_ms = 0;
@@ -663,6 +605,12 @@ private:
 		float mask_first_gpu_ms = 0;
 		float mask_rest_gpu_ms = 0;
 		float merge_gpu_ms = 0;
+		float um_layer_gpu_ms = 0;
+		float um_verdict_gpu_ms = 0;
+		float um_apply_gpu_ms = 0;
+		float um_base_ms = 0;
+		float um_merge_ms = 0;
+		float um_finish_ms = 0;
 		// Frame-phase waits (seconds): fence wait at frame top, GUI,
 		// and render_end submit (end_frame IPC). Names CPU stalls the
 		// section timers above can't see.
@@ -729,7 +677,7 @@ private:
 		// never the shared pool).
 		xr::swapchain swapchain;
 		bool wait_warned = false; // image-wait timeout already reported
-		XrExtent2Di extent{0, 0}; // submitted size (tier-selected)
+		XrExtent2Di extent{0, 0}; // submitted size (half for feather/debug groups, quarter for hidden)
 		bool active = false; // submitting this frame
 		// Acquired swapchain image this frame (-1 = none): lets the
 		// merge borrow the recorded image + its array view
@@ -752,7 +700,7 @@ private:
 	// does (real groups punch cutouts themselves), and promoted to the
 	// boundary-veil carrier while the veil is active with no group to
 	// carry its floor (boundary-only / all-culled configs). Empty
-	// draws (clear-only record), tier 0; the submit-time bias lifts the
+	// draws (clear-only record, feather-0 identity path); the submit-time bias lifts the
 	// cleared image to a uniform floor.
 	mask_group debug_group;
 	// Set when the record phase built marker-window cutouts this frame
@@ -761,25 +709,64 @@ private:
 	bool cutouts_punched = false;
 
 	// Hidden passthrough objects (3d-passthrough-hidden): hard-edged cutout
-	// on a dedicated mask layer. The mask reuses the feather renderer at
-	// tier 0 (direct raster, no blur chain) but lives outside mask_groups:
+	// on a dedicated mask layer. The mask reuses the feather renderer on
+	// the hidden path (direct raster, no blur chain) but lives outside mask_groups:
 	// its own swapchain, never feathered, never cut by reversed draws
 	// (hidden always wins). Merged like every other input at submit.
 	// Render thread only.
 	// NOTE: hidden_group.feather_px (and debug_group.feather_px)
 	// intentionally untouched (stale defaults): the hidden record and
-	// the debug record pass tier/behavior literals.
+	// the debug record pass explicit literals instead.
 	mask_group hidden_group;
 	// Merge (single submitted alpha layer for the flat feed):
 	// MAX-combines every active contributor (feather groups +
-	// debug + hidden) into one full-res image, submitted once with
-	// REPLACE. merge_image is the acquired target (-1 = none);
-	// merge_this_frame is evaluated ONCE at record time (contributor
-	// activity, not submit_flat/cutouts_punched) and read back at
-	// submit, so record and submit cannot disagree. Render thread only.
+	// debug + hidden) into the owned merged target, then the VR
+	// verdict gates it (common depth layer vs virtual depth) into the
+	// acquired submit image. merge_image is the acquired target
+	// (-1 = none); merge_this_frame is evaluated ONCE at record time
+	// (contributor activity, not submit_flat/cutouts_punched) and read
+	// back at submit, so record and submit cannot disagree. Render
+	// thread only.
 	std::unique_ptr<union_merge_renderer> merge_renderer;
 	int merge_image = -1;
 	bool merge_this_frame = false;
+	// Common depth-layer working buffers (positives only, rebuilt every
+	// mask frame): per-object MVPs on the server color-eye timebase +
+	// upload hashes for the merge-owned mesh store. Capacity survives
+	// clear(). Render thread only.
+	std::vector<union_merge_renderer::geom_draw> layer_draws;
+	std::map<std::string, std::string> layer_mesh_hashes;
+	// Sensor-copy working buffers (rebuilt every mask frame when a depth
+	// volume is placed): hidden occluders (all placed, no proximity gate)
+	// + depth-volume back walls, same timebase as layer_draws.
+	// Capacity survives clear(). Render thread only.
+	std::vector<union_merge_renderer::geom_draw> copy_occluder_draws;
+	std::vector<union_merge_renderer::geom_draw> copy_volume_draws;
+	std::map<std::string, std::string> copy_occluder_hashes;
+	std::map<std::string, std::string> copy_volume_hashes;
+	// Depth reveal tuning (Passthrough-tab sliders, session-only,
+	// applied live): dilate radius in half-res texels (known-occluder
+	// widening, 0 = off) and sensor-compare bias in meters (added to
+	// the whole copy before the test).
+	int depth_dilate_px = 2;
+	float depth_bias_m = 0.f;
+	// One-shot log when the VR verdict first engages (virt paired).
+	bool vr_occlusion_logged = false;
+	// Passthrough-tab toggle: VR depth testing on/off. Off skips both
+	// halves of the depth test (the rastered common layer CLEAR/draws
+	// and the depth-stream side of the verdict, which then submits
+	// merged directly) while the MAX merge + apply + submit stay
+	// intact. Session-only, render-thread only, default on.
+	bool vr_depth_test = true;
+	// Layout gate for the async verdict sample (see depth block): the
+	// fused verdict samples the decoder SBS image as GENERAL. The
+	// frame-top transition executes on the main command buffer, which
+	// the async mask submission can precede — so the verdict only
+	// samples when the image was already GENERAL before this frame's
+	// transition (steady state), or on the inline path where the
+	// barrier executes first in the same command buffer. Transition
+	// frames submit merged directly (neutral, fail-open).
+	bool depth_verdict_safe = false;
 	// Per-frame hidden working buffers (filled by the shared silhouette
 	// build in the mask phase; capacity survives clear()). Render thread
 	// only.
@@ -803,6 +790,32 @@ private:
 	// Capacity survives clear(). Render thread only.
 	std::vector<std::array<glm::mat4, 2>> proximity_spheres;
 	std::vector<std::array<glm::mat4, 2>> proximity_cylinders;
+	// Tracked-hand soup for the sensor heightfield (3d-depth-passthrough):
+	// CPU-skinned FB hand meshes (lobby quality) in world space at the
+	// video-frame time, rastered into the sync-eye splat transient right
+	// after the sensor splat (same LESS test). Static topology per mesh
+	// fetch (indices rebuilt on fetch only); positions re-skinned every
+	// frame into a host-visible vertex buffer (cutout_verts idiom).
+	// Render thread only.
+	struct hand_soup_topology
+	{
+		std::vector<XrVector3f> bind_positions;
+		std::vector<XrVector4sFB> blend_indices;
+		std::vector<XrVector4f> blend_weights;
+		std::vector<int16_t> indices;
+		std::vector<glm::mat4> inv_bind; // inverse(bind pose), static per fetch
+		bool ready = false;
+	};
+	std::array<hand_soup_topology, view_count> hand_soup_topo; // 0 = left, 1 = right
+	buffer_allocation hand_soup_verts;   // host-visible vec3 positions (both hands)
+	buffer_allocation hand_soup_indices; // host-visible uint16 (both hands, static)
+	uint32_t hand_soup_index_count = 0;
+	uint32_t hand_soup_vert_cap = 0; // allocated vertex capacity (verts)
+	bool hand_soup_valid = false;    // at least one hand skinned this frame
+	// Persistent skinning scratch (no per-frame heap churn,
+	// verdict_map_scratch precedent).
+	std::vector<glm::vec3> hand_soup_pos_scratch;
+	std::vector<uint16_t> hand_soup_idx_scratch;
 	// The proximity palms borrow the GUI hand trackers (shared handles,
 	// per-frame positions — never culled): set from hidden_known at
 	// frame top so the GUI pair survives its interactability reset
@@ -839,6 +852,16 @@ private:
 	float until_lock_fade_s = 2.0f;
 	XrTime until_lock_time = 0; // latch time; 0 = not fading
 	bool until_lock_fading = false;
+	// Video (re)start fade: fullscreen passthrough whenever the feed
+	// resumes after a gap, fading to normal over startup-fade-time
+	// (smoothstep, min-combined into boundary_s so a starting feed
+	// always wins while fading). Re-arms on the same gap as the
+	// waiting kiosk (video absent > holdoff) but independent of
+	// kiosk-mode, so first connect and stop->start both fade with
+	// the kiosk off. Render thread only.
+	float startup_fade_s = 2.0f;
+	XrTime startup_time = 0; // fade start; 0 = never
+	bool startup_fading = false;
 	// Origin alignment (alignment -> local-origin): render thread derives
 	// the correction from the resolved board pose every frame, tracking
 	// thread applies it to outgoing poses. configured = map carries a
@@ -879,25 +902,89 @@ private:
 	size_t dbg_tris = 0, dbg_boxes = 0; // last recorded debug counts
 	std::unique_ptr<debug_lines_renderer> gizmo_lines;
 
-	// Environment-depth debug overlay (Quest 3/3S, Passthrough tab,
-	// session-scoped, render thread only): fullscreen false-color of the
-	// runtime D16 (green = nearZ, red = farZ) with a global opacity.
-	// Provider cost is bound to the toggle (off = zero cost).
+	// Debug visualization selector (Passthrough tab, session-scoped,
+	// render thread only): fullscreen false-color viz as ONE transparent
+	// projection layer above passthrough/video, below the GUI. Sensor =
+	// runtime D16 (green = nearZ, red = farZ). The VR/layer/verdict modes
+	// isolate the occlusion comparison (green->red over 0..2.046m, virt
+	// far past 1020 black, layer far saturates red, absent black;
+	// verdict red = VR wins incl. far-vs-far, green = passthrough). The
+	// raster-vs-sensor mode validates the composited layer against the
+	// live sensor depth (green = agree, red ramp = |layer - sensor|
+	// over 0..2m, no-data black). Vr_raster overlays the raster ramp on
+	// the VR depth ramp wherever a window is present (shared ramp: same
+	// wall, different color = the paths disagree by that distance). All
+	// modes share the opacity below.
+	// Sensor provider cost is bound to its mode (off = zero cost).
 	std::unique_ptr<depth_overlay_renderer> depth_overlay;
 	std::unique_ptr<xr::environment_depth> env_depth;
 	bool env_depth_probed = false;   // supported() queried once, cached below
 	bool env_depth_supported = false;
-	bool debug_depth_overlay = false; // master toggle (starts the provider)
-	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1
+	debug_viz_mode debug_viz = debug_viz_mode::none;
+	bool debug_viz_show_vr = false; // viz background: VR video instead of passthrough
+	float debug_depth_opacity = 0.3f; // overlay alpha, 0..1 (all modes)
+	// Pause the sensor stream: freeze the last acquired sensor frame
+	// (rolling buffer of depth 1, updated only while a sensor-driven
+	// viz mode is active) and keep submitting it instead of fresh
+	// acquires. Lets head motion drive the runtime rotation-warp from
+	// a fixed capture pose for careful reprojection inspection.
+	bool debug_pause_sensor = false;
+	xr::environment_depth::frame frozen_depth{};
+	std::array<XrPosef, view_count> frozen_capture_pose{};
+	bool frozen_have_capture_pose = false;
+	bool frozen_depth_valid = false;
+	// Custom forward-splat warp of the sensor depth into the predicted
+	// display view (CPU copy of the runtime timewarp): per-eye rigid
+	// capture->display splatted with hardware depth test, then tapped
+	// by the sensor / raster-vs-sensor viz. Off = direct tap + runtime
+	// warp (today's behavior) for A/B.
+	bool debug_custom_splat = true;
+	// Per-texel flow correction (device-validated): the depth content
+	// is ~20ms newer than its capture timestamp, so the warp shifts each
+	// texel forward along its display-eye image velocity by a fixed 20ms
+	// of the latest sensor-sample finite-difference velocity.
+	// Translation flow ~ v/Z per texel depth, rotation flow uniform,
+	// zero along the rotation axis.
+	struct flow_sample
+	{
+		XrTime t = 0;
+		std::array<XrPosef, view_count> pose{};
+	};
+	std::deque<flow_sample> flow_samp_history{}; // oldest front; cap 2 (newest pair only)
 	std::string depth_status;         // UI status line, refreshed per frame
-	// Fullscreen flat passthrough while depth debugging: the mask floor
-	// lifts to full alpha under the viz (same lift as the boundary
-	// veil). True from the toggle frame (pre-probe optimistic) so the
-	// canvas exists when the probe lands; runtimes without depth support
-	// drop out once probing reports unsupported.
+	// Status rebuild gate: the human readout strings are rebuilt at
+	// most every 250ms (a fmt::format heap churn per frame otherwise),
+	// immediately on viz-mode change. Suffix sites in the same frame
+	// chain through (first call per frame stamps, later calls ride).
+	// Render thread only.
+	bool status_rebuild_due(XrTime now);
+	// Splat warp params (capture->target rigid + frustum tangents +
+	// flow): shared by the viz custom-splat and the depth heightfield.
+	// FROM is the headset pose at capture (or the acquire-time depth
+	// pose fallback); TO is the target eye pose (predicted display for
+	// viz, sync/video eye for depth). near/far ride the depth frame;
+	// opacity rides the viz slider (depth callers pass their own).
+	// Returns false on degenerate quats (caller sits the splat out).
+	// Render thread only.
+	bool build_splat_warp(const std::array<XrPosef, view_count> & from_pose,
+	                      const std::array<XrPosef, view_count> & to_pose,
+	                      const std::array<XrFovf, view_count> & sens_fov,
+	                      const std::array<XrFovf, view_count> & disp_fov,
+	                      float near_z, float far_z, float opacity,
+	                      depth_overlay_renderer::splat_warp_params & out);
+	// Fullscreen flat passthrough under the viz (same lift as the
+	// boundary veil). True from the toggle frame for sensor (pre-probe
+	// optimistic so the canvas exists when the probe lands; runtimes
+	// without depth support drop out once probing reports unsupported)
+	// and whenever a VR/layer/verdict viz is active. Show-VR suppresses
+	// the viz-forced part only (boundary/effects veils still hold).
 	bool depth_fullscreen_passthrough() const
 	{
-		return debug_depth_overlay and (not env_depth_probed or env_depth_supported);
+		if (debug_viz == debug_viz_mode::none or debug_viz_show_vr)
+			return false;
+		if (debug_viz == debug_viz_mode::sensor)
+			return not env_depth_probed or env_depth_supported;
+		return true;
 	}
 
 	// Stale-hold multiplier for debug visuals: full presence on fresh
@@ -922,6 +1009,34 @@ private:
 	void gui_kiosk_waiting();
 	void gui_passthrough();
 	void gui_fiducial_status();
+	void gui_diagnostics();
+
+	// Diagnostics resolutions snapshot (render thread only): filled in
+	// render() each frame, read by gui_diagnostics(). Only copied ints
+	// are GUI-visible: video_stream_description lives on the network
+	// thread, and extents/foveation are render() locals. Requested sizes
+	// are written once in create() (read-only after).
+	struct diagnostics_snapshot
+	{
+		bool has_desc = false;
+		uint16_t desc_w = 0, desc_h = 0;
+		uint16_t desc_depth_w = 0, desc_depth_h = 0;
+		XrExtent2Di last_extents[2]{{0, 0}, {0, 0}};
+		wivrn::to_headset::foveation_parameter last_foveation[2]{};
+		bool has_frames = false;
+		uint16_t req_render_w = 0, req_render_h = 0;
+		uint16_t req_stream_w = 0, req_stream_h = 0;
+		// App-submitted sizes, copied from the color view_info each video
+		// frame (ungated ints). app_layers: 1 = fast path, N = squashed
+		// N layers, 0 = unset (has_app false).
+		bool has_app = false;
+		uint16_t app_w[2]{}, app_h[2]{};
+		uint16_t app_depth_w[2]{}, app_depth_h[2]{};
+		uint8_t app_layers = 0;
+	};
+	// Snapshot arrays assume stereo; fail loudly if that ever changes.
+	static_assert(view_count == 2, "diagnostics_snapshot assumes stereo");
+	diagnostics_snapshot diag;
 	void draw_gui(XrTime predicted_display_time, XrDuration predicted_display_period, std::span<const XrView> live_views = {});
 
 	// Eager USE_SCENE runtime-permission request (Android): manifest presence

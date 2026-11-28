@@ -88,6 +88,22 @@ public:
 		return provider_started;
 	}
 
+	// Hand removal (Meta depth API): when enabled the runtime replaces
+	// hand depths with the estimated background behind them, so tracked
+	// hand meshes can carry the occlusion instead (sharper than the
+	// low-res sensor). Requires hand tracking (no effect with
+	// controllers). No-op when unsupported or not ready; sticky state
+	// (redundant sets skipped). Render thread only.
+	void set_hand_removal(bool enabled);
+	bool hand_removal() const
+	{
+		return hand_removal_enabled;
+	}
+	bool supports_hand_removal() const
+	{
+		return supports_hand_removal_;
+	}
+
 	// Lock the latest depth image for this frame. Must be called between
 	// begin_frame/end_frame, at most once per frame. Returns false with
 	// per-call logging when no frame is available yet (recently started)
@@ -98,7 +114,6 @@ public:
 	// array, D16). Valid while the provider lives.
 	vk::ImageView depth_view(uint32_t swapchain_index) const;
 
-	uint32_t depth_image_count() const;
 	uint32_t depth_width() const
 	{
 		return depth_w;
@@ -116,6 +131,10 @@ private:
 	uint32_t ext_version = 0;
 	bool logged_unsupported = false;
 	bool provider_started = false;
+	// Hand-removal state (see set_hand_removal): capability probed in
+	// supported(), sticky request (skips redundant runtime sets).
+	bool supports_hand_removal_ = false;
+	bool hand_removal_enabled = false;
 	// Set on start: the runtime needs a frame to spin up, so the first
 	// acquire would transiently fail. The start frame skips acquire
 	// silently instead of logging it.
@@ -131,6 +150,7 @@ private:
 	PFN_xrStartEnvironmentDepthProviderMETA xrStartEnvironmentDepthProviderMETA{};
 	PFN_xrStopEnvironmentDepthProviderMETA xrStopEnvironmentDepthProviderMETA{};
 	PFN_xrAcquireEnvironmentDepthImageMETA xrAcquireEnvironmentDepthImageMETA{};
+	PFN_xrSetEnvironmentDepthHandRemovalMETA xrSetEnvironmentDepthHandRemovalMETA{};
 
 	using provider_handle = utils::handle<XrEnvironmentDepthProviderMETA>;
 	using swapchain_handle = utils::handle<XrEnvironmentDepthSwapchainMETA>;

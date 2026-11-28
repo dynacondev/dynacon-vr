@@ -19,6 +19,7 @@
 #include "passthrough_mesh.h"
 
 #include "utils/mapped_file.h"
+#include <bit>
 #include <cmath>
 #include <fastgltf/core.hpp>
 #include <fastgltf/glm_element_traits.hpp>
@@ -28,7 +29,147 @@
 #include <glm/gtc/quaternion.hpp>
 #include <numeric>
 #include <spdlog/spdlog.h>
+#include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
+
+// File-scope bake helpers (needed both inside append_primitive's anonymous
+// namespace and by the global conforming pass in flatten_gltf below).
+
+// Bitwise position key: collapse bitwise-identical baked positions so
+// duplicated verts from overlapping primitives share one index.
+struct weld_key
+{
+	uint32_t x, y, z;
+	bool operator==(const weld_key & o) const
+	{
+		return x == o.x && y == o.y && z == o.z;
+	}
+};
+struct weld_hash
+{
+	size_t operator()(weld_key const & k) const noexcept
+	{
+		size_t h = std::hash<uint32_t>{}(k.x);
+		h ^= std::hash<uint32_t>{}(k.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		h ^= std::hash<uint32_t>{}(k.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
+		return h;
+	}
+};
+
+// Sanity cap: refuse absurd meshes rather than handing them to the runtime
+constexpr size_t max_triangles = 4'000'000;
+
+// Conforming closure over [range_vert, ...)/[range_start, ...): force-split
+// tris at hanging vertices. Defined after the anonymous namespace (it is
+// called both per-primitive and globally from flatten_gltf).
+void conforming_closure_range(passthrough_mesh::triangle_soup & out, uint32_t range_vert, size_t range_start); // fwd (defined below)
+
+// Explicit silhouette loop extraction (closed-volume dynamic AA): one
+// record per unique position-keyed edge with both opposite vertices.
+// Sort-based (3T directed edges, 64-bit canonical keys), linear sweep.
+// Boundary/non-manifold/inconsistent groups encode c1==c0 (forced emit,
+// fail-safe over-reveal). Runs at map load; off the frame path.
+std::pair<std::vector<passthrough_mesh::silhouette_edge>, passthrough_mesh::silhouette_edge_stats>
+passthrough_mesh::build_silhouette_edges(const passthrough_mesh::triangle_soup & soup)
+{
+	std::vector<silhouette_edge> edges;
+	silhouette_edge_stats stats{};
+	if (soup.indices.size() < 3 or soup.vertices.empty())
+		return {edges, stats};
+	// Canonical position ids (cross-primitive duplicates share one key).
+	std::unordered_map<weld_key, uint32_t, weld_hash> canon;
+	canon.reserve(soup.vertices.size() * 2);
+	uint32_t next_canon = 0;
+	std::vector<uint32_t> vcanon(soup.vertices.size(), UINT32_MAX);
+	for (size_t v = 0; v < soup.vertices.size(); ++v)
+	{
+		const XrVector3f & p = soup.vertices[v];
+		weld_key k{std::bit_cast<uint32_t>(p.x), std::bit_cast<uint32_t>(p.y), std::bit_cast<uint32_t>(p.z)};
+		auto it = canon.find(k);
+		if (it == canon.end())
+		{
+			canon.emplace(k, next_canon);
+			vcanon[v] = next_canon++;
+		}
+		else
+			vcanon[v] = it->second;
+	}
+	struct directed
+	{
+		uint64_t key;
+		uint32_t a, b, c;
+		uint32_t ca, cb;
+	};
+	size_t tri_count = soup.indices.size() / 3;
+	std::vector<directed> dirs;
+	dirs.reserve(tri_count * 3);
+	for (size_t t = 0; t < tri_count; ++t)
+	{
+		uint32_t i0 = soup.indices[t * 3], i1 = soup.indices[t * 3 + 1], i2 = soup.indices[t * 3 + 2];
+		if (i0 >= soup.vertices.size() or i1 >= soup.vertices.size() or i2 >= soup.vertices.size())
+			continue;
+		if (i0 == i1 or i1 == i2 or i2 == i0)
+			continue;
+		uint32_t c0 = vcanon[i0], c1 = vcanon[i1], c2 = vcanon[i2];
+		if (c0 == UINT32_MAX or c1 == UINT32_MAX or c2 == UINT32_MAX)
+			continue;
+		auto push = [&](uint32_t u, uint32_t v, uint32_t w) {
+			uint32_t cu = vcanon[u], cv = vcanon[v];
+			uint64_t key = cu < cv ? ((uint64_t)cu << 32 | cv) : ((uint64_t)cv << 32 | cu);
+			dirs.push_back({key, u, v, w, cu, cv});
+		};
+		push(i0, i1, i2);
+		push(i1, i2, i0);
+		push(i2, i0, i1);
+	}
+	std::sort(dirs.begin(), dirs.end(), [](const directed & l, const directed & r) { return l.key < r.key; });
+	edges.reserve(tri_count * 3 / 2);
+	for (size_t i = 0; i < dirs.size();)
+	{
+		size_t j = i + 1;
+		while (j < dirs.size() and dirs[j].key == dirs[i].key)
+			++j;
+		size_t n = j - i;
+		auto pos_of = [&](uint32_t v) -> XrVector3f { return soup.vertices[v]; };
+		if (n == 2)
+		{
+			const auto & e0 = dirs[i], & e1 = dirs[i + 1];
+			// Canon-id compare (not raw indices): cross-primitive
+			// duplicates share bits under distinct indices, so raw
+			// compare misclassifies every such shared edge as
+			// inconsistent and force-emits the band everywhere.
+			bool opposite = (e0.ca == e1.cb and e0.cb == e1.ca);
+			if (opposite)
+			{
+				edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e1.c)});
+			}
+			else
+			{
+				// Inconsistent winding: force emit (safe direction).
+				edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e0.c)});
+				++stats.inconsistent;
+			}
+		}
+		else if (n == 1)
+		{
+			const auto & e0 = dirs[i];
+			edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e0.c)});
+			++stats.boundary;
+		}
+		else
+		{
+			// Non-manifold (3+): force emit (fail-safe over-reveal; no
+			// per-view fold test exists for >2 incident triangles).
+			const auto & e0 = dirs[i];
+			edges.push_back({pos_of(e0.a), pos_of(e0.b), pos_of(e0.c), pos_of(e0.c)});
+			++stats.non_manifold;
+		}
+		i = j;
+	}
+	stats.edges = edges.size();
+	return {std::move(edges), stats};
+}
 
 namespace
 {
@@ -45,9 +186,6 @@ struct error_category : std::error_category
 	}
 };
 static error_category fastgltf_error_category;
-
-// Sanity cap: refuse absurd meshes rather than handing them to the runtime
-constexpr size_t max_triangles = 4'000'000;
 
 std::vector<uint32_t> read_indices(fastgltf::Asset & asset, const fastgltf::Accessor & accessor)
 {
@@ -125,11 +263,29 @@ void append_primitive(
 
 	const fastgltf::Accessor & position_accessor = asset.accessors.at(position_attr->accessorIndex);
 
-	// Bake node transform into positions
+	// Bake node transform into positions, bitwise-welded: exactly
+	// coincident positions share one vertex (remap records the welded
+	// index per position in accessor order). Near-but-unequal positions
+	// (1-ulp seams) do NOT merge — they surface in extraction as
+	// boundary forced-emits (fail-safe over-reveal), never pinholes.
 	uint32_t base_vertex = out.vertices.size();
+	size_t index_start = out.indices.size();
+	std::vector<uint32_t> weld_remap;
+	weld_remap.reserve(position_accessor.count);
+	std::unordered_map<weld_key, uint32_t, weld_hash> welded;
 	fastgltf::iterateAccessor<glm::vec3>(asset, position_accessor, [&](glm::vec3 position) {
 		glm::vec3 world = glm::vec3(world_transform * glm::vec4(position, 1));
+		weld_key k{std::bit_cast<uint32_t>(world.x), std::bit_cast<uint32_t>(world.y), std::bit_cast<uint32_t>(world.z)};
+		auto it = welded.find(k);
+		if (it != welded.end())
+		{
+			weld_remap.push_back(it->second - base_vertex);
+			return;
+		}
+		uint32_t idx = (uint32_t)out.vertices.size();
 		out.vertices.push_back({world.x, world.y, world.z});
+		welded.emplace(k, idx);
+		weld_remap.push_back(idx - base_vertex);
 	});
 
 	std::vector<uint32_t> indices;
@@ -150,19 +306,65 @@ void append_primitive(
 		return;
 	}
 
+	// Indices address positions in accessor order: remap through the weld.
+	// Also rejects out-of-range values before any vertex dereference.
+	if (!indices.empty() && *std::max_element(indices.begin(), indices.end()) >= weld_remap.size())
+	{
+		spdlog::warn("passthrough_mesh: index out of range, skipping primitive");
+		out.vertices.resize(base_vertex);
+		return;
+	}
+	for (uint32_t & idx : indices)
+		idx = base_vertex + weld_remap[idx];
+
 	if (out.indices.size() + indices.size() > max_triangles * 3)
 		throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
 
+	// Reject non-finite baked positions with the same skip discipline
+	// as malformed indices below: NaN/inf would otherwise pin the
+	// worklist (all comparisons false) until the budget throw, after
+	// burning ~100MB transiently.
+	for (size_t v = base_vertex; v < out.vertices.size(); ++v)
+	{
+		const XrVector3f & p = out.vertices[v];
+		if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z))
+		{
+			spdlog::warn("passthrough_mesh: non-finite baked position, skipping primitive");
+			out.vertices.resize(base_vertex);
+			return;
+		}
+	}
+
+	// Direct emit (no bake-time subdivision): the feather silhouette /
+	// R8 / mark / reveal / band / hidden-silhouette pipes and the merge
+	// layer + occluder pipes are all cull-none, so the historic
+	// cull-back mis-cull of huge near-plane-straddling triangles cannot
+	// occur there — hardware clipping handles arbitrary edge lengths.
+	// One exception: the merge volume back-wall pipe is cull-front
+	// (exit-wall resolve) and consumes soup, so a huge volume triangle
+	// straddling the near plane can still mis-cull there (head at or
+	// inside a depth-volume wall). Accepted residual: the miss leaves
+	// the dilated occluder or the FAR clear, i.e. fail-open over-reveal
+	// — the same direction as every other behind-camera fallback.
+	// The conforming closure below still heals native-model T-junctions
+	// (fixed-point deficit pinholes bite cull-none raster identically).
+	// flip_winding composes at emit (it used to compose in the removed
+	// splitter). Budget was enforced above for the whole primitive
+	// (indices size unchanged since), and the closure guards its own
+	// splits.
 	for (size_t i = 0; i < indices.size(); i += 3)
 	{
-		uint32_t a = indices[i] + base_vertex;
-		uint32_t b = indices[i + 1] + base_vertex;
-		uint32_t c = indices[i + 2] + base_vertex;
+		uint32_t a = indices[i];
+		uint32_t b = indices[i + 1];
+		uint32_t c = indices[i + 2];
+		if (a == b || b == c || c == a)
+			continue; // welded-degenerate: zero area, rasterizer-culls anyway
 		if (flip_winding)
 			out.indices.insert(out.indices.end(), {a, c, b});
 		else
 			out.indices.insert(out.indices.end(), {a, b, c});
 	}
+	conforming_closure_range(out, base_vertex, index_start);
 }
 
 void append_node(
@@ -193,7 +395,88 @@ void append_node(
 	for (size_t child: node.children)
 		append_node(asset, child, world, out);
 }
+
 } // namespace
+
+// Conforming closure over [range_vert, ...)/[range_start, ...): force-split
+// tris at hanging vertices so both sides of every shared edge reference
+// identical endpoints. The rasterizer evaluates each side's edge equation
+// in fixed point; a long edge on one side vs two halves on the other can
+// disagree by snapping and drop the pixel on both sides (deficit pinhole,
+// which the erode widens into a hairline). Midpoints computed from
+// identical endpoints are bitwise-identical, so the lookup below never
+// creates vertices — it only reuses existing ones. Midpoint probes
+// only (no third-point/uneven splits): residual non-midpoint junctions
+// persist (capped, warned). Boundary/unconnected
+// matches are split too (exact tilings either way; only costs tris).
+// Runs per primitive inside append_primitive and once globally over the
+// whole soup in flatten_gltf (cross-primitive duplicates need the global
+// pass: weld/posmap are per-primitive).
+void conforming_closure_range(passthrough_mesh::triangle_soup & out, uint32_t range_vert, size_t range_start)
+{
+	auto same_pos = [&](uint32_t u, uint32_t v) {
+		const XrVector3f & a = out.vertices[u];
+		const XrVector3f & b = out.vertices[v];
+		return std::bit_cast<uint32_t>(a.x) == std::bit_cast<uint32_t>(b.x) &&
+		       std::bit_cast<uint32_t>(a.y) == std::bit_cast<uint32_t>(b.y) &&
+		       std::bit_cast<uint32_t>(a.z) == std::bit_cast<uint32_t>(b.z);
+	};
+	// Vertex set is fixed by closure (no pushes), so build once.
+	std::unordered_map<weld_key, uint32_t, weld_hash> posmap;
+	for (size_t v = range_vert; v < out.vertices.size(); ++v)
+	{
+		const XrVector3f & p = out.vertices[v];
+		posmap[{std::bit_cast<uint32_t>(p.x), std::bit_cast<uint32_t>(p.y), std::bit_cast<uint32_t>(p.z)}] =
+		        (uint32_t)v;
+	}
+	constexpr size_t kMaxClosureRounds = 64;
+	for (size_t round = 0; round < kMaxClosureRounds; ++round)
+	{
+		struct hanging
+		{
+			size_t pos;
+			uint32_t e0, e1, w, m;
+		};
+		std::vector<hanging> splits;
+		for (size_t p = range_start; p + 3 <= out.indices.size(); p += 3)
+		{
+			uint32_t t[3] = {out.indices[p], out.indices[p + 1], out.indices[p + 2]};
+			if (t[0] == t[1] || t[1] == t[2] || t[2] == t[0] || same_pos(t[0], t[1]) ||
+			    same_pos(t[1], t[2]) || same_pos(t[2], t[0]))
+				continue;
+			for (int k = 0; k < 3; ++k)
+			{
+				uint32_t a = t[k], b = t[(k + 1) % 3], c = t[(k + 2) % 3];
+				const XrVector3f & pa = out.vertices[a];
+				const XrVector3f & pb = out.vertices[b];
+				weld_key mk{std::bit_cast<uint32_t>((pa.x + pb.x) * 0.5f),
+				            std::bit_cast<uint32_t>((pa.y + pb.y) * 0.5f),
+				            std::bit_cast<uint32_t>((pa.z + pb.z) * 0.5f)};
+				auto it = posmap.find(mk);
+				if (it == posmap.end())
+					continue;
+				uint32_t m = it->second;
+				if (same_pos(m, a) || same_pos(m, b) || same_pos(m, c))
+					continue;
+				splits.push_back({p, a, b, c, m});
+				break; // one split per tri per round (two would rewrite the same slots)
+			}
+		}
+		if (splits.empty())
+			break;
+		if (round + 1 == kMaxClosureRounds)
+			spdlog::warn("passthrough_mesh: conforming closure cap hit, residual T-junctions remain");
+		for (auto & s : splits)
+		{
+			if (out.indices.size() + 3 > max_triangles * 3)
+				throw std::runtime_error("passthrough_mesh: model exceeds triangle budget");
+			out.indices[s.pos] = s.e0;
+			out.indices[s.pos + 1] = s.m;
+			out.indices[s.pos + 2] = s.w;
+			out.indices.insert(out.indices.end(), {s.m, s.e1, s.w});
+		}
+	}
+}
 
 passthrough_mesh::triangle_soup passthrough_mesh::flatten_gltf(const std::filesystem::path & path)
 {
@@ -259,6 +542,11 @@ passthrough_mesh::triangle_soup passthrough_mesh::flatten_gltf(const std::filesy
 
 	if (out.vertices.empty() or out.indices.empty())
 		throw std::runtime_error("passthrough_mesh: no triangles found in model");
+
+	// Global conforming pass: heals cross-primitive T-junctions (the
+	// per-primitive pass inside append_primitive only sees its own
+	// range). No new vertices; idempotent on conformed ranges.
+	conforming_closure_range(out, 0, 0);
 
 	spdlog::info("passthrough_mesh: {} -> {} vertices, {} triangles", path.string(), out.vertices.size(), out.indices.size() / 3);
 	return out;

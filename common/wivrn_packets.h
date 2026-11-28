@@ -849,19 +849,22 @@ struct video_stream_description
 	// dimensions of the video stream per eye
 	// alpha is half resolution
 	// depth is a side-by-side (left|right) 10-bit virtual-depth
-	// channel at half stream resolution per eye, 2mm/LSB, clamped at
-	// 2.040m (code 1020) so beyond-range VR occludes passthrough;
-	// 1021+ is a lossy-overshoot guard band, decoded as far
+	// channel at per-eye stream resolution, foveated with the same
+	// tables as color (shared gaze center and source size, so the
+	// pack grids match exactly); valid codes 0-1020 (0-2.040m);
+	// holes, sky and beyond-range pin to 1023 (far), 1021+ is a
+	// guard band absorbing lossy wobble, decoded as far
 	uint16_t width;
 	uint16_t height;
 	std::array<video_codec, 4> codec; // left, right, alpha, depth
 	// Depth SBS dimensions (left|right halves); color width/height above
-	// are per-eye. Half stream resolution per eye, carried explicitly so
-	// the client never hardcodes it. Wire convention: row 0 = scene top,
-	// left eye in x[0..depth_width/2), 10-bit 2mm/LSB luma clamped
-	// at 2.040m (code 1020); 1021+ decodes as far (lossy guard).
-	// Overwritten on connect from the encoder settings (half stream
-	// resolution per eye); 0 = not yet advertised. No legacy default:
+	// are per-eye. Full stream resolution per eye (SBS canvas 2x width),
+	// carried explicitly so the client never hardcodes it. Wire
+	// convention: row 0 = scene top, left eye in x[0..depth_width/2),
+	// 10-bit 2mm/LSB luma valid 0-1020 (0-2.040m); 1021+ decodes as far
+	// (server pins far to 1023).
+	// Overwritten on connect from the encoder settings (full stream
+	// resolution per eye, SBS canvas 2x width); 0 = not yet advertised. No legacy default:
 	// the client sizes its idle decoder from the connect-time describe.
 	uint16_t depth_width = 0;
 	uint16_t depth_height = 0;
@@ -879,7 +882,7 @@ public:
 	// 0 left
 	// 1 right
 	// 2 alpha
-	// 3 virtual depth SBS (half-res left|right, strict frame_idx pairing
+	// 3 virtual depth SBS (full-res left|right, strict frame_idx pairing
 	//   with color; absent when the color frame had no depth warp)
 	uint8_t stream_item_idx;
 	// Counter increased for each frame
@@ -903,6 +906,19 @@ public:
 		// tell "no depth by design" from "depth expected but missing"
 		// (wire loss or pairing miss).
 		bool depth_expected = false;
+		// App-submitted sizes, per eye, as the game rendered them into
+		// its swapchains (sub.rect extents): the ground truth of what
+		// the server received, independent of requested/render sizes.
+		std::array<uint16_t, 2> app_w{};
+		std::array<uint16_t, 2> app_h{};
+		// Depth submitted rects per eye; all-zero when the app submitted
+		// no depth layer (plain PROJECTION).
+		std::array<uint16_t, 2> app_depth_w{};
+		std::array<uint16_t, 2> app_depth_h{};
+		// Submitted layer count: 1 = single-layer fast path, N =
+		// squashed N layers (sizes then describe the squashed canvas,
+		// not one app frame). 0 = unset (never sent: old server).
+		uint8_t app_layers = 0;
 	};
 	std::optional<view_info_t> view_info;
 
@@ -1068,9 +1084,12 @@ struct passthrough_object
 	float scale;
 	// Passthrough window feather width in screen pixels (alpha-gradient
 	// blend band around the mesh silhouette). Mask stacks group by this
-	// value so each object feathers independently. 0 disables feathering.
-	// Not accepted for 3d-passthrough-reversed, 3d-boundary(-reversed)
-	// and 3d-passthrough-hidden (warned + ignored on the server).
+	// value so each object feathers independently. 0 keeps the AA band
+	// on the half-res path (no blur). Clamped 0..32 on the
+	// server (single spread-scaled kernel range). Not accepted for
+	// 3d-passthrough-reversed, 3d-boundary(-reversed) and
+	// 3d-passthrough-hidden (warned + ignored on the server).
+	// 3d-depth-passthrough defaults to 12 (half res) when unconfigured.
 	float feather_px = 24;
 	// Boundary fade width in meters (3d-boundary(-reversed) only):
 	// symmetric smoothstep over +/- this distance around the mesh
@@ -1122,6 +1141,10 @@ struct fiducial_map
 	// Smoothstep fade from full passthrough to VR once the until-lock
 	// target latches, in seconds (default 2). 0 = instant release.
 	float passthrough_fade_time_s = 2.0f;
+	// Smoothstep fade from full passthrough to video whenever the
+	// video feed (re)starts after a gap, in seconds (default 2).
+	// 0 disables (instant cut). Re-arms after the kiosk holdoff.
+	float startup_fade_time_s = 2.0f;
 };
 
 struct fiducial_model_chunk

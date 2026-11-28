@@ -26,8 +26,7 @@ layout(set = 0, binding = 0) uniform sampler2D src_depth;
 
 layout(set = 0, binding = 1) uniform SplatUBO
 {
-	mat4 render_inv_vp; // source clip -> world (inverse view * inverse projection, folded on CPU)
-	mat4 warp_vp; // target projection * target view
+	mat4 clip_to_target; // source clip -> target clip (render_inv_vp then warp_vp, folded on CPU)
 	vec4 depth_rect; // normalized depth sub-image: x, y, w, h
 	float depth_flip; // 1 = mirror rows (Vulkan-ordered source)
 	float src_reverse_z; // 1 = reverse-Z source (convert 1-z)
@@ -64,8 +63,7 @@ void main()
 		z = 1.0;
 
 	vec4 clip_pos = vec4(guv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
-	vec4 frag_worldspace = ubo.render_inv_vp * clip_pos;
-	vec4 result = ubo.warp_vp * frag_worldspace;
+	vec4 result = ubo.clip_to_target * clip_pos;
 
 	// Behind the target camera: nothing to splat (sign must be tested
 	// before the perspective divide destroys it).

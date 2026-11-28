@@ -31,21 +31,28 @@ struct vk_bundle;
 //
 // Input: the warp's per-eye target-view splat images (R32Uint,
 // DEPTH_SCALE-encoded NDC, sentinel = no splat) at full render size, plus
-// the dst frustum near/far per eye. Output: the Y plane (2D view on layer
-// 3) of the SBS staging image — left eye x[0..half), right eye
-// x[half..2*half), 10-bit 2mm/LSB codes 0-1020 clamped at 2.040m
-// (beyond-range VR reads as near and occludes passthrough);
-// 1021-1023 = lossy-overshoot guard, decoded as far, where
-// half/height track half the stream resolution per eye.
-//
-// Resample (MIN-pool, foreground wins) runs before linearisation, in the
-// encoded domain; linearisation + quantize run at depth resolution. See
-// shaders/depth_pack.comp.
+// the dst frustum near/far per eye, plus color's per-slot foveation
+// tables (shared gaze center and source size, read-only — never
+// re-uploaded here). Output: the Y plane (2D view on layer 3) of the
+// SBS staging image — left eye x[0..half), right eye x[half..2*half),
+// 10-bit 2mm/LSB valid codes 0-1020 (0-2.040m); holes, sky and
+// beyond-range pin to 1023 (far), 1021-1023 = guard band absorbing
+// lossy wobble, decoded as far. Each eye is foveated to per-eye stream
+// resolution with the same tables as color. The CbCr plane (2D R16G16
+// view on the same layer 3) is filled with neutral 0.5 by the same
+// dispatch — a clearColorImage here would be illegal
+// (VUID-02498/01545: no clears on YCbCr-conversion planes).
+// Gather is a variable-footprint MIN over the shared table spans
+// (foreground wins, order-independent): bilinear filtering of nonlinear
+// depth would blend foreground/background into false mid-depths.
+// The sentinel is the max uint, so a plain min ignores holes
+// automatically; all-sentinel windows stay sentinel. Linearisation +
+// quantize run at depth resolution. See shaders/depth_pack.comp.
 //
 // Slot ownership mirrors depth_reprojector: one descriptor set per commit
 // slot, rewritten per pack; the caller records only into its owned slot
-// while the other may still execute. Push constants carry the small
-// params (src extent + near/far); no UBOs.
+// while the other may still execute. Push constants carry near/far; the
+// table buffer rides the new storage-buffer binding.
 class depth_packer
 {
 public:
@@ -53,9 +60,10 @@ public:
 
 	// Records the pack into cmd. Returns false on degenerate input
 	// (nothing recorded). The caller owns layout/barrier transitions of
-	// dst_y (GENERAL on entry); splat inputs must be visible for shader
-	// read (the warp's own barriers cover this when recorded after fill).
-	// dst_extent sizes the dispatch and must match the dst_y image.
+	// dst_y/dst_cbcr (GENERAL on entry); splat and hole inputs must be
+	// visible for shader read (the warp's own barriers cover this when
+	// recorded after fill). dst_extent sizes the dispatch and must match
+	// the dst_y image.
 	bool pack(vk::raii::Device & device,
 	          vk::raii::CommandBuffer & cmd,
 	          int slot,
@@ -67,16 +75,19 @@ public:
 	          float near_r,
 	          float far_r,
 	          vk::ImageView dst_y,
-	          vk::Extent2D dst_extent);
+	          vk::ImageView dst_cbcr,
+	          vk::Extent2D dst_extent,
+	          vk::Buffer foveation_tables,
+	          vk::ImageView hole_l,
+	          vk::ImageView hole_r);
 
 private:
 	struct push
 	{
-		float src_w, src_h;
 		float near_l, far_l;
 		float near_r, far_r;
 	};
-	static_assert(sizeof(push) == 24);
+	static_assert(sizeof(push) == 16);
 
 	static constexpr size_t num_slots = 2;
 	vk::raii::DescriptorSetLayout set_layout = nullptr;

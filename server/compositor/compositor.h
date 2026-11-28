@@ -65,13 +65,14 @@ public:
 		bool has_depth = false;
 	};
 
-	// Virtual-depth staging for stream 3: half-res SBS YCbCr, depth in
-	// layer 3 (so encoder backends keep indexing baseArrayLayer 3).
-	// Paired 1:1 with the color slots above (shared busy lifetime).
+	// Virtual-depth staging for stream 3: foveated SBS YCbCr at
+	// color-equivalent per-eye size, depth in layer 3 (so encoder
+	// backends keep indexing baseArrayLayer 3). Paired 1:1 with the
+	// color slots above (shared busy lifetime).
 	struct depth_image
 	{
 		image_allocation image;
-		// 2D views on layer 3: pack target (Y) + neutral-chroma clear (CbCr).
+		// 2D views on layer 3: pack target (Y) + neutral-chroma store (CbCr).
 		vk::raii::ImageView out_y = nullptr;
 		vk::raii::ImageView out_cbcr = nullptr;
 	};
@@ -113,6 +114,11 @@ private:
 
 	std::array<image, num_frame_slots> images;
 	std::array<vk::raii::CommandBuffer, num_frame_slots> cmds{nullptr, nullptr};
+	// Per-slot submit fence (created signalled): the worker clears
+	// busy without waiting on all-skip frames (no encoder waits on the
+	// submit semaphore then), so the fence — polled at acquire, never
+	// waited on — is the only proof the slot's prior submit retired.
+	std::array<vk::raii::Fence, num_frame_slots> slot_fences{nullptr, nullptr};
 	vk::raii::Semaphore sem;
 	uint64_t sem_value = 0;
 

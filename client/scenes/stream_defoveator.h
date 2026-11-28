@@ -37,13 +37,28 @@ class stream_defoveator
 
 	// Graphic pipeline
 	vk::raii::RenderPass renderpass = nullptr;
+	// Sets are individually freed on per-view generation rebuilds
+	// (FREE flag; target = {} drops just that view's set/layout/
+	// pipeline, leaving other views' recorded binds intact) or
+	// abandoned wholesale by reset_pipelines (pool reset after all
+	// pipelines die).
 	vk::raii::DescriptorPool ds_pool = nullptr;
 	struct pipeline_t
 	{
 		vk::raii::DescriptorSetLayout descriptor_set_layout = nullptr;
-		vk::DescriptorSet ds;
+		// RAII set (pool carries FREE): a generation rebuild destroys
+		// just this view's set via target = {}, leaving other views'
+		// recorded binds intact — unlike reset_pipelines, which drops
+		// everything at once.
+		vk::raii::DescriptorSet ds = nullptr;
 		vk::raii::PipelineLayout layout = nullptr;
 		vk::raii::Pipeline pipeline = nullptr;
+		// Samplers baked into the immutable set layout (empty when no
+		// pipeline built yet): rebuilt on generation change, or new
+		// views would sample through a stale conversion (VUID-01948,
+		// Adreno fault). Mirrors the verdict layout discipline.
+		vk::Sampler baked_rgb = nullptr;
+		vk::Sampler baked_a = nullptr;
 	};
 	pipeline_t pipeline_rgb[view_count];
 	pipeline_t pipeline_a[view_count];

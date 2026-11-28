@@ -269,6 +269,10 @@ void decoder::frame_completed(const wivrn::from_headset::feedback & feedback, co
 	        index,
 	        this);
 
+	// Stable for the decoder's lifetime (built once in the ctor), so a
+	// plain copy is generation-correct.
+	handle->sampler = *rgb_sampler;
+
 	if (auto scene = weak_scene.lock())
 		scene->push_blit_handle(accumulator, std::move(handle));
 }

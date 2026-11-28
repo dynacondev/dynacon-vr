@@ -35,6 +35,25 @@ struct triangle_soup
 	std::vector<uint32_t> indices; // 3 per triangle
 };
 
+// Explicit silhouette band edge (48B, inline positions): a,b are the
+// edge endpoints, c0/c1 the opposite vertices of the two incident
+// triangles. c1==c0 marks a forced emit (boundary, non-manifold or
+// inconsistent winding): the band shader always covers it (fail-safe
+// over-reveal). Built once at map load from the post-closure soup;
+// positions are model-space like the soup above.
+struct silhouette_edge
+{
+	XrVector3f a, b, c0, c1;
+};
+struct silhouette_edge_stats
+{
+	size_t edges = 0;
+	size_t boundary = 0;
+	size_t non_manifold = 0;
+	size_t inconsistent = 0;
+};
+std::pair<std::vector<silhouette_edge>, silhouette_edge_stats> build_silhouette_edges(const triangle_soup & soup);
+
 // Parse a .glb/.gltf file and bake all node transforms into a single
 // indexed triangle list. Skinned meshes use their rest pose, morph targets,
 // points/lines are skipped. Throws std::exception on parse errors.

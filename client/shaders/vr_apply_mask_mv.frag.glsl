@@ -23,25 +23,22 @@
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 out_color;
 
-// Multiview twin of downsample.frag.glsl: identical 2x2 box prefilter,
-// reading the calling view's layer. Same push prefix, so it shares the
-// blur pipeline layout. Keeps the linear sampler (see the single-view
-// note on ±0.5 tie-breaks).
-layout(set = 0, binding = 0) uniform sampler2DArray src;
-
-layout(push_constant) uniform Push
-{
-	vec2 src_texel;
-}
-pc;
+// Mask-only apply: merged contributor alpha (NEAREST — the feather
+// bands are already filtered) straight into the submit image, no
+// verdict tap. Used when no virtual-depth frame paired (toggle off,
+// decoder dead, transition frames): the verdict would clear to 1 and
+// multiply by 1, so skipping the whole verdict pass + barrier and
+// copying merged directly is pixel-identical with one tap instead of
+// two. RGB stays zero (downstream the REPLACE blend preserves dst
+// color, same as the verdict apply it replaces).
+//
+// Only binding 0 is declared: the pipeline shares the 2-binding
+// apply layout (binding 1 is simply never written or sampled here).
+layout(set = 0, binding = 0) uniform sampler2DArray merged_tex;
 
 void main()
 {
-	vec2 t = pc.src_texel;
-	vec3 base_uv = vec3(uv, float(gl_ViewIndex));
-	float a = texture(src, base_uv + vec3(vec2(-0.5, -0.5) * t, 0)).r;
-	a += texture(src, base_uv + vec3(vec2(0.5, -0.5) * t, 0)).r;
-	a += texture(src, base_uv + vec3(vec2(-0.5, 0.5) * t, 0)).r;
-	a += texture(src, base_uv + vec3(vec2(0.5, 0.5) * t, 0)).r;
-	out_color = vec4(a * 0.25);
+	vec3 buv = vec3(uv, float(gl_ViewIndex));
+	float a = texture(merged_tex, buv).a;
+	out_color = vec4(0.0, 0.0, 0.0, a);
 }

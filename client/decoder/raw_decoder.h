@@ -76,11 +76,6 @@ public:
 	        const wivrn::from_headset::feedback & feedback,
 	        const wivrn::to_headset::video_stream_data_shard::view_info_t & view_info) override;
 
-	vk::Sampler sampler() override
-	{
-		return *sampler_;
-	}
-
 	static std::vector<wivrn::video_codec> supported_codecs();
 
 private:
