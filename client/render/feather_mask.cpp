@@ -87,10 +87,11 @@ static_assert(sizeof(band_push) <= 256);
 // ~2px — orders below any real inter-face gap — so nothing valid
 // lives inside it except the edge's own surface. Too large
 // re-admits front-over-behind pixels (the step artifact); too small
-// drops the inner ramp. Magnitude is in depth-buffer LSBs
-// (constant × r, r ≈ 1 D24 LSB), not NDC units. Device-tuned;
-// start 4.0.
-constexpr float band_depth_bias = 4.0f;
+// drops the inner ramp. Magnitude is in depth-buffer LSBs: rescale
+// with the format (D16→D24 is 256× smaller LSBs, so the old tuned
+// 4.0 becomes 1024 here for the same ~6e-5 NDC window).
+// Device-tuned; start 1024.
+constexpr float band_depth_bias = 1024.0f;
 
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
