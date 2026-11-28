@@ -275,8 +275,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        // (near = 1, far = 0), matching scene_renderer. LESS here
 	        // inverts the interference (behind cuts, front doesn't).
 	        .depthCompareOp = vk::CompareOp::eGreater,
-	        // Stencil coverage mark for the explicit band (outer + lo/hi
-	        // draws below): REPLACE 1 wherever any triangle covers.
+	        // Stencil coverage mark for the explicit band (outer +
+	        // marker/painter draws below): REPLACE 1 wherever any
+	        // triangle covers.
 	        // Reversed cuts use depth_test below (stencil untouched, cuts
 	        // stay binary and skip the band).
 	        .stencilTestEnable = VK_TRUE,
@@ -1225,10 +1226,11 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		auto [stencil_front, stencil_back] = band_stencil(cmp_mask, reference, pass_op, write_mask);
 		// NOTE: Vulkan compares (stencil & compareMask) vs
-		// (reference & compareMask) with a SINGLE reference field,
-		// so the marker (test 1, write bit1) cannot share one state:
-		// outer/inner use test==write, the marker is specialized
-		// below by patching state.reference after the helper.
+		// (reference & compareMask) with a SINGLE reference field
+		// that REPLACE also uses for the write value:
+		// (stencil & ~writeMask) | (reference & writeMask). The
+		// marker exploits this: ref 3 tests (s&1)==1 through the
+		// compare mask while writing bit1 through the write mask.
 		vk::PipelineDepthStencilStateCreateInfo band_depth{
 		        .depthTestEnable = depth_test ? VK_TRUE : VK_FALSE,
 		        .depthWriteEnable = VK_FALSE,
@@ -1272,7 +1274,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		return vk::raii::Pipeline(device, *pipe_cache, band_pipe_info);
 	};
-	// Outer (background only): (stencil & 1) == 0, no depth test.
 	// Outer (background only): (stencil & 1) == 0, no depth test.
 	band_r8_outer_pipeline = make_band_pipe(band_r8_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0x01, 0, vk::StencilOp::eKeep, 0x00, true);
 	band_rgba_outer_pipeline = make_band_pipe(band_rgba_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0x01, 0, vk::StencilOp::eKeep, 0x00, true);
@@ -2830,9 +2831,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// one instanced quad per baked loop edge on the just-rasterized
 	// target (LOAD re-begin, REPLACE). Stencil marks coverage (Pass 1
 	// wrote 1 wherever any triangle covers); the three draws partition
-	// every case — outer paints background-only pixels (stencil == 0,
-	// no depth test), lo/hi paint own-surface pixels (stencil == 1
-	// with a symmetric ±bias depth window). Occluded and
+	// every case — outer paints background-only pixels (bit0 == 0,
+	// no depth test), marker tags own-surface candidates (bit0 == 1
+	// with a +bias depth window, stencil 1 → 3, no color write),
+	// painter ramps tagged pixels (bits == 3 with a -bias depth
+	// window). Occluded and
 	// front-over-behind quads fail everywhere, so step overhangs and
 	// hidden back edges keep binary instead of darkening valid pixels.
 	// Kill-side failure is fail-safe (a dead quad leaves the binary
@@ -2919,14 +2922,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(band_begin, vk::SubpassContents::eInline);
 		set_full_viewport(e);
-		// Three draws partition every case: outer paints background
-		// only (stencil == 0); lo/hi paint own-surface pixels only
-		// draws partition every case: outer paints background-only
-		// pixels (bit0 == 0); marker tags own-surface candidates
-		// (bit0 == 1, +bias window, stencil 1 → 3); painter ramps
-		// tagged pixels (−bias window). Marker+painter form the AND
-		// neither window has alone. Draw order is load-bearing only
-		// in that painter runs after marker (it tests marker's bit).
+		// Three draws partition every case: outer paints
+		// background-only pixels (bit0 == 0, no depth test, no
+		// stencil write); marker tags own-surface candidates
+		// (bit0 == 1, +bias window, stencil 1 → 3, no color write);
+		// painter ramps tagged pixels (-bias window). Marker+painter
+		// form the AND neither window has alone. Draw order is
+		// load-bearing only in that painter runs after marker
+		// (it tests marker's bit).
 		vk::Pipeline band_pipes[3] = {
 		        rgba ? *band_rgba_outer_pipeline : *band_r8_outer_pipeline,
 		        rgba ? *band_rgba_mark_pipeline : *band_r8_mark_pipeline,
