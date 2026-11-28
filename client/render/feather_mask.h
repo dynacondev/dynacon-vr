@@ -299,9 +299,16 @@ private:
 	vk::raii::Pipeline pipeline_mv{nullptr};
 	vk::raii::Pipeline depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline reverse_pipeline_mv{nullptr};
+	// Stencil-mark twin of the binary raster (positives-only single
+	// pass): identical color overwrite, no depth test/write, stencil
+	// REPLACE 1 wherever any triangle covers. The band gates on the
+	// mark (outer) and the mark + front-triangle clip (inner); the
+	// mark pipe is what `mark_cover` engages below.
+	vk::raii::Pipeline mark_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_depth_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
+	vk::raii::Pipeline raster_r8_mark_pipeline_mv{nullptr};
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// per-edge instanced quads (sil_band_mv.vert/frag, 4 verts/edge as
 	// a triangle strip, blend-off overwrite, stencil-gated three-draw
@@ -315,22 +322,17 @@ private:
 	// which legally discards); color LOAD/STOREs. Push-only layout
 	// (140B: MVP pair + opacity + viewport size), no descriptors.
 	vk::raii::PipelineLayout band_layout{nullptr};
-	// Band draw set (REPLACE, no depth write): outer paints
-	// background-only pixels (stencil bit0 == 0, no depth test);
-	// marker tags own-surface pixels (bit0 == 1 with a +bias depth
-	// window, color writes off, sets bit1); painter ramps tagged
-	// pixels (bits == 3 with a -bias depth window). Marker+painter
-	// form the AND the two-window-draws version lacked (separate
-	// draws OR together, which is a tautology — it painted every
-	// covered pixel). Occluded and front-over-behind quads fail
-	// somewhere in the chain, so step overhangs and hidden back edges
-	// keep binary; true rims ramp both halves. R8 + RGBA8 variants.
+	// Band draw set (REPLACE, no depth test anywhere, no bias, no
+	// tuning): outer paints background-only pixels (stencil bit0 == 0);
+	// inner paints own-surface pixels (stencil bit0 == 1 AND inside
+	// the edge's front triangle — deterministic clip, depth-free).
+	// Occluded and front-over-behind quads fail the clip, so step
+	// overhangs and hidden back edges keep binary; true rims ramp
+	// both halves. R8 + RGBA8 variants.
 	vk::raii::Pipeline band_r8_outer_pipeline{nullptr};
-	vk::raii::Pipeline band_r8_mark_pipeline{nullptr};
-	vk::raii::Pipeline band_r8_paint_pipeline{nullptr};
+	vk::raii::Pipeline band_r8_inner_pipeline{nullptr};
 	vk::raii::Pipeline band_rgba_outer_pipeline{nullptr};
-	vk::raii::Pipeline band_rgba_mark_pipeline{nullptr};
-	vk::raii::Pipeline band_rgba_paint_pipeline{nullptr};
+	vk::raii::Pipeline band_rgba_inner_pipeline{nullptr};
 	vk::raii::RenderPass band_r8_depth_rp{nullptr};
 	vk::raii::RenderPass band_rgba_depth_rp{nullptr};
 	// Band LOAD framebuffers: one per color image, creation-only

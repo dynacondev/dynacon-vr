@@ -54,6 +54,10 @@ layout(location = 0) flat out vec2 fA;
 layout(location = 1) flat out vec2 fB;
 layout(location = 2) flat out float fSide;
 layout(location = 3) flat out float fOpacity;
+// Front triangle's third vertex (screen px): the inner draw clips its
+// ramp to the edge's own front triangle (deterministic, depth-free).
+// Same per-eye predicate as the side selection below.
+layout(location = 4) flat out vec2 fC;
 
 void main()
 {
@@ -85,6 +89,7 @@ void main()
 		fB = vec2(0.0);
 		fSide = 1.0;
 		fOpacity = 0.0;
+		fC = vec2(0.0);
 		return;
 	}
 	vec2 t = e / len;
@@ -103,4 +108,5 @@ void main()
 	fB = pb;
 	fSide = s;
 	fOpacity = pc.opacity;
+	fC = front;
 }

@@ -78,20 +78,14 @@ struct band_push
 static_assert(sizeof(band_push) == 140);
 static_assert(sizeof(band_push) <= 256);
 
-// Depth-bias forgiveness for the band inner window: the bias is
-// applied + in one sub-draw and - in the other, forming a symmetric
-// window around the stored surface for the flat ±1px quads (strict
-// testing would speckle the inner half wherever the surface curves
-// away within tolerance). Under this reversed-Z (near = 1) larger
-// means nearer. The window only needs to cover flatness error over
-// ~2px — orders below any real inter-face gap — so nothing valid
-// lives inside it except the edge's own surface. Too large
-// re-admits front-over-behind pixels (the step artifact); too small
-// drops the inner ramp. Magnitude is in depth-buffer LSBs: rescale
-// with the format (D16→D24 is 256× smaller LSBs, so the old tuned
-// 4.0 becomes 1024 here for the same ~6e-5 NDC window).
-// Device-tuned; start 1024.
-constexpr float band_depth_bias = 1024.0f;
+// Explicit silhouette band design (deterministic, depth-free): the
+// band clips to the edge's own front triangle (inner) and to
+// background (outer, stencil == 0), so no depth test and no bias
+// window exist anywhere. A depth window cannot work here in
+// general: grazing views compress real gaps below quad flatness
+// error (gap < deviation), leaving no bias value that both keeps
+// true rims and rejects overhangs. Stencil still needs the D/S
+// attachment (the mark lives there); depth values are never read.
 
 // Erosion push block: source texel size, pass direction and box radius
 // (matches blur_push at 24 bytes, so all fullscreen passes share one
@@ -275,11 +269,35 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        // (near = 1, far = 0), matching scene_renderer. LESS here
 	        // inverts the interference (behind cuts, front doesn't).
 	        .depthCompareOp = vk::CompareOp::eGreater,
-	        // Stencil coverage mark for the explicit band (outer +
-	        // marker/painter draws below): REPLACE 1 wherever any
-	        // triangle covers.
+	        // Stencil coverage mark for the explicit band (outer/inner
+	        // draws below): REPLACE 1 wherever any triangle covers.
 	        // Reversed cuts use depth_test below (stencil untouched, cuts
 	        // stay binary and skip the band).
+	        .stencilTestEnable = VK_TRUE,
+	        .front = {.failOp = vk::StencilOp::eKeep,
+	                  .passOp = vk::StencilOp::eReplace,
+	                  .depthFailOp = vk::StencilOp::eKeep,
+	                  .compareOp = vk::CompareOp::eAlways,
+	                  .compareMask = 0xFF,
+	                  .writeMask = 0xFF,
+	                  .reference = 1},
+	        .back = {.failOp = vk::StencilOp::eKeep,
+	                 .passOp = vk::StencilOp::eReplace,
+	                 .depthFailOp = vk::StencilOp::eKeep,
+	                 .compareOp = vk::CompareOp::eAlways,
+	                 .compareMask = 0xFF,
+	                 .writeMask = 0xFF,
+	                 .reference = 1},
+	};
+	// Stencil-mark twin of the binary raster (positives-only single
+	// pass): identical color overwrite, no depth test/write, stencil
+	// REPLACE 1 wherever any triangle covers. What `mark_cover`
+	// engages below — the band never reads depth, so the depth unit
+	// stays idle on this path (reversed groups keep the two-pass
+	// depth-tested path above).
+	vk::PipelineDepthStencilStateCreateInfo mark_cover_ds{
+	        .depthTestEnable = VK_FALSE,
+	        .depthWriteEnable = VK_FALSE,
 	        .stencilTestEnable = VK_TRUE,
 	        .front = {.failOp = vk::StencilOp::eKeep,
 	                  .passOp = vk::StencilOp::eReplace,
@@ -404,11 +422,11 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .format = depth_format,
 		                .samples = vk::SampleCountFlagBits::e1,
 		                .loadOp = vk::AttachmentLoadOp::eClear,
-		                // Depth AND stencil STORE: the band LOADs both
-		                // right after (occlusion window + coverage
-		                // mark). DONT_CARE here would let the tile
-		                // allocator discard them between the passes.
-		                .storeOp = vk::AttachmentStoreOp::eStore,
+		                // Depth tile-local now (nothing reads working depth:
+		                // the band tests stencil + front-triangle clip;
+		                // reversed pass-1→pass-2 is intra-begin). Stencil
+		                // STOREs for the band LOAD (stencil CLEAR above).
+		                .storeOp = vk::AttachmentStoreOp::eDontCare,
 		                .stencilLoadOp = vk::AttachmentLoadOp::eClear,
 		                .stencilStoreOp = vk::AttachmentStoreOp::eStore,
 		                .initialLayout = vk::ImageLayout::eUndefined,
@@ -460,9 +478,11 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	pipeline_mv = make_raster_mv_variant(renderpass_mv, blend, nullptr);
 	depth_pipeline_mv = make_raster_mv_variant(depth_renderpass_mv, blend, &depth_write);
 	reverse_pipeline_mv = make_raster_mv_variant(depth_renderpass_mv, min_blend, &depth_test);
+	mark_pipeline_mv = make_raster_mv_variant(depth_renderpass_mv, blend, &mark_cover_ds);
 	raster_r8_pipeline_mv = make_raster_mv_variant(raster_r8_renderpass_mv, blend, nullptr);
 	raster_r8_depth_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, blend, &depth_write);
 	raster_r8_reverse_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, min_blend, &depth_test);
+	raster_r8_mark_pipeline_mv = make_raster_mv_variant(raster_r8_depth_renderpass_mv, blend, &mark_cover_ds);
 
 	// Blur render pass: fully overwritten every use (fullscreen triangle),
 	// so no clear and no prior contents needed.
@@ -1074,14 +1094,14 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	}
 
 	// Explicit silhouette band pipes (one instanced quad per loop
-	// edge, REPLACE blend, stencil-gated three-draw partition with
-	// write off, cull-none; multiview broadcast like every raster path
-	// here). R8 bakes against band_r8_depth_rp (working
+	// edge, REPLACE blend, stencil-gated two-draw partition, no depth
+	// test anywhere, cull-none; multiview broadcast like every raster
+	// path here). R8 bakes against band_r8_depth_rp (working
 	// intermediates), RGBA8 against band_rgba_depth_rp (tier-0
-	// submits): dedicated color+depth LOAD twins with per-image cached
-	// framebuffers (see band_fb_for). Push-only layout (the file-scope
-	// band_push above); Adreno 740 provides 256B (same assertion as
-	// the silhouette layout above).
+	// submits): dedicated stencil-carrying LOAD twins with per-image
+	// cached framebuffers (see band_fb_for). Push-only layout (the
+	// file-scope band_push above); Adreno 740 provides 256B (same
+	// assertion as the silhouette layout above).
 	if (physical_device.getProperties().limits.maxPushConstantsSize < sizeof(band_push))
 		throw std::runtime_error("feather silhouette band needs 140B push constants");
 	{
@@ -1098,6 +1118,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	}
 	auto band_vert = load_shader(device, "sil_band_mv.vert");
 	auto band_frag = load_shader(device, "sil_band_mv.frag");
+	auto band_inner_frag = load_shader(device, "sil_band_inner_mv.frag");
 	vk::PipelineShaderStageCreateInfo band_stages[2] = {
 	        {
 	                .stage = vk::ShaderStageFlagBits::eVertex,
@@ -1107,6 +1128,18 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        {
 	                .stage = vk::ShaderStageFlagBits::eFragment,
 	                .module = **band_frag,
+	                .pName = "main",
+	        },
+	};
+	vk::PipelineShaderStageCreateInfo band_inner_stages[2] = {
+	        {
+	                .stage = vk::ShaderStageFlagBits::eVertex,
+	                .module = **band_vert,
+	                .pName = "main",
+	        },
+	        {
+	                .stage = vk::ShaderStageFlagBits::eFragment,
+	                .module = **band_inner_frag,
 	                .pName = "main",
 	        },
 	};
@@ -1143,7 +1176,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	        .viewportCount = 1,
 	        .scissorCount = 1,
 	};
-	auto make_band_depth_rp = [&](vk::Format color_format) {
+	auto make_band_rp = [&](vk::Format color_format) {
 		uint32_t band_view_mask = 0b11, band_corr_mask = 0b11;
 		vk::RenderPassMultiviewCreateInfo band_mv_info{
 		        .subpassCount = 1,
@@ -1161,9 +1194,12 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                .finalLayout = vk::ImageLayout::eColorAttachmentOptimal,
 		        },
 		        {
+		                // Stencil-carrying D/S slot: depth values are never
+		                // read (no depth test in any band pipe), so depth
+		                // LOADs are dropped; stencil LOADs the Pass-1 mark.
 		                .format = depth_format,
 		                .samples = vk::SampleCountFlagBits::e1,
-		                .loadOp = vk::AttachmentLoadOp::eLoad,
+		                .loadOp = vk::AttachmentLoadOp::eDontCare,
 		                .storeOp = vk::AttachmentStoreOp::eDontCare,
 		                .stencilLoadOp = vk::AttachmentLoadOp::eLoad,
 		                .stencilStoreOp = vk::AttachmentStoreOp::eDontCare,
@@ -1193,49 +1229,43 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		                                                .pSubpasses = &band_sub,
 		                                        });
 	};
-	band_r8_depth_rp = make_band_depth_rp(blur_format);
-	band_rgba_depth_rp = make_band_depth_rp(format);
+	band_r8_depth_rp = make_band_rp(blur_format);
+	band_rgba_depth_rp = make_band_rp(format);
 	// One reference field serves both compare and REPLACE: pick it
 	// so (reference & compareMask) is the test value and
 	// (reference & writeMask) is the write value. Outer tests
 	// (s&1)==0 with ref 0; marker tests (s&1)==1 and sets bit1
 	// with ref 3 / writeMask 0x02 ((3&2)=2, bit0 preserved);
 	// painter tests (s&3)==3 with ref 3.
-	auto band_stencil = [&](uint32_t compare_mask, uint32_t reference, vk::StencilOp pass_op, uint32_t write_mask) {
+	auto band_stencil = [&](uint32_t compare_mask, uint32_t reference) {
 		vk::StencilOpState state{
 		        .failOp = vk::StencilOp::eKeep,
-		        .passOp = pass_op,
+		        .passOp = vk::StencilOp::eKeep,
 		        .depthFailOp = vk::StencilOp::eKeep,
 		        .compareOp = vk::CompareOp::eEqual,
 		        .compareMask = compare_mask,
-		        .writeMask = write_mask,
+		        .writeMask = 0x00,
 		        .reference = reference,
 		};
 		return std::pair<vk::StencilOpState, vk::StencilOpState>{state, state};
 	};
-	auto make_band_pipe = [&](vk::raii::RenderPass & rp, bool depth_test, vk::CompareOp depth_op, float bias,
-	                          uint32_t cmp_mask, uint32_t reference, vk::StencilOp pass_op, uint32_t write_mask,
-	                          bool write_color) {
+	// No depth test anywhere in the band (the partition is stencil +
+	// triangle clip, both exact); pDepthStencilState carries the
+	// stencil test only. One reference field serves the compare:
+	// (reference & compareMask) is the test value. Outer tests
+	// (s&1)==0 with ref 0; inner tests (s&1)==1 with ref 1.
+	auto make_band_pipe = [&](vk::raii::RenderPass & rp, vk::PipelineShaderStageCreateInfo * stages,
+	                          uint32_t cmp_mask, uint32_t reference) {
 		vk::PipelineRasterizationStateCreateInfo band_rasterization{
 		        .polygonMode = vk::PolygonMode::eFill,
 		        .cullMode = vk::CullModeFlagBits::eNone,
 		        .frontFace = vk::FrontFace::eCounterClockwise,
-		        .depthBiasEnable = depth_test ? VK_TRUE : VK_FALSE,
-		        .depthBiasConstantFactor = bias,
 		        .lineWidth = 1,
 		};
-		auto [stencil_front, stencil_back] = band_stencil(cmp_mask, reference, pass_op, write_mask);
-		// NOTE: Vulkan compares (stencil & compareMask) vs
-		// (reference & compareMask) with a SINGLE reference field
-		// that REPLACE also uses for the write value:
-		// (stencil & ~writeMask) | (reference & writeMask). The
-		// marker exploits this: ref 3 tests (s&1)==1 through the
-		// compare mask while writing bit1 through the write mask.
+		auto [stencil_front, stencil_back] = band_stencil(cmp_mask, reference);
 		vk::PipelineDepthStencilStateCreateInfo band_depth{
-		        .depthTestEnable = depth_test ? VK_TRUE : VK_FALSE,
+		        .depthTestEnable = VK_FALSE,
 		        .depthWriteEnable = VK_FALSE,
-		        // Reversed-Z (near = 1).
-		        .depthCompareOp = depth_op,
 		        .stencilTestEnable = VK_TRUE,
 		        .front = stencil_front,
 		        .back = stencil_back,
@@ -1245,9 +1275,8 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		vk::PipelineColorBlendAttachmentState band_blend_attachment{
 		        .blendEnable = VK_FALSE,
-		        .colorWriteMask = write_color ? (vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-		                                        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA)
-		                                      : vk::ColorComponentFlagBits{},
+		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
 		};
 		vk::PipelineColorBlendStateCreateInfo band_blend{
 		        .attachmentCount = 1,
@@ -1260,7 +1289,7 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		vk::GraphicsPipelineCreateInfo band_pipe_info{
 		        .stageCount = 2,
-		        .pStages = band_stages,
+		        .pStages = stages,
 		        .pVertexInputState = &band_vertex_input,
 		        .pInputAssemblyState = &band_input_assembly,
 		        .pViewportState = &band_viewport_state,
@@ -1274,20 +1303,14 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		return vk::raii::Pipeline(device, *pipe_cache, band_pipe_info);
 	};
-	// Outer (background only): (stencil & 1) == 0, no depth test.
-	band_r8_outer_pipeline = make_band_pipe(band_r8_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0x01, 0, vk::StencilOp::eKeep, 0x00, true);
-	band_rgba_outer_pipeline = make_band_pipe(band_rgba_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0x01, 0, vk::StencilOp::eKeep, 0x00, true);
-	// Marker (own-surface candidate): (stencil & 1) == 1 with a +bias
-	// depth window, color writes off, sets bit1 (stencil 1 → 3).
-	band_r8_mark_pipeline = make_band_pipe(band_r8_depth_rp, true, vk::CompareOp::eGreaterOrEqual, band_depth_bias, 0x01, 3, vk::StencilOp::eReplace, 0x02, false);
-	band_rgba_mark_pipeline = make_band_pipe(band_rgba_depth_rp, true, vk::CompareOp::eGreaterOrEqual, band_depth_bias, 0x01, 3, vk::StencilOp::eReplace, 0x02, false);
-	// Painter (confirmed own surface): stencil == 3 with a -bias depth
-	// window. Marker+painter AND the two half-windows: a pixel paints
-	// iff it is nearer-or-equal within +bias AND farther-or-equal
-	// within -bias, i.e. |quad - stored| <= bias on covered pixels.
-	band_r8_paint_pipeline = make_band_pipe(band_r8_depth_rp, true, vk::CompareOp::eLessOrEqual, -band_depth_bias, 0x03, 3, vk::StencilOp::eKeep, 0x00, true);
-	band_rgba_paint_pipeline = make_band_pipe(band_rgba_depth_rp, true, vk::CompareOp::eLessOrEqual, -band_depth_bias, 0x03, 3, vk::StencilOp::eKeep, 0x00, true);
-	spdlog::info("feather silhouette band pipes built (explicit loop, stencil outer + mark/paint AND window)");
+	// Outer (background only): (stencil & 1) == 0.
+	band_r8_outer_pipeline = make_band_pipe(band_r8_depth_rp, band_stages, 0x01, 0);
+	band_rgba_outer_pipeline = make_band_pipe(band_rgba_depth_rp, band_stages, 0x01, 0);
+	// Inner (own surface only): (stencil & 1) == 1 + front-triangle
+	// clip in the fragment. No depth test, no bias — exact.
+	band_r8_inner_pipeline = make_band_pipe(band_r8_depth_rp, band_inner_stages, 0x01, 1);
+	band_rgba_inner_pipeline = make_band_pipe(band_rgba_depth_rp, band_inner_stages, 0x01, 1);
+	spdlog::info("feather silhouette band pipes built (explicit loop, stencil outer + triangle-clip inner)");
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -2489,7 +2512,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// Reversed-only raster is a provable no-op (MIN against clear 0 writes
 	// 0), so clear-only and let the cutout punch below run if armed. Depth
 	// engages when a reversed draw exists (two-pass use_depth) or when
-	// the band will depth-test (positives-only band_depth single pass);
+	// the band will stencil-test (positives-only mark_cover single pass);
 	// positive-only calls without the band rasterize as usual.
 	auto fill_stats = [&] {
 		if (cpu_stats)
@@ -2768,11 +2791,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// tier-res targets with only the viewport changing.
 	// Raster target bundle: color-only and depth (color+depth) MV
 	// framebuffers for one raster site. The caller engages depth
-	// whenever a reversed draw exists, or whenever the band will
-	// depth-test (positives-only write_depth single pass). Both depth
-	// companions are always built (intermediates in ensure_targets,
-	// tier-0 submits in the targets map above), so site.depth_fb is
-	// never null on any raster path.
+	// whenever a reversed draw exists, and the mark pipe (stencil
+	// REPLACE, no depth test) for positives-only band groups.
 	struct raster_site
 	{
 		vk::Framebuffer color_fb;
@@ -2780,19 +2800,20 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		vk::Pipeline pipe;
 		vk::Pipeline depth_pipe;
 		vk::Pipeline rev_pipe;
+		vk::Pipeline mark_pipe;
 		vk::RenderPass rp;
 		vk::RenderPass depth_rp;
 	};
 	// Multiview silhouette raster: one draw broadcasts to both layers via
 	// mask_mv.vert (gl_ViewIndex selects the MVP). Same polarity passes as
 	// the depth path, same clears; one begin and one pipe bind per pass.
-	// write_depth runs positives-only groups through the depth-write
-	// pipe in a single pass so the band below can occlusion-test
-	// (reversed groups keep the two-pass use_depth path and skip the
-	// band). Color output is identical either way (overwrite).
-	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth, bool write_depth = false) {
-		write_depth = write_depth and not use_depth;
-		bool fb_depth = use_depth or write_depth;
+	// mark_cover runs positives-only groups through the stencil-mark
+	// pipe in a single pass so the band below can partition on the
+	// mark (reversed groups keep the two-pass use_depth path and skip
+	// the band). Color output is identical either way (overwrite).
+	auto raster_silhouette_mv = [&](const raster_site & site, vk::Extent2D e, bool use_depth, bool mark = false) {
+		mark = mark and not use_depth;
+		bool fb_depth = use_depth or mark;
 		std::array<vk::ClearValue, 2> clears{};
 		clears[0].color.float32.fill(0);
 		clears[1].depthStencil = vk::ClearDepthStencilValue{0.f, 0};
@@ -2808,7 +2829,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		for (int pass = 0; pass < (use_depth ? 2 : 1); ++pass)
 		{
 			bool rev_pass = use_depth && pass == 1;
-			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (fb_depth ? site.depth_pipe : site.pipe));
+			cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, rev_pass ? site.rev_pipe : (use_depth ? site.depth_pipe : (mark ? site.mark_pipe : site.pipe)));
 			for (const auto & d: draws)
 			{
 				if (d.reverse != rev_pass)
@@ -2830,13 +2851,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
 	// one instanced quad per baked loop edge on the just-rasterized
 	// target (LOAD re-begin, REPLACE). Stencil marks coverage (Pass 1
-	// wrote 1 wherever any triangle covers); the three draws partition
-	// every case — outer paints background-only pixels (bit0 == 0,
-	// no depth test), marker tags own-surface candidates (bit0 == 1
-	// with a +bias depth window, stencil 1 → 3, no color write),
-	// painter ramps tagged pixels (bits == 3 with a -bias depth
-	// window). Occluded and
-	// front-over-behind quads fail everywhere, so step overhangs and
+	// wrote 1 wherever any triangle covers); the two draws partition
+	// every case — outer paints background-only pixels (bit0 == 0),
+	// inner paints own-surface pixels (bit0 == 1 AND inside the edge's
+	// front triangle). Occluded and
+	// front-over-behind quads fail the clip, so step overhangs and
 	// hidden back edges keep binary instead of darkening valid pixels.
 	// Kill-side failure is fail-safe (a dead quad leaves the binary
 	// raster underneath, never a hole). Reversed groups skip (cuts
@@ -2895,8 +2914,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                 vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eColorAttachmentRead,
 		                 vk::PipelineStageFlagBits::eColorAttachmentOutput,
 		                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
-		// Depth+stencil write→test hazard (hidden-path precedent):
-		// Pass 1 wrote both, the band below tests both. Layout stays
+		// Stencil write→test hazard (hidden-path precedent): Pass 1
+		// marked coverage, the band below tests it. Narrowed to the
+		// stencil aspect (the band never reads depth); layout stays
 		// DEPTH_ATTACHMENT on both sides.
 		cmd.pipelineBarrier(vk::PipelineStageFlagBits::eLateFragmentTests,
 		                    vk::PipelineStageFlagBits::eEarlyFragmentTests, {}, {}, {},
@@ -2909,7 +2929,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		                            .image = depth_img,
 		                            .subresourceRange = {
-		                                    .aspectMask = vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil,
+		                                    .aspectMask = vk::ImageAspectFlagBits::eStencil,
 		                                    .levelCount = 1,
 		                                    .layerCount = 2,
 		                            },
@@ -2922,18 +2942,14 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		};
 		cmd.beginRenderPass(band_begin, vk::SubpassContents::eInline);
 		set_full_viewport(e);
-		// Three draws partition every case: outer paints
-		// background-only pixels (bit0 == 0, no depth test, no
-		// stencil write); marker tags own-surface candidates
-		// (bit0 == 1, +bias window, stencil 1 → 3, no color write);
-		// painter ramps tagged pixels (-bias window). Marker+painter
-		// form the AND neither window has alone. Draw order is
-		// load-bearing only in that painter runs after marker
-		// (it tests marker's bit).
-		vk::Pipeline band_pipes[3] = {
+		// Two draws partition every case: outer paints
+		// background-only pixels (bit0 == 0); inner paints own-surface
+		// pixels (bit0 == 1 AND inside the edge's front triangle —
+		// deterministic, depth-free). Draw order irrelevant
+		// (disjoint pixel sets: {s&1==0} vs {s&1==1 ∧ inside}).
+		vk::Pipeline band_pipes[2] = {
 		        rgba ? *band_rgba_outer_pipeline : *band_r8_outer_pipeline,
-		        rgba ? *band_rgba_mark_pipeline : *band_r8_mark_pipeline,
-		        rgba ? *band_rgba_paint_pipeline : *band_r8_paint_pipeline,
+		        rgba ? *band_rgba_inner_pipeline : *band_r8_inner_pipeline,
 		};
 		for (vk::Pipeline pipe: band_pipes)
 		{
@@ -3122,7 +3138,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// swapchain image).
 		tier_out = tier;
 
-		// Band depth source for tier-0 submits: the same output_depth
+		// Stencil-mark source for tier-0 submits: the same output_depth
 		// entry the targets build above baked its depth FB against
 		// (same extent key, same array view — idempotent lookup, so no
 		// stale-image aliasing after a submit resize; output_depth
@@ -3133,18 +3149,18 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			return (vk::Image)*dit->second.image;
 		};
 		// Band runs on positives-only groups (reversed skips inside
-		// run_band too): raster writes depth so the band can
-		// occlusion-test. Color output identical either way.
-		bool band_depth = has_positive and not has_reversed;
+		// run_band too): raster marks stencil so the band can
+		// partition on it. Color output identical either way.
+		bool mark_cover = has_positive and not has_reversed;
 		if (tier == 0)
 		{
 			section_clock raster_clk(&ms_raster);
 			// Hard edge: rasterize silhouettes straight into the swapchain
 			// image. Exact, one multiview raster pass, no blur passes.
 			// (Tier-0 groups submit full, so out matches working here.)
-			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed, band_depth);
+			raster_silhouette_mv({*it->second.framebuffer_mv, *it->second.depth_framebuffer_mv, *pipeline_mv, *depth_pipeline_mv, *reverse_pipeline_mv, *mark_pipeline_mv, *renderpass_mv, *depth_renderpass_mv}, out_extent, has_reversed, mark_cover);
 			// Explicit silhouette band on the submit (native res here).
-			if (band_depth)
+			if (mark_cover)
 				run_band(image, submit_depth_image(), *it->second.view_array, output_depth_array_view(out_extent), out_extent, true);
 			if (reveal)
 				run_reveal(image, *it->second.framebuffer_mv, *cutout_load_renderpass, *reveal_rgba_pipeline, out_extent);
@@ -3167,9 +3183,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		int erode = erode_radius(spread, 2.f);
 		{
 			section_clock raster_clk(&ms_raster);
-			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed, band_depth);
+			raster_silhouette_mv({*target_a.raster_fb_mv, *target_a.raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_mark_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, half_extent, has_reversed, mark_cover);
 			// Explicit silhouette band on the half-res seed (native res).
-			if (band_depth)
+			if (mark_cover)
 				run_band(*target_a.image, *target_a.depth_image, *target_a.view_array, *target_a.depth_view_array, half_extent, false);
 		}
 		if (reveal)
@@ -3279,9 +3295,9 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			// below runs once per level for both eyes (multiview).
 			{
 				section_clock raster_clk(&ms_raster);
-				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed, band_depth);
+				raster_silhouette_mv({*down_targets[seed_level - 1].raster_fb_mv, *down_targets[seed_level - 1].raster_depth_fb_mv, *raster_r8_pipeline_mv, *raster_r8_depth_pipeline_mv, *raster_r8_reverse_pipeline_mv, *raster_r8_mark_pipeline_mv, *raster_r8_renderpass_mv, *raster_r8_depth_renderpass_mv}, de_seed, has_reversed, mark_cover);
 				// Explicit silhouette band on the seed (native res).
-				if (band_depth)
+				if (mark_cover)
 					run_band(*down_targets[seed_level - 1].image, *down_targets[seed_level - 1].depth_image,
 					         *down_targets[seed_level - 1].view_array, *down_targets[seed_level - 1].depth_view_array, de_seed, false);
 			}
