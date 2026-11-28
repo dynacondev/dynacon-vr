@@ -87,9 +87,10 @@ public:
 	// multiview array view (both layers, BORROWED from the owning
 	// feather renderer — same-frame use only, never cached here).
 	// extent is the contributor image size (kept for API stability;
-	// currently implied by the views). AA spike: the merge always takes
-	// the LINEAR path (4 taps) so analytic-coverage grey edge pixels
-	// filter; the NEAREST 1:1 fast path is dropped.
+	// currently implied by the views). The merge always takes the
+	// LINEAR path (4 taps): the bilinear tap IS the upscale for
+	// half/quarter-res inputs; flat interiors sample identically
+	// either way (all 4 taps agree).
 	// All contributors end COLOR_ATTACHMENT_OPTIMAL and transition to
 	// SHADER_READ_ONLY for the merge; every next record re-begins
 	// UNDEFINED+CLEAR, so no transition back is needed.

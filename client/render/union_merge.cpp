@@ -409,11 +409,10 @@ void union_merge_renderer::init_pipelines(vk::Format format)
 	                                                                 .pBindings = bindings,
 	                                                         });
 	// Linear + ClampToEdge (feather sampler precedent): the bilinear
-	// tap IS the upscale for half/quarter-res inputs, and (AA spike)
-	// for full-res tier-0 inputs too, so grey coverage edges filter.
+	// tap IS the upscale for half/quarter-res inputs (and the 2x
+	// full-res tier-0 copy, filtered like the rest of the chain).
 	// maxLod 0, no mipmap chain on swapchain images. The 4-tap cost on
-	// 1:1 copies is accepted for the trial (interiors are bit-identical
-	// either way); revert restores the NEAREST 1:1 fast path.
+	// 1:1 copies is accepted (interiors are bit-identical either way).
 	vk::SamplerCreateInfo sampler_info{
 	        .magFilter = vk::Filter::eLinear,
 	        .minFilter = vk::Filter::eLinear,
@@ -1246,9 +1245,9 @@ bool union_merge_renderer::record(vk::raii::CommandBuffer & cmd,
 	// legal; max() over duplicates is neutral). Ping-pong parity:
 	// the other set may still be read by a prior in-flight command
 	// buffer (inline fallback while the async CB flies).
-	// AA (Nov 2026): always LINEAR. The NEAREST 1:1 fast path is
-	// dropped so analytic-coverage grey edge pixels filter on upscale;
-	// flat interiors sample identically either way (all 4 taps agree).
+	// Always LINEAR: the bilinear tap IS the upscale for
+	// half/quarter-res inputs; flat interiors sample identically
+	// either way (all 4 taps agree).
 	// extent (the merge size) is currently implied by the views; kept for
 	// API stability with record_finish.
 	(void)extent;
