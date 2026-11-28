@@ -1194,20 +1194,27 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	band_r8_depth_rp = make_band_depth_rp(blur_format);
 	band_rgba_depth_rp = make_band_depth_rp(format);
-	auto band_stencil = [&](uint32_t ref, vk::CompareOp op) {
+	// One reference field serves both compare and REPLACE: pick it
+	// so (reference & compareMask) is the test value and
+	// (reference & writeMask) is the write value. Outer tests
+	// (s&1)==0 with ref 0; marker tests (s&1)==1 and sets bit1
+	// with ref 3 / writeMask 0x02 ((3&2)=2, bit0 preserved);
+	// painter tests (s&3)==3 with ref 3.
+	auto band_stencil = [&](uint32_t compare_mask, uint32_t reference, vk::StencilOp pass_op, uint32_t write_mask) {
 		vk::StencilOpState state{
 		        .failOp = vk::StencilOp::eKeep,
-		        .passOp = vk::StencilOp::eKeep,
+		        .passOp = pass_op,
 		        .depthFailOp = vk::StencilOp::eKeep,
-		        .compareOp = op,
-		        .compareMask = 0xFF,
-		        .writeMask = 0x00,
-		        .reference = ref,
+		        .compareOp = vk::CompareOp::eEqual,
+		        .compareMask = compare_mask,
+		        .writeMask = write_mask,
+		        .reference = reference,
 		};
 		return std::pair<vk::StencilOpState, vk::StencilOpState>{state, state};
 	};
 	auto make_band_pipe = [&](vk::raii::RenderPass & rp, bool depth_test, vk::CompareOp depth_op, float bias,
-	                          uint32_t stencil_ref) {
+	                          uint32_t cmp_mask, uint32_t reference, vk::StencilOp pass_op, uint32_t write_mask,
+	                          bool write_color) {
 		vk::PipelineRasterizationStateCreateInfo band_rasterization{
 		        .polygonMode = vk::PolygonMode::eFill,
 		        .cullMode = vk::CullModeFlagBits::eNone,
@@ -1216,12 +1223,16 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		        .depthBiasConstantFactor = bias,
 		        .lineWidth = 1,
 		};
-		auto [stencil_front, stencil_back] = band_stencil(stencil_ref, vk::CompareOp::eEqual);
+		auto [stencil_front, stencil_back] = band_stencil(cmp_mask, reference, pass_op, write_mask);
+		// NOTE: Vulkan compares (stencil & compareMask) vs
+		// (reference & compareMask) with a SINGLE reference field,
+		// so the marker (test 1, write bit1) cannot share one state:
+		// outer/inner use test==write, the marker is specialized
+		// below by patching state.reference after the helper.
 		vk::PipelineDepthStencilStateCreateInfo band_depth{
 		        .depthTestEnable = depth_test ? VK_TRUE : VK_FALSE,
 		        .depthWriteEnable = VK_FALSE,
-		        // Reversed-Z (near = 1): lo passes at-or-nearer than
-		        // stored (+bias window), hi at-or-farther (-bias).
+		        // Reversed-Z (near = 1).
 		        .depthCompareOp = depth_op,
 		        .stencilTestEnable = VK_TRUE,
 		        .front = stencil_front,
@@ -1232,8 +1243,9 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		vk::PipelineColorBlendAttachmentState band_blend_attachment{
 		        .blendEnable = VK_FALSE,
-		        .colorWriteMask = vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
-		                          vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA,
+		        .colorWriteMask = write_color ? (vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+		                                        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA)
+		                                      : vk::ColorComponentFlagBits{},
 		};
 		vk::PipelineColorBlendStateCreateInfo band_blend{
 		        .attachmentCount = 1,
@@ -1260,19 +1272,21 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 		};
 		return vk::raii::Pipeline(device, *pipe_cache, band_pipe_info);
 	};
-	// Outer (background only): stencil == 0, no depth test — no valid
-	// surface anywhere behind the quad.
-	band_r8_outer_pipeline = make_band_pipe(band_r8_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0);
-	band_rgba_outer_pipeline = make_band_pipe(band_rgba_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0);
-	// Inner window (own surface only): stencil == 1 with a symmetric
-	// ±bias depth window around the stored surface. lo passes
-	// at-or-nearer, hi at-or-farther; both write the same ramp so
-	// overlap is harmless.
-	band_r8_lo_pipeline = make_band_pipe(band_r8_depth_rp, true, vk::CompareOp::eGreaterOrEqual, band_depth_bias, 1);
-	band_r8_hi_pipeline = make_band_pipe(band_r8_depth_rp, true, vk::CompareOp::eLessOrEqual, -band_depth_bias, 1);
-	band_rgba_lo_pipeline = make_band_pipe(band_rgba_depth_rp, true, vk::CompareOp::eGreaterOrEqual, band_depth_bias, 1);
-	band_rgba_hi_pipeline = make_band_pipe(band_rgba_depth_rp, true, vk::CompareOp::eLessOrEqual, -band_depth_bias, 1);
-	spdlog::info("feather silhouette band pipes built (explicit loop, stencil-gated outer + depth-window inner)");
+	// Outer (background only): (stencil & 1) == 0, no depth test.
+	// Outer (background only): (stencil & 1) == 0, no depth test.
+	band_r8_outer_pipeline = make_band_pipe(band_r8_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0x01, 0, vk::StencilOp::eKeep, 0x00, true);
+	band_rgba_outer_pipeline = make_band_pipe(band_rgba_depth_rp, false, vk::CompareOp::eAlways, 0.f, 0x01, 0, vk::StencilOp::eKeep, 0x00, true);
+	// Marker (own-surface candidate): (stencil & 1) == 1 with a +bias
+	// depth window, color writes off, sets bit1 (stencil 1 → 3).
+	band_r8_mark_pipeline = make_band_pipe(band_r8_depth_rp, true, vk::CompareOp::eGreaterOrEqual, band_depth_bias, 0x01, 3, vk::StencilOp::eReplace, 0x02, false);
+	band_rgba_mark_pipeline = make_band_pipe(band_rgba_depth_rp, true, vk::CompareOp::eGreaterOrEqual, band_depth_bias, 0x01, 3, vk::StencilOp::eReplace, 0x02, false);
+	// Painter (confirmed own surface): stencil == 3 with a -bias depth
+	// window. Marker+painter AND the two half-windows: a pixel paints
+	// iff it is nearer-or-equal within +bias AND farther-or-equal
+	// within -bias, i.e. |quad - stored| <= bias on covered pixels.
+	band_r8_paint_pipeline = make_band_pipe(band_r8_depth_rp, true, vk::CompareOp::eLessOrEqual, -band_depth_bias, 0x03, 3, vk::StencilOp::eKeep, 0x00, true);
+	band_rgba_paint_pipeline = make_band_pipe(band_rgba_depth_rp, true, vk::CompareOp::eLessOrEqual, -band_depth_bias, 0x03, 3, vk::StencilOp::eKeep, 0x00, true);
+	spdlog::info("feather silhouette band pipes built (explicit loop, stencil outer + mark/paint AND window)");
 }
 
 std::pair<vk::raii::Buffer, vk::raii::DeviceMemory> feather_mask_renderer::make_buffer(vk::DeviceSize size,
@@ -2907,12 +2921,16 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		set_full_viewport(e);
 		// Three draws partition every case: outer paints background
 		// only (stencil == 0); lo/hi paint own-surface pixels only
-		// (stencil == 1 with a symmetric ±bias depth window). All
-		// write the same ramp, so cross-draw overlap is harmless.
+		// draws partition every case: outer paints background-only
+		// pixels (bit0 == 0); marker tags own-surface candidates
+		// (bit0 == 1, +bias window, stencil 1 → 3); painter ramps
+		// tagged pixels (−bias window). Marker+painter form the AND
+		// neither window has alone. Draw order is load-bearing only
+		// in that painter runs after marker (it tests marker's bit).
 		vk::Pipeline band_pipes[3] = {
 		        rgba ? *band_rgba_outer_pipeline : *band_r8_outer_pipeline,
-		        rgba ? *band_rgba_lo_pipeline : *band_r8_lo_pipeline,
-		        rgba ? *band_rgba_hi_pipeline : *band_r8_hi_pipeline,
+		        rgba ? *band_rgba_mark_pipeline : *band_r8_mark_pipeline,
+		        rgba ? *band_rgba_paint_pipeline : *band_r8_paint_pipeline,
 		};
 		for (vk::Pipeline pipe: band_pipes)
 		{

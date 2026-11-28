@@ -315,19 +315,22 @@ private:
 	// which legally discards); color LOAD/STOREs. Push-only layout
 	// (140B: MVP pair + opacity + viewport size), no descriptors.
 	vk::raii::PipelineLayout band_layout{nullptr};
-	// Band draw set (stencil-gated, REPLACE, no depth write):
-	// outer paints background-only pixels (stencil == 0, no depth
-	// test); inner-lo/hi paint own-surface pixels (stencil == 1 with
-	// a symmetric ±bias depth window around the stored surface).
-	// The three draws partition every case: occluded and
-	// front-over-behind quads fail everywhere, true rims ramp both
-	// halves. R8 + RGBA8 variants.
+	// Band draw set (REPLACE, no depth write): outer paints
+	// background-only pixels (stencil bit0 == 0, no depth test);
+	// marker tags own-surface pixels (bit0 == 1 with a +bias depth
+	// window, color writes off, sets bit1); painter ramps tagged
+	// pixels (bits == 3 with a -bias depth window). Marker+painter
+	// form the AND the two-window-draws version lacked (separate
+	// draws OR together, which is a tautology — it painted every
+	// covered pixel). Occluded and front-over-behind quads fail
+	// somewhere in the chain, so step overhangs and hidden back edges
+	// keep binary; true rims ramp both halves. R8 + RGBA8 variants.
 	vk::raii::Pipeline band_r8_outer_pipeline{nullptr};
-	vk::raii::Pipeline band_r8_lo_pipeline{nullptr};
-	vk::raii::Pipeline band_r8_hi_pipeline{nullptr};
+	vk::raii::Pipeline band_r8_mark_pipeline{nullptr};
+	vk::raii::Pipeline band_r8_paint_pipeline{nullptr};
 	vk::raii::Pipeline band_rgba_outer_pipeline{nullptr};
-	vk::raii::Pipeline band_rgba_lo_pipeline{nullptr};
-	vk::raii::Pipeline band_rgba_hi_pipeline{nullptr};
+	vk::raii::Pipeline band_rgba_mark_pipeline{nullptr};
+	vk::raii::Pipeline band_rgba_paint_pipeline{nullptr};
 	vk::raii::RenderPass band_r8_depth_rp{nullptr};
 	vk::raii::RenderPass band_rgba_depth_rp{nullptr};
 	// Band LOAD framebuffers: one per color image, creation-only
