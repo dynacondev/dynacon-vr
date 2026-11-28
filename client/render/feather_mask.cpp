@@ -3006,7 +3006,8 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		// padded for the ±1px quads + square caps): shrinks renderArea
 		// (tile LOAD/STORE traffic on TBDR — outside renderArea is
 		// preserved, not reloaded) and fragments. Any straddling draw
-		// falls back to fullscreen; fully-off-screen draws contribute
+		// falls back to fullscreen (accumulators bypassed, never
+		// returned-through); fully-off-screen draws contribute
 		// nothing. Empty union → return before any barrier.
 		vk::Rect2D band_area{{0, 0}, e};
 		{
@@ -3032,10 +3033,18 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 				x1 = std::max(x1, box.offset.x + (int32_t)box.extent.width);
 				y1 = std::max(y1, box.offset.y + (int32_t)box.extent.height);
 			}
-			if (x1 <= x0 or y1 <= y0)
-				return;
-			if (!full)
+			// A straddling draw (any AABB corner behind either camera)
+			// cannot clip: keep the fullscreen fallback (band_area
+			// init). Only a truly empty union (every draw off-screen,
+			// none straddling) proves nothing paints and returns
+			// early.
+			if (not full)
+			{
+				if (x1 <= x0 or y1 <= y0)
+					return;
 				band_area = vk::Rect2D{{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+			}
+			// else: straddle fallback, band_area stays fullscreen.
 		}
 		transfer_barrier(img,
 		                 vk::ImageLayout::eColorAttachmentOptimal,
