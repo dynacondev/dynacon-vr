@@ -28,8 +28,13 @@
 // tuning — the test is resolution-exact by construction. Closed
 // boundary (== 0 paints) keeps the shared edge row gap-free; the
 // fallback (discard) preserves binary underneath (fail-safe).
-// Same tent as the outer shader: identical cov(d) where both paint,
-// so overlap is idempotent.
+// Degenerate triangles (needle/collinear: all s_i ~ 0) paint —
+// over-reveal by design, never a pinhole (non-forced silhouette edges
+// always carry a non-degenerate front triangle: area0*area1 < 0 forces
+// the picked half to nonzero area, so only forced boundary edges can
+// hit this path).
+// Same tent as the outer shader: identical cov(d), so the two stencil-
+// disjoint halves join continuously at the edge row.
 layout(location = 0) flat in vec2 fA;
 layout(location = 1) flat in vec2 fB;
 layout(location = 2) flat in float fSide;

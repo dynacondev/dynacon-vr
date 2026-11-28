@@ -310,16 +310,18 @@ private:
 	vk::raii::Pipeline raster_r8_reverse_pipeline_mv{nullptr};
 	vk::raii::Pipeline raster_r8_mark_pipeline_mv{nullptr};
 	// Explicit silhouette band (closed-volume dynamic AA, all tiers):
-	// per-edge instanced quads (sil_band_mv.vert/frag, 4 verts/edge as
-	// a triangle strip, blend-off overwrite, stencil-gated three-draw
-	// partition with write off, cull-none), evaluated per eye from the
+	// per-edge instanced quads (sil_band_mv.vert + sil_band_mv.frag
+	// outer / sil_band_inner_mv.frag inner, 4 verts/edge as a triangle
+	// strip, blend-off overwrite, stencil-gated two-draw partition, no
+	// depth test anywhere, cull-none), evaluated per eye from the
 	// calling view's MVP. R8 pipe renders the working intermediates under
 	// band_r8_depth_rp; RGBA8 renders tier-0 submits under
-	// band_rgba_depth_rp (dedicated color+depth LOAD twins: Pass 1
-	// wrote both, the band tests depth and overwrites color). Depth
-	// LOADs (preserves Pass-1), stores DONT_CARE (depth is dead after
-	// the band — the next use is a CLEAR with initialLayout UNDEFINED,
-	// which legally discards); color LOAD/STOREs. Push-only layout
+	// band_rgba_depth_rp (dedicated stencil-carrying LOAD twins: Pass 1
+	// marked coverage, the band tests stencil + front-triangle clip and
+	// overwrites color). Depth LOAD/STOREs are DONT_CARE (nothing reads
+	// working depth — the next use is a CLEAR with initialLayout
+	// UNDEFINED, which legally discards); stencil LOADs the mark;
+	// color LOAD/STOREs. Push-only layout
 	// (140B: MVP pair + opacity + viewport size), no descriptors.
 	vk::raii::PipelineLayout band_layout{nullptr};
 	// Band draw set (REPLACE, no depth test anywhere, no bias, no

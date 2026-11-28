@@ -1231,12 +1231,6 @@ feather_mask_renderer::feather_mask_renderer(vk::raii::Device & device_,
 	};
 	band_r8_depth_rp = make_band_rp(blur_format);
 	band_rgba_depth_rp = make_band_rp(format);
-	// One reference field serves both compare and REPLACE: pick it
-	// so (reference & compareMask) is the test value and
-	// (reference & writeMask) is the write value. Outer tests
-	// (s&1)==0 with ref 0; marker tests (s&1)==1 and sets bit1
-	// with ref 3 / writeMask 0x02 ((3&2)=2, bit0 preserved);
-	// painter tests (s&3)==3 with ref 3.
 	auto band_stencil = [&](uint32_t compare_mask, uint32_t reference) {
 		vk::StencilOpState state{
 		        .failOp = vk::StencilOp::eKeep,
@@ -2148,7 +2142,7 @@ void feather_mask_renderer::ensure_targets(vk::Extent2D extent, bool with_interm
 		// Tier-0 direct raster never touches the blur/downsample
 		// workspaces: it rasters straight into the submitted images
 		// (per-image targets map); reversed depth and the band's
-		// occlusion test use output_depth.
+		// stencil mark use output_depth.
 		// Drop any present
 		// (tier downgrade) and skip the ~17 MB alloc. Views die before
 		// the images they reference (existing order below).
@@ -2761,7 +2755,7 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		        });
 		// Depth-tested raster companion for tier-0 direct raster: one
 		// layers=1 color+depth FB under depth_renderpass_mv. Always
-		// present: the band's occlusion test needs depth even for
+		// present: the band's stencil mark needs coverage even for
 		// positives-only groups (reversed groups reuse the same FB).
 		vk::ImageView depth_array_view = output_depth_array_view(out_extent);
 		vk::ImageView mv_depth_atts[2] = {mv_raw_array, depth_array_view};
