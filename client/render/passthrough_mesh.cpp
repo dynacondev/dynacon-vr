@@ -263,9 +263,11 @@ void append_primitive(
 
 	const fastgltf::Accessor & position_accessor = asset.accessors.at(position_attr->accessorIndex);
 
-	// Bake node transform into positions, epsilon-welded: near-coincident
-	// positions share one vertex (remap records the welded index per
-	// position in accessor order).
+	// Bake node transform into positions, bitwise-welded: exactly
+	// coincident positions share one vertex (remap records the welded
+	// index per position in accessor order). Near-but-unequal positions
+	// (1-ulp seams) do NOT merge — they surface in extraction as
+	// boundary forced-emits (fail-safe over-reveal), never pinholes.
 	uint32_t base_vertex = out.vertices.size();
 	size_t index_start = out.indices.size();
 	std::vector<uint32_t> weld_remap;
@@ -403,7 +405,9 @@ void append_node(
 // disagree by snapping and drop the pixel on both sides (deficit pinhole,
 // which tier-1 erode widens into a hairline). Midpoints computed from
 // identical endpoints are bitwise-identical, so the lookup below never
-// creates vertices — it only reuses existing ones. Boundary/unconnected
+// creates vertices — it only reuses existing ones. Midpoint probes
+// only (no third-point/uneven splits): residual non-midpoint junctions
+// persist (capped, warned). Boundary/unconnected
 // matches are split too (exact tilings either way; only costs tris).
 // Runs per primitive inside append_primitive and once globally over the
 // whole soup in flatten_gltf (cross-primitive duplicates need the global

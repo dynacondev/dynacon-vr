@@ -2796,6 +2796,72 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// set with no dynamic offsets).
 	std::array<uint32_t, 0> no_offsets{};
 
+	// Conservative per-draw screen bounds (both eyes merged, pixels at
+	// extent e): returns false when the box cannot clip (any AABB corner
+	// behind the camera — fall back to fullscreen); otherwise fills
+	// `box`, which may be empty (fully off-screen in both eyes — safe
+	// to skip the draw). Raster callers pass pad 0; band callers pad
+	// for the ±1px quads + square caps. Same NDC→pixel mapping as the
+	// group pass_scissor below. Missing mesh → empty (caller skips).
+	auto draw_screen_box = [&](const instance_draw & d, vk::Extent2D e, int32_t pad, vk::Rect2D & box) {
+		auto mit = meshes.find(d.mesh);
+		if (mit == meshes.end())
+		{
+			box = vk::Rect2D{{0, 0}, {0, 0}};
+			return true;
+		}
+		const glm::vec3 & mn = mit->second.aabb_min;
+		const glm::vec3 & mx = mit->second.aabb_max;
+		float uminx = 1e30f, uminy = 1e30f, umaxx = -1e30f, umaxy = -1e30f;
+		int behind = 0, front = 0;
+		for (int eye = 0; eye < 2; ++eye)
+		{
+			for (int corner = 0; corner < 8; ++corner)
+			{
+				glm::vec4 q((corner & 1) ? mx.x : mn.x, (corner & 2) ? mx.y : mn.y,
+				            (corner & 4) ? mx.z : mn.z, 1);
+				glm::vec4 c = d.mvp[eye] * q;
+				if (c.w <= 0)
+				{
+					++behind;
+					continue;
+				}
+				++front;
+				float nx = c.x / c.w, ny = c.y / c.w;
+				uminx = std::min(uminx, nx);
+				uminy = std::min(uminy, ny);
+				umaxx = std::max(umaxx, nx);
+				umaxy = std::max(umaxy, ny);
+			}
+		}
+		if (front == 0)
+		{
+			// Fully behind the camera: raster clips everything, band
+			// quads all collapse — nothing to draw or shade.
+			box = vk::Rect2D{{0, 0}, {0, 0}};
+			return true;
+		}
+		if (behind > 0)
+			return false; // straddle: cannot clip, fullscreen fallback
+		// floor/ceil (not truncation): an empty box then proves no
+		// pixel is touched, so skipping the draw is exact.
+		int32_t px0 = std::max<int32_t>(0, (int32_t)std::floor((uminx * 0.5f + 0.5f) * (float)e.width) - pad);
+		int32_t py0 = std::max<int32_t>(0, (int32_t)std::floor((uminy * 0.5f + 0.5f) * (float)e.height) - pad);
+		int32_t px1 = std::min<int32_t>((int32_t)e.width, (int32_t)std::ceil((umaxx * 0.5f + 0.5f) * (float)e.width) + pad);
+		int32_t py1 = std::min<int32_t>((int32_t)e.height, (int32_t)std::ceil((umaxy * 0.5f + 0.5f) * (float)e.height) + pad);
+		if (px1 <= px0 or py1 <= py0)
+			box = vk::Rect2D{{0, 0}, {0, 0}};
+		else
+			box = vk::Rect2D{{px0, py0}, {(uint32_t)(px1 - px0), (uint32_t)(py1 - py0)}};
+		return true;
+	};
+	auto draw_visible = [&](const instance_draw & d, vk::Extent2D e, int32_t pad = 0) {
+		vk::Rect2D box;
+		if (!draw_screen_box(d, e, pad, box))
+			return true;
+		return box.extent.width > 0 and box.extent.height > 0;
+	};
+
 	// Silhouette raster shared by every path: one draw per (mesh,
 	// instance) broadcasts to both layers. Missing meshes (removed
 	// object racing a queued draw) skip defensively. NDC is
@@ -2848,6 +2914,10 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					continue;
 				auto mit = meshes.find(d.mesh);
 				if (mit == meshes.end() or mit->second.index_count == 0)
+					continue;
+				// Fully off-screen in both eyes: clipping already yields
+				// nothing; skip the vertex cost (clear still runs above).
+				if (!draw_visible(d, e))
 					continue;
 				float v = d.reverse ? 1.f - d.opacity : d.opacity;
 				cmd.pushConstants<silhouette_mv_push>(*silhouette_mv_layout, vk::ShaderStageFlagBits::eVertex | vk::ShaderStageFlagBits::eFragment, 0,
@@ -2926,6 +2996,41 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		if (not any)
 			return;
 		section_clock band_clk(&ms_raster);
+		// Band scissor union (per-draw AABB boxes at the target extent,
+		// padded for the ±1px quads + square caps): shrinks renderArea
+		// (tile LOAD/STORE traffic on TBDR — outside renderArea is
+		// preserved, not reloaded) and fragments. Any straddling draw
+		// falls back to fullscreen; fully-off-screen draws contribute
+		// nothing. Empty union → return before any barrier.
+		vk::Rect2D band_area{{0, 0}, e};
+		{
+			int32_t x0 = (int32_t)e.width, y0 = (int32_t)e.height, x1 = 0, y1 = 0;
+			bool full = false;
+			for (const auto & d: draws)
+			{
+				if (d.reverse)
+					continue;
+				auto mit = meshes.find(d.mesh);
+				if (mit == meshes.end() or mit->second.edge_count == 0)
+					continue;
+				vk::Rect2D box;
+				if (!draw_screen_box(d, e, 4, box))
+				{
+					full = true;
+					break;
+				}
+				if (box.extent.width == 0 or box.extent.height == 0)
+					continue;
+				x0 = std::min(x0, box.offset.x);
+				y0 = std::min(y0, box.offset.y);
+				x1 = std::max(x1, box.offset.x + (int32_t)box.extent.width);
+				y1 = std::max(y1, box.offset.y + (int32_t)box.extent.height);
+			}
+			if (x1 <= x0 or y1 <= y0)
+				return;
+			if (!full)
+				band_area = vk::Rect2D{{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+		}
 		transfer_barrier(img,
 		                 vk::ImageLayout::eColorAttachmentOptimal,
 		                 vk::ImageLayout::eColorAttachmentOptimal,
@@ -2956,11 +3061,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		vk::RenderPassBeginInfo band_begin{
 		        .renderPass = rgba ? *band_rgba_depth_rp : *band_r8_depth_rp,
 		        .framebuffer = band_fb_for(img, color_view, depth_view, e, rgba),
-		        .renderArea = {.offset = {0, 0}, .extent = e},
+		        .renderArea = band_area,
 		        .clearValueCount = 0,
 		};
 		cmd.beginRenderPass(band_begin, vk::SubpassContents::eInline);
 		set_full_viewport(e);
+		cmd.setScissor(0, band_area);
 		// Two draws partition every case: outer paints
 		// background-only pixels (stencil == 0); inner paints
 		// single-covered own-surface pixels (stencil == 1 AND inside
@@ -2980,6 +3086,11 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 					continue;
 				auto mit = meshes.find(d.mesh);
 				if (mit == meshes.end() or mit->second.edge_count == 0)
+					continue;
+				// Pad 4 matches the union above: quads reach ~2px past
+				// the AABB, so only a pad-4-empty box proves no quad
+				// touches a pixel.
+				if (!draw_visible(d, e, 4))
 					continue;
 				cmd.pushConstants<band_push>(*band_layout, vk::ShaderStageFlagBits::eVertex, 0,
 				                             band_push{.mvp = {{d.mvp[0], d.mvp[1]}}, .opacity = d.opacity, .vp_w = (float)e.width, .vp_h = (float)e.height});
@@ -3168,10 +3279,24 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 			assert(dit != output_depth.end());
 			return (vk::Image)*dit->second.image;
 		};
-		// Band runs on positives-only groups (reversed skips inside
-		// run_band too): raster marks stencil so the band can
-		// partition on it. Color output identical either way.
-		bool mark_cover = has_positive and not has_reversed;
+		// Band runs on positives-only groups with loop edges (reversed
+		// skips inside run_band too): raster marks stencil so the band
+		// can partition on it. The edge check spares edgeless groups
+		// the depth/stencil target (same predicate run_band re-checks
+		// below). Color output identical either way.
+		bool any_band_edges = false;
+		for (const auto & d: draws)
+		{
+			if (d.reverse)
+				continue;
+			auto mit = meshes.find(d.mesh);
+			if (mit != meshes.end() and mit->second.edge_count > 0)
+			{
+				any_band_edges = true;
+				break;
+			}
+		}
+		bool mark_cover = has_positive and not has_reversed and any_band_edges;
 		if (tier == 0)
 		{
 			section_clock raster_clk(&ms_raster);
