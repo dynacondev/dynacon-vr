@@ -2797,6 +2797,12 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 	// to skip the draw). Raster callers pass pad 0; band callers pad
 	// for the ±1px quads + square caps. Same NDC→pixel mapping as the
 	// group pass_scissor below. Missing mesh → empty (caller skips).
+	// A 1px outward guard is folded in (float rounding in the MVP
+	// chain, worst near-camera where x/w magnifies it), and the float
+	// edges clamp to [0, extent] BEFORE the int cast: all-front
+	// near-camera geometry can project to |NDC| >> 1 (x/w with w → 0+),
+	// far past int32 range — casting first is UB and in practice yields
+	// INT_MIN, i.e. a false empty box around a fullscreen object.
 	auto draw_screen_box = [&](const instance_draw & d, vk::Extent2D e, int32_t pad, vk::Rect2D & box) {
 		auto mit = meshes.find(d.mesh);
 		if (mit == meshes.end())
@@ -2837,12 +2843,18 @@ void feather_mask_renderer::record(vk::raii::CommandBuffer & cmd,
 		}
 		if (behind > 0)
 			return false; // straddle: cannot clip, fullscreen fallback
-		// floor/ceil (not truncation): an empty box then proves no
-		// pixel is touched, so skipping the draw is exact.
-		int32_t px0 = std::max<int32_t>(0, (int32_t)std::floor((uminx * 0.5f + 0.5f) * (float)e.width) - pad);
-		int32_t py0 = std::max<int32_t>(0, (int32_t)std::floor((uminy * 0.5f + 0.5f) * (float)e.height) - pad);
-		int32_t px1 = std::min<int32_t>((int32_t)e.width, (int32_t)std::ceil((umaxx * 0.5f + 0.5f) * (float)e.width) + pad);
-		int32_t py1 = std::min<int32_t>((int32_t)e.height, (int32_t)std::ceil((umaxy * 0.5f + 0.5f) * (float)e.height) + pad);
+		// floor/ceil (not truncation) on clamped floats: an empty box
+		// then proves no pixel is touched, so skipping the draw is
+		// exact. Only in-range edges take floor/ceil, where the int
+		// cast cannot overflow.
+		float fx0 = (uminx * 0.5f + 0.5f) * (float)e.width - 1 - (float)pad;
+		float fy0 = (uminy * 0.5f + 0.5f) * (float)e.height - 1 - (float)pad;
+		float fx1 = (umaxx * 0.5f + 0.5f) * (float)e.width + 1 + (float)pad;
+		float fy1 = (umaxy * 0.5f + 0.5f) * (float)e.height + 1 + (float)pad;
+		int32_t px0 = fx0 <= 0.f ? 0 : (fx0 >= (float)e.width ? (int32_t)e.width : (int32_t)std::floor(fx0));
+		int32_t py0 = fy0 <= 0.f ? 0 : (fy0 >= (float)e.height ? (int32_t)e.height : (int32_t)std::floor(fy0));
+		int32_t px1 = fx1 <= 0.f ? 0 : (fx1 >= (float)e.width ? (int32_t)e.width : (int32_t)std::ceil(fx1));
+		int32_t py1 = fy1 <= 0.f ? 0 : (fy1 >= (float)e.height ? (int32_t)e.height : (int32_t)std::ceil(fy1));
 		if (px1 <= px0 or py1 <= py0)
 			box = vk::Rect2D{{0, 0}, {0, 0}};
 		else
